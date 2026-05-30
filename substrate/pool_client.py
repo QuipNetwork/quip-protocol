@@ -119,6 +119,15 @@ class PoolClient:
             "query_winning_solution", {"block_number": block_number}
         )
 
+    async def query_winning_solution_count(self) -> int:
+        """Return the recorded ``QuantumPow.WinningSolutions`` count.
+
+        The controller uses ``count + 1`` as the chain-global ordinal of the
+        solution currently being mined (the on-disk archive key). Routes
+        through the pool's idempotent-retry path.
+        """
+        return await self._pool.send("query_winning_solution_count", {})
+
     async def query_balance(self, account: bytes) -> int:
         return await self._pool.send("query_balance", {"account": account})
 

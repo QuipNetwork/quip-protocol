@@ -179,6 +179,44 @@ for per-solver `h_range`, `j_range`, `extended_j_range`, and
 | Modal | 128–4096 | (adaptive) |
 | QPU | annealing 5–20µs | 32–64 |
 
+## Identifiers: solution number vs `dispatch_id`
+
+Two distinct identifiers exist; **never conflate them**, and never persist
+on `dispatch_id`.
+
+- **Solution number** — the chain-global *ordinal* of the QPoW solution
+  being mined: `count(QuantumPow.WinningSolutions) + 1`. The chain has no
+  stored solution counter — solutions are keyed in `WinningSolutions` by
+  the block number they won at (`submitted_at == key`), so the ordinal is
+  derived by counting that map's keys (cheap: one paged `state_getKeysPaged`
+  over the storage prefix, keys only). It is **determinable at round
+  start** — a round mines toward a specific upcoming solution number; the
+  round's `last_proof_block_hash` (= `block_hash(LastProofBlock)`) stays
+  constant until a proof wins and advances it. Compute the count **once per
+  round and cache it** (recount only when `last_proof_block_hash` changes);
+  it is global, monotonic, and never repeats.
+  - **Not the same as a block number.** `LastProofBlock` (e.g. 52507) is
+    the block number of the most recent winning proof — the round anchor,
+    not the solution ordinal (e.g. 196). Don't conflate them.
+  - **This is the on-disk key for the mining-attempts archive**
+    (`{base}/{solution_number}/…`). Because it tracks the logical
+    solution, a controller/worker restart mid-round correctly *resumes*
+    writing into the same solution dir — that is not stale accretion, it
+    is the same solution. Different solution number ⇒ different dir.
+
+- **`dispatch_id`** — an **internal-only** controller↔worker coordination
+  handle: `_dispatch_contexts[(handle_id, dispatch_id)]`, cancel-ack
+  (`_await_handle_done`), and the preview channel (see `ARCHITECTURE.md`
+  §3.3). It is a process-local monotonic counter that **resets to 0 on
+  restart**, so it collides across runs and MUST NOT be used as a durable
+  or on-disk identity. Keep it in memory for pairing responses to
+  contexts; never name persisted artifacts after it.
+
+The old `SubmissionLogger` `next_solution_id` local counter (persisted in
+`{base}/next_solution_id`) was a stand-in for the chain solution number
+and is misaligned with this model — replace it with the chain-derived
+solution number, do not extend it.
+
 ## Code style
 
 - **Imports** at top of file, in stdlib → third-party → local order. Absolute imports only. No inline imports inside functions/methods. Exception: optional-dependency `try/except` at module level.
