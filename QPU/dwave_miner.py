@@ -270,7 +270,9 @@ class DWaveMiner(BaseMiner):
         except Exception as e:
             if hasattr(self, 'logger'):
                 self.logger.error(f"Error during QPU miner cleanup: {e}")
-        sys.exit(0)
+        # Guard against raising SystemExit during interpreter finalization
+        # (would produce "Exception ignored" noise on stderr).
+        self._graceful_exit()
 
     def _pre_mine_setup(
         self,
