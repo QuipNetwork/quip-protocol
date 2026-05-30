@@ -536,14 +536,20 @@ def test_close_driver_reaps_and_unlinks():
     import time as _t
     t = threading.Thread(target=lambda: miner.mine_work_item(ctx, stop))
     t.start()
-    _t.sleep(0.4)
-    names = list(miner._ring.names)
-    stop.set()
-    t.join(timeout=15.0)
-    miner._close_driver()
+    try:
+        # Poll for the persistent ring to come up (driver spawned) rather than
+        # a fixed sleep, so a loaded box can't race us into a None deref.
+        deadline = _t.monotonic() + 5.0
+        while miner._ring is None and _t.monotonic() < deadline:
+            _t.sleep(0.02)
+        assert miner._ring is not None, "driver ring never came up"
+        names = list(miner._ring.names)
+    finally:
+        stop.set()
+        t.join(timeout=15.0)
+        miner._close_driver()
     assert miner._driver_proc is None
     assert miner._ring is None
-    # Segments are unlinked: re-attaching by name must fail.
     import pytest
     from multiprocessing import shared_memory
     with pytest.raises(FileNotFoundError):
