@@ -1,4 +1,5 @@
 """Tests for IsingModel dataclass, RandomIsingFeeder, and FixedIsingFeeder."""
+
 from __future__ import annotations
 
 import dataclasses
@@ -39,8 +40,10 @@ _NONCE_BYTES_42 = (42).to_bytes(32, "big")
 class TestIsingModel:
     def test_fields(self):
         model = IsingModel(
-            h={0: 1.0}, J={(0, 1): -1.0},
-            nonce=_NONCE_BYTES_42, salt=b"salt",
+            h={0: 1.0},
+            J={(0, 1): -1.0},
+            nonce=_NONCE_BYTES_42,
+            salt=b"salt",
         )
         assert model.h == {0: 1.0}
         assert model.J == {(0, 1): -1.0}
@@ -49,8 +52,10 @@ class TestIsingModel:
 
     def test_model_immutable(self):
         model = IsingModel(
-            h={0: 1.0}, J={(0, 1): -1.0},
-            nonce=_NONCE_BYTES_42, salt=b"salt",
+            h={0: 1.0},
+            J={(0, 1): -1.0},
+            nonce=_NONCE_BYTES_42,
+            salt=b"salt",
         )
         with pytest.raises(
             (AttributeError, dataclasses.FrozenInstanceError),
@@ -113,10 +118,7 @@ class TestRandomIsingFeeder:
         feeder = _make_feeder(seed=5)
         try:
             result = feeder.try_pop()
-            assert (
-                result is None
-                or isinstance(result, IsingModel)
-            )
+            assert result is None or isinstance(result, IsingModel)
         finally:
             feeder.stop()
 
@@ -150,7 +152,9 @@ class TestRandomIsingFeeder:
         try:
             model = feeder.pop_blocking()
             h2, J2 = generate_ising_model_from_nonce(
-                model.nonce, _NODES, _EDGES,
+                model.nonce,
+                _NODES,
+                _EDGES,
             )
             assert model.h == h2
             assert model.J == J2
@@ -164,16 +168,21 @@ class TestRandomIsingFeeder:
                 feeder.pop_blocking()
             snap = feeder.stats()
             assert set(snap) >= {
-                'max_depth_seen', 'min_depth_seen', 'drained_count',
-                'pop_wait_total_s', 'pop_wait_count', 'ready',
-                'pending', 'buffer_size',
+                "max_depth_seen",
+                "min_depth_seen",
+                "drained_count",
+                "pop_wait_total_s",
+                "pop_wait_count",
+                "ready",
+                "pending",
+                "buffer_size",
             }
-            assert snap['buffer_size'] == 4
-            assert snap['max_depth_seen'] >= 0
-            assert snap['pop_wait_total_s'] >= 0.0
+            assert snap["buffer_size"] == 4
+            assert snap["max_depth_seen"] >= 0
+            assert snap["pop_wait_total_s"] >= 0.0
             # pop_wait_count only increments when pop_blocking actually
             # blocks on a worker; depending on timing it may be 0.
-            assert snap['pop_wait_count'] >= 0
+            assert snap["pop_wait_count"] >= 0
         finally:
             feeder.stop()
 
@@ -183,12 +192,46 @@ class TestRandomIsingFeeder:
             feeder.pop_blocking()
             feeder.reset_stats()
             snap = feeder.stats()
-            assert snap['max_depth_seen'] == 0
-            assert snap['drained_count'] == 0
-            assert snap['pop_wait_total_s'] == 0.0
-            assert snap['pop_wait_count'] == 0
+            assert snap["max_depth_seen"] == 0
+            assert snap["drained_count"] == 0
+            assert snap["pop_wait_total_s"] == 0.0
+            assert snap["pop_wait_count"] == 0
         finally:
             feeder.stop()
+
+    def test_reseed_swaps_seed_and_keeps_pool(self):
+        """reseed swaps the round seed, flushes old-seed models, reuses
+        the pool.
+        """
+        feeder = _make_feeder(seed=42)
+        try:
+            pool_before = feeder._pool
+            m_old = feeder.pop_blocking()
+            assert len(m_old.nonce) == 32
+
+            feeder.reseed(b"\x09" * 32, b"\x02" * 32)
+
+            # Same ProcessPoolExecutor object — no re-fork on reseed.
+            assert feeder._pool is pool_before
+            # New seed is in effect; the ready buffer was flushed
+            # (no stale models).
+            assert feeder._last_proof_block_hash == b"\x09" * 32
+            m_new = feeder.pop_blocking()
+            assert len(m_new.nonce) == 32
+        finally:
+            feeder.stop()
+
+    def test_reseed_validates_lengths(self):
+        """reseed validates that arguments are exactly 32 bytes."""
+        feeder = _make_feeder(seed=43)
+        try:
+            with pytest.raises(ValueError):
+                feeder.reseed(b"\x03" * 31, b"\x02" * 32)
+            with pytest.raises(ValueError):
+                feeder.reseed(b"\x03" * 32, b"\x02" * 31)
+        finally:
+            feeder.stop()
+
 
 def _make_model(seed: int = 0) -> IsingModel:
     """Build a small deterministic IsingModel for FixedIsingFeeder tests."""
@@ -260,12 +303,17 @@ class TestFixedIsingFeeder:
         try:
             snap = feeder.stats()
             assert set(snap) == {
-                'max_depth_seen', 'min_depth_seen', 'drained_count',
-                'pop_wait_total_s', 'pop_wait_count', 'ready',
-                'pending', 'buffer_size',
+                "max_depth_seen",
+                "min_depth_seen",
+                "drained_count",
+                "pop_wait_total_s",
+                "pop_wait_count",
+                "ready",
+                "pending",
+                "buffer_size",
             }
-            assert snap['drained_count'] == 0
-            assert snap['buffer_size'] == 2
+            assert snap["drained_count"] == 0
+            assert snap["buffer_size"] == 2
         finally:
             feeder.stop()
 
@@ -320,6 +368,7 @@ class TestRandomIsingFeederFinalizer:
         del feeder
         # Force a GC cycle so CPython's reference counting picks it up.
         import gc
+
         gc.collect()
 
         # Feeder should be gone.

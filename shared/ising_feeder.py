@@ -14,6 +14,7 @@ Both expose the same ``pop`` / ``pop_blocking`` / ``try_pop`` / ``pop_n`` /
 ``__iter__`` / ``stop`` surface so ``BaseMiner.mine_work_item`` can pop
 models from a feeder without caring which backend supplied it.
 """
+
 from __future__ import annotations
 
 import itertools
@@ -36,7 +37,7 @@ from shared.quantum_proof_of_work import (
 
 logger = logging.getLogger(__name__)
 
-_SPAWN_CTX = _mp.get_context('spawn')
+_SPAWN_CTX = _mp.get_context("spawn")
 
 
 def _generate_one_model(
@@ -152,18 +153,13 @@ class RandomIsingFeeder:
                 f"{len(last_proof_block_hash)}"
             )
         if len(miner_bytes) != 32:
-            raise ValueError(
-                f"miner_bytes must be 32 bytes, got {len(miner_bytes)}"
-            )
+            raise ValueError(f"miner_bytes must be 32 bytes, got {len(miner_bytes)}")
         self._last_proof_block_hash = last_proof_block_hash
         self._miner_id = miner_bytes
         self._nodes = nodes
         self._edges = edges
         self._buffer_size = buffer_size
-        self._rng = (
-            random.Random(seed) if seed is not None
-            else None
-        )
+        self._rng = random.Random(seed) if seed is not None else None
         self._pool = ProcessPoolExecutor(
             max_workers=max_workers,
             mp_context=_SPAWN_CTX,
@@ -174,7 +170,9 @@ class RandomIsingFeeder:
         # this runs too late to help — concurrent.futures' _python_exit join
         # fires first — which is why robust teardown lives in stop().
         self._finalizer = weakref.finalize(
-            self, _force_shutdown_pool, self._pool,
+            self,
+            _force_shutdown_pool,
+            self._pool,
         )
         self._futures: list = []
         self._queue: queue.Queue[IsingModel] = queue.Queue()
@@ -184,13 +182,58 @@ class RandomIsingFeeder:
         # full under load (drained_count > 0 means the QPU stream out-ran
         # the worker pool).
         self._stats: dict = {
-            'max_depth_seen': 0,
-            'min_depth_seen': 0,
-            'drained_count': 0,
-            'pop_wait_total_s': 0.0,
-            'pop_wait_count': 0,
+            "max_depth_seen": 0,
+            "min_depth_seen": 0,
+            "drained_count": 0,
+            "pop_wait_total_s": 0.0,
+            "pop_wait_count": 0,
         }
         self._min_depth_init = False
+        self._fill()
+
+    def reseed(self, last_proof_block_hash: bytes, miner_bytes: bytes) -> None:
+        """Swap the round seed in place, keeping the worker pool alive.
+
+        A new chain head changes ``last_proof_block_hash`` (and in principle
+        the miner identity). Re-deriving models requires only the new seed —
+        not a new ``ProcessPoolExecutor`` (that fork is the only expensive
+        part of feeder construction). This:
+
+        1. Cancels + drops all in-flight futures (they were submitted under
+           the OLD seed; their results must never reach the new round).
+        2. Drains the ready buffer (old-seed models).
+        3. Installs the new seed and refills under it.
+
+        Args:
+            last_proof_block_hash: New 32-byte ``block_hash(LastProofBlock)``.
+            miner_bytes: Canonical 32-byte miner identity (unchanged in
+                practice, but accepted for a clean interface).
+
+        Raises:
+            ValueError: If either argument is not exactly 32 bytes.
+        """
+        if len(last_proof_block_hash) != 32:
+            raise ValueError(
+                "last_proof_block_hash must be 32 bytes, got "
+                f"{len(last_proof_block_hash)}"
+            )
+        if len(miner_bytes) != 32:
+            raise ValueError(f"miner_bytes must be 32 bytes, got {len(miner_bytes)}")
+        # Abandon old-seed in-flight work. cancel() is best-effort (a
+        # running worker keeps going), but clearing _futures means _fill
+        # never harvests the result, so no old-seed model can reach the new
+        # round.
+        for f in self._futures:
+            f.cancel()
+        self._futures.clear()
+        # Drain ready buffer of old-seed models.
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        self._last_proof_block_hash = last_proof_block_hash
+        self._miner_id = miner_bytes
         self._fill()
 
     def _make_salt(self) -> bytes:
@@ -214,18 +257,17 @@ class RandomIsingFeeder:
                     logger.warning(
                         "RandomIsingFeeder worker failed: %s (pending=%d, "
                         "queue=%d, buffer_size=%d)",
-                        exc, len(still_pending),
-                        self._queue.qsize(), self._buffer_size,
+                        exc,
+                        len(still_pending),
+                        self._queue.qsize(),
+                        self._buffer_size,
                     )
             else:
                 still_pending.append(f)
         self._futures = still_pending
 
         submitted = 0
-        while (
-            len(self._futures) + self._queue.qsize()
-            < self._buffer_size
-        ):
+        while len(self._futures) + self._queue.qsize() < self._buffer_size:
             salt = self._make_salt()
             f = self._pool.submit(
                 _generate_one_model,
@@ -247,18 +289,21 @@ class RandomIsingFeeder:
             logger.info(
                 "RandomIsingFeeder state: ready=%d pending=%d "
                 "buffer_size=%d submitted=%d failures=%d",
-                ready, pending, self._buffer_size,
-                submitted, failures,
+                ready,
+                pending,
+                self._buffer_size,
+                submitted,
+                failures,
             )
 
     def _record_depth(self, ready: int) -> None:
         s = self._stats
         if ready == 0:
-            s['drained_count'] += 1
-        if ready > s['max_depth_seen']:
-            s['max_depth_seen'] = ready
-        if not self._min_depth_init or ready < s['min_depth_seen']:
-            s['min_depth_seen'] = ready
+            s["drained_count"] += 1
+        if ready > s["max_depth_seen"]:
+            s["max_depth_seen"] = ready
+        if not self._min_depth_init or ready < s["min_depth_seen"]:
+            s["min_depth_seen"] = ready
             self._min_depth_init = True
 
     def stats(self) -> dict:
@@ -272,19 +317,19 @@ class RandomIsingFeeder:
             owns the feeder.
         """
         snap = dict(self._stats)
-        snap['ready'] = self._queue.qsize()
-        snap['pending'] = len(self._futures)
-        snap['buffer_size'] = self._buffer_size
+        snap["ready"] = self._queue.qsize()
+        snap["pending"] = len(self._futures)
+        snap["buffer_size"] = self._buffer_size
         return snap
 
     def reset_stats(self) -> None:
         """Zero the cumulative counters (point-in-time fields unaffected)."""
         self._stats = {
-            'max_depth_seen': 0,
-            'min_depth_seen': 0,
-            'drained_count': 0,
-            'pop_wait_total_s': 0.0,
-            'pop_wait_count': 0,
+            "max_depth_seen": 0,
+            "min_depth_seen": 0,
+            "drained_count": 0,
+            "pop_wait_total_s": 0.0,
+            "pop_wait_count": 0,
         }
         self._min_depth_init = False
 
@@ -312,9 +357,7 @@ class RandomIsingFeeder:
                 model = self._futures.pop(i).result()
                 self._fill()
                 return model
-        assert self._futures, (
-            "RandomIsingFeeder: no pending work and empty queue"
-        )
+        assert self._futures, "RandomIsingFeeder: no pending work and empty queue"
         assert False, (
             f"RandomIsingFeeder buffer underrun: "
             f"{len(self._futures)} futures pending, "
@@ -342,20 +385,20 @@ class RandomIsingFeeder:
             return self._queue.get_nowait()
         except queue.Empty:
             pass
-        assert self._futures, (
-            "RandomIsingFeeder: no pending work and empty queue"
-        )
+        assert self._futures, "RandomIsingFeeder: no pending work and empty queue"
         fut = self._futures.pop(0)
         t0 = time.monotonic()
         model = fut.result()
         waited = time.monotonic() - t0
-        self._stats['pop_wait_total_s'] += waited
-        self._stats['pop_wait_count'] += 1
+        self._stats["pop_wait_total_s"] += waited
+        self._stats["pop_wait_count"] += 1
         if waited > 1.0:
             logger.info(
                 "RandomIsingFeeder.pop_blocking waited %.2fs for a "
                 "worker (pending=%d, queue=%d)",
-                waited, len(self._futures), self._queue.qsize(),
+                waited,
+                len(self._futures),
+                self._queue.qsize(),
             )
         self._fill()
         return model
@@ -433,8 +476,7 @@ class FixedIsingFeeder:
     def __init__(self, models: Sequence[IsingModel]) -> None:
         if len(models) < 1:
             raise ValueError(
-                "FixedIsingFeeder requires at least one IsingModel, "
-                f"got {len(models)}"
+                f"FixedIsingFeeder requires at least one IsingModel, got {len(models)}"
             )
         # Materialise the input — accepting a Sequence keeps the
         # constructor flexible (lists, tuples, generators that have
@@ -488,14 +530,14 @@ class FixedIsingFeeder:
         """
         n = len(self._models)
         return {
-            'max_depth_seen': n,
-            'min_depth_seen': n,
-            'drained_count': 0,
-            'pop_wait_total_s': 0.0,
-            'pop_wait_count': 0,
-            'ready': n,
-            'pending': 0,
-            'buffer_size': n,
+            "max_depth_seen": n,
+            "min_depth_seen": n,
+            "drained_count": 0,
+            "pop_wait_total_s": 0.0,
+            "pop_wait_count": 0,
+            "ready": n,
+            "pending": 0,
+            "buffer_size": n,
         }
 
     def reset_stats(self) -> None:
