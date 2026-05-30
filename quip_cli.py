@@ -40,7 +40,6 @@ from shared.miner_bootstrap import (
     ensure_funded,
 )
 from shared.miner_config import (
-    CPU_BACKEND_SECTIONS,
     GPU_BACKEND_SECTIONS,
     MODE_NAMES,
     MinerConfigError,
@@ -1099,28 +1098,6 @@ def _parse_topology(spec: str):
         ) from exc
 
 
-def _inject_topology(miner_config: dict, kind: str, topology) -> dict:
-    """Stash the topology in the appropriate miner section's `args`.
-
-    The miner-builder paths in `MinerCore._initialize_miners` forward
-    `args["topology"]` straight to the sampler constructor.
-    """
-    out = dict(miner_config)
-    if kind == "cpu":
-        section = dict(out.get("cpu") or {})
-        args = dict(section.get("args") or {})
-        args["topology"] = topology
-        section["args"] = args
-        out["cpu"] = section
-    else:
-        click.echo(
-            f"warning: --topology injection not yet implemented for kind={kind!r}; "
-            "GPU/QPU samplers will use their default topology (Phase 6)",
-            err=True,
-        )
-    return out
-
-
 # Seconds to wait for a controller to drain after signalling shutdown.
 # Must exceed the longest controller poll interval (<=10s for head-subscription
 # timeout in SubstrateMinerController).
@@ -1290,8 +1267,10 @@ async def _run_concurrent_miner(
         f"{topology.num_edges} edges)"
     )
 
-    miner_config = _inject_topology(miner_config, miner_kind, topology)
-    core = MinerCore(node_id=f"quip-miner-{mode}", miners_config=miner_config)
+    core = MinerCore(
+        node_id=f"quip-miner-{mode}", miners_config=miner_config,
+        topology=topology,
+    )
     if not core.miner_handles:
         click.echo(f"no miner handles built for kind={miner_kind}", err=True)
         return 2

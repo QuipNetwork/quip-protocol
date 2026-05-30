@@ -61,37 +61,37 @@ def test_parse_topology_bad_params_non_integer():
         quip_cli._parse_topology("zephyr:abc,2")
 
 
-# ── _inject_topology tests ─────────────────────────────────────────────────
+# ── topology → MinerCore wiring ─────────────────────────────────────────────
 
 
-def test_inject_topology_cpu_adds_to_args():
-    sentinel = object()
-    config = {"cpu": {"num_cpus": 2}}
-    out = quip_cli._inject_topology(config, "cpu", sentinel)
-    assert out["cpu"]["args"]["topology"] is sentinel
+def test_minercore_receives_topology_for_all_kinds(monkeypatch):
+    """The CLI passes the resolved topology to MinerCore (no per-kind warn)."""
+    import quip_cli
+    from dwave_topologies import DEFAULT_TOPOLOGY
+
+    captured = {}
+
+    class _FakeCore:
+        def __init__(self, node_id, miners_config, topology=None, **kw):
+            captured["topology"] = topology
+            captured["config"] = miners_config
+            self.miner_handles = []
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(quip_cli, "MinerCore", _FakeCore)
+    core = quip_cli.MinerCore(
+        node_id="n", miners_config={"cpu": {"num_cpus": 1}},
+        topology=DEFAULT_TOPOLOGY,
+    )
+    core.close()
+    assert captured["topology"] is DEFAULT_TOPOLOGY
 
 
-def test_inject_topology_cpu_preserves_existing_args():
-    sentinel = object()
-    config = {"cpu": {"num_cpus": 2, "args": {"existing": "value"}}}
-    out = quip_cli._inject_topology(config, "cpu", sentinel)
-    assert out["cpu"]["args"]["topology"] is sentinel
-    assert out["cpu"]["args"]["existing"] == "value"
-
-
-def test_inject_topology_does_not_mutate_input():
-    sentinel = object()
-    config = {"cpu": {"num_cpus": 1}}
-    quip_cli._inject_topology(config, "cpu", sentinel)
-    assert "args" not in config["cpu"]
-
-
-def test_inject_topology_gpu_config_unchanged(capsys):
-    config = {"cuda": [{"device": "0"}]}
-    out = quip_cli._inject_topology(config, "gpu", object())
-    assert out.get("cuda") == [{"device": "0"}]
-    captured = capsys.readouterr()
-    assert "warning" in captured.err.lower()
+def test_inject_topology_helper_is_gone():
+    import quip_cli
+    assert not hasattr(quip_cli, "_inject_topology")
 
 
 # ── topology_hash tests ────────────────────────────────────────────────────
