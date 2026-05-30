@@ -75,6 +75,75 @@ _PUMP_DONE = object()
 # Maximum number of work-tags remembered by _SetupAbortThrottle.
 _SETUP_ABORT_TAG_LIMIT = 32
 
+# Result-acquisition control signals returned by ``_acquire_result`` so the
+# loop in ``mine_work_item`` can reproduce the original inline ``return None``
+# / ``break`` / ``continue`` semantics without a helper hijacking control flow.
+_ACQUIRE_OK = "ok"  # payload present; process this iteration
+_ACQUIRE_STOP = "stop"  # stop_event fired -> caller returns None
+_ACQUIRE_DONE = "done"  # stream exhausted (_PUMP_DONE) -> caller breaks
+_ACQUIRE_CONTINUE = "continue"  # recoverable sampling error -> caller continues
+
+
+@dataclass(frozen=True)
+class _AcquireResult:
+    """Outcome of one ``_acquire_result`` call.
+
+    ``action`` is one of the ``_ACQUIRE_*`` constants. The payload fields are
+    only meaningful when ``action`` is :data:`_ACQUIRE_OK`.
+    """
+
+    action: str
+    nonce: Any = None
+    salt: bytes = b""
+    sampleset: Any = None
+    qpu_access_time_us: Optional[int] = None
+
+
+@dataclass
+class _DispatchSetup:
+    """Everything ``_setup_dispatch`` hands back to ``mine_work_item``.
+
+    Bundles the per-dispatch loop inputs and the (optional) result-pump
+    handles so the main method stays a thin loop driver. ``None`` from
+    ``_setup_dispatch`` means ``_pre_mine_setup`` aborted and the caller
+    returns ``None`` immediately (same as the original early return).
+    """
+
+    loop_state: "_MiningLoopState"
+    is_substrate: bool
+    sample_ctx: Dict[str, Any]
+    num_reads: int
+    num_sweeps: int
+    result_queue: Optional["queue.Queue"]
+    pump_thread: Optional[threading.Thread]
+    pump_stop: Optional[threading.Event]
+
+
+@dataclass
+class _MiningLoopState:
+    """Per-dispatch state bundle for ``mine_work_item``'s loop helpers.
+
+    Groups the locals the extracted per-iteration helpers
+    (``_run_substrate_ratchet``, ``_run_mempool_eval``,
+    ``_finalize_iteration_logging``) need so each stays under the
+    positional-param limit. Constructed once per ``mine_work_item`` call
+    and mutated in place (``top_k``, ``previewed_floor_milli``) by the
+    ratchet helper, mirroring the original inline locals exactly.
+    """
+
+    requirements: BlockRequirements
+    nodes: List[int]
+    edges: List[Tuple[int, int]]
+    prev_timestamp: int
+    start_time: float
+    dispatch_id_for_log: int
+    attempt_log: AttemptLogger
+    solution_store: SolutionStore
+    live_threshold_var: Optional[Any]
+    top_k_cap: int
+    top_k: List[MiningResult]
+    previewed_floor_milli: int
+
 
 class _SetupAbortThrottle:
     """Rate-limiter for the ``_pre_mine_setup`` returned-False warning.
@@ -515,7 +584,178 @@ class BaseMiner(ABC):
             A ``MiningResult`` if a valid solution is found before the
             stop event fires; ``None`` otherwise.
         """
-        # -- setup --------------------------------------------------------
+        setup = self._setup_dispatch(context, stop_event, **kwargs)
+        if setup is None:
+            return None  # _pre_mine_setup aborted (e.g. QPU budget exhausted)
+        loop_state = setup.loop_state
+        is_substrate = setup.is_substrate
+        sample_ctx = setup.sample_ctx
+        result_queue = setup.result_queue
+        pump_thread = setup.pump_thread
+        pump_stop = setup.pump_stop
+
+        progress = 0
+        try:
+            while self.mining and not stop_event.is_set():
+                # Each iteration sources one (nonce, salt, sampleset):
+                # streaming backends via ``_sample_batch`` (which pulls
+                # models from the feeder internally), or the single-shot
+                # path which pops one model. The PoW feeder derives a
+                # fresh ``salt -> nonce -> (h, J)`` per model in a
+                # background process; the mempool feeder cycles the
+                # order's stored ``(h, J)``.
+                preprocess_start = time.time()
+                self.current_stage = 'preprocessing'
+                self.current_stage_start = preprocess_start
+
+                # Source one (nonce, salt, sampleset) plus the per-iteration
+                # QPU access time. The returned signal directs the loop's
+                # stop / stream-exhausted / sampling-error control flow.
+                acquired = self._acquire_result(
+                    stop_event, result_queue, preprocess_start,
+                    sample_ctx=sample_ctx,
+                )
+                if acquired.action == _ACQUIRE_STOP:
+                    return None
+                if acquired.action == _ACQUIRE_DONE:
+                    break  # stream exhausted; exit the loop
+                if acquired.action == _ACQUIRE_CONTINUE:
+                    continue
+                nonce = acquired.nonce
+                salt = acquired.salt
+                sampleset = acquired.sampleset
+                qpu_access_time_us = acquired.qpu_access_time_us
+
+                sampleset = self._post_sample(sampleset)
+                if stop_event.is_set():
+                    return None
+
+                postprocess_start = time.time()
+                self.current_stage = 'postprocessing'
+                self.current_stage_start = postprocess_start
+
+                self.timing_stats['total_samples'] += len(
+                    sampleset.record.energy,
+                )
+                self.timing_stats['blocks_attempted'] += 1
+
+                # Per-iteration log fields (filled below per code path).
+                attempt_log_kwargs = self._init_attempt_log_kwargs(
+                    loop_state.dispatch_id_for_log, progress, nonce, salt,
+                    sampleset,
+                )
+
+                if is_substrate:
+                    result = self._run_substrate_ratchet(
+                        loop_state, sampleset, nonce, salt, postprocess_start,
+                        preview_cb=preview_cb,
+                        attempt_log_kwargs=attempt_log_kwargs,
+                    )
+                else:
+                    result = self._run_mempool_eval(
+                        loop_state, sampleset, nonce, salt, postprocess_start,
+                        attempt_log_kwargs=attempt_log_kwargs,
+                    )
+
+                self._finalize_iteration_logging(
+                    loop_state, sampleset, nonce, salt, progress,
+                    preprocess_start=preprocess_start,
+                    qpu_access_time_us=qpu_access_time_us,
+                    attempt_log_kwargs=attempt_log_kwargs,
+                )
+
+                if result:
+                    # Post-evaluation cancel check. evaluate_sampleset can
+                    # take meaningful time on dense graphs; if cancel
+                    # raced with a valid result, return None so the next
+                    # dispatch can decide what to do — the controller is
+                    # already moving on. Without this check, a result
+                    # produced after stop_event was set surfaces as
+                    # "fresh" against the new dispatch and may submit a
+                    # proof against a stale context.
+                    if stop_event.is_set():
+                        self.logger.info(
+                            "mine_work_item: valid result produced after "
+                            "cancel; discarding (stop_event set)"
+                        )
+                        return None
+                    # Use result.nonce / result.salt — the submitted
+                    # candidate — not the loop-local nonce/salt, which may
+                    # belong to a different iteration when the submit gate
+                    # returns a stashed top-k entry.
+                    result_nonce_disp = f"0x{result.nonce.hex()[:16]}..."
+                    self.logger.info(
+                        f"[work-item {_work_tag(context)}] mined! "
+                        f"nonce={result_nonce_disp} "
+                        f"salt=0x{result.salt.hex()[:8]}... "
+                        f"energy={result.energy:.2f} "
+                        f"solutions={result.num_valid} "
+                        f"diversity={result.diversity:.3f} "
+                        f"attempt_time={result.mining_time:.2f}s "
+                        f"total_time={time.time() - loop_state.start_time:.2f}s"
+                    )
+                    return result
+
+                progress += 1
+                if progress % PROGRESS_LOG_INTERVAL == 0:
+                    # `self.top_attempts` is intentionally not maintained in
+                    # substrate mode — no best-energy field to surface here.
+                    self.logger.info(
+                        "mine_work_item progress: %d attempts | "
+                        "sweeps=%d reads=%d",
+                        progress, setup.num_sweeps, setup.num_reads,
+                    )
+            self.logger.info("mine_work_item: stopped, no valid result")
+            return None
+        finally:
+            self._teardown_dispatch(pump_stop, pump_thread)
+
+    @staticmethod
+    def _init_attempt_log_kwargs(
+        dispatch_id: int,
+        progress: int,
+        nonce: Any,
+        salt: bytes,
+        sampleset: Any,
+    ) -> Dict[str, Any]:
+        """Build the per-iteration attempt-log kwargs (pre-eval defaults).
+
+        Per-path fields (threshold, num_valid, result_kind, ...) are filled
+        in later by the eval helpers. Behaviour matches the original inline
+        dict literal exactly.
+        """
+        return {
+            "dispatch_id": dispatch_id,
+            "iter_num": progress + 1,
+            "nonce_hex": (
+                f"0x{nonce.hex()}"
+                if isinstance(nonce, (bytes, bytearray))
+                else hex(int(nonce))
+            ),
+            "salt_hex": f"0x{salt.hex()}",
+            "best_energy_milli": int(
+                float(np.min(sampleset.record.energy)) * 1000
+            ),
+            "num_samples": len(sampleset.record.energy),
+            "post_processed": False,
+            "stored_as_best": False,
+            "result_kind": "rejected",
+        }
+
+    def _setup_dispatch(
+        self,
+        context: WorkContext,
+        stop_event: multiprocessing.synchronize.Event,
+        **kwargs,
+    ) -> Optional[_DispatchSetup]:
+        """One-time per-dispatch setup for ``mine_work_item``.
+
+        Runs ``_pre_mine_setup`` (returning ``None`` to abort, exactly as the
+        original early ``return None`` did), adapts params, builds the
+        ``_MiningLoopState`` and sampling context, creates the feeder, and
+        starts the result pump for streaming backends. Behaviour matches the
+        original inline setup block.
+        """
         self.mining = True
         self.top_attempts = []
         start_time = time.time()
@@ -619,6 +859,21 @@ class BaseMiner(ABC):
             self._solution_store = solution_store
         dispatch_id_for_log = int(getattr(self, '_current_dispatch_id', 0))
 
+        loop_state = _MiningLoopState(
+            requirements=requirements,
+            nodes=nodes,
+            edges=edges,
+            prev_timestamp=prev_timestamp,
+            start_time=start_time,
+            dispatch_id_for_log=dispatch_id_for_log,
+            attempt_log=attempt_log,
+            solution_store=solution_store,
+            live_threshold_var=live_threshold_var,
+            top_k_cap=top_k_cap,
+            top_k=top_k,
+            previewed_floor_milli=previewed_floor_milli,
+        )
+
         # Build the feeder for this attempt. Each context flavor picks
         # the right backing implementation (RandomIsingFeeder for PoW,
         # FixedIsingFeeder for mempool). We own the lifecycle here —
@@ -636,472 +891,495 @@ class BaseMiner(ABC):
         # QPU/GPU streaming impls ignore them — their feeder already
         # encapsulates the round seed and miner identity — but the base
         # contract requires (prev_hash, miner_id, cur_index).
-        batch_prev_hash = bridge_prev_block.hash
-        batch_miner_id = bridge_node_info.miner_id
-        batch_cur_index = bridge_prev_block.header.index
+        sample_ctx = {
+            "prev_hash": bridge_prev_block.hash,
+            "miner_id": bridge_node_info.miner_id,
+            "cur_index": bridge_prev_block.header.index,
+            "nodes": nodes,
+            "edges": edges,
+            "num_reads": num_reads,
+            "num_sweeps": current_num_sweeps,
+            "extra": extra_params,
+        }
 
-        # --- Out-of-band result pump (streaming backends only) ----------
-        # CPU/GPU/Metal keep the inline path below (STREAMING_PUMP=False).
+        result_queue, pump_thread, pump_stop = self._start_result_pump(
+            sample_ctx,
+        )
+        return _DispatchSetup(
+            loop_state=loop_state,
+            is_substrate=is_substrate,
+            sample_ctx=sample_ctx,
+            num_reads=num_reads,
+            num_sweeps=current_num_sweeps,
+            result_queue=result_queue,
+            pump_thread=pump_thread,
+            pump_stop=pump_stop,
+        )
+
+    def _start_result_pump(
+        self,
+        sample_ctx: Dict[str, Any],
+    ) -> Tuple[
+        Optional["queue.Queue"],
+        Optional[threading.Thread],
+        Optional[threading.Event],
+    ]:
+        """Start the out-of-band result pump for streaming backends.
+
+        CPU/GPU/Metal (``STREAMING_PUMP=False``) keep the inline acquisition
+        path and get ``(None, None, None)``. Behaviour matches the original
+        inline pump-setup block.
+        """
         self._dropped_results = 0
-        result_queue: Optional["queue.Queue"] = None
-        pump_thread: Optional[threading.Thread] = None
-        pump_stop: Optional[threading.Event] = None
-        if self.STREAMING_PUMP:
-            result_queue = queue.Queue(maxsize=self.RESULT_QUEUE_MAXSIZE)
-            pump_stop = threading.Event()
-            # The QPU stream observes this so its in-flight next() unblocks
-            # on shutdown before we join the pump and close the generator.
-            self._pump_stop = pump_stop
-            sample_kwargs = {
-                "prev_hash": batch_prev_hash,
-                "miner_id": batch_miner_id,
-                "cur_index": batch_cur_index,
-                "nodes": nodes,
-                "edges": edges,
-                "num_reads": num_reads,
-                "num_sweeps": current_num_sweeps,
-                "extra": extra_params,
-            }
-            pump_thread = threading.Thread(
-                target=self._result_pump,
-                args=(result_queue, pump_stop, sample_kwargs),
-                name=f"qpu-pump-{self.miner_id}",
-                daemon=True,
-            )
-            pump_thread.start()
+        if not self.STREAMING_PUMP:
+            return None, None, None
+        result_queue: "queue.Queue" = queue.Queue(
+            maxsize=self.RESULT_QUEUE_MAXSIZE,
+        )
+        pump_stop = threading.Event()
+        # The QPU stream observes this so its in-flight next() unblocks
+        # on shutdown before we join the pump and close the generator.
+        self._pump_stop = pump_stop
+        pump_thread = threading.Thread(
+            target=self._result_pump,
+            args=(result_queue, pump_stop, sample_ctx),
+            name=f"qpu-pump-{self.miner_id}",
+            daemon=True,
+        )
+        pump_thread.start()
+        return result_queue, pump_thread, pump_stop
 
-        progress = 0
+    def _acquire_result(
+        self,
+        stop_event: multiprocessing.synchronize.Event,
+        result_queue: Optional["queue.Queue"],
+        preprocess_start: float,
+        *,
+        sample_ctx: Dict[str, Any],
+    ) -> _AcquireResult:
+        """Source one ``(nonce, salt, sampleset)`` for a loop iteration.
+
+        Pump mode (``result_queue`` set) blocks on the queue, waking to check
+        ``stop_event``; the inline path calls ``_sample_batch`` (falling back
+        to a single ``_sample`` on the popped feeder model). Appends the
+        sampling / preprocessing timings on success. Returns an
+        :class:`_AcquireResult` whose ``action`` reproduces the original
+        inline control flow exactly:
+
+        - :data:`_ACQUIRE_STOP` — ``stop_event`` fired (caller returns None).
+        - :data:`_ACQUIRE_DONE` — stream exhausted (caller breaks the loop).
+        - :data:`_ACQUIRE_CONTINUE` — recoverable sampling error and
+          ``_on_sampling_error`` returned falsey (caller continues).
+        - :data:`_ACQUIRE_OK` — payload populated; process the iteration.
+
+        A sampling error where ``_on_sampling_error`` returns truthy maps to
+        :data:`_ACQUIRE_STOP` (the original ``return None``).
+        """
+        qpu_access_time_us: Optional[int] = None
         try:
-            while self.mining and not stop_event.is_set():
-                # Each iteration sources one (nonce, salt, sampleset):
-                # streaming backends via ``_sample_batch`` (which pulls
-                # models from the feeder internally), or the single-shot
-                # path which pops one model. The PoW feeder derives a
-                # fresh ``salt -> nonce -> (h, J)`` per model in a
-                # background process; the mempool feeder cycles the
-                # order's stored ``(h, J)``.
-                preprocess_start = time.time()
-                self.current_stage = 'preprocessing'
-                self.current_stage_start = preprocess_start
-
-                # Per-iteration QPU access time in microseconds (D-Wave
-                # ``qpu_programming_time + qpu_sampling_time``). In pump mode
-                # the pump thread extracts it and ships it on the result; on
-                # the inline path the branch below snapshots the shared
-                # ``timing_stats['qpu_access_time']`` list around the sample.
-                # ``None`` when no entry was produced (non-QPU backends, or a
-                # QPU sampleset without timing info).
-                qpu_access_time_us: Optional[int] = None
-                try:
-                    sample_start = time.time()
-                    self.current_stage = 'sampling'
-                    self.current_stage_start = sample_start
-                    if result_queue is not None:
-                        # Pump mode: block on the queue, but wake to check
-                        # stop_event. _PUMP_DONE means the stream ended.
-                        item = None
-                        while not stop_event.is_set():
-                            try:
-                                item = result_queue.get(timeout=0.1)
-                                break
-                            except queue.Empty:
-                                continue
-                        if stop_event.is_set():
-                            return None
-                        if item is _PUMP_DONE:
-                            break  # stream exhausted; exit the loop
-                        nonce = item.nonce
-                        salt = item.salt
-                        sampleset = item.sampleset
-                        qpu_access_time_us = item.qpu_access_time_us
-                    else:
-                        # Inline path (CPU/GPU/Metal): unchanged.
-                        qpu_access_len_before = len(
-                            self.timing_stats['qpu_access_time'],
-                        )
-                        batch = self._sample_batch(
-                            batch_prev_hash, batch_miner_id, batch_cur_index,
-                            nodes, edges,
-                            num_reads=num_reads,
-                            num_sweeps=current_num_sweeps,
-                            **extra_params,
-                        )
-                        if batch is not None:
-                            nonce, salt, sampleset = batch[0]
-                        else:
-                            model = self._feeder.pop_blocking()
-                            nonce, salt = model.nonce, model.salt
-                            sampleset = self._sample(
-                                model.h, model.J,
-                                num_reads=num_reads,
-                                num_sweeps=current_num_sweeps,
-                                nonce_seed=nonce,
-                                **extra_params,
-                            )
-                        qpu_access_list = self.timing_stats['qpu_access_time']
-                        if len(qpu_access_list) > qpu_access_len_before:
-                            qpu_access_time_us = int(qpu_access_list[-1])
-                    sample_time = time.time() - sample_start
-                    # In pump mode sample_time is queue-dequeue latency (~0µs),
-                    # not QPU access time — qpu_access_time_us carries the real
-                    # QPU figure.
-                    self.timing_stats['sampling'].append(sample_time * 1e6)
-                    self.timing_stats['preprocessing'].append(
-                        (sample_start - preprocess_start) * 1e6,
-                    )
-                except Exception as exc:
-                    if self._on_sampling_error(exc, stop_event):
-                        return None
-                    continue
-
-                sampleset = self._post_sample(sampleset)
+            sample_start = time.time()
+            self.current_stage = 'sampling'
+            self.current_stage_start = sample_start
+            if result_queue is not None:
+                # Pump mode: block on the queue, but wake to check
+                # stop_event. _PUMP_DONE means the stream ended.
+                item = None
+                while not stop_event.is_set():
+                    try:
+                        item = result_queue.get(timeout=0.1)
+                        break
+                    except queue.Empty:
+                        continue
                 if stop_event.is_set():
-                    return None
-
-                postprocess_start = time.time()
-                self.current_stage = 'postprocessing'
-                self.current_stage_start = postprocess_start
-
-                self.timing_stats['total_samples'] += len(
-                    sampleset.record.energy,
+                    return _AcquireResult(_ACQUIRE_STOP)
+                if item is _PUMP_DONE:
+                    return _AcquireResult(_ACQUIRE_DONE)
+                nonce = item.nonce
+                salt = item.salt
+                sampleset = item.sampleset
+                qpu_access_time_us = item.qpu_access_time_us
+            else:
+                # Inline path (CPU/GPU/Metal): unchanged.
+                qpu_access_len_before = len(
+                    self.timing_stats['qpu_access_time'],
                 )
-                self.timing_stats['blocks_attempted'] += 1
-
-                # Per-iteration log fields (filled below per code path).
-                attempt_log_kwargs: Dict[str, Any] = {
-                    "dispatch_id": dispatch_id_for_log,
-                    "iter_num": progress + 1,
-                    "nonce_hex": (
-                        f"0x{nonce.hex()}"
-                        if isinstance(nonce, (bytes, bytearray))
-                        else hex(int(nonce))
-                    ),
-                    "salt_hex": f"0x{salt.hex()}",
-                    "best_energy_milli": int(
-                        float(np.min(sampleset.record.energy)) * 1000
-                    ),
-                    "num_samples": len(sampleset.record.energy),
-                    "post_processed": False,
-                    "stored_as_best": False,
-                    "result_kind": "rejected",
-                }
-                stored_replaced = False
-
-                if is_substrate:
-                    # ---- Ratchet path (substrate / PoW) -------------
-                    # Read the chain's *live* (decay-applied) energy
-                    # threshold the controller pushed via shared mem.
-                    # When the chain decays past our stored best, the
-                    # next iteration's check returns the stored result.
-                    if live_threshold_var is not None:
-                        with live_threshold_var.get_lock():
-                            live_threshold_milli = int(live_threshold_var.value)
-                    else:
-                        live_threshold_milli = int(
-                            requirements.difficulty_energy * 1000,
-                        )
-
-                    # Post-processing gate: stash the K best candidates
-                    # we've mined, not the best the chain wants. The
-                    # ratchet is about *local progress* — until the
-                    # stash is full, every iter post-processes
-                    # unconditionally so we build a baseline; once full,
-                    # only iters beating the heap's worst-energy entry
-                    # earn the expensive ``evaluate_sampleset`` call.
-                    # Submission against the chain's live (decayed)
-                    # threshold is a separate decision handled by the
-                    # submit gate below — gating storage on the chain
-                    # target would lock the miner out of building a
-                    # baseline whenever the live threshold is harder
-                    # than what SA is producing.
-                    iter_best_energy = float(
-                        np.min(sampleset.record.energy),
-                    )
-                    ratchet_threshold = (
-                        top_k[-1].energy
-                        if len(top_k) >= top_k_cap
-                        else float("inf")
-                    )
-                    # Pre-check: only pay the lenient evaluate when the iter
-                    # both (a) would improve the running top_k baseline and
-                    # (b) is within RATCHET_PRECHECK_MARGIN_MILLI of the live
-                    # (decayed) threshold — i.e. could submit now or after a
-                    # little decay. No-hope iters (best far worse than the
-                    # live target) skip the expensive diversity/selection
-                    # work and log a lightweight rejected row. Mirrors the
-                    # strict fast-bail the canary gets for free.
-                    # NOTE: if the miner never lands within margin of the live
-                    # target (e.g. hardware underperforming), the stash stays
-                    # empty and nothing submits — expected; every skipped iter
-                    # still logs as "rejected".
-                    iter_best_milli = int(iter_best_energy * 1000)
-                    near_live = iter_best_milli <= (
-                        live_threshold_milli + self.RATCHET_PRECHECK_MARGIN_MILLI
-                    )
-                    improves_stash = iter_best_energy < ratchet_threshold
-
-                    result = None
-                    # Values captured from the post-processed eval so the
-                    # submit-gate's later rebind of `result` doesn't
-                    # destroy them — we want them logged on every
-                    # ``post_processed=true`` iteration, not just the
-                    # submitted ones. No new computation: these are
-                    # already produced by ``evaluate_sampleset``.
-                    post_num_valid: Optional[int] = None
-                    post_diversity_milli: Optional[int] = None
-                    if improves_stash and near_live:
-                        # Lenient eval — diversity + min_solutions
-                        # still required, but no energy gate. The
-                        # ratchet itself enforces "only improvements
-                        # land" via the comparison below.
-                        result = self.evaluate_sampleset(
-                            sampleset, requirements, nodes, edges,
-                            nonce, salt, prev_timestamp, start_time,
-                            strict_energy=False,
-                            live_threshold_energy=(
-                                live_threshold_milli / 1000.0
-                            ),
-                        )
-                        attempt_log_kwargs["post_processed"] = True
-                        if result is not None:
-                            post_num_valid = result.num_valid
-                            post_diversity_milli = int(result.diversity * 1000)
-                            # Insert into the bounded heap. Always
-                            # admits when there's room; otherwise the
-                            # iter only got here because it beat the
-                            # worst-energy entry (ratchet gate above),
-                            # so we evict that tail and re-sort.
-                            if len(top_k) < top_k_cap:
-                                top_k.append(result)
-                                top_k.sort(key=lambda r: r.energy)
-                                stored_replaced = True
-                            elif result.energy < top_k[-1].energy:
-                                top_k[-1] = result
-                                top_k.sort(key=lambda r: r.energy)
-                                stored_replaced = True
-
-                    # Anticipatory-submission preview. When the stash gains
-                    # a candidate whose best-by-floor improves on anything
-                    # we've previewed, hand the controller a lightweight,
-                    # picklable snapshot so Task 6b can predict the
-                    # decay-block at which it clears and pre-submit. This is
-                    # purely a preview — the local submit gate below is
-                    # still the only thing that returns a result. Throttled
-                    # to strict floor improvements; failures never break
-                    # mining.
-                    if preview_cb is not None and stored_replaced:
-                        previewed_floor_milli = self._maybe_emit_preview(
-                            preview_cb, top_k, previewed_floor_milli,
-                            dispatch_id_for_log,
-                        )
-
-                    self.timing_stats['postprocessing'].append(
-                        (time.time() - postprocess_start) * 1e6,
-                    )
-
-                    # Submit gate. The chain re-derives each submitted
-                    # solution's energy and filters with strict
-                    # ``< max_energy_milli`` before counting; gating on
-                    # ``energy`` (best of set) would let through proofs
-                    # whose mid-pack solutions get rejected, producing
-                    # ``InsufficientSolutions`` despite the headline
-                    # energy clearing. ``submit_floor_energy`` is the
-                    # chain-equivalent recompute, so it's what the gate
-                    # must compare against.
-                    #
-                    # Walk the stash in energy-ascending order (best
-                    # first). Prefer the best candidate whose floor
-                    # clears; fall back to worse-energy stash entries
-                    # if a better candidate's floor sits above the
-                    # live threshold (the two can diverge — a tighter
-                    # solution set can have a lower best but a higher
-                    # worst, leaving a wider-spread candidate eligible
-                    # for submission while the headline winner isn't).
-                    result = None
-                    for candidate in top_k:
-                        floor_energy = (
-                            candidate.submit_floor_energy
-                            if candidate.submit_floor_energy is not None
-                            else candidate.energy
-                        )
-                        if int(floor_energy * 1000) < live_threshold_milli:
-                            result = candidate
-                            break
-
-                    # ratchet_threshold is float("inf") on the first iter
-                    # before anything is stored — log None there since
-                    # there's no meaningful prior to display.
-                    ratchet_threshold_milli_log = (
-                        int(ratchet_threshold * 1000)
-                        if math.isfinite(ratchet_threshold)
-                        else None
-                    )
-                    attempt_log_kwargs.update(
-                        threshold_milli=live_threshold_milli,
-                        ratchet_threshold_milli=ratchet_threshold_milli_log,
-                        num_valid=post_num_valid,
-                        diversity_milli=post_diversity_milli,
-                        stored_as_best=stored_replaced,
-                        result_kind=(
-                            "submitted" if result is not None
-                            else "stored" if stored_replaced
-                            else "rejected"
-                        ),
-                    )
+                batch = self._sample_batch(
+                    sample_ctx["prev_hash"], sample_ctx["miner_id"],
+                    sample_ctx["cur_index"],
+                    sample_ctx["nodes"], sample_ctx["edges"],
+                    num_reads=sample_ctx["num_reads"],
+                    num_sweeps=sample_ctx["num_sweeps"],
+                    **sample_ctx["extra"],
+                )
+                if batch is not None:
+                    nonce, salt, sampleset = batch[0]
                 else:
-                    # ---- Mempool path (unchanged strict semantics) ---
-                    result = self.evaluate_sampleset(
-                        sampleset, requirements, nodes, edges,
-                        nonce, salt, prev_timestamp, start_time,
+                    model = self._feeder.pop_blocking()
+                    nonce, salt = model.nonce, model.salt
+                    sampleset = self._sample(
+                        model.h, model.J,
+                        num_reads=sample_ctx["num_reads"],
+                        num_sweeps=sample_ctx["num_sweeps"],
+                        nonce_seed=nonce,
+                        **sample_ctx["extra"],
                     )
+                qpu_access_list = self.timing_stats['qpu_access_time']
+                if len(qpu_access_list) > qpu_access_len_before:
+                    qpu_access_time_us = int(qpu_access_list[-1])
+            sample_time = time.time() - sample_start
+            # In pump mode sample_time is queue-dequeue latency (~0µs),
+            # not QPU access time — qpu_access_time_us carries the real
+            # QPU figure.
+            self.timing_stats['sampling'].append(sample_time * 1e6)
+            self.timing_stats['preprocessing'].append(
+                (sample_start - preprocess_start) * 1e6,
+            )
+        except Exception as exc:
+            if self._on_sampling_error(exc, stop_event):
+                return _AcquireResult(_ACQUIRE_STOP)
+            return _AcquireResult(_ACQUIRE_CONTINUE)
+        return _AcquireResult(
+            _ACQUIRE_OK, nonce, salt, sampleset, qpu_access_time_us,
+        )
 
-                    self.timing_stats['postprocessing'].append(
-                        (time.time() - postprocess_start) * 1e6,
-                    )
-                    # Mempool path may have ``difficulty_energy = +inf``
-                    # (unbounded threshold for jobs with no min_energy
-                    # floor). int() would overflow — use None instead.
-                    threshold_milli_log: Optional[int] = None
-                    if math.isfinite(requirements.difficulty_energy):
-                        threshold_milli_log = int(
-                            requirements.difficulty_energy * 1000,
-                        )
-                    attempt_log_kwargs.update(
-                        post_processed=True,
-                        threshold_milli=threshold_milli_log,
-                        num_valid=(result.num_valid if result is not None else None),
-                        diversity_milli=(
-                            int(result.diversity * 1000)
-                            if result is not None else None
-                        ),
-                        result_kind=(
-                            "submitted" if result is not None else "rejected"
-                        ),
-                    )
+    def _teardown_dispatch(
+        self,
+        pump_stop: Optional[threading.Event],
+        pump_thread: Optional[threading.Thread],
+    ) -> None:
+        """Tear down per-dispatch state in ``mine_work_item``'s ``finally``.
 
-                attempt_log_kwargs["mining_time_us"] = int(
-                    (time.time() - preprocess_start) * 1e6
+        Stops and joins the result pump (if any), clears the pump-stop
+        reference, stops and clears the feeder, flushes the attempt logger,
+        and delegates to subclass ``_post_mine_cleanup``. Behaviour matches
+        the original inline ``finally`` block exactly.
+        """
+        self.mining = False
+        if self._dropped_results:
+            self.logger.info(
+                "mine_work_item: %d QPU results dropped under "
+                "result-queue backpressure", self._dropped_results,
+            )
+        # Stop the pump first: signal it, let the QPU stream observe the
+        # stop and return from its in-flight next(), then join. Only
+        # after the pump thread is dead is it safe for _post_mine_cleanup
+        # to close the generator (close() on a generator executing in
+        # another thread raises "already executing").
+        if pump_stop is not None:
+            pump_stop.set()
+        if pump_thread is not None:
+            pump_thread.join(timeout=5.0)
+            if pump_thread.is_alive():
+                self.logger.warning(
+                    "mine_work_item: result pump did not join in 5s — "
+                    "pump thread still alive (QPU stream pump-stop wiring "
+                    "closes this race)",
                 )
-                attempt_log_kwargs["qpu_access_time_us"] = qpu_access_time_us
-                if self._feeder is not None:
-                    fstats = self._feeder.stats()
-                    attempt_log_kwargs["feeder_ready"] = fstats["ready"]
-                    attempt_log_kwargs["feeder_drained_count"] = (
-                        fstats["drained_count"]
-                    )
-                    attempt_log_kwargs["feeder_pop_wait_total_s"] = (
-                        fstats["pop_wait_total_s"]
-                    )
-                # Compute solution_meta scalars + capture top-5
-                # solutions. Meta is always embedded in the attempt
-                # log; top-5 spins go to disk only when this iter is
-                # stored or submitted (see write below).
-                sol_meta, top_5_sols, top_5_es = compute_solution_meta(
-                    sampleset, requirements.difficulty_energy,
+        self._pump_stop = None
+        # Tear down the feeder before delegating to subclass cleanup.
+        if self._feeder is not None:
+            try:
+                self._feeder.stop()
+            finally:
+                self._feeder = None
+        # Persist any buffered aggregate metadata for this dispatch.
+        attempt_logger = getattr(self, "_attempt_logger", None)
+        if attempt_logger is not None:
+            attempt_logger.flush()
+        self._post_mine_cleanup()
+
+    @staticmethod
+    def _insert_into_stash(
+        top_k: List[MiningResult],
+        top_k_cap: int,
+        result: MiningResult,
+    ) -> bool:
+        """Insert ``result`` into the bounded, energy-ascending ``top_k``.
+
+        Always admits when there's room; otherwise (the caller only reaches
+        here when ``result`` beat the worst-energy entry) evicts the tail.
+        Re-sorts in place. Returns True when the stash changed. Behaviour
+        matches the original inline heap-insert.
+        """
+        if len(top_k) < top_k_cap:
+            top_k.append(result)
+            top_k.sort(key=lambda r: r.energy)
+            return True
+        if result.energy < top_k[-1].energy:
+            top_k[-1] = result
+            top_k.sort(key=lambda r: r.energy)
+            return True
+        return False
+
+    @staticmethod
+    def _select_submittable_candidate(
+        top_k: List[MiningResult],
+        live_threshold_milli: int,
+    ) -> Optional[MiningResult]:
+        """Return the first stash entry whose chain floor clears the threshold.
+
+        Walks ``top_k`` (energy-ascending) and returns the first candidate
+        whose ``submit_floor_energy`` (falling back to ``energy``) is strictly
+        below ``live_threshold_milli``, or ``None``. Behaviour matches the
+        original inline submit-gate walk.
+        """
+        for candidate in top_k:
+            floor_energy = (
+                candidate.submit_floor_energy
+                if candidate.submit_floor_energy is not None
+                else candidate.energy
+            )
+            if int(floor_energy * 1000) < live_threshold_milli:
+                return candidate
+        return None
+
+    def _run_substrate_ratchet(
+        self,
+        state: _MiningLoopState,
+        sampleset: Any,
+        nonce: Any,
+        salt: bytes,
+        postprocess_start: float,
+        *,
+        preview_cb: Optional[Any],
+        attempt_log_kwargs: Dict[str, Any],
+    ) -> Optional[MiningResult]:
+        """Substrate / PoW ratchet path (the ``is_substrate`` branch).
+
+        Reads the chain's live (decay-applied) threshold, runs the lenient
+        pre-checked ``evaluate_sampleset``, maintains ``state.top_k`` in
+        place, emits an anticipatory preview, applies the submit gate, and
+        updates ``attempt_log_kwargs``. Returns the submittable
+        ``MiningResult`` (or ``None``). Mutates ``state.top_k`` and
+        ``state.previewed_floor_milli`` in place. Behaviour is identical to
+        the original inline ratchet branch.
+        """
+        # Read the chain's *live* (decay-applied) energy threshold the
+        # controller pushed via shared mem. When the chain decays past our
+        # stored best, the next iteration's check returns the stored result.
+        if state.live_threshold_var is not None:
+            with state.live_threshold_var.get_lock():
+                live_threshold_milli = int(state.live_threshold_var.value)
+        else:
+            live_threshold_milli = int(
+                state.requirements.difficulty_energy * 1000,
+            )
+
+        # Post-processing gate: stash the K best candidates we've mined, not
+        # the best the chain wants. Until the stash is full, every iter
+        # post-processes unconditionally to build a baseline; once full, only
+        # iters beating the heap's worst-energy entry earn the expensive
+        # ``evaluate_sampleset`` call. Submission against the chain's live
+        # (decayed) threshold is a separate decision handled by the submit
+        # gate below — gating storage on the chain target would lock the
+        # miner out of building a baseline whenever the live threshold is
+        # harder than what SA is producing.
+        iter_best_energy = float(np.min(sampleset.record.energy))
+        ratchet_threshold = (
+            state.top_k[-1].energy
+            if len(state.top_k) >= state.top_k_cap
+            else float("inf")
+        )
+        # Pre-check: only pay the lenient evaluate when the iter both (a)
+        # would improve the running top_k baseline and (b) is within
+        # RATCHET_PRECHECK_MARGIN_MILLI of the live (decayed) threshold —
+        # i.e. could submit now or after a little decay. No-hope iters skip
+        # the expensive diversity/selection work and log a lightweight
+        # rejected row. NOTE: if the miner never lands within margin of the
+        # live target (e.g. hardware underperforming), the stash stays empty
+        # and nothing submits — expected; every skipped iter still logs as
+        # "rejected".
+        iter_best_milli = int(iter_best_energy * 1000)
+        near_live = iter_best_milli <= (
+            live_threshold_milli + self.RATCHET_PRECHECK_MARGIN_MILLI
+        )
+        improves_stash = iter_best_energy < ratchet_threshold
+
+        result = None
+        stored_replaced = False
+        # Values captured from the post-processed eval so the submit-gate's
+        # later rebind of `result` doesn't destroy them — logged on every
+        # ``post_processed=true`` iteration, not just submitted ones.
+        post_num_valid: Optional[int] = None
+        post_diversity_milli: Optional[int] = None
+        if improves_stash and near_live:
+            # Lenient eval — diversity + min_solutions still required, but no
+            # energy gate. The ratchet itself enforces "only improvements
+            # land" via the comparison below.
+            result = self.evaluate_sampleset(
+                sampleset, state.requirements, state.nodes, state.edges,
+                nonce, salt, state.prev_timestamp, state.start_time,
+                strict_energy=False,
+                live_threshold_energy=(live_threshold_milli / 1000.0),
+            )
+            attempt_log_kwargs["post_processed"] = True
+            if result is not None:
+                post_num_valid = result.num_valid
+                post_diversity_milli = int(result.diversity * 1000)
+                stored_replaced = self._insert_into_stash(
+                    state.top_k, state.top_k_cap, result,
                 )
-                attempt_log_kwargs["solution_meta"] = sol_meta
-                attempt_log.record(**attempt_log_kwargs)
 
-                # SolutionStore — archive top-5 spin configs only when
-                # the chain ratchet kept this candidate. The result_kind
-                # set on the attempt drives the gate; "submitted" and
-                # "stored" both qualify since both produce a candidate
-                # we (or someone) might reproduce for analysis.
-                attempt_result_kind = attempt_log_kwargs.get("result_kind")
-                if attempt_result_kind in ("stored", "submitted") and top_5_sols:
-                    nonce_hex = (
-                        nonce.hex() if isinstance(nonce, (bytes, bytearray))
-                        else f"{int(nonce):064x}"
-                    )
-                    solution_store.record(
-                        dispatch_id=dispatch_id_for_log,
-                        iter_num=progress + 1,
-                        nonce_hex=nonce_hex,
-                        salt_hex=salt.hex(),
-                        top_5_solutions_hex=[
-                            pack_spins_hex(s) for s in top_5_sols
-                        ],
-                        top_5_energies=top_5_es,
-                        result_kind=attempt_result_kind,
-                    )
+        # Anticipatory-submission preview. When the stash gains a candidate
+        # whose best-by-floor improves on anything we've previewed, hand the
+        # controller a lightweight, picklable snapshot. This is purely a
+        # preview — the local submit gate below is still the only thing that
+        # returns a result. Throttled to strict floor improvements; failures
+        # never break mining.
+        if preview_cb is not None and stored_replaced:
+            state.previewed_floor_milli = self._maybe_emit_preview(
+                preview_cb, state.top_k, state.previewed_floor_milli,
+                state.dispatch_id_for_log,
+            )
 
-                if result:
-                    # Post-evaluation cancel check. evaluate_sampleset can
-                    # take meaningful time on dense graphs; if cancel
-                    # raced with a valid result, return None so the next
-                    # dispatch can decide what to do — the controller is
-                    # already moving on. Without this check, a result
-                    # produced after stop_event was set surfaces as
-                    # "fresh" against the new dispatch and may submit a
-                    # proof against a stale context.
-                    if stop_event.is_set():
-                        self.logger.info(
-                            "mine_work_item: valid result produced after "
-                            "cancel; discarding (stop_event set)"
-                        )
-                        return None
-                    # Use result.nonce / result.salt — the submitted
-                    # candidate — not the loop-local nonce/salt, which may
-                    # belong to a different iteration when the submit gate
-                    # returns a stashed top-k entry.
-                    result_nonce_disp = f"0x{result.nonce.hex()[:16]}..."
-                    self.logger.info(
-                        f"[work-item {_work_tag(context)}] mined! "
-                        f"nonce={result_nonce_disp} "
-                        f"salt=0x{result.salt.hex()[:8]}... "
-                        f"energy={result.energy:.2f} "
-                        f"solutions={result.num_valid} "
-                        f"diversity={result.diversity:.3f} "
-                        f"attempt_time={result.mining_time:.2f}s "
-                        f"total_time={time.time() - start_time:.2f}s"
-                    )
-                    return result
+        self.timing_stats['postprocessing'].append(
+            (time.time() - postprocess_start) * 1e6,
+        )
 
-                progress += 1
-                if progress % PROGRESS_LOG_INTERVAL == 0:
-                    # `self.top_attempts` is intentionally not maintained in
-                    # substrate mode — no best-energy field to surface here.
-                    self.logger.info(
-                        "mine_work_item progress: %d attempts | "
-                        "sweeps=%d reads=%d",
-                        progress, current_num_sweeps, num_reads,
-                    )
-            self.logger.info("mine_work_item: stopped, no valid result")
-            return None
-        finally:
-            self.mining = False
-            if self._dropped_results:
-                self.logger.info(
-                    "mine_work_item: %d QPU results dropped under "
-                    "result-queue backpressure", self._dropped_results,
-                )
-            # Stop the pump first: signal it, let the QPU stream observe the
-            # stop and return from its in-flight next(), then join. Only
-            # after the pump thread is dead is it safe for _post_mine_cleanup
-            # to close the generator (close() on a generator executing in
-            # another thread raises "already executing").
-            if pump_stop is not None:
-                pump_stop.set()
-            if pump_thread is not None:
-                pump_thread.join(timeout=5.0)
-                if pump_thread.is_alive():
-                    self.logger.warning(
-                        "mine_work_item: result pump did not join in 5s — "
-                        "pump thread still alive (QPU stream pump-stop wiring "
-                        "closes this race)",
-                    )
-            self._pump_stop = None
-            # Tear down the feeder before delegating to subclass cleanup.
-            if self._feeder is not None:
-                try:
-                    self._feeder.stop()
-                finally:
-                    self._feeder = None
-            # Persist any buffered aggregate metadata for this dispatch.
-            attempt_logger = getattr(self, "_attempt_logger", None)
-            if attempt_logger is not None:
-                attempt_logger.flush()
-            self._post_mine_cleanup()
+        # Submit gate. The chain re-derives each submitted solution's energy
+        # and filters with strict ``< max_energy_milli`` before counting;
+        # gating on ``energy`` (best of set) would let through proofs whose
+        # mid-pack solutions get rejected. ``submit_floor_energy`` is the
+        # chain-equivalent recompute, so it's what the gate must compare
+        # against. Walk the stash in energy-ascending order (best first);
+        # prefer the best candidate whose floor clears, falling back to
+        # worse-energy stash entries when a better candidate's floor sits
+        # above the live threshold (the two can diverge).
+        result = self._select_submittable_candidate(
+            state.top_k, live_threshold_milli,
+        )
+
+        # ratchet_threshold is float("inf") on the first iter before anything
+        # is stored — log None there since there's no meaningful prior.
+        ratchet_threshold_milli_log = (
+            int(ratchet_threshold * 1000)
+            if math.isfinite(ratchet_threshold)
+            else None
+        )
+        attempt_log_kwargs.update(
+            threshold_milli=live_threshold_milli,
+            ratchet_threshold_milli=ratchet_threshold_milli_log,
+            num_valid=post_num_valid,
+            diversity_milli=post_diversity_milli,
+            stored_as_best=stored_replaced,
+            result_kind=(
+                "submitted" if result is not None
+                else "stored" if stored_replaced
+                else "rejected"
+            ),
+        )
+        return result
+
+    def _run_mempool_eval(
+        self,
+        state: _MiningLoopState,
+        sampleset: Any,
+        nonce: Any,
+        salt: bytes,
+        postprocess_start: float,
+        *,
+        attempt_log_kwargs: Dict[str, Any],
+    ) -> Optional[MiningResult]:
+        """Mempool-path strict evaluation (the ``else`` of ``is_substrate``).
+
+        Runs ``evaluate_sampleset`` with strict semantics, appends the
+        post-processing timing, and updates ``attempt_log_kwargs`` in place.
+        Returns the evaluated ``MiningResult`` (or ``None``). Behaviour is
+        identical to the original inline mempool branch.
+        """
+        result = self.evaluate_sampleset(
+            sampleset, state.requirements, state.nodes, state.edges,
+            nonce, salt, state.prev_timestamp, state.start_time,
+        )
+
+        self.timing_stats['postprocessing'].append(
+            (time.time() - postprocess_start) * 1e6,
+        )
+        # Mempool path may have ``difficulty_energy = +inf``
+        # (unbounded threshold for jobs with no min_energy
+        # floor). int() would overflow — use None instead.
+        threshold_milli_log: Optional[int] = None
+        if math.isfinite(state.requirements.difficulty_energy):
+            threshold_milli_log = int(
+                state.requirements.difficulty_energy * 1000,
+            )
+        attempt_log_kwargs.update(
+            post_processed=True,
+            threshold_milli=threshold_milli_log,
+            num_valid=(result.num_valid if result is not None else None),
+            diversity_milli=(
+                int(result.diversity * 1000)
+                if result is not None else None
+            ),
+            result_kind=(
+                "submitted" if result is not None else "rejected"
+            ),
+        )
+        return result
+
+    def _finalize_iteration_logging(
+        self,
+        state: _MiningLoopState,
+        sampleset: Any,
+        nonce: Any,
+        salt: bytes,
+        progress: int,
+        *,
+        preprocess_start: float,
+        qpu_access_time_us: Optional[int],
+        attempt_log_kwargs: Dict[str, Any],
+    ) -> None:
+        """Finalise + persist per-iteration logging.
+
+        Fills the timing/feeder/solution-meta fields on
+        ``attempt_log_kwargs``, records the attempt row, and archives the
+        top-5 spin configs to the solution store when the iter was stored or
+        submitted. Pure side effects — no control flow. Behaviour matches
+        the original inline logging block exactly.
+        """
+        attempt_log_kwargs["mining_time_us"] = int(
+            (time.time() - preprocess_start) * 1e6
+        )
+        attempt_log_kwargs["qpu_access_time_us"] = qpu_access_time_us
+        if self._feeder is not None:
+            fstats = self._feeder.stats()
+            attempt_log_kwargs["feeder_ready"] = fstats["ready"]
+            attempt_log_kwargs["feeder_drained_count"] = (
+                fstats["drained_count"]
+            )
+            attempt_log_kwargs["feeder_pop_wait_total_s"] = (
+                fstats["pop_wait_total_s"]
+            )
+        # Compute solution_meta scalars + capture top-5 solutions. Meta is
+        # always embedded in the attempt log; top-5 spins go to disk only
+        # when this iter is stored or submitted (see write below).
+        sol_meta, top_5_sols, top_5_es = compute_solution_meta(
+            sampleset, state.requirements.difficulty_energy,
+        )
+        attempt_log_kwargs["solution_meta"] = sol_meta
+        state.attempt_log.record(**attempt_log_kwargs)
+
+        # SolutionStore — archive top-5 spin configs only when the chain
+        # ratchet kept this candidate. The result_kind set on the attempt
+        # drives the gate; "submitted" and "stored" both qualify since both
+        # produce a candidate we (or someone) might reproduce for analysis.
+        attempt_result_kind = attempt_log_kwargs.get("result_kind")
+        if attempt_result_kind in ("stored", "submitted") and top_5_sols:
+            nonce_hex = (
+                nonce.hex() if isinstance(nonce, (bytes, bytearray))
+                else f"{int(nonce):064x}"
+            )
+            state.solution_store.record(
+                dispatch_id=state.dispatch_id_for_log,
+                iter_num=progress + 1,
+                nonce_hex=nonce_hex,
+                salt_hex=salt.hex(),
+                top_5_solutions_hex=[
+                    pack_spins_hex(s) for s in top_5_sols
+                ],
+                top_5_energies=top_5_es,
+                result_kind=attempt_result_kind,
+            )
 
     # ------------------------------------------------------------------
     # Anticipatory-submission preview (substrate / PoW ratchet path)
