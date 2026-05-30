@@ -100,6 +100,26 @@ class _AcquireResult:
 
 
 @dataclass
+class _DispatchSetup:
+    """Everything ``_setup_dispatch`` hands back to ``mine_work_item``.
+
+    Bundles the per-dispatch loop inputs and the (optional) result-pump
+    handles so the main method stays a thin loop driver. ``None`` from
+    ``_setup_dispatch`` means ``_pre_mine_setup`` aborted and the caller
+    returns ``None`` immediately (same as the original early return).
+    """
+
+    loop_state: "_MiningLoopState"
+    is_substrate: bool
+    sample_ctx: Dict[str, Any]
+    num_reads: int
+    num_sweeps: int
+    result_queue: Optional["queue.Queue"]
+    pump_thread: Optional[threading.Thread]
+    pump_stop: Optional[threading.Event]
+
+
+@dataclass
 class _MiningLoopState:
     """Per-dispatch state bundle for ``mine_work_item``'s loop helpers.
 
@@ -564,7 +584,159 @@ class BaseMiner(ABC):
             A ``MiningResult`` if a valid solution is found before the
             stop event fires; ``None`` otherwise.
         """
-        # -- setup --------------------------------------------------------
+        setup = self._setup_dispatch(context, stop_event, **kwargs)
+        if setup is None:
+            return None  # _pre_mine_setup aborted (e.g. QPU budget exhausted)
+        loop_state = setup.loop_state
+        is_substrate = setup.is_substrate
+        sample_ctx = setup.sample_ctx
+        result_queue = setup.result_queue
+        pump_thread = setup.pump_thread
+        pump_stop = setup.pump_stop
+
+        progress = 0
+        try:
+            while self.mining and not stop_event.is_set():
+                # Each iteration sources one (nonce, salt, sampleset):
+                # streaming backends via ``_sample_batch`` (which pulls
+                # models from the feeder internally), or the single-shot
+                # path which pops one model. The PoW feeder derives a
+                # fresh ``salt -> nonce -> (h, J)`` per model in a
+                # background process; the mempool feeder cycles the
+                # order's stored ``(h, J)``.
+                preprocess_start = time.time()
+                self.current_stage = 'preprocessing'
+                self.current_stage_start = preprocess_start
+
+                # Source one (nonce, salt, sampleset) plus the per-iteration
+                # QPU access time. The returned signal directs the loop's
+                # stop / stream-exhausted / sampling-error control flow.
+                acquired = self._acquire_result(
+                    stop_event, result_queue, preprocess_start,
+                    sample_ctx=sample_ctx,
+                )
+                if acquired.action == _ACQUIRE_STOP:
+                    return None
+                if acquired.action == _ACQUIRE_DONE:
+                    break  # stream exhausted; exit the loop
+                if acquired.action == _ACQUIRE_CONTINUE:
+                    continue
+                nonce = acquired.nonce
+                salt = acquired.salt
+                sampleset = acquired.sampleset
+                qpu_access_time_us = acquired.qpu_access_time_us
+
+                sampleset = self._post_sample(sampleset)
+                if stop_event.is_set():
+                    return None
+
+                postprocess_start = time.time()
+                self.current_stage = 'postprocessing'
+                self.current_stage_start = postprocess_start
+
+                self.timing_stats['total_samples'] += len(
+                    sampleset.record.energy,
+                )
+                self.timing_stats['blocks_attempted'] += 1
+
+                # Per-iteration log fields (filled below per code path).
+                attempt_log_kwargs: Dict[str, Any] = {
+                    "dispatch_id": loop_state.dispatch_id_for_log,
+                    "iter_num": progress + 1,
+                    "nonce_hex": (
+                        f"0x{nonce.hex()}"
+                        if isinstance(nonce, (bytes, bytearray))
+                        else hex(int(nonce))
+                    ),
+                    "salt_hex": f"0x{salt.hex()}",
+                    "best_energy_milli": int(
+                        float(np.min(sampleset.record.energy)) * 1000
+                    ),
+                    "num_samples": len(sampleset.record.energy),
+                    "post_processed": False,
+                    "stored_as_best": False,
+                    "result_kind": "rejected",
+                }
+
+                if is_substrate:
+                    result = self._run_substrate_ratchet(
+                        loop_state, sampleset, nonce, salt, postprocess_start,
+                        preview_cb=preview_cb,
+                        attempt_log_kwargs=attempt_log_kwargs,
+                    )
+                else:
+                    result = self._run_mempool_eval(
+                        loop_state, sampleset, nonce, salt, postprocess_start,
+                        attempt_log_kwargs=attempt_log_kwargs,
+                    )
+
+                self._finalize_iteration_logging(
+                    loop_state, sampleset, nonce, salt, progress,
+                    preprocess_start=preprocess_start,
+                    qpu_access_time_us=qpu_access_time_us,
+                    attempt_log_kwargs=attempt_log_kwargs,
+                )
+
+                if result:
+                    # Post-evaluation cancel check. evaluate_sampleset can
+                    # take meaningful time on dense graphs; if cancel
+                    # raced with a valid result, return None so the next
+                    # dispatch can decide what to do — the controller is
+                    # already moving on. Without this check, a result
+                    # produced after stop_event was set surfaces as
+                    # "fresh" against the new dispatch and may submit a
+                    # proof against a stale context.
+                    if stop_event.is_set():
+                        self.logger.info(
+                            "mine_work_item: valid result produced after "
+                            "cancel; discarding (stop_event set)"
+                        )
+                        return None
+                    # Use result.nonce / result.salt — the submitted
+                    # candidate — not the loop-local nonce/salt, which may
+                    # belong to a different iteration when the submit gate
+                    # returns a stashed top-k entry.
+                    result_nonce_disp = f"0x{result.nonce.hex()[:16]}..."
+                    self.logger.info(
+                        f"[work-item {_work_tag(context)}] mined! "
+                        f"nonce={result_nonce_disp} "
+                        f"salt=0x{result.salt.hex()[:8]}... "
+                        f"energy={result.energy:.2f} "
+                        f"solutions={result.num_valid} "
+                        f"diversity={result.diversity:.3f} "
+                        f"attempt_time={result.mining_time:.2f}s "
+                        f"total_time={time.time() - loop_state.start_time:.2f}s"
+                    )
+                    return result
+
+                progress += 1
+                if progress % PROGRESS_LOG_INTERVAL == 0:
+                    # `self.top_attempts` is intentionally not maintained in
+                    # substrate mode — no best-energy field to surface here.
+                    self.logger.info(
+                        "mine_work_item progress: %d attempts | "
+                        "sweeps=%d reads=%d",
+                        progress, setup.num_sweeps, setup.num_reads,
+                    )
+            self.logger.info("mine_work_item: stopped, no valid result")
+            return None
+        finally:
+            self._teardown_dispatch(pump_stop, pump_thread)
+
+    def _setup_dispatch(
+        self,
+        context: WorkContext,
+        stop_event: multiprocessing.synchronize.Event,
+        **kwargs,
+    ) -> Optional[_DispatchSetup]:
+        """One-time per-dispatch setup for ``mine_work_item``.
+
+        Runs ``_pre_mine_setup`` (returning ``None`` to abort, exactly as the
+        original early ``return None`` did), adapts params, builds the
+        ``_MiningLoopState`` and sampling context, creates the feeder, and
+        starts the result pump for streaming backends. Behaviour matches the
+        original inline setup block.
+        """
         self.mining = True
         self.top_attempts = []
         start_time = time.time()
@@ -700,17 +872,10 @@ class BaseMiner(ABC):
         # QPU/GPU streaming impls ignore them — their feeder already
         # encapsulates the round seed and miner identity — but the base
         # contract requires (prev_hash, miner_id, cur_index).
-        batch_prev_hash = bridge_prev_block.hash
-        batch_miner_id = bridge_node_info.miner_id
-        batch_cur_index = bridge_prev_block.header.index
-
-        # Sampling inputs bundled once for the inline ``_acquire_result``
-        # path and the streaming pump (identical keys — the pump consumes
-        # this same dict shape).
         sample_ctx = {
-            "prev_hash": batch_prev_hash,
-            "miner_id": batch_miner_id,
-            "cur_index": batch_cur_index,
+            "prev_hash": bridge_prev_block.hash,
+            "miner_id": bridge_node_info.miner_id,
+            "cur_index": bridge_prev_block.header.index,
             "nodes": nodes,
             "edges": edges,
             "num_reads": num_reads,
@@ -718,154 +883,52 @@ class BaseMiner(ABC):
             "extra": extra_params,
         }
 
-        # --- Out-of-band result pump (streaming backends only) ----------
-        # CPU/GPU/Metal keep the inline path below (STREAMING_PUMP=False).
+        result_queue, pump_thread, pump_stop = self._start_result_pump(
+            sample_ctx,
+        )
+        return _DispatchSetup(
+            loop_state=loop_state,
+            is_substrate=is_substrate,
+            sample_ctx=sample_ctx,
+            num_reads=num_reads,
+            num_sweeps=current_num_sweeps,
+            result_queue=result_queue,
+            pump_thread=pump_thread,
+            pump_stop=pump_stop,
+        )
+
+    def _start_result_pump(
+        self,
+        sample_ctx: Dict[str, Any],
+    ) -> Tuple[
+        Optional["queue.Queue"],
+        Optional[threading.Thread],
+        Optional[threading.Event],
+    ]:
+        """Start the out-of-band result pump for streaming backends.
+
+        CPU/GPU/Metal (``STREAMING_PUMP=False``) keep the inline acquisition
+        path and get ``(None, None, None)``. Behaviour matches the original
+        inline pump-setup block.
+        """
         self._dropped_results = 0
-        result_queue: Optional["queue.Queue"] = None
-        pump_thread: Optional[threading.Thread] = None
-        pump_stop: Optional[threading.Event] = None
-        if self.STREAMING_PUMP:
-            result_queue = queue.Queue(maxsize=self.RESULT_QUEUE_MAXSIZE)
-            pump_stop = threading.Event()
-            # The QPU stream observes this so its in-flight next() unblocks
-            # on shutdown before we join the pump and close the generator.
-            self._pump_stop = pump_stop
-            pump_thread = threading.Thread(
-                target=self._result_pump,
-                args=(result_queue, pump_stop, sample_ctx),
-                name=f"qpu-pump-{self.miner_id}",
-                daemon=True,
-            )
-            pump_thread.start()
-
-        progress = 0
-        try:
-            while self.mining and not stop_event.is_set():
-                # Each iteration sources one (nonce, salt, sampleset):
-                # streaming backends via ``_sample_batch`` (which pulls
-                # models from the feeder internally), or the single-shot
-                # path which pops one model. The PoW feeder derives a
-                # fresh ``salt -> nonce -> (h, J)`` per model in a
-                # background process; the mempool feeder cycles the
-                # order's stored ``(h, J)``.
-                preprocess_start = time.time()
-                self.current_stage = 'preprocessing'
-                self.current_stage_start = preprocess_start
-
-                # Source one (nonce, salt, sampleset) plus the per-iteration
-                # QPU access time. The returned signal directs the loop's
-                # stop / stream-exhausted / sampling-error control flow.
-                acquired = self._acquire_result(
-                    stop_event, result_queue, preprocess_start,
-                    sample_ctx=sample_ctx,
-                )
-                if acquired.action == _ACQUIRE_STOP:
-                    return None
-                if acquired.action == _ACQUIRE_DONE:
-                    break  # stream exhausted; exit the loop
-                if acquired.action == _ACQUIRE_CONTINUE:
-                    continue
-                nonce = acquired.nonce
-                salt = acquired.salt
-                sampleset = acquired.sampleset
-                qpu_access_time_us = acquired.qpu_access_time_us
-
-                sampleset = self._post_sample(sampleset)
-                if stop_event.is_set():
-                    return None
-
-                postprocess_start = time.time()
-                self.current_stage = 'postprocessing'
-                self.current_stage_start = postprocess_start
-
-                self.timing_stats['total_samples'] += len(
-                    sampleset.record.energy,
-                )
-                self.timing_stats['blocks_attempted'] += 1
-
-                # Per-iteration log fields (filled below per code path).
-                attempt_log_kwargs: Dict[str, Any] = {
-                    "dispatch_id": dispatch_id_for_log,
-                    "iter_num": progress + 1,
-                    "nonce_hex": (
-                        f"0x{nonce.hex()}"
-                        if isinstance(nonce, (bytes, bytearray))
-                        else hex(int(nonce))
-                    ),
-                    "salt_hex": f"0x{salt.hex()}",
-                    "best_energy_milli": int(
-                        float(np.min(sampleset.record.energy)) * 1000
-                    ),
-                    "num_samples": len(sampleset.record.energy),
-                    "post_processed": False,
-                    "stored_as_best": False,
-                    "result_kind": "rejected",
-                }
-
-                if is_substrate:
-                    result = self._run_substrate_ratchet(
-                        loop_state, sampleset, nonce, salt, postprocess_start,
-                        preview_cb=preview_cb,
-                        attempt_log_kwargs=attempt_log_kwargs,
-                    )
-                else:
-                    result = self._run_mempool_eval(
-                        loop_state, sampleset, nonce, salt, postprocess_start,
-                        attempt_log_kwargs=attempt_log_kwargs,
-                    )
-
-                self._finalize_iteration_logging(
-                    loop_state, sampleset, nonce, salt, progress,
-                    preprocess_start=preprocess_start,
-                    qpu_access_time_us=qpu_access_time_us,
-                    attempt_log_kwargs=attempt_log_kwargs,
-                )
-
-                if result:
-                    # Post-evaluation cancel check. evaluate_sampleset can
-                    # take meaningful time on dense graphs; if cancel
-                    # raced with a valid result, return None so the next
-                    # dispatch can decide what to do — the controller is
-                    # already moving on. Without this check, a result
-                    # produced after stop_event was set surfaces as
-                    # "fresh" against the new dispatch and may submit a
-                    # proof against a stale context.
-                    if stop_event.is_set():
-                        self.logger.info(
-                            "mine_work_item: valid result produced after "
-                            "cancel; discarding (stop_event set)"
-                        )
-                        return None
-                    # Use result.nonce / result.salt — the submitted
-                    # candidate — not the loop-local nonce/salt, which may
-                    # belong to a different iteration when the submit gate
-                    # returns a stashed top-k entry.
-                    result_nonce_disp = f"0x{result.nonce.hex()[:16]}..."
-                    self.logger.info(
-                        f"[work-item {_work_tag(context)}] mined! "
-                        f"nonce={result_nonce_disp} "
-                        f"salt=0x{result.salt.hex()[:8]}... "
-                        f"energy={result.energy:.2f} "
-                        f"solutions={result.num_valid} "
-                        f"diversity={result.diversity:.3f} "
-                        f"attempt_time={result.mining_time:.2f}s "
-                        f"total_time={time.time() - start_time:.2f}s"
-                    )
-                    return result
-
-                progress += 1
-                if progress % PROGRESS_LOG_INTERVAL == 0:
-                    # `self.top_attempts` is intentionally not maintained in
-                    # substrate mode — no best-energy field to surface here.
-                    self.logger.info(
-                        "mine_work_item progress: %d attempts | "
-                        "sweeps=%d reads=%d",
-                        progress, current_num_sweeps, num_reads,
-                    )
-            self.logger.info("mine_work_item: stopped, no valid result")
-            return None
-        finally:
-            self._teardown_dispatch(pump_stop, pump_thread)
+        if not self.STREAMING_PUMP:
+            return None, None, None
+        result_queue: "queue.Queue" = queue.Queue(
+            maxsize=self.RESULT_QUEUE_MAXSIZE,
+        )
+        pump_stop = threading.Event()
+        # The QPU stream observes this so its in-flight next() unblocks
+        # on shutdown before we join the pump and close the generator.
+        self._pump_stop = pump_stop
+        pump_thread = threading.Thread(
+            target=self._result_pump,
+            args=(result_queue, pump_stop, sample_ctx),
+            name=f"qpu-pump-{self.miner_id}",
+            daemon=True,
+        )
+        pump_thread.start()
+        return result_queue, pump_thread, pump_stop
 
     def _acquire_result(
         self,
