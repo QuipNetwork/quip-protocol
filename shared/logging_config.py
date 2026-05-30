@@ -11,12 +11,10 @@ This module provides:
 
 import logging
 import logging.handlers
-import multiprocessing as mp
 import sys
 from datetime import datetime
-from logging.handlers import QueueListener, QueueHandler
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict
 
 
 class QuipFormatter(logging.Formatter):
@@ -207,34 +205,6 @@ def update_log_level(loggers: Dict[str, logging.Logger], level: str):
     # Update component loggers
     for logger in loggers.values():
         logger.setLevel(numeric_level)
-
-
-def setup_multiprocess_logging() -> Tuple[mp.Queue, QueueListener]:
-    """Set up logging for multiprocessing environment.
-
-    Returns:
-        Tuple of (log_queue, listener) for multiprocessing logging.
-    """
-    # Create queue for inter-process communication
-    log_queue = mp.Queue()
-
-    # Handler that sends log records to queue
-    queue_handler = QueueHandler(log_queue)
-
-    # Get root logger and add queue handler
-    root_logger = logging.getLogger()
-    root_logger.addHandler(queue_handler)
-    root_logger.setLevel(logging.INFO)
-
-    # Create listener that processes queue in main process
-    formatter = QuipFormatter()
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-
-    listener = QueueListener(log_queue, console_handler)
-    listener.start()
-
-    return log_queue, listener
 
 
 def init_component_logger(component: str, identifier: str) -> logging.Logger:
