@@ -64,33 +64,20 @@ def test_parse_topology_bad_params_non_integer():
 # ── topology → MinerCore wiring ─────────────────────────────────────────────
 
 
-def test_minercore_receives_topology_for_all_kinds(monkeypatch):
-    """The CLI passes the resolved topology to MinerCore (no per-kind warn)."""
-    import quip_cli
-    from dwave_topologies import DEFAULT_TOPOLOGY
+def test_run_concurrent_miner_wires_topology_to_minercore():
+    """Guard the exact wiring Task 5 added: _run_concurrent_miner must pass
+    the resolved topology to MinerCore and no longer route through the removed
+    per-kind helper. Driving the full async path needs chain/keystore mocks;
+    assert against the function source instead (catches a dropped/renamed
+    `topology=topology` or a reintroduced `_inject_topology`)."""
+    import inspect
 
-    captured = {}
-
-    class _FakeCore:
-        def __init__(self, node_id, miners_config, topology=None, **kw):
-            captured["topology"] = topology
-            captured["config"] = miners_config
-            self.miner_handles = []
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(quip_cli, "MinerCore", _FakeCore)
-    core = quip_cli.MinerCore(
-        node_id="n", miners_config={"cpu": {"num_cpus": 1}},
-        topology=DEFAULT_TOPOLOGY,
-    )
-    core.close()
-    assert captured["topology"] is DEFAULT_TOPOLOGY
+    src = inspect.getsource(quip_cli._run_concurrent_miner)
+    assert "topology=topology" in src
+    assert "_inject_topology" not in src
 
 
 def test_inject_topology_helper_is_gone():
-    import quip_cli
     assert not hasattr(quip_cli, "_inject_topology")
 
 
