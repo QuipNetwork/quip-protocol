@@ -177,7 +177,14 @@ class NodeDescriptor:
 
 # ── Scrubbing (defense in depth) ──────────────────────────────
 
-def _is_forbidden_key(key: str) -> bool:
+def is_secret_key(key: str) -> bool:
+    """True if ``key`` names a secret-bearing field (token, password, ...).
+
+    Single source of truth for telemetry redaction across modules (the
+    descriptor scrub here and the miner-survey config in
+    ``shared.miner_survey``), so a credential can't leak through one path
+    while being scrubbed on another.
+    """
     lowered = key.lower()
     return any(sub in lowered for sub in _FORBIDDEN_SUBSTRINGS)
 
@@ -187,7 +194,7 @@ def _scrub(value: Any) -> Any:
     if isinstance(value, dict):
         return {
             k: _scrub(v) for k, v in value.items()
-            if not _is_forbidden_key(k)
+            if not is_secret_key(k)
         }
     if isinstance(value, list):
         return [_scrub(v) for v in value]
@@ -534,7 +541,7 @@ def _filter_args(args: Dict[str, Any], whitelist) -> Dict[str, Any]:
     """Keep only whitelisted, non-forbidden, JSON-friendly entries."""
     out: Dict[str, Any] = {}
     for k, v in (args or {}).items():
-        if not isinstance(k, str) or _is_forbidden_key(k):
+        if not isinstance(k, str) or is_secret_key(k):
             continue
         if k not in whitelist:
             continue
@@ -611,7 +618,7 @@ def _qpu_spec_entry(spec: Dict[str, Any], miner_id: str) -> Dict[str, Any]:
     }
     for source in (cfg, args):
         for k in _QPU_HANDLE_FIELD_WHITELIST:
-            if k in source and not _is_forbidden_key(k):
+            if k in source and not is_secret_key(k):
                 v = source[k]
                 if _is_jsonable(v) and k not in entry:
                     entry[k] = v
@@ -910,6 +917,7 @@ __all__ = [
     "SystemInfo",
     "build_descriptor",
     "collect_system_info",
+    "is_secret_key",
     "summarize_miners_from_handles",
     "summarize_miners_from_specs",
     "to_canonical_json",

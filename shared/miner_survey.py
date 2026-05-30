@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
+from shared.system_info import is_secret_key
 from shared.version import get_version
 
 
@@ -223,12 +224,12 @@ def _config_dict(spec: Dict[str, Any]) -> Dict[str, Any]:
     args = spec.get("args") or {}
     merged: Dict[str, Any] = {}
     for k, v in cfg.items():
-        if isinstance(k, str) and _is_jsonable(v):
+        if isinstance(k, str) and not is_secret_key(k) and _is_jsonable(v):
             merged[k] = v
     for k, v in args.items():
         if k == "topology":
             continue
-        if isinstance(k, str) and _is_jsonable(v):
+        if isinstance(k, str) and not is_secret_key(k) and _is_jsonable(v):
             merged[k] = v
     return merged
 

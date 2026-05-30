@@ -223,6 +223,49 @@ def test_non_jsonable_args_are_filtered_from_config():
 
 
 # ----------------------------------------------------------------------
+# Secret-bearing config keys are redacted
+# ----------------------------------------------------------------------
+
+
+def test_secret_config_keys_are_redacted():
+    """`token`/`api_key`/etc. must never appear in the survey config.
+
+    The survey is served unauthenticated at `/api/v1/miner/survey` and
+    `/api/v1/stats`; a D-Wave `token` carried in the spec cfg would leak
+    in cleartext. Non-secret keys (solver, num_reads) must still survive.
+    """
+    core = MinerCore(node_id="quip-miner-secret", miners_config={"cpu": {"num_cpus": 1}})
+    try:
+        handle = core.miner_handles[0]
+        handle.spec["cfg"] = {
+            "token": "SECRET-DWAVE-TOKEN",
+            "solver": "Advantage2_system1",
+            "num_reads": 112,
+        }
+        handle.spec.setdefault("args", {})["api_key"] = "SECRET-KEY"
+        handle.spec["args"]["password"] = "hunter2"
+        handle.spec["args"]["region"] = "na-west-1"
+        survey = build_miner_survey(core, _signer())
+    finally:
+        core.close()
+
+    config = survey["miners"][0]["config"]
+    # Secrets gone.
+    assert "token" not in config
+    assert "api_key" not in config
+    assert "password" not in config
+    # Non-secret config preserved.
+    assert config.get("solver") == "Advantage2_system1"
+    assert config.get("num_reads") == 112
+    assert config.get("region") == "na-west-1"
+    # No secret VALUE survives anywhere in the serialized survey.
+    blob = json.dumps(survey)
+    assert "SECRET-DWAVE-TOKEN" not in blob
+    assert "SECRET-KEY" not in blob
+    assert "hunter2" not in blob
+
+
+# ----------------------------------------------------------------------
 # Capability flags reflect handle inventory
 # ----------------------------------------------------------------------
 
