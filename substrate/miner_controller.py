@@ -512,6 +512,11 @@ class SubstrateMinerController:
         # Set after a successful snapshot fetch; consulted by the
         # storm-prevention check in _handle_result.
         self._current_work_key: Optional[WorkKey] = None
+        # Chain-global solution number (ordinal of the solution being mined,
+        # = count(WinningSolutions) + 1) per work key. Resolved once per
+        # round and reused for re-dispatches and the submission record so the
+        # on-disk archive is keyed consistently. Pruned on round eviction.
+        self._solution_number_by_work_key: "dict[WorkKey, int]" = {}
         # LRU map of work keys for which the chain already accepted one
         # of our proofs this head. Subsequent same-key results from
         # sibling handles are dropped without resubmission — that's the
@@ -534,10 +539,10 @@ class SubstrateMinerController:
         # ``epoch_length`` blocks elapsed since LastProofBlock), so most
         # heads don't need a refresh. Initialised to 0 (never pushed).
         self._last_pushed_threshold_milli: int = 0
-        # Per-controller submission log — paired with per-worker attempt
-        # logs via (handle_id, dispatch_id). The query API in
-        # shared.telemetry_api hits both. assign_id() reserves the
-        # next monotonic solution_id; record() writes the outcome.
+        # Per-controller submission log. Keyed by the chain-global solution
+        # number (resolved per round in _resolve_solution_number), the same
+        # key the worker files its attempts under — so submission.json lands
+        # in the matching {solution_number}/ dir with no separate index.
         self._submission_log = SubmissionLogger()
         self._result_queue: asyncio.Queue[_ResultEnvelope] = asyncio.Queue()
         # Anticipatory-submission preview store (Task 6a primitive).
@@ -1036,16 +1041,22 @@ class SubstrateMinerController:
         # 8. Dispatch.
         self._current_context = ctx
         self._current_work_key = new_work_key
+        # Chain-global solution number for this round — the on-disk archive
+        # key the workers write under. Resolved once per round (cached).
+        solution_number = await self._resolve_solution_number(new_work_key)
         logger.info(
-            "new head (event manager): last_proof=0x%s... topology=0x%s... "
-            "nodes=%d edges=%d",
+            "new head (event manager): solution=%s last_proof=0x%s... "
+            "topology=0x%s... nodes=%d edges=%d",
+            solution_number,
             ctx.last_proof_block_hash.hex()[:16],
             ctx.topology_hash.hex()[:16],
             len(ctx.nodes),
             len(ctx.edges),
         )
         for handle in self.miner_handles:
-            dispatch_id = handle.mine_work_item(ctx)
+            dispatch_id = handle.mine_work_item(
+                ctx, solution_number=solution_number,
+            )
             self._dispatch_contexts[(handle.miner_id, dispatch_id)] = ctx
             self._prune_dispatch_contexts(handle.miner_id, dispatch_id)
         self.stats.contexts_dispatched += len(self.miner_handles)
@@ -1123,9 +1134,9 @@ class SubstrateMinerController:
         except ValueError as exc:
             raise RuntimeError(f"proof encoding failed (bug): {exc}") from exc
 
-        # Reserve a solution_id before the network round-trip so that
-        # even an RPC failure produces a log entry with a stable id.
-        solution_id = self._submission_log.assign_id()
+        # The solution number (resolved when this round was dispatched) is
+        # the archive key shared with the worker's attempts.
+        solution_number = self._solution_number_for_context(envelope.context)
         result_energy_milli = int(envelope.result.energy * 1000)
         result_diversity_milli = int(envelope.result.diversity * 1000)
         snapshot_threshold_milli = int(envelope.context.difficulty.max_energy_milli)
@@ -1150,11 +1161,9 @@ class SubstrateMinerController:
             )
             pow_seq_rpc_err = await self._query_proofs_submitted_safe()
             self._submission_log.record(
-                solution_id=solution_id,
+                solution_number=solution_number,
                 miner_id=envelope.handle_id,
-                miner_type=envelope.result.miner_type,
-                dispatch_id=envelope.dispatch_id,
-                energy_milli=result_energy_milli,
+                miner_type=envelope.result.miner_type,                energy_milli=result_energy_milli,
                 diversity_milli=result_diversity_milli,
                 threshold_milli=snapshot_threshold_milli,
                 last_proof_block_hash_hex=last_proof_hex,
@@ -1189,11 +1198,9 @@ class SubstrateMinerController:
                 self.stats.proofs_unverified += 1
                 pow_seq_mismatch = await self._query_proofs_submitted_safe()
                 self._submission_log.record(
-                    solution_id=solution_id,
+                    solution_number=solution_number,
                     miner_id=envelope.handle_id,
-                    miner_type=envelope.result.miner_type,
-                    dispatch_id=envelope.dispatch_id,
-                    energy_milli=result_energy_milli,
+                    miner_type=envelope.result.miner_type,                    energy_milli=result_energy_milli,
                     diversity_milli=result_diversity_milli,
                     threshold_milli=snapshot_threshold_milli,
                     last_proof_block_hash_hex=last_proof_hex,
@@ -1325,11 +1332,9 @@ class SubstrateMinerController:
                 verified if (verified is not None and verified >= 0) else None
             )
             self._submission_log.record(
-                solution_id=solution_id,
+                solution_number=solution_number,
                 miner_id=envelope.handle_id,
-                miner_type=envelope.result.miner_type,
-                dispatch_id=envelope.dispatch_id,
-                energy_milli=result_energy_milli,
+                miner_type=envelope.result.miner_type,                energy_milli=result_energy_milli,
                 diversity_milli=result_diversity_milli,
                 threshold_milli=snapshot_threshold_milli,
                 last_proof_block_hash_hex=last_proof_hex,
@@ -1364,11 +1369,9 @@ class SubstrateMinerController:
             )
             pow_seq_stale = await self._query_proofs_submitted_safe()
             self._submission_log.record(
-                solution_id=solution_id,
+                solution_number=solution_number,
                 miner_id=envelope.handle_id,
-                miner_type=envelope.result.miner_type,
-                dispatch_id=envelope.dispatch_id,
-                energy_milli=result_energy_milli,
+                miner_type=envelope.result.miner_type,                energy_milli=result_energy_milli,
                 diversity_milli=result_diversity_milli,
                 threshold_milli=snapshot_threshold_milli,
                 last_proof_block_hash_hex=last_proof_hex,
@@ -1383,11 +1386,9 @@ class SubstrateMinerController:
             self.stats.last_submission_error = str(receipt.error or "")
             pow_seq_fatal = await self._query_proofs_submitted_safe()
             self._submission_log.record(
-                solution_id=solution_id,
+                solution_number=solution_number,
                 miner_id=envelope.handle_id,
-                miner_type=envelope.result.miner_type,
-                dispatch_id=envelope.dispatch_id,
-                energy_milli=result_energy_milli,
+                miner_type=envelope.result.miner_type,                energy_milli=result_energy_milli,
                 diversity_milli=result_diversity_milli,
                 threshold_milli=snapshot_threshold_milli,
                 last_proof_block_hash_hex=last_proof_hex,
@@ -1481,6 +1482,71 @@ class SubstrateMinerController:
             )
         except Exception:  # noqa: BLE001
             return None
+
+    async def _query_winning_solution_count_safe(self) -> Optional[int]:
+        """Return ``count(QuantumPow.WinningSolutions)``, or None on failure.
+
+        Best-effort — swallows all exceptions so a transient RPC failure
+        never blocks dispatch. See :meth:`_resolve_solution_number` for how
+        the fallback is handled when this returns None.
+        """
+        try:
+            return await self.pool_client.query_winning_solution_count()
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _resolve_solution_number(
+        self, work_key: WorkKey
+    ) -> Optional[int]:
+        """Chain-global solution number for the round ``work_key``.
+
+        ``count(WinningSolutions) + 1`` — the ordinal of the solution we're
+        mining toward. Cached per work key: resolved once when a round opens
+        and reused for re-dispatches and the submission record, so all
+        artifacts for the round land under one ``{solution_number}/`` dir.
+
+        On RPC failure, falls back to ``max(known) + 1`` (each round closes
+        by adding exactly one winning solution, so one-more-than-the-last is
+        the correct estimate) and, failing that, ``None`` — which the
+        loggers bucket under solution 0 with a warning.
+        """
+        cached = self._solution_number_by_work_key.get(work_key)
+        if cached is not None:
+            return cached
+        count = await self._query_winning_solution_count_safe()
+        if count is not None:
+            solution_number = count + 1
+        elif self._solution_number_by_work_key:
+            solution_number = max(self._solution_number_by_work_key.values()) + 1
+            logger.warning(
+                "WinningSolutions count RPC failed; estimating solution "
+                "number %d (last known + 1)", solution_number,
+            )
+        else:
+            logger.warning(
+                "WinningSolutions count RPC failed and no prior solution "
+                "number; this round's attempts will bucket under solution 0"
+            )
+            return None
+        self._solution_number_by_work_key[work_key] = solution_number
+        # Bound the map — keep only recent rounds (parity with dispatch
+        # context / closed-work-key retention).
+        while len(self._solution_number_by_work_key) > _DISPATCH_CONTEXT_RETENTION:
+            oldest = next(iter(self._solution_number_by_work_key))
+            self._solution_number_by_work_key.pop(oldest, None)
+        return solution_number
+
+    def _solution_number_for_context(
+        self, ctx: "SubstrateMiningContext"
+    ) -> Optional[int]:
+        """Solution number for ``ctx``'s round, resolved at dispatch time.
+
+        Submissions reuse the value cached when the round opened so the
+        submission record lands in the same ``{solution_number}/`` dir as
+        the worker's attempts. Returns None if the round was never
+        dispatched (not expected on a real submit path).
+        """
+        return self._solution_number_by_work_key.get(_work_key(ctx))
 
     async def _verify_proof_recorded(self, envelope: _ResultEnvelope) -> Optional[int]:
         """Confirm the runtime recorded this miner's proof on chain.
@@ -1880,10 +1946,9 @@ class SubstrateMinerController:
         """
         pow_seq_stale = await self._query_proofs_submitted_safe()
         self._submission_log.record(
-            solution_id=self._submission_log.assign_id(),
+            solution_number=self._solution_number_for_context(ctx),
             miner_id=str(preview.get("handle_id", "anticipatory")),
             miner_type=result.miner_type,
-            dispatch_id=int(preview.get("dispatch_id", 0) or 0),
             energy_milli=int(float(preview.get("energy", 0.0)) * 1000),
             diversity_milli=int(float(preview.get("diversity", 0.0)) * 1000),
             threshold_milli=int(ctx.difficulty.max_energy_milli),
@@ -2030,17 +2095,15 @@ class SubstrateMinerController:
             handle_id=handle_id,
             dispatch_id=int(preview.get("dispatch_id", 0) or 0),
         )
-        solution_id = self._submission_log.assign_id()
         # Shared submission-log fields for both the success and verify-fail
         # rows — keeps the two record() calls in sync.
         log_common = {
-            "solution_id": solution_id,
+            "solution_number": self._solution_number_for_context(ctx),
             "miner_id": handle_id,
             # Real source backend (cpu/gpu/qpu) carried through the preview,
             # so per-backend dashboard attribution stays accurate — NOT the
             # "anticipatory" path marker.
             "miner_type": result.miner_type,
-            "dispatch_id": int(preview.get("dispatch_id", 0) or 0),
             "energy_milli": int(float(preview.get("energy", 0.0)) * 1000),
             "diversity_milli": int(float(preview.get("diversity", 0.0)) * 1000),
             "threshold_milli": int(ctx.difficulty.max_energy_milli),

@@ -6,14 +6,12 @@ writes via StatsSnapshotWriter.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import multiprocessing as mp
 import socket
 import time
 from pathlib import Path
 
-import pytest
 
 
 def _free_port() -> int:
@@ -236,7 +234,7 @@ def test_telemetry_process_aggregator_mode_merges_per_kind_snapshots(tmp_path: P
         # request.app["stats_snapshot_path"] (None in aggregator mode),
         # raising "expected str, bytes or os.PathLike object, not NoneType".
         attempts_raw = urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/api/v1/mining/attempts?miner_id=rig-CPU-1&dispatch_id=0",
+            f"http://127.0.0.1:{port}/api/v1/mining/attempts?miner_id=rig-CPU-1&solution_number=0",
             timeout=2.0,
         ).read()
         attempts = json.loads(attempts_raw)

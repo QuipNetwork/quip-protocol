@@ -1287,8 +1287,8 @@ def test_stored_solution_iter_matches_attempt_iter(
     Before the fix, attempt-log rows used ``progress + 1`` (1-based) while
     ``SolutionStore.record`` received ``progress`` (0-based), so the two
     records for the SAME iteration carried different ``iter`` values and
-    cross-referencing via ``query_by_dispatch`` / ``query_stored_solutions``
-    was broken.
+    cross-referencing via ``query_by_solution_number`` /
+    ``query_stored_solutions`` was broken.
 
     Drives ``mine_work_item`` through one substrate-ratchet iteration that
     produces a stored or submitted candidate, then reads back both artefacts
@@ -1297,11 +1297,11 @@ def test_stored_solution_iter_matches_attempt_iter(
     from shared.mining_attempt_log import (
         AttemptLogger,
         SolutionStore,
-        query_by_dispatch,
+        query_by_solution_number,
         query_stored_solutions,
     )
 
-    DISPATCH_ID = 9900
+    SOLUTION_NUMBER = 9900
 
     real_logger = AttemptLogger(
         cpu_miner.miner_id, log_dir=tmp_path, miner_type=cpu_miner.miner_type,
@@ -1322,7 +1322,7 @@ def test_stored_solution_iter_matches_attempt_iter(
     live_var = mp.Value('q', 0)
     cpu_miner._attempt_logger = real_logger
     cpu_miner._solution_store = real_store
-    cpu_miner._current_dispatch_id = DISPATCH_ID
+    cpu_miner._current_solution_number = SOLUTION_NUMBER
     cpu_miner._live_max_energy_milli = live_var
     try:
         cpu_miner.mine_work_item(relaxed_context, stop)
@@ -1330,12 +1330,12 @@ def test_stored_solution_iter_matches_attempt_iter(
         real_logger.record = original_record  # type: ignore[method-assign]
         del cpu_miner._attempt_logger
         del cpu_miner._solution_store
-        del cpu_miner._current_dispatch_id
+        del cpu_miner._current_solution_number
         del cpu_miner._live_max_energy_milli
 
     # Read back attempt rows and find the stored/submitted one.
-    attempt_rows = query_by_dispatch(
-        cpu_miner.miner_id, DISPATCH_ID, log_dir=tmp_path,
+    attempt_rows = query_by_solution_number(
+        cpu_miner.miner_id, SOLUTION_NUMBER, log_dir=tmp_path,
     )
     stored_rows = [
         r for r in attempt_rows
@@ -1350,7 +1350,7 @@ def test_stored_solution_iter_matches_attempt_iter(
 
     # Read back the stored solution record.
     sol_records = query_stored_solutions(
-        DISPATCH_ID, log_dir=tmp_path, miner_id=cpu_miner.miner_id,
+        SOLUTION_NUMBER, log_dir=tmp_path, miner_id=cpu_miner.miner_id,
     )
     assert sol_records, (
         "expected at least one stored-solution file; "

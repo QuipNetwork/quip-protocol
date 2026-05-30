@@ -222,10 +222,13 @@ def miner_worker_main(
                     }
                 )
                 continue
-            # Stash the dispatch_id on the miner so attempt logs can
-            # correlate with the controller's submission logs. See
-            # shared/mining_attempt_log.py for the cross-process join.
+            # Stash the dispatch_id (internal coordination handle) and the
+            # chain-global solution number (the on-disk archive key) on the
+            # miner. dispatch_id pairs late results with their context;
+            # solution_number is what attempts/solutions are filed under.
+            # See shared/mining_attempt_log.py.
             miner._current_dispatch_id = dispatch_id
+            miner._current_solution_number = msg.get("solution_number")
 
             # Anticipatory-submission preview channel. The miner calls
             # this whenever its best-by-floor stashed candidate improves;
@@ -355,7 +358,9 @@ class MinerHandle:
             return "GPU-CUDA-Gibbs"
         return k.upper()
 
-    def mine_work_item(self, context) -> int:
+    def mine_work_item(
+        self, context, *, solution_number: Optional[int] = None
+    ) -> int:
         """Dispatch a substrate-mode mining attempt.
 
         ``context`` is a ``SubstrateMiningContext`` or ``MempoolJobContext``.
@@ -363,10 +368,15 @@ class MinerHandle:
         enqueue so a cancel landing between clear and the worker dequeue
         still short-circuits the worker's loop.
 
-        Returns the dispatch_id assigned to this attempt. Every worker
-        response for this attempt (``mine_result`` / ``work_item_done`` /
-        ``error``) will echo the same id so the caller can pair late
-        results with the right context.
+        ``solution_number`` is the chain-global ordinal of the solution
+        being mined (``count(WinningSolutions) + 1``); the worker files all
+        on-disk attempt/solution artifacts under it. ``None`` only when the
+        controller couldn't resolve it (rare RPC failure with no prior).
+
+        Returns the dispatch_id assigned to this attempt — an internal
+        coordination handle echoed on every worker response
+        (``mine_result`` / ``work_item_done`` / ``error``) so the caller can
+        pair late results with the right context.
         """
         self._next_dispatch_id += 1
         self._active_dispatch_id = self._next_dispatch_id
@@ -376,6 +386,7 @@ class MinerHandle:
                 "op": "mine_work_item",
                 "context": context,
                 "dispatch_id": self._active_dispatch_id,
+                "solution_number": solution_number,
             }
         )
         return self._active_dispatch_id

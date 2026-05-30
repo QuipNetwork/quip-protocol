@@ -9,7 +9,8 @@ Two regression surfaces motivate these tests:
      here.
   2. The mining-attempts JSONL pipeline. This is a forensics tool;
      it's only valuable if the schema stays stable and the cross-file
-     join (submission_id → attempt records) keeps working.
+     join (solution_number → attempt records) keeps working. The archive
+     is keyed by the chain-global solution number (see AGENTS.md).
 """
 from __future__ import annotations
 
@@ -21,8 +22,8 @@ from shared.mining_attempt_log import (
     SolutionStore,
     SubmissionLogger,
     _default_log_dir,
-    query_by_dispatch,
     query_by_solution_id,
+    query_by_solution_number,
     query_stored_solutions,
 )
 
@@ -56,7 +57,7 @@ def test_default_log_dir_writes_under_runtime(monkeypatch, tmp_path: Path) -> No
     monkeypatch.setenv("QUIP_RUNTIME_DIR", str(tmp_path))
     logger = AttemptLogger("rig-1", log_dir=_default_log_dir())
     logger.record(
-        dispatch_id=7, iter_num=1, nonce_hex="0xab", salt_hex="0xcd",
+        solution_number=7, iter_num=1, nonce_hex="0xab", salt_hex="0xcd",
         best_energy_milli=-14_000_000, num_samples=10, result_kind="rejected",
         post_processed=False, stored_as_best=False,
     )
@@ -98,7 +99,7 @@ def test_miner_handle_live_threshold_round_trip() -> None:
 def test_attempt_logger_writes_jsonl_record(tmp_path: Path) -> None:
     logger = AttemptLogger("miner-1", log_dir=tmp_path)
     logger.record(
-        dispatch_id=42,
+        solution_number=42,
         iter_num=7,
         nonce_hex="0xdeadbeef",
         salt_hex="0xfeedface",
@@ -115,7 +116,7 @@ def test_attempt_logger_writes_jsonl_record(tmp_path: Path) -> None:
         qpu_access_time_us=8_432,
     )
 
-    # Per-dispatch layout: file lives under {dispatch_id}/attempts-{miner}.jsonl
+    # Per-solution layout: file at {solution_number}/attempts-{miner}.jsonl
     files = sorted(tmp_path.glob("42/attempts-miner-1.jsonl"))
     assert len(files) == 1
 
@@ -125,7 +126,7 @@ def test_attempt_logger_writes_jsonl_record(tmp_path: Path) -> None:
     record = json.loads(lines[0])
     assert record["type"] == "attempt"
     assert record["miner_id"] == "miner-1"
-    assert record["dispatch_id"] == 42
+    assert record["solution_number"] == 42
     assert record["iter"] == 7
     assert record["best_energy_milli"] == -3_950_000
     assert record["stored_as_best"] is True
@@ -144,7 +145,7 @@ def test_attempt_logger_qpu_access_time_defaults_to_none(tmp_path: Path) -> None
     presence check."""
     logger = AttemptLogger("miner-cpu", log_dir=tmp_path)
     logger.record(
-        dispatch_id=1,
+        solution_number=1,
         iter_num=1,
         nonce_hex="0x0",
         salt_hex="0x0",
@@ -162,53 +163,20 @@ def test_attempt_logger_qpu_access_time_defaults_to_none(tmp_path: Path) -> None
     assert record["qpu_access_time_us"] is None
 
 
-def test_submission_logger_assigns_monotonic_ids(tmp_path: Path) -> None:
-    log = SubmissionLogger(log_dir=tmp_path)
-    ids = [log.assign_id() for _ in range(5)]
-    assert ids == [1, 2, 3, 4, 5], (
-        "solution_id must be strictly monotonic; non-monotonic ids would "
-        "let two submissions share an id and break query_by_solution_id"
-    )
-
-
-def test_submission_logger_resumes_id_counter_across_instances(
-    tmp_path: Path,
-) -> None:
-    """After a restart, ``assign_id`` must continue from the disk
-    high-water mark + 1 — not reset to 1, which would shadow older
-    entries in subsequent queries.
-    """
-    log = SubmissionLogger(log_dir=tmp_path)
-    sid = log.assign_id()
-    log.record(
-        solution_id=sid,
-        miner_id="m",
-        dispatch_id=1,
-        energy_milli=-1,
-        diversity_milli=0,
-        threshold_milli=-1,
-        last_proof_block_hash_hex="0x" + "00" * 32,
-        outcome="submitted_inblock",
-    )
-
-    # New logger pointed at the same dir should pick up where we left off.
-    log2 = SubmissionLogger(log_dir=tmp_path)
-    assert log2.assign_id() == sid + 1
-
-
 def test_query_by_solution_id_joins_attempts_and_submission(
     tmp_path: Path,
 ) -> None:
-    """The query API joins attempts with their submission via
-    ``(miner_id, dispatch_id)``. This is the load-bearing primitive for
-    the user-requested "queryable by solution #" requirement."""
+    """The query API joins attempts with their submission via the shared
+    solution number — the load-bearing primitive for the "queryable by
+    solution #" requirement. The solution number is the directory key, so
+    the join needs no separate index."""
     attempt_log = AttemptLogger("rig-01", log_dir=tmp_path)
     submission_log = SubmissionLogger(log_dir=tmp_path)
 
-    # Three attempts feed dispatch 100 on miner rig-01.
+    # Three attempts feed solution 100 on miner rig-01.
     for i in range(3):
         attempt_log.record(
-            dispatch_id=100,
+            solution_number=100,
             iter_num=i,
             nonce_hex=f"0x{i:064x}",
             salt_hex="0x" + "00" * 32,
@@ -218,11 +186,10 @@ def test_query_by_solution_id_joins_attempts_and_submission(
             stored_as_best=(i == 2),
             result_kind="stored" if i == 2 else "rejected",
         )
-    # One unrelated attempt on a different dispatch — must NOT be
-    # returned by the solution_id query, since it's a different
-    # mining round.
+    # One unrelated attempt on a different solution — must NOT be returned
+    # by the solution query, since it's a different mining round.
     attempt_log.record(
-        dispatch_id=999,
+        solution_number=999,
         iter_num=0,
         nonce_hex="0xbadbadbad",
         salt_hex="0x" + "ff" * 32,
@@ -233,11 +200,9 @@ def test_query_by_solution_id_joins_attempts_and_submission(
         result_kind="rejected",
     )
 
-    sid = submission_log.assign_id()
     submission_log.record(
-        solution_id=sid,
+        solution_number=100,
         miner_id="rig-01",
-        dispatch_id=100,
         energy_milli=-3_999_998,
         diversity_milli=210,
         threshold_milli=-3_999_999,
@@ -248,23 +213,23 @@ def test_query_by_solution_id_joins_attempts_and_submission(
         chain_block_number=1234,
     )
 
-    result = query_by_solution_id(sid, log_dir=tmp_path)
+    result = query_by_solution_id(100, log_dir=tmp_path)
     assert result is not None
-    assert result["submission"]["solution_id"] == sid
+    assert result["submission"]["solution_number"] == 100
     assert result["submission"]["chain_block_number"] == 1234
-    # Exactly the three attempts on dispatch 100 — not the unrelated one.
+    # Exactly the three attempts on solution 100 — not the unrelated one.
     assert len(result["attempts"]) == 3
-    assert all(a["dispatch_id"] == 100 for a in result["attempts"])
+    assert all(a["solution_number"] == 100 for a in result["attempts"])
     assert {a["iter"] for a in result["attempts"]} == {0, 1, 2}
 
 
-def test_query_by_dispatch_returns_only_matching_attempts(
+def test_query_by_solution_number_returns_only_matching_attempts(
     tmp_path: Path,
 ) -> None:
     log = AttemptLogger("rig-01", log_dir=tmp_path)
-    for did in (1, 2, 3):
+    for sol in (1, 2, 3):
         log.record(
-            dispatch_id=did,
+            solution_number=sol,
             iter_num=0,
             nonce_hex="0x00",
             salt_hex="0x00",
@@ -274,126 +239,64 @@ def test_query_by_dispatch_returns_only_matching_attempts(
             stored_as_best=False,
             result_kind="rejected",
         )
-    attempts = query_by_dispatch("rig-01", dispatch_id=2, log_dir=tmp_path)
+    attempts = query_by_solution_number("rig-01", 2, log_dir=tmp_path)
     assert len(attempts) == 1
-    assert attempts[0]["dispatch_id"] == 2
+    assert attempts[0]["solution_number"] == 2
 
 
-def test_attempt_logger_resets_reused_dispatch_id_across_processes(
+def test_attempt_logger_resumes_same_solution_across_processes(
     tmp_path: Path,
 ) -> None:
-    """A fresh AttemptLogger (new worker process after controller restart)
-    must clear a reused dispatch_id's stale artifacts on first use.
+    """A restart mid-solution must RESUME the same solution dir, not clear
+    it — the solution number is chain-global and stable, so a worker that
+    restarts while still mining solution N keeps appending to {N}/.
 
-    ``dispatch_id`` is a controller-local counter that resets to 0 on
-    restart, so run N+1 reuses ids from run N. The append-only attempts
-    JSONL and the cumulative metadata aggregate would otherwise accrete
-    iterations across runs — breaking the dashboard's iter-as-recency
-    assumption. The first write to a dispatch_id in a new process must
-    start that dispatch's files clean.
+    This is the opposite of the old dispatch_id behavior (which reset on
+    reuse because the counter collided across unrelated runs). With the
+    solution-number key, "same number" means "same solution", so appending
+    is correct and accumulates the full mining history for that solution.
     """
-    def _rec(log: AttemptLogger, did: int, it: int) -> None:
+    def _rec(log: AttemptLogger, sol: int, it: int) -> None:
         log.record(
-            dispatch_id=did, iter_num=it,
+            solution_number=sol, iter_num=it,
             nonce_hex="0x00", salt_hex="0x00",
             best_energy_milli=0, num_samples=1,
             post_processed=False, stored_as_best=False,
             result_kind="rejected",
         )
 
-    # Run 1: three attempts under dispatch_id=5, then flush so the
-    # aggregate metadata lands on disk (a real run persists it via
-    # FLUSH_EVERY / stored-submitted events / dispatch-end flush).
     run1 = AttemptLogger("rig-01", log_dir=tmp_path)
     for it in (1, 2, 3):
         _rec(run1, 5, it)
     run1.flush()
-    assert len(query_by_dispatch("rig-01", 5, log_dir=tmp_path)) == 3
-    assert json.loads(
-        (tmp_path / "5" / "metadata-rig-01.json").read_text()
-    )["n_attempts"] == 3
 
-    # Run 2: a brand-new logger (simulates the restarted worker process)
-    # reuses dispatch_id=5 and records a single attempt.
+    # Restart: a fresh logger continues mining the SAME solution 5.
     run2 = AttemptLogger("rig-01", log_dir=tmp_path)
-    _rec(run2, 5, 1)
+    _rec(run2, 5, 4)
     run2.flush()
 
-    attempts = query_by_dispatch("rig-01", 5, log_dir=tmp_path)
-    assert len(attempts) == 1, (
-        "reused dispatch_id must not accrete prior-run attempts; "
+    attempts = query_by_solution_number("rig-01", 5, log_dir=tmp_path)
+    assert len(attempts) == 4, (
+        "restart mid-solution must resume the same dir, not clear it; "
         f"got {len(attempts)}"
     )
-    assert attempts[0]["iter"] == 1
-
-    # The aggregate metadata must reflect only run 2, not 3 + 1 = 4.
-    meta_path = tmp_path / "5" / "metadata-rig-01.json"
-    meta = json.loads(meta_path.read_text())
-    assert meta["n_attempts"] == 1, (
-        f"metadata aggregate must reset on reuse; got {meta['n_attempts']}"
-    )
-
-
-def test_attempt_logger_reset_is_per_miner_not_whole_dispatch_dir(
-    tmp_path: Path,
-) -> None:
-    """Resetting a reused dispatch_id must only clear THIS miner's files —
-    a concurrent miner sharing the same numeric dispatch dir keeps its data.
-    """
-    def _rec(log: AttemptLogger, did: int, it: int) -> None:
-        log.record(
-            dispatch_id=did, iter_num=it,
-            nonce_hex="0x00", salt_hex="0x00",
-            best_energy_milli=0, num_samples=1,
-            post_processed=False, stored_as_best=False,
-            result_kind="rejected",
-        )
-
-    cpu = AttemptLogger("rig-cpu", log_dir=tmp_path)
-    qpu = AttemptLogger("rig-qpu", log_dir=tmp_path)
-    _rec(cpu, 5, 1)
-    _rec(qpu, 5, 1)
-    _rec(qpu, 5, 2)
-
-    # Both miners archive a solution into the shared dispatch-5 solutions/.
-    SolutionStore("rig-cpu", log_dir=tmp_path).record(
-        dispatch_id=5, iter_num=1, nonce_hex="aaaa" + "00" * 30,
-        salt_hex="00" * 32, top_5_solutions_hex=["a1"],
-        top_5_energies=[-1.0], result_kind="stored",
-    )
-    SolutionStore("rig-qpu", log_dir=tmp_path).record(
-        dispatch_id=5, iter_num=2, nonce_hex="bbbb" + "00" * 30,
-        salt_hex="00" * 32, top_5_solutions_hex=["b2"],
-        top_5_energies=[-2.0], result_kind="stored",
-    )
-
-    # CPU "restarts" and reuses dispatch_id=5 — must not touch QPU's files.
-    cpu2 = AttemptLogger("rig-cpu", log_dir=tmp_path)
-    _rec(cpu2, 5, 1)
-
-    assert len(query_by_dispatch("rig-cpu", 5, log_dir=tmp_path)) == 1
-    assert len(query_by_dispatch("rig-qpu", 5, log_dir=tmp_path)) == 2, (
-        "a sibling miner's attempts in the same dispatch dir must survive"
-    )
-    assert query_stored_solutions(
-        5, log_dir=tmp_path, miner_id="rig-cpu",
-    ) == [], "the restarted miner's stale solutions must be cleared"
-    assert len(
-        query_stored_solutions(5, log_dir=tmp_path, miner_id="rig-qpu")
-    ) == 1, "a sibling miner's stored solutions must survive the reset"
+    assert [a["iter"] for a in attempts] == [1, 2, 3, 4]
+    # The aggregate metadata accumulates across the restart.
+    meta = json.loads((tmp_path / "5" / "metadata-rig-01.json").read_text())
+    assert meta["n_attempts"] == 4
 
 
 def test_solution_store_writes_packed_spins(tmp_path: Path) -> None:
     """SolutionStore archives top-5 spin configs per stored attempt."""
     store = SolutionStore("miner-q", log_dir=tmp_path)
     store.record(
-        dispatch_id=99, iter_num=3,
+        solution_number=99, iter_num=3,
         nonce_hex="deadbeef" + "00" * 28, salt_hex="cafe" + "00" * 30,
         top_5_solutions_hex=["a1b2", "c3d4", "e5f6", "0708", "1a2b"],
         top_5_energies=[-100.5, -99.0, -98.5, -97.0, -96.0],
         result_kind="submitted",
     )
-    # File at {dispatch}/solutions/{iter:06d}-{nonce8}
+    # File at {solution_number}/solutions/{iter:06d}-{nonce8}
     path = tmp_path / "99" / "solutions" / "000003-deadbeef"
     assert path.exists()
     rec = json.loads(path.read_text())
@@ -409,11 +312,9 @@ def test_submission_logger_record_writes_pow_sequence(tmp_path: Path) -> None:
     log = SubmissionLogger(log_dir=tmp_path)
 
     # With pow_sequence set.
-    sid = log.assign_id()
     log.record(
-        solution_id=sid,
+        solution_number=200,
         miner_id="rig-q",
-        dispatch_id=200,
         energy_milli=-4_200_000,
         diversity_milli=210,
         threshold_milli=-4_000_000,
@@ -429,11 +330,9 @@ def test_submission_logger_record_writes_pow_sequence(tmp_path: Path) -> None:
     )
 
     # Default: pow_sequence omitted → None in record.
-    sid2 = log.assign_id()
     log.record(
-        solution_id=sid2,
+        solution_number=201,
         miner_id="rig-q",
-        dispatch_id=201,
         energy_milli=-4_200_000,
         diversity_milli=210,
         threshold_milli=-4_000_000,
@@ -452,7 +351,7 @@ def test_query_stored_solutions_returns_sorted_by_iter(tmp_path: Path) -> None:
     store = SolutionStore("miner-q", log_dir=tmp_path)
     for it in (12, 3, 27):
         store.record(
-            dispatch_id=5, iter_num=it,
+            solution_number=5, iter_num=it,
             nonce_hex=f"{it:064x}", salt_hex="00" * 32,
             top_5_solutions_hex=[f"{it:04x}"] * 5,
             top_5_energies=[float(it)] * 5,
@@ -463,7 +362,7 @@ def test_query_stored_solutions_returns_sorted_by_iter(tmp_path: Path) -> None:
 
 
 def test_query_by_solution_id_missing_returns_none(tmp_path: Path) -> None:
-    """A query for an id that was never recorded must return None, not
+    """A query for a solution that was never recorded must return None, not
     an empty join — the API caller needs to distinguish 'no such
     submission' (404) from 'submission exists but no attempts'."""
     assert query_by_solution_id(999_999, log_dir=tmp_path) is None
@@ -476,7 +375,7 @@ def test_attempt_logger_writes_miner_type(tmp_path: Path) -> None:
     containers without parsing miner_id."""
     logger = AttemptLogger("miner-cpu-1", log_dir=tmp_path, miner_type="CPU")
     logger.record(
-        dispatch_id=1, iter_num=0,
+        solution_number=1, iter_num=0,
         nonce_hex="0x00", salt_hex="0x00",
         best_energy_milli=-1_000_000, num_samples=64,
         post_processed=True, stored_as_best=False,
@@ -493,7 +392,7 @@ def test_attempt_logger_miner_type_defaults_to_empty(tmp_path: Path) -> None:
     miner_type so old miners keep working through the upgrade."""
     logger = AttemptLogger("miner-legacy", log_dir=tmp_path)
     logger.record(
-        dispatch_id=1, iter_num=0,
+        solution_number=1, iter_num=0,
         nonce_hex="0x00", salt_hex="0x00",
         best_energy_milli=-1_000_000, num_samples=64,
         post_processed=True, stored_as_best=False,
@@ -507,11 +406,9 @@ def test_submission_logger_record_writes_num_valid(tmp_path: Path) -> None:
     """num_valid from MiningResult must land in submission.json so the
     dashboard 'Solutions' column has a stable value per submission."""
     log = SubmissionLogger(log_dir=tmp_path)
-    sid = log.assign_id()
     log.record(
-        solution_id=sid,
+        solution_number=55,
         miner_id="rig-QPU-1",
-        dispatch_id=55,
         energy_milli=-14_000_000,
         diversity_milli=400,
         threshold_milli=-13_500_000,
@@ -531,11 +428,9 @@ def test_submission_logger_record_num_valid_defaults_to_none(tmp_path: Path) -> 
     """Omitting num_valid must produce null in submission.json — old
     submission records stay readable without a schema migration."""
     log = SubmissionLogger(log_dir=tmp_path)
-    sid = log.assign_id()
     log.record(
-        solution_id=sid,
+        solution_number=56,
         miner_id="rig-CPU-1",
-        dispatch_id=56,
         energy_milli=-5_000_000,
         diversity_milli=200,
         threshold_milli=-4_900_000,
@@ -555,20 +450,18 @@ def test_submission_logger_writes_miner_type_per_call(tmp_path: Path) -> None:
     handle so the dashboard can render the Backend column for the
     Recent Performance table."""
     log = SubmissionLogger(log_dir=tmp_path)
-    sid = log.assign_id()
     log.record(
-        solution_id=sid,
+        solution_number=1,
         miner_id="rig-QPU-DWAVE-1",
         miner_type="QPU",
-        dispatch_id=1,
         energy_milli=-14_000_000,
         diversity_milli=400,
         threshold_milli=-13_500_000,
         last_proof_block_hash_hex="0xabc",
         outcome="submitted_inblock",
     )
-    # Per-dispatch layout: submission.json is a single JSON object,
-    # not a JSONL line; lives at {dispatch_id}/submission.json.
+    # Per-solution layout: submission.json is a single JSON object,
+    # not a JSONL line; lives at {solution_number}/submission.json.
     sub_path = tmp_path / "1" / "submission.json"
     record = json.loads(sub_path.read_text())
     assert record["miner_type"] == "QPU"

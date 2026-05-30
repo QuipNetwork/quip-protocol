@@ -137,6 +137,11 @@ class _MiningLoopState:
     edges: List[Tuple[int, int]]
     prev_timestamp: int
     start_time: float
+    # On-disk archive key (chain-global solution ordinal).
+    solution_number_for_log: int
+    # Internal coordination handle — used only for the anticipatory preview
+    # channel, where the controller resolves preview→context by
+    # (miner_id, dispatch_id). Never persisted.
     dispatch_id_for_log: int
     attempt_log: AttemptLogger
     solution_store: SolutionStore
@@ -642,7 +647,7 @@ class BaseMiner(ABC):
 
                 # Per-iteration log fields (filled below per code path).
                 attempt_log_kwargs = self._init_attempt_log_kwargs(
-                    loop_state.dispatch_id_for_log, progress, nonce, salt,
+                    loop_state.solution_number_for_log, progress, nonce, salt,
                     sampleset,
                 )
 
@@ -713,7 +718,7 @@ class BaseMiner(ABC):
 
     @staticmethod
     def _init_attempt_log_kwargs(
-        dispatch_id: int,
+        solution_number: int,
         progress: int,
         nonce: Any,
         salt: bytes,
@@ -722,11 +727,11 @@ class BaseMiner(ABC):
         """Build the per-iteration attempt-log kwargs (pre-eval defaults).
 
         Per-path fields (threshold, num_valid, result_kind, ...) are filled
-        in later by the eval helpers. Behaviour matches the original inline
-        dict literal exactly.
+        in later by the eval helpers. ``solution_number`` is the on-disk
+        archive key (chain-global ordinal of the solution being mined).
         """
         return {
-            "dispatch_id": dispatch_id,
+            "solution_number": solution_number,
             "iter_num": progress + 1,
             "nonce_hex": (
                 f"0x{nonce.hex()}"
@@ -858,6 +863,12 @@ class BaseMiner(ABC):
         )
         if not hasattr(self, '_solution_store'):
             self._solution_store = solution_store
+        # On-disk archive key = the chain-global solution number. dispatch_id
+        # stays internal (controller↔worker pairing); it is NOT persisted.
+        # Solution 0 is the "unresolved" bucket (controller couldn't read the
+        # WinningSolutions count and had no prior — rare).
+        solution_number = getattr(self, '_current_solution_number', None)
+        solution_number_for_log = int(solution_number) if solution_number is not None else 0
         dispatch_id_for_log = int(getattr(self, '_current_dispatch_id', 0))
 
         loop_state = _MiningLoopState(
@@ -866,6 +877,7 @@ class BaseMiner(ABC):
             edges=edges,
             prev_timestamp=prev_timestamp,
             start_time=start_time,
+            solution_number_for_log=solution_number_for_log,
             dispatch_id_for_log=dispatch_id_for_log,
             attempt_log=attempt_log,
             solution_store=solution_store,
@@ -1386,7 +1398,7 @@ class BaseMiner(ABC):
                 else f"{int(nonce):064x}"
             )
             state.solution_store.record(
-                dispatch_id=state.dispatch_id_for_log,
+                solution_number=state.solution_number_for_log,
                 iter_num=progress + 1,
                 nonce_hex=nonce_hex,
                 salt_hex=salt.hex(),
