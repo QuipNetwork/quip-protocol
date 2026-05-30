@@ -241,3 +241,32 @@ def test_driver_gate_reconstructs_after_loosening_threshold():
     finally:
         stop.set()
         ctx.cleanup()
+
+
+def test_build_persistent_context_forwards_topology():
+    from unittest.mock import patch
+    from dwave_topologies import DEFAULT_TOPOLOGY
+    import QPU.dwave_miner as dm
+
+    with patch.object(dm, "DWaveMiner") as mk:
+        dm.build_persistent_context(
+            miner_id="m", queue_depth=2, nodes=[0, 1, 2], edges=[(0, 1)],
+            feeder_buffer_size=4, num_reads=4, annealing_time=80.0,
+            energy_threshold_milli=0, precheck_margin_milli=2000,
+            topology=DEFAULT_TOPOLOGY,
+        )
+    _a, kwargs = mk.call_args
+    assert kwargs["topology"] is DEFAULT_TOPOLOGY
+
+
+def test_build_persistent_context_requires_topology():
+    import pytest
+    import QPU.dwave_miner as dm
+
+    with pytest.raises(ValueError, match="requires a topology"):
+        dm.build_persistent_context(
+            miner_id="m", queue_depth=2, nodes=[0, 1, 2], edges=[(0, 1)],
+            feeder_buffer_size=4, num_reads=4, annealing_time=80.0,
+            energy_threshold_milli=0, precheck_margin_milli=2000,
+            topology=None,
+        )

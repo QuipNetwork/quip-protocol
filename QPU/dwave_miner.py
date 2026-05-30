@@ -287,6 +287,7 @@ def build_persistent_context(
     solver_name: Optional[str] = None,
     region: Optional[str] = None,
     token: Optional[str] = None,
+    topology: Optional[DWaveTopology] = None,
     stop_event: Optional[multiprocessing.synchronize.Event] = None,
 ) -> PersistentStreamContext:
     """Build the persistent QPU context (the expensive D-Wave connect).
@@ -294,17 +295,30 @@ def build_persistent_context(
     Constructs a connected :class:`DWaveMiner` ONCE; the feeder is created
     lazily on the first ``switch`` command (it needs the round seed) and
     reseeded thereafter. Runs ONLY in the stream-driver process — never in
-    tests (it connects to D-Wave).
+    tests (it connects to D-Wave). Requires a topology to wire the chain
+    topology to the QPU sampler.
+
+    Args:
+        topology: The chain topology for the QPU (required).
 
     Returns:
         A :class:`PersistentStreamContext` ready to receive ctl_q commands.
+
+    Raises:
+        ValueError: If topology is None.
     """
+    if topology is None:
+        raise ValueError(
+            "the QPU stream driver requires a topology; the chain topology "
+            "was not wired to build_persistent_context"
+        )
     miner = DWaveMiner(
         miner_id=miner_id,
         queue_depth=queue_depth,
         solver_name=solver_name,
         region=region,
         token=token,
+        topology=topology,
     )
     return PersistentStreamContext(
         miner=miner,
