@@ -238,3 +238,47 @@ def init_component_logger(component: str, identifier: str) -> logging.Logger:
 def shutdown_logging():
     """Shutdown logging system and close all handlers."""
     logging.shutdown()
+
+
+def log_writer_main(log_queue, stop_event, log_file_path, level) -> None:
+    """Sole owner of the file/console log handlers; drains the shared queue.
+
+    Replaces the in-process QueueListener thread. All processes (controller
+    + workers) route records here via QueueHandler, so this is the only
+    writer of the log file — no double-write or rotation race. A None on the
+    queue or a set stop_event ends the loop.
+
+    Args:
+        log_queue: Multiprocessing queue of LogRecord objects.
+        stop_event: Multiprocessing Event; when set the loop exits after
+            draining any pending records.
+        log_file_path: Absolute path for the RotatingFileHandler, or None to
+            skip file output (console-only mode).
+        level: Numeric logging level applied to all handlers.
+    """
+    import queue as _queue
+
+    fmt = QuipFormatter()
+    console = logging.StreamHandler()
+    console.setLevel(level)
+    console.setFormatter(fmt)
+    handlers = [console]
+    if log_file_path:
+        fh = logging.handlers.RotatingFileHandler(
+            log_file_path, maxBytes=10 * 1024 * 1024, backupCount=5,
+        )
+        fh.setLevel(level)
+        fh.setFormatter(fmt)
+        handlers.append(fh)
+    while not stop_event.is_set():
+        try:
+            record = log_queue.get(timeout=0.2)
+        except _queue.Empty:
+            continue
+        if record is None:
+            break
+        for h in handlers:
+            if record.levelno >= h.level:
+                h.handle(record)
+    for h in handlers:
+        h.close()

@@ -25,8 +25,8 @@ Phase 5b's deletion sweep removes the original.
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import multiprocessing
-from logging.handlers import QueueListener
 from typing import Any, Callable, Dict, List, Optional
 
 from shared.logging_config import init_component_logger
@@ -158,7 +158,8 @@ class MinerCore:
         self._descriptor_builder = descriptor_builder
 
         self._log_queue: Optional[multiprocessing.Queue] = None
-        self._log_listener: Optional[QueueListener] = None
+        self._log_proc: Optional[multiprocessing.Process] = None
+        self._log_stop: Optional[multiprocessing.Event] = None  # type: ignore[type-arg]
         self._setup_multiprocess_logging()
 
         self.logger = init_component_logger("miner-core", node_id)
@@ -221,12 +222,15 @@ class MinerCore:
                         )
         self.miner_handles = []
 
-        if self._log_listener is not None:
+        if getattr(self, "_log_proc", None) is not None:
             try:
-                self._log_listener.stop()
+                self._log_stop.set()
+                self._log_queue.put(None)
+                from shared.proc_util import terminate_join
+                terminate_join(self._log_proc, 3.0)
             except Exception as exc:  # noqa: BLE001
-                self.logger.warning("close: log listener stop failed: %s", exc)
-            self._log_listener = None
+                self.logger.warning("close: log writer stop failed: %s", exc)
+            self._log_proc = None
 
     # ------------------------------------------------------------------
     # Telemetry surface (preserved across the v0.1 -> v0.2 refactor)
@@ -310,19 +314,41 @@ class MinerCore:
     # ------------------------------------------------------------------
 
     def _setup_multiprocess_logging(self) -> None:
-        self._log_queue = multiprocessing.Queue()
+        ctx = multiprocessing.get_context("spawn")
+        self._log_queue = ctx.Queue()
         root_logger = logging.getLogger()
         handlers = list(root_logger.handlers)
-        if handlers:
-            self._log_listener = QueueListener(
-                self._log_queue, *handlers, respect_handler_level=True
-            )
-            self._log_listener.start()
-        else:
+        if not handlers:
+            self._log_proc = None
+            self._log_stop = None
             logging.getLogger(__name__).warning(
                 "MinerCore: root logger has no handlers; child-process logs will be "
                 "discarded. Call setup_logging() before constructing MinerCore."
             )
+            return
+        # Capture the file path + level so the writer process can recreate the
+        # real handlers and become the SOLE owner of the file.
+        level = root_logger.level or logging.INFO
+        log_file_path = None
+        for h in handlers:
+            if isinstance(h, logging.FileHandler):  # RotatingFileHandler subclasses it
+                log_file_path = h.baseFilename
+                if h.level:
+                    level = h.level
+        from shared.logging_config import log_writer_main
+        from shared.proc_util import spawn_worker
+        self._log_stop = ctx.Event()
+        self._log_proc = spawn_worker(
+            log_writer_main,
+            (self._log_queue, self._log_stop, log_file_path, level),
+            name="log-writer",
+        )
+        # Route THIS process's logs through the queue too, so the writer owns
+        # the file alone (no double-write / rotation race). Workers already
+        # attach a QueueHandler to the same queue in miner_worker.
+        for h in handlers:
+            root_logger.removeHandler(h)
+        root_logger.addHandler(logging.handlers.QueueHandler(self._log_queue))
 
     def _initialize_miners(self, cfg: Dict[str, Any]) -> None:
         # CPU section. `cfg["cpu"]["num_cpus"]` defaults to 1 if present.
