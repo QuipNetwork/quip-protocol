@@ -233,3 +233,23 @@ list (vestigial code flagged for removal).
 - **Docker** (`docker/`): `Dockerfile.cpu`, `Dockerfile.cuda`, `docker-compose.yml`, `entrypoint.sh`, plus the example TOML configs (`quip-miner.cpu.toml`, `quip-miner.cuda.toml`).
 - **Cloud**: `akash/` and `aws/` contain deployment configs.
 - **GitLab CI** (`.gitlab-ci.yml`): builds CPU + CUDA Docker images on main/tags.
+
+## Concurrency: processes, not threads
+
+Use `multiprocessing` for concurrency. Do **not** introduce `threading.Thread`
+in our own code. Threads share the GIL; a CPU-bound thread starves its
+siblings. This stalled the QPU stream pump in v0.2 — the per-attempt consumer
+held the GIL ~1.2 s and the pump thread could not drive the sampler, so the
+QPU pipeline drained (throughput 0.6 vs ~8 subs/sec).
+
+Rules:
+- New background work → a `multiprocessing` process (use `spawn`).
+- Share scalars via `multiprocessing.Value`; share large numpy buffers via
+  `multiprocessing.shared_memory.SharedMemory` (zero-copy), never by pickling
+  per item on a hot path.
+- `threading.Lock`/`RLock` for intra-process state is fine (a lock is not a
+  thread). Cross-process correctness uses `os.replace`/PIPE_BUF atomicity or
+  `mp` primitives, not locks.
+- Exceptions we don't control: third-party internal threads (D-Wave SDK,
+  asyncio executors, stdlib `QueueListener` if ever reused). Document any such
+  exception inline with the reason.
