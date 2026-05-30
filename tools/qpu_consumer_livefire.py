@@ -20,7 +20,8 @@ This exercises the parts the in-process probe cannot:
   * **Liveness** — (``--fault-injection``) a driver is hard-killed mid-stream
     and the consumer must end the dispatch instead of hanging on an empty
     queue (the silent "miner looks stuck" failure mode).
-  * **Teardown** — no ``BufferError`` on ring close, no orphaned child
+  * **Teardown** — the ring's named SHM segments are actually unlinked (a
+    leaked sample view would force a close-without-unlink), no orphaned child
     processes, and ``/dev/shm`` segments returned to baseline (no leak).
 
 ``inprocess`` — the consumer-cost probe: drives
@@ -108,6 +109,27 @@ def _count_shm() -> Optional[int]:
         except OSError:
             return None
     return None
+
+
+def _segments_unlinked(names: List[str]) -> bool:
+    """True if every named SHM segment was unlinked after teardown.
+
+    A leaked sample view forces ``_close_driver``'s fallback
+    ``close()``-without-unlink, leaving the segments attachable. Re-attaching
+    by name then succeeds — which means the ring leaked. This is the real
+    signal the old (now-dead) BufferError check was meant to provide:
+    ``_close_driver`` swallows BufferError internally and never re-raises.
+    """
+    from multiprocessing import shared_memory
+
+    for name in names:
+        try:
+            seg = shared_memory.SharedMemory(name=name)
+            seg.close()
+            return False  # still attachable -> not unlinked -> leaked
+        except FileNotFoundError:
+            continue
+    return True
 
 
 class _BudgetSpy:
@@ -384,12 +406,15 @@ def run_driver(args: argparse.Namespace) -> int:
                    requirements, args, generation)
 
     # --- Clean teardown: _close_driver reaps the persistent driver +
-    # close_unlinks the ring.
-    buffererror = False
-    try:
-        consumer._close_driver()
-    except BufferError:
-        buffererror = True
+    # close_unlinks the ring. Capture the segment names first so we can verify
+    # they were actually unlinked (a leaked view forces a close()-without-unlink
+    # fallback inside _close_driver, which never raises — so re-attach is the
+    # only reliable leak signal).
+    ring_names = (
+        list(consumer._ring.names) if consumer._ring is not None else []
+    )
+    consumer._close_driver()
+    segments_unlinked = _segments_unlinked(ring_names)
 
     time.sleep(0.5)  # let reaped children settle before the orphan scan
     leftover = [c for c in multiprocessing.active_children()
@@ -411,11 +436,12 @@ def run_driver(args: argparse.Namespace) -> int:
     for child in multiprocessing.active_children():
         terminate_join(child, 2.0)
 
-    return _emit_verdict(spawn_ok, consume_ok, res, buffererror, orphans_ok,
-                         leftover, shm_ok, base_shm, shm_after, live)
+    return _emit_verdict(spawn_ok, consume_ok, res, segments_unlinked,
+                         orphans_ok, leftover, shm_ok, base_shm, shm_after,
+                         live)
 
 
-def _emit_verdict(spawn_ok, consume_ok, res, buffererror, orphans_ok,
+def _emit_verdict(spawn_ok, consume_ok, res, segments_unlinked, orphans_ok,
                   leftover, shm_ok, base_shm, shm_after, live) -> int:
     """Print the smoke-check checklist and return 0 (PASS) / 1 (FAIL)."""
     print("\n=== production smoke check ===")
@@ -423,7 +449,7 @@ def _emit_verdict(spawn_ok, consume_ok, res, buffererror, orphans_ok,
         ("driver spawned non-daemon", spawn_ok),
         ("errors == 0", res["errors"] == 0),
         (f"consumer <= {_CONSUMER_TARGET_MS:.0f}ms", consume_ok),
-        ("no BufferError on teardown", not buffererror),
+        ("ring segments unlinked (no leaked view)", segments_unlinked),
         ("no orphaned child processes", orphans_ok),
         ("no /dev/shm leak", shm_ok),
     ]
