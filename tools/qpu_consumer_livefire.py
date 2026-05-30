@@ -411,6 +411,10 @@ def _emit_verdict(spawn_ok, consume_ok, res, buffererror, orphans_ok,
         print(f"      liveness: flowing={live['flowing']} "
               f"reached_done={live['reached_done']} "
               f"in {live['elapsed']:.2f}s (bound {_LIVENESS_BOUND_S:.0f}s)")
+        print("      note: the hard-kill can't unlink the driver's feeder-pool "
+              "semaphores, so the OS resource_tracker reclaims them at exit — "
+              "an expected 'leaked semaphore objects' warning, not a real leak "
+              "(use --no-fault-injection for a warning-free run).")
     all_ok = all(ok for _, ok in checks)
     print(f"\n  VERDICT      : {'PASS' if all_ok else 'FAIL'}")
     return 0 if all_ok else 1
