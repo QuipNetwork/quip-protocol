@@ -839,51 +839,12 @@ class BaseMiner(ABC):
                         attempt_log_kwargs=attempt_log_kwargs,
                     )
 
-                attempt_log_kwargs["mining_time_us"] = int(
-                    (time.time() - preprocess_start) * 1e6
+                self._finalize_iteration_logging(
+                    loop_state, sampleset, nonce, salt, progress,
+                    preprocess_start=preprocess_start,
+                    qpu_access_time_us=qpu_access_time_us,
+                    attempt_log_kwargs=attempt_log_kwargs,
                 )
-                attempt_log_kwargs["qpu_access_time_us"] = qpu_access_time_us
-                if self._feeder is not None:
-                    fstats = self._feeder.stats()
-                    attempt_log_kwargs["feeder_ready"] = fstats["ready"]
-                    attempt_log_kwargs["feeder_drained_count"] = (
-                        fstats["drained_count"]
-                    )
-                    attempt_log_kwargs["feeder_pop_wait_total_s"] = (
-                        fstats["pop_wait_total_s"]
-                    )
-                # Compute solution_meta scalars + capture top-5
-                # solutions. Meta is always embedded in the attempt
-                # log; top-5 spins go to disk only when this iter is
-                # stored or submitted (see write below).
-                sol_meta, top_5_sols, top_5_es = compute_solution_meta(
-                    sampleset, requirements.difficulty_energy,
-                )
-                attempt_log_kwargs["solution_meta"] = sol_meta
-                attempt_log.record(**attempt_log_kwargs)
-
-                # SolutionStore — archive top-5 spin configs only when
-                # the chain ratchet kept this candidate. The result_kind
-                # set on the attempt drives the gate; "submitted" and
-                # "stored" both qualify since both produce a candidate
-                # we (or someone) might reproduce for analysis.
-                attempt_result_kind = attempt_log_kwargs.get("result_kind")
-                if attempt_result_kind in ("stored", "submitted") and top_5_sols:
-                    nonce_hex = (
-                        nonce.hex() if isinstance(nonce, (bytes, bytearray))
-                        else f"{int(nonce):064x}"
-                    )
-                    solution_store.record(
-                        dispatch_id=dispatch_id_for_log,
-                        iter_num=progress + 1,
-                        nonce_hex=nonce_hex,
-                        salt_hex=salt.hex(),
-                        top_5_solutions_hex=[
-                            pack_spins_hex(s) for s in top_5_sols
-                        ],
-                        top_5_energies=top_5_es,
-                        result_kind=attempt_result_kind,
-                    )
 
                 if result:
                     # Post-evaluation cancel check. evaluate_sampleset can
@@ -1176,6 +1137,70 @@ class BaseMiner(ABC):
             ),
         )
         return result
+
+    def _finalize_iteration_logging(
+        self,
+        state: _MiningLoopState,
+        sampleset: Any,
+        nonce: Any,
+        salt: bytes,
+        progress: int,
+        *,
+        preprocess_start: float,
+        qpu_access_time_us: Optional[int],
+        attempt_log_kwargs: Dict[str, Any],
+    ) -> None:
+        """Finalise + persist per-iteration logging.
+
+        Fills the timing/feeder/solution-meta fields on
+        ``attempt_log_kwargs``, records the attempt row, and archives the
+        top-5 spin configs to the solution store when the iter was stored or
+        submitted. Pure side effects — no control flow. Behaviour matches
+        the original inline logging block exactly.
+        """
+        attempt_log_kwargs["mining_time_us"] = int(
+            (time.time() - preprocess_start) * 1e6
+        )
+        attempt_log_kwargs["qpu_access_time_us"] = qpu_access_time_us
+        if self._feeder is not None:
+            fstats = self._feeder.stats()
+            attempt_log_kwargs["feeder_ready"] = fstats["ready"]
+            attempt_log_kwargs["feeder_drained_count"] = (
+                fstats["drained_count"]
+            )
+            attempt_log_kwargs["feeder_pop_wait_total_s"] = (
+                fstats["pop_wait_total_s"]
+            )
+        # Compute solution_meta scalars + capture top-5 solutions. Meta is
+        # always embedded in the attempt log; top-5 spins go to disk only
+        # when this iter is stored or submitted (see write below).
+        sol_meta, top_5_sols, top_5_es = compute_solution_meta(
+            sampleset, state.requirements.difficulty_energy,
+        )
+        attempt_log_kwargs["solution_meta"] = sol_meta
+        state.attempt_log.record(**attempt_log_kwargs)
+
+        # SolutionStore — archive top-5 spin configs only when the chain
+        # ratchet kept this candidate. The result_kind set on the attempt
+        # drives the gate; "submitted" and "stored" both qualify since both
+        # produce a candidate we (or someone) might reproduce for analysis.
+        attempt_result_kind = attempt_log_kwargs.get("result_kind")
+        if attempt_result_kind in ("stored", "submitted") and top_5_sols:
+            nonce_hex = (
+                nonce.hex() if isinstance(nonce, (bytes, bytearray))
+                else f"{int(nonce):064x}"
+            )
+            state.solution_store.record(
+                dispatch_id=state.dispatch_id_for_log,
+                iter_num=progress + 1,
+                nonce_hex=nonce_hex,
+                salt_hex=salt.hex(),
+                top_5_solutions_hex=[
+                    pack_spins_hex(s) for s in top_5_sols
+                ],
+                top_5_energies=top_5_es,
+                result_kind=attempt_result_kind,
+            )
 
     # ------------------------------------------------------------------
     # Anticipatory-submission preview (substrate / PoW ratchet path)
