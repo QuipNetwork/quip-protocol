@@ -46,38 +46,92 @@ def _extract_qpu_us(sampleset) -> int:
     return int(t.get("qpu_programming_time", 0) + t.get("qpu_sampling_time", 0))
 
 
-def stream_driver_main(ring_args: Dict[str, Any], desc_q, stop_event,
+def _coalesce_ctl_q(ctx, ctl_q) -> str:
+    """Drain ctl_q, applying the newest switch + latest threshold.
+
+    Returns ``"shutdown"`` if a ``None`` sentinel was seen, else ``"ok"``.
+    A burst of switches coalesces to the highest generation (dead
+    intermediate rounds are skipped); a trailing threshold still applies.
+    """
+    latest_switch = None
+    latest_threshold = None
+    shutdown = False
+    while True:
+        try:
+            cmd = ctl_q.get_nowait()
+        except _queue.Empty:
+            break
+        if cmd is None:
+            shutdown = True
+            break
+        if cmd[0] == "switch":
+            if latest_switch is None or cmd[1] >= latest_switch[1]:
+                latest_switch = cmd
+        elif cmd[0] == "threshold":
+            latest_threshold = cmd
+    if latest_switch is not None:
+        ctx.apply_command(latest_switch)
+    if latest_threshold is not None and (
+        latest_switch is None or latest_threshold[1] >= ctx.generation
+    ):
+        ctx.apply_command(latest_threshold)
+    return "shutdown" if shutdown else "ok"
+
+
+def _wait_for_first_switch(ctx, ctl_q, stop_event) -> bool:
+    """Block (polling stop_event) until the first switch arrives.
+
+    Returns True once a round is active, False if shutdown/stop came first.
+    """
+    while not stop_event.is_set():
+        try:
+            cmd = ctl_q.get(timeout=0.1)
+        except _queue.Empty:
+            continue
+        if cmd is None:
+            return False
+        if cmd[0] == "switch":
+            ctx.apply_command(cmd)
+            return True
+        # A 'threshold' before any 'switch' is meaningless; apply + keep waiting.
+        ctx.apply_command(cmd)
+    return False
+
+
+def stream_driver_main(ring_args: Dict[str, Any], desc_q, ctl_q, stop_event,
                        stream_factory_dotted: str,
                        factory_kwargs: Dict[str, Any]) -> None:
-    """Drive the stream; write each result into the ring; enqueue descriptor.
+    """Long-lived stream driver: persist the context, switch rounds via ctl_q.
 
-    stream_factory_dotted resolves to a callable returning an iterator of
-    (model, sampleset). Descriptor tuple:
-    (slot, n_rows, n_cols, nonce_bytes, salt_bytes, qpu_us). A trailing None
-    on the queue signals end-of-stream.
+    ``stream_factory_dotted`` resolves to a context factory
+    (``build_persistent_context``) returning an object exposing
+    ``apply_command`` / ``iter_results`` / ``cleanup`` / ``generation``.
+    Descriptor tuple:
+    ``(slot, n_rows, n_cols, nonce, salt, qpu_us, generation)``. A trailing
+    ``None`` on ``desc_q`` signals end-of-stream (driver exit).
     """
     ring = SharedSampleRing(**ring_args)
-    cleanup = lambda: None  # noqa: E731 — rebound below once the stream opens
+    ctx = None
     dropped = 0
-    # Factory construction (build_production_stream) can raise on D-Wave auth,
-    # embedding, or topology errors. Keep it inside the try so the finally
-    # always sends the end-of-stream sentinel; otherwise the consumer's
-    # desc_q.get loop would hang until external cancel.
+    # Context construction can raise on D-Wave auth/topology errors; keep it
+    # inside the try so the finally always sends the end-of-stream sentinel.
     try:
-        make_stream = _resolve(stream_factory_dotted)
-        result = make_stream(
-            **_maybe_with_stop(make_stream, factory_kwargs, stop_event))
-        stream, cleanup = (
-            result if isinstance(result, tuple) else (result, cleanup))
-        for model, sampleset in stream:
+        factory = _resolve(stream_factory_dotted)
+        ctx = factory(**_maybe_with_stop(factory, factory_kwargs, stop_event))
+        if not _wait_for_first_switch(ctx, ctl_q, stop_event):
+            return  # shutdown/stop before any round began
+        for model, sampleset, submit_gen in ctx.iter_results():
             if stop_event.is_set():
                 break
+            if _coalesce_ctl_q(ctx, ctl_q) == "shutdown":
+                break
+            # Discard completions from a superseded round (driver-side
+            # generation filter — the first of the three independent filters).
+            if submit_gen != ctx.generation:
+                continue
             sample = np.asarray(sampleset.record.sample, dtype=np.int8)
             energy = np.asarray(sampleset.record.energy, dtype=np.float64)
             n_rows, n_cols = sample.shape
-            # Drop oversized samples (D-Wave can return more rows than
-            # num_reads after unembed) instead of overflowing the slot into
-            # the adjacent energy region.
             if n_rows > ring.max_rows or n_cols > ring.max_cols:
                 log.warning(
                     "stream driver: dropping oversized sample %dx%d "
@@ -93,26 +147,23 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, stop_event,
             ring.write(slot, sample, energy)
             try:
                 desc_q.put_nowait(
-                    (slot, n_rows, n_cols, bytes(model.nonce), bytes(model.salt),
-                     _extract_qpu_us(sampleset)))
+                    (slot, n_rows, n_cols, bytes(model.nonce),
+                     bytes(model.salt), _extract_qpu_us(sampleset),
+                     ctx.generation))
             except _queue.Full:
-                # Consumer backpressure: release the slot and drop. Any other
-                # exception (closed/broken queue) propagates to the outer
-                # handler so it's logged + the stream tears down cleanly.
+                # Consumer backpressure: release the slot and drop.
                 ring.release(slot)
                 dropped += 1
     except Exception:
         log.exception("stream driver failed")
     finally:
         if dropped:
-            # The worker can't see this counter (separate process), so log it
-            # here — silent drops would otherwise be invisible on both sides.
             log.warning("stream driver dropped %d samples (backpressure / "
                         "oversized)", dropped)
         try:
-            cleanup()
+            if ctx is not None:
+                ctx.cleanup()
         finally:
-            # Bounded so a wedged/closed consumer can't block driver teardown.
             try:
                 desc_q.put(None, timeout=2.0)
             except Exception:

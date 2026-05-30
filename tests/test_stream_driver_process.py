@@ -1,41 +1,109 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
 
-"""Integration test: stream_driver_main produces descriptors via SharedSampleRing."""
+"""Integration tests: stream_driver_main over a fake persistent context."""
+
 from __future__ import annotations
 
 import multiprocessing as mp
 
-from shared.shared_sample_ring import SharedSampleRing
 from shared.proc_util import terminate_join
+from shared.shared_sample_ring import SharedSampleRing
+
+_FAKE_CTX = "tests.fakes.fake_stream:build_fake_persistent_context"
+_FAKE_RAISING = "tests.fakes.fake_stream:build_fake_raising_context"
 
 
-def test_driver_produces_descriptors_via_ring():
+def _spawn_driver(ring, desc_q, ctl_q, stop, factory, factory_kwargs):
     from QPU.stream_driver import stream_driver_main
-    ctx = mp.get_context("spawn")
-    ring = SharedSampleRing(slots=4, max_rows=8, max_cols=16)
-    desc_q = ctx.Queue()
-    stop = ctx.Event()
-    proc = ctx.Process(
+
+    proc = mp.get_context("spawn").Process(
         target=stream_driver_main,
-        args=(ring.attach_args(), desc_q, stop,
-              "tests.fakes.fake_stream:make_stream",
-              {"n": 5, "rows": 8, "cols": 16}),
-        daemon=True)
+        args=(ring.attach_args(), desc_q, ctl_q, stop, factory, factory_kwargs),
+        daemon=True,
+    )
     proc.start()
+    return proc
+
+
+def test_driver_produces_generation_tagged_descriptors():
+    ctx = mp.get_context("spawn")
+    ring = SharedSampleRing(slots=4, max_rows=8, max_cols=3)
+    desc_q, ctl_q, stop = ctx.Queue(), ctx.Queue(), ctx.Event()
+    proc = _spawn_driver(
+        ring,
+        desc_q,
+        ctl_q,
+        stop,
+        _FAKE_CTX,
+        {"num_reads": 8, "nodes": [0, 1, 2], "n": 5},
+    )
+    ctl_q.put(("switch", 3, b"\x01" * 32, b"\x02" * 32, 0, 8, 80.0))
     seen = 0
     try:
         for _ in range(5):
-            item = desc_q.get(timeout=5.0)
+            item = desc_q.get(timeout=10.0)
             assert item is not None
-            slot, nr, nc, nonce, salt, qpu = item
-            s, e = ring.read(slot, nr, nc)
+            slot, nr, nc, nonce, salt, qpu, gen = item
+            assert gen == 3  # tagged with the live generation
+            s, _e = ring.read(slot, nr, nc)
             assert s.shape == (nr, nc)
-            del s, e
+            del s, _e
             ring.release(slot)
             seen += 1
     finally:
         stop.set()
-        assert terminate_join(proc, 3.0)
+        assert terminate_join(proc, 5.0)
         ring.close_unlink()
     assert seen == 5
+
+
+def test_driver_shuts_down_on_ctl_q_none():
+    ctx = mp.get_context("spawn")
+    ring = SharedSampleRing(slots=2, max_rows=8, max_cols=3)
+    desc_q, ctl_q, stop = ctx.Queue(), ctx.Queue(), ctx.Event()
+    proc = _spawn_driver(
+        ring,
+        desc_q,
+        ctl_q,
+        stop,
+        _FAKE_CTX,
+        {"num_reads": 8, "nodes": [0, 1, 2], "n": 0},  # infinite
+    )
+    ctl_q.put(("switch", 1, b"\x01" * 32, b"\x02" * 32, 0, 8, 80.0))
+    try:
+        assert desc_q.get(timeout=10.0) is not None  # streaming
+        ctl_q.put(None)  # shutdown sentinel
+        saw_none = False
+        for _ in range(200):
+            if desc_q.get(timeout=10.0) is None:
+                saw_none = True
+                break
+        assert saw_none, "driver never enqueued end-of-stream None"
+    finally:
+        stop.set()
+        assert terminate_join(proc, 5.0)
+        ring.close_unlink()
+
+
+def test_driver_factory_error_yields_none_not_hang():
+    ctx = mp.get_context("spawn")
+    ring = SharedSampleRing(slots=2, max_rows=8, max_cols=3)
+    desc_q, ctl_q, stop = ctx.Queue(), ctx.Queue(), ctx.Event()
+    proc = _spawn_driver(
+        ring,
+        desc_q,
+        ctl_q,
+        stop,
+        _FAKE_RAISING,
+        {"num_reads": 8, "nodes": [0, 1, 2]},
+    )
+    ctl_q.put(("switch", 1, b"\x01" * 32, b"\x02" * 32, 0, 8, 80.0))
+    try:
+        assert desc_q.get(timeout=10.0) is None, (
+            "factory error did not produce end-of-stream None"
+        )
+    finally:
+        stop.set()
+        assert terminate_join(proc, 5.0)
+        ring.close_unlink()
