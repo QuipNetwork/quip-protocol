@@ -640,23 +640,10 @@ class BaseMiner(ABC):
                 self.timing_stats['blocks_attempted'] += 1
 
                 # Per-iteration log fields (filled below per code path).
-                attempt_log_kwargs: Dict[str, Any] = {
-                    "dispatch_id": loop_state.dispatch_id_for_log,
-                    "iter_num": progress + 1,
-                    "nonce_hex": (
-                        f"0x{nonce.hex()}"
-                        if isinstance(nonce, (bytes, bytearray))
-                        else hex(int(nonce))
-                    ),
-                    "salt_hex": f"0x{salt.hex()}",
-                    "best_energy_milli": int(
-                        float(np.min(sampleset.record.energy)) * 1000
-                    ),
-                    "num_samples": len(sampleset.record.energy),
-                    "post_processed": False,
-                    "stored_as_best": False,
-                    "result_kind": "rejected",
-                }
+                attempt_log_kwargs = self._init_attempt_log_kwargs(
+                    loop_state.dispatch_id_for_log, progress, nonce, salt,
+                    sampleset,
+                )
 
                 if is_substrate:
                     result = self._run_substrate_ratchet(
@@ -722,6 +709,38 @@ class BaseMiner(ABC):
             return None
         finally:
             self._teardown_dispatch(pump_stop, pump_thread)
+
+    @staticmethod
+    def _init_attempt_log_kwargs(
+        dispatch_id: int,
+        progress: int,
+        nonce: Any,
+        salt: bytes,
+        sampleset: Any,
+    ) -> Dict[str, Any]:
+        """Build the per-iteration attempt-log kwargs (pre-eval defaults).
+
+        Per-path fields (threshold, num_valid, result_kind, ...) are filled
+        in later by the eval helpers. Behaviour matches the original inline
+        dict literal exactly.
+        """
+        return {
+            "dispatch_id": dispatch_id,
+            "iter_num": progress + 1,
+            "nonce_hex": (
+                f"0x{nonce.hex()}"
+                if isinstance(nonce, (bytes, bytearray))
+                else hex(int(nonce))
+            ),
+            "salt_hex": f"0x{salt.hex()}",
+            "best_energy_milli": int(
+                float(np.min(sampleset.record.energy)) * 1000
+            ),
+            "num_samples": len(sampleset.record.energy),
+            "post_processed": False,
+            "stored_as_best": False,
+            "result_kind": "rejected",
+        }
 
     def _setup_dispatch(
         self,
