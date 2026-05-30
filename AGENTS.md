@@ -253,3 +253,40 @@ Rules:
 - Exceptions we don't control: third-party internal threads (D-Wave SDK,
   asyncio executors, stdlib `QueueListener` if ever reused). Document any such
   exception inline with the reason.
+
+## Debugging a hung process (get a traceback)
+
+`SIGINT` (Ctrl-C) only helps when the **main thread is running Python
+bytecode** — it raises `KeyboardInterrupt` at the next bytecode boundary. A
+process wedged in a C-level call (a lock/`join`/`wait`, an `mp.Queue`
+feeder-thread join at interpreter shutdown, a blocking syscall) won't unwind,
+so `SIGINT` just kills it with **no traceback**. Don't reach for it on a hang.
+
+Use **`faulthandler`** + **`SIGABRT`** — the repo convention (CI already runs
+`timeout --signal=ABRT … python -X faulthandler -m pytest`):
+
+```bash
+# 1. Start the process with faulthandler enabled (installs handlers for the
+#    fatal signals SIGSEGV/SIGFPE/SIGABRT/SIGBUS/SIGILL).
+PYTHONFAULTHANDLER=1 python tools/whatever.py …      # or: python -X faulthandler …
+
+# 2. When it hangs, dump every thread's Python (and C) stack to stderr:
+kill -ABRT <pid>          # SIGABRT -> faulthandler dumps, then the process aborts (exit 134)
+```
+
+This prints the exact frame each thread is stuck in (e.g. `threading.py:wait`
+→ an unjoined queue feeder thread). Notes:
+
+- **Pre-arm it.** Faulthandler must be enabled *before* the hang. For tools we
+  expect to run interactively against the QPU/long pipelines, prefer enabling
+  it (env var or `faulthandler.enable()` at startup) so a hang is debuggable.
+- **Dump without killing:** `faulthandler.register(signal.SIGUSR1)` in code,
+  then `kill -USR1 <pid>` dumps and **continues** (repeatable). `SIGABRT` is
+  fatal; `SIGUSR1` (registered) is not.
+- **No instrumentation available?** `py-spy dump --pid <pid>` attaches to any
+  running CPython and prints all-thread tracebacks without a signal or restart.
+- **Inspect the tree first:** `ps -o pid,ppid,stat,command -p <pid>` and
+  `pgrep -P <pid>` reveal stuck children / orphans (`PPID 1` = reparented after
+  a parent crash). An interpreter that won't exit is usually blocked joining a
+  non-daemon child or an `mp.Queue` feeder thread (call `cancel_join_thread()`
+  on queues whose buffered data is worthless at teardown).
