@@ -574,25 +574,6 @@ class SubstrateClient:
             )
         return difficulty
 
-    async def query_last_proof_block_number(self) -> int:
-        """Return the ``QuantumPow.LastProofBlock`` storage value.
-
-        The block number — not the hash — of the most recent winning
-        proof. Genesis sentinel is ``0`` (no proof has ever won).
-
-        The number is the second of the two "time" inputs to local
-        decay computation (the other being ``epoch_length``). Unlike
-        ``Difficulty``, this updates on every winning proof, so the
-        controller re-reads it whenever ``last_proof_block_hash``
-        changes in a fresh snapshot.
-        """
-        result = await self._run(
-            lambda: self._iface.query("QuantumPow", "LastProofBlock")
-        )
-        if result is None or result.value is None:
-            return 0
-        return int(result.value)
-
     async def query_pow_constants(self) -> PowConstants:
         """Read the four ``pallet_quantum_pow`` constants needed for decay.
 
