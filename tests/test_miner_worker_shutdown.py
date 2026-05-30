@@ -35,3 +35,32 @@ def test_shutdown_op_calls_miner_close(monkeypatch):
 
     fake_miner.close.assert_called_once()
     assert stop.is_set()
+
+
+def test_shutdown_sends_ack_even_if_close_raises(monkeypatch):
+    """A failing miner.close() must NOT prevent the shutdown_ack (anti-hang)."""
+    fake_miner = MagicMock()
+    fake_miner.miner_id = "QPU-1"
+    fake_miner.close.side_effect = RuntimeError("boom")
+    monkeypatch.setattr(
+        miner_worker,
+        "build_miner_from_spec",
+        lambda spec: fake_miner,
+    )
+
+    req: mp.Queue = mp.Queue()
+    resp: mp.Queue = mp.Queue()
+    stop = mp.Event()
+    req.put({"op": "shutdown"})
+
+    miner_worker.miner_worker_main(
+        req,
+        resp,
+        {"id": "QPU-1", "kind": "qpu"},
+        stop,
+    )
+
+    fake_miner.close.assert_called_once()
+    # The ack must still arrive despite close() raising.
+    msg = resp.get(timeout=2.0)
+    assert msg == {"op": "shutdown_ack"}
