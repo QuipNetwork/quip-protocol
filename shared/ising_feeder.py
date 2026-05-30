@@ -59,67 +59,59 @@ def _generate_one_model(
     return IsingModel(h=h, J=J, nonce=nonce, salt=salt)
 
 
-def _kill_workers(pids: list[int], timeout: float = 3.0):
-    """SIGTERM workers, wait, then SIGKILL survivors.
+def _force_shutdown_pool(pool: ProcessPoolExecutor) -> None:
+    """Shut down a ProcessPoolExecutor so its manager thread is guaranteed
+    to terminate.
 
-    Logs a warning if SIGKILL is needed — that indicates a
-    bug in the worker shutdown path.
-    """
-    alive = []
-    for pid in pids:
-        try:
-            os.kill(pid, _signal.SIGTERM)
-            alive.append(pid)
-        except OSError:
-            pass
+    ``concurrent.futures`` registers an interpreter-exit hook
+    (``_python_exit``) that joins every live executor's manager thread with
+    NO timeout. A still-running manager therefore deadlocks interpreter
+    shutdown. ``shutdown(wait=False)`` alone only *signals* shutdown and can
+    leave the manager blocked in ``wait_result_broken_or_wakeup`` waiting on
+    a worker, so this:
 
-    if not alive:
-        return
+    1. signals shutdown (non-blocking) so no new workers are spawned,
+    2. SIGKILLs the workers — uncatchable, so a worker that inherited a
+       SIGTERM handler via spawn re-import (e.g. the CPU miner's
+       ``_cleanup_handler``) can't swallow it and stay alive, and the
+       manager observes the broken pool,
+    3. polls the manager thread, re-killing any worker that was still
+       mid-spawn (no PID yet) at step 2 and only appears in
+       ``_processes`` afterwards — that late worker would otherwise keep
+       the manager alive,
+    4. bounded-joins so a genuinely wedged manager leaks (logged) rather
+       than hanging the caller.
 
-    deadline = time.monotonic() + timeout
-    while alive and time.monotonic() < deadline:
-        time.sleep(0.1)
-        alive = [
-            p for p in alive if _pid_alive(p)
-        ]
-
-    for pid in alive:
-        logger.warning(
-            "RandomIsingFeeder: worker %d did not exit after "
-            "SIGTERM, sending SIGKILL", pid,
-        )
-        try:
-            os.kill(pid, _signal.SIGKILL)
-        except OSError:
-            pass
-
-
-def _pid_alive(pid: int) -> bool:
-    """Check if a process is still alive."""
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-
-def _shutdown_pool_quietly(pool: ProcessPoolExecutor) -> None:
-    """Best-effort shutdown of a ProcessPoolExecutor from a weakref finalizer.
-
-    Called by ``weakref.finalize`` when a ``RandomIsingFeeder`` is GC-ed or
-    the interpreter exits without ``stop()`` being called.  Must never raise:
-    a finalizer that propagates an exception is silently ignored by the GC but
-    can corrupt interpreter state during shutdown.
-
-    Rationale: ``concurrent.futures`` registers an ``atexit`` hook
-    (``_python_exit``) that joins the management thread of every
-    still-alive executor.  If the feeder isn't ``stop()``-ed the join blocks
-    during interpreter finalization — creating the window where a SIGTERM
-    lands and ``_cleanup_handler``'s ``sys.exit(0)`` raises in a bad context.
-    Shutting down with ``wait=False`` here makes the atexit join a no-op.
+    Never raises — it is also invoked from a ``weakref.finalize`` callback,
+    where a propagated exception is swallowed by the GC but can corrupt
+    interpreter state during finalization.
     """
     try:
+        manager_thread = getattr(pool, "_executor_manager_thread", None)
+        # Signal shutdown first so the executor stops spawning replacements.
         pool.shutdown(wait=False, cancel_futures=True)
+        deadline = time.monotonic() + 10.0
+        while True:
+            # ``_processes`` flips to None once the executor finishes its own
+            # internal join — tolerate that.
+            procs = getattr(pool, "_processes", None) or {}
+            for proc in list(procs.values()):
+                if proc.pid is not None:
+                    try:
+                        os.kill(proc.pid, _signal.SIGKILL)
+                    except OSError:
+                        pass
+            if manager_thread is None:
+                break
+            manager_thread.join(timeout=0.2)
+            if not manager_thread.is_alive() or time.monotonic() > deadline:
+                break
+        if manager_thread is not None and manager_thread.is_alive():
+            logger.warning(
+                "RandomIsingFeeder: executor manager thread still alive "
+                "10s after worker SIGKILL; pool may block interpreter "
+                "shutdown",
+            )
     except Exception:
         pass
 
@@ -176,12 +168,13 @@ class RandomIsingFeeder:
             max_workers=max_workers,
             mp_context=_SPAWN_CTX,
         )
-        # Backstop: shut down the pool even if stop() is never called.
-        # weakref.finalize runs at GC time or interpreter-exit, which makes
-        # the concurrent.futures atexit join a no-op (nothing left to join).
-        # stop() detaches this finalizer to avoid double-shutdown.
+        # Backstop: shut down the pool even if stop() is never called (the
+        # feeder is dropped and GC-ed mid-run). stop() detaches this
+        # finalizer to avoid double-shutdown. Note: at true interpreter exit
+        # this runs too late to help — concurrent.futures' _python_exit join
+        # fires first — which is why robust teardown lives in stop().
         self._finalizer = weakref.finalize(
-            self, _shutdown_pool_quietly, self._pool,
+            self, _force_shutdown_pool, self._pool,
         )
         self._futures: list = []
         self._queue: queue.Queue[IsingModel] = queue.Queue()
@@ -401,18 +394,10 @@ class RandomIsingFeeder:
             f.cancel()
         self._futures.clear()
 
-        # Collect worker PIDs before shutdown — after
-        # shutdown() the process objects may be gone.
-        pids = [
-            p.pid for p in self._pool._processes.values()
-            if p.pid is not None
-        ]
-
-        self._pool.shutdown(
-            wait=False, cancel_futures=True,
-        )
-
-        _kill_workers(pids)
+        # SIGKILL the workers and join the manager thread (see
+        # _force_shutdown_pool) so concurrent.futures' no-timeout
+        # interpreter-exit join can't deadlock on a surviving manager.
+        _force_shutdown_pool(self._pool)
 
         # Detach the weakref finalizer so it doesn't double-shutdown the
         # already-closed pool when this feeder is later garbage-collected.
