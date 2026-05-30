@@ -6,10 +6,12 @@
 Two modes (``--mode``):
 
 ``driver`` (default) — **production smoke check.** Drives the *real*
-production path the live miner uses: ``BaseMiner._start_result_pump`` spawns
-the ``QPU.stream_driver`` subprocess running ``build_production_stream``
-against the live QPU; the consumer reads samplesets through the
-``SharedSampleRing`` via ``_acquire_result``; ``_teardown_dispatch`` reaps it.
+production path the live miner uses: ``BaseMiner._ensure_driver`` spawns the
+ONE persistent ``QPU.stream_driver`` subprocess running
+``build_persistent_context`` against the live QPU, and a ``switch_round``
+control message starts the round; the consumer reads generation-tagged
+samplesets through the ``SharedSampleRing`` via ``_acquire_result``;
+``_close_driver`` reaps the persistent driver + ring.
 This exercises the parts the in-process probe cannot:
 
   * **Spawn** — the driver starts NON-DAEMON and builds the feeder's
@@ -69,6 +71,7 @@ from shared.base_miner import (  # noqa: E402
     _ACQUIRE_DONE,
     _ACQUIRE_OK,
     _ACQUIRE_STOP,
+    _energy_to_milli,
 )
 from shared.ising_feeder import RandomIsingFeeder  # noqa: E402
 from shared.miner_types import BlockRequirements  # noqa: E402
@@ -154,7 +157,7 @@ def _build_consumer(args: argparse.Namespace) -> DWaveMiner:
 
 
 def _make_sample_ctx(nodes, edges, args: argparse.Namespace) -> Dict[str, Any]:
-    """The per-dispatch context ``_start_result_pump`` forwards to the driver."""
+    """The per-dispatch context dict forwarded to the persistent driver."""
     return {
         "miner_id": "smoke",
         "num_reads": args.num_reads,
@@ -168,6 +171,30 @@ def _make_sample_ctx(nodes, edges, args: argparse.Namespace) -> Dict[str, Any]:
         "feeder_buffer_size": args.feeder_buffer_size,
         "extra": {},
     }
+
+
+def _open_round(consumer: DWaveMiner, sample_ctx: Dict[str, Any]) -> tuple:
+    """Ensure the persistent driver is up and start one round (switch_round).
+
+    Mirrors ``BaseMiner._setup_dispatch``: spawns/keeps the one driver via
+    ``_ensure_driver``, bumps the generation, and sends a ``switch`` control
+    message carrying the round seed + threshold. Returns ``(driver_proc,
+    generation)``; pass the generation to ``_acquire_result`` so the consumer
+    accepts this round's descriptors.
+    """
+    ready = consumer._ensure_driver(sample_ctx)
+    assert ready, "driver did not come up (STREAMING_PUMP must be True)"
+    consumer._generation += 1
+    gen = consumer._generation
+    threshold_milli = _energy_to_milli(sample_ctx["energy_threshold"])
+    consumer._ctl_q.put((
+        "switch", gen,
+        sample_ctx["last_proof_block_hash"], sample_ctx["miner_bytes"],
+        threshold_milli,
+        int(sample_ctx["num_reads"]), float(sample_ctx["annealing_time"]),
+    ))
+    consumer._last_forwarded_threshold_milli = threshold_milli
+    return consumer._driver_proc, gen
 
 
 def _release(consumer: DWaveMiner, acquired) -> None:
@@ -197,7 +224,7 @@ def _hard_kill(pids: List[int]) -> None:
 
 
 def _consume(consumer, desc_q, driver_proc, sample_ctx, nodes, edges,
-             requirements, args) -> Dict[str, Any]:
+             requirements, args, generation) -> Dict[str, Any]:
     """Read ``args.n`` results through the real ``_acquire_result`` path."""
     stop = multiprocessing.Event()
     t_acq: List[float] = []
@@ -210,7 +237,8 @@ def _consume(consumer, desc_q, driver_proc, sample_ctx, nodes, edges,
     for i in range(args.n):
         t0 = time.perf_counter()
         acquired = consumer._acquire_result(
-            stop, desc_q, t0, sample_ctx=sample_ctx, driver_proc=driver_proc)
+            stop, desc_q, t0, sample_ctx=sample_ctx, driver_proc=driver_proc,
+            generation=generation)
         if acquired.action == _ACQUIRE_DONE:
             ended_early = True
             print("[smoke] stream ended early (driver DONE)", file=sys.stderr)
@@ -262,13 +290,14 @@ def _liveness_check(consumer, nodes, edges, args) -> Dict[str, Any]:
     returns DONE rather than draining an empty queue forever.
     """
     sample_ctx = _make_sample_ctx(nodes, edges, args)
-    ring, desc_q, proc, dstop = consumer._start_result_pump(sample_ctx)
+    proc, generation = _open_round(consumer, sample_ctx)
+    desc_q = consumer._desc_q
     stop = multiprocessing.Event()
     try:
         # Confirm the stream is actually flowing before we kill it.
         first = consumer._acquire_result(
             stop, desc_q, time.perf_counter(), sample_ctx=sample_ctx,
-            driver_proc=proc)
+            driver_proc=proc, generation=generation)
         flowing = first.action == _ACQUIRE_OK
         _release(consumer, first)
         # Capture the driver's feeder ProcessPoolExecutor workers before the
@@ -276,8 +305,7 @@ def _liveness_check(consumer, nodes, edges, args) -> Dict[str, Any]:
         # to init). Reap them explicitly so the smoke check leaves nothing
         # behind — a real hard crash would leak these until the OS reaps them.
         workers = _child_pids(proc.pid)
-        # Simulate a hard crash: kill without setting the stop event so no
-        # sentinel is ever sent.
+        # Simulate a hard crash: kill without the stop event so no sentinel.
         proc.kill()
         proc.join(timeout=5.0)
         _hard_kill(workers)
@@ -288,7 +316,7 @@ def _liveness_check(consumer, nodes, edges, args) -> Dict[str, Any]:
         while time.perf_counter() - t0 < _LIVENESS_BOUND_S:
             acq = consumer._acquire_result(
                 stop, desc_q, time.perf_counter(), sample_ctx=sample_ctx,
-                driver_proc=proc)
+                driver_proc=proc, generation=generation)
             if acq.action == _ACQUIRE_DONE:
                 reached_done = True
                 break
@@ -299,7 +327,7 @@ def _liveness_check(consumer, nodes, edges, args) -> Dict[str, Any]:
         return {"flowing": flowing, "reached_done": reached_done,
                 "elapsed": elapsed}
     finally:
-        consumer._teardown_dispatch(dstop, proc)
+        consumer._close_driver()
 
 
 def _report_consume(res: Dict[str, Any]) -> bool:
@@ -342,9 +370,9 @@ def run_driver(args: argparse.Namespace) -> int:
     base_children = {c.pid for c in multiprocessing.active_children()}
     base_shm = _count_shm()
 
-    # --- Spawn: this is build_production_stream in a real subprocess ---
-    ring, desc_q, driver_proc, driver_stop = consumer._start_result_pump(
-        sample_ctx)
+    # --- Spawn the ONE persistent driver + start a round (switch_round) ---
+    driver_proc, generation = _open_round(consumer, sample_ctx)
+    desc_q = consumer._desc_q
     spawn_ok = driver_proc is not None and driver_proc.daemon is False
     print(f"[smoke] driver spawned: pid={getattr(driver_proc, 'pid', None)} "
           f"daemon={getattr(driver_proc, 'daemon', None)} "
@@ -353,12 +381,13 @@ def run_driver(args: argparse.Namespace) -> int:
 
     # --- Consume through the real _acquire_result path ---
     res = _consume(consumer, desc_q, driver_proc, sample_ctx, nodes, edges,
-                   requirements, args)
+                   requirements, args, generation)
 
-    # --- Clean teardown (stop event -> driver finally -> close_unlink) ---
+    # --- Clean teardown: _close_driver reaps the persistent driver +
+    # close_unlinks the ring.
     buffererror = False
     try:
-        consumer._teardown_dispatch(driver_stop, driver_proc)
+        consumer._close_driver()
     except BufferError:
         buffererror = True
 
