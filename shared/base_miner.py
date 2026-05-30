@@ -1946,7 +1946,6 @@ def _energy_to_milli(energy: float) -> int:
     return int(energy * 1000)
 
 
-
 @dataclass(frozen=True)
 class _BridgePrevBlockHeader:
     index: int

@@ -5,8 +5,8 @@ The in-worker pump thread was replaced by a stream-driver PROCESS that
 writes samplesets into a SharedSampleRing and enqueues small descriptors
 (see QPU/stream_driver.py). These tests exercise the consumer side
 (``_acquire_result`` reading the ring, slot release, budget feed, clean
-teardown) without contacting a QPU — a module-level fake factory stands in
-for ``build_production_stream``.
+teardown) without contacting a QPU — ``build_fake_persistent_context``
+stands in for the persistent stream-driver context.
 """
 from __future__ import annotations
 
@@ -303,6 +303,7 @@ def test_mine_work_item_persists_driver_across_dispatches():
         import threading
         import time as _t
 
+        pids = []
         for _ in range(2):
             stop = mp.Event()
             done = threading.Event()
@@ -314,16 +315,15 @@ def test_mine_work_item_persists_driver_across_dispatches():
             t = threading.Thread(target=_run)
             t.start()
             _t.sleep(0.4)
-            pid = miner._driver_proc.pid
+            pids.append(miner._driver_proc.pid)
             stop.set()
             t.join(timeout=15.0)
             assert not t.is_alive()
-            # Driver persists after a dispatch ends.
             assert miner._driver_proc is not None
             assert miner._driver_proc.is_alive()
-            assert miner._driver_proc.pid == pid
-            assert miner._ring is not None  # ring persists too
-        # Two dispatches bumped the generation twice.
+            assert miner._ring is not None
+        # The SECOND dispatch reused the SAME driver process (not respawned).
+        assert pids[0] == pids[1]
         assert miner._generation == 2
     finally:
         miner._close_driver()
