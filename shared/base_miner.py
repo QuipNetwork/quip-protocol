@@ -1069,39 +1069,53 @@ class BaseMiner(ABC):
             self.logger.info("mine_work_item: stopped, no valid result")
             return None
         finally:
-            self.mining = False
-            if self._dropped_results:
-                self.logger.info(
-                    "mine_work_item: %d QPU results dropped under "
-                    "result-queue backpressure", self._dropped_results,
+            self._teardown_dispatch(pump_stop, pump_thread)
+
+    def _teardown_dispatch(
+        self,
+        pump_stop: Optional[threading.Event],
+        pump_thread: Optional[threading.Thread],
+    ) -> None:
+        """Tear down per-dispatch state in ``mine_work_item``'s ``finally``.
+
+        Stops and joins the result pump (if any), clears the pump-stop
+        reference, stops and clears the feeder, flushes the attempt logger,
+        and delegates to subclass ``_post_mine_cleanup``. Behaviour matches
+        the original inline ``finally`` block exactly.
+        """
+        self.mining = False
+        if self._dropped_results:
+            self.logger.info(
+                "mine_work_item: %d QPU results dropped under "
+                "result-queue backpressure", self._dropped_results,
+            )
+        # Stop the pump first: signal it, let the QPU stream observe the
+        # stop and return from its in-flight next(), then join. Only
+        # after the pump thread is dead is it safe for _post_mine_cleanup
+        # to close the generator (close() on a generator executing in
+        # another thread raises "already executing").
+        if pump_stop is not None:
+            pump_stop.set()
+        if pump_thread is not None:
+            pump_thread.join(timeout=5.0)
+            if pump_thread.is_alive():
+                self.logger.warning(
+                    "mine_work_item: result pump did not join in 5s — "
+                    "pump thread still alive (QPU stream pump-stop wiring "
+                    "closes this race)",
                 )
-            # Stop the pump first: signal it, let the QPU stream observe the
-            # stop and return from its in-flight next(), then join. Only
-            # after the pump thread is dead is it safe for _post_mine_cleanup
-            # to close the generator (close() on a generator executing in
-            # another thread raises "already executing").
-            if pump_stop is not None:
-                pump_stop.set()
-            if pump_thread is not None:
-                pump_thread.join(timeout=5.0)
-                if pump_thread.is_alive():
-                    self.logger.warning(
-                        "mine_work_item: result pump did not join in 5s — "
-                        "pump thread still alive (QPU stream pump-stop wiring "
-                        "closes this race)",
-                    )
-            self._pump_stop = None
-            # Tear down the feeder before delegating to subclass cleanup.
-            if self._feeder is not None:
-                try:
-                    self._feeder.stop()
-                finally:
-                    self._feeder = None
-            # Persist any buffered aggregate metadata for this dispatch.
-            attempt_logger = getattr(self, "_attempt_logger", None)
-            if attempt_logger is not None:
-                attempt_logger.flush()
-            self._post_mine_cleanup()
+        self._pump_stop = None
+        # Tear down the feeder before delegating to subclass cleanup.
+        if self._feeder is not None:
+            try:
+                self._feeder.stop()
+            finally:
+                self._feeder = None
+        # Persist any buffered aggregate metadata for this dispatch.
+        attempt_logger = getattr(self, "_attempt_logger", None)
+        if attempt_logger is not None:
+            attempt_logger.flush()
+        self._post_mine_cleanup()
 
     # ------------------------------------------------------------------
     # Anticipatory-submission preview (substrate / PoW ratchet path)
