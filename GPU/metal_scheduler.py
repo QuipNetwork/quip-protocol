@@ -18,7 +18,6 @@ import ctypes
 import ctypes.util
 import logging
 import threading
-import time
 from typing import Optional
 
 
@@ -199,9 +198,6 @@ class MetalScheduler:
         self._iokit_thread: Optional[threading.Thread] = None
         self._iokit_stop = threading.Event()
         self._util_lock = threading.Lock()
-        self._util_cache: Optional[int] = None
-        self._util_cache_time = 0.0
-        self._CACHE_TTL = 0.3
 
         # Hysteresis for stable target threadgroups
         self._prev_target = 0
@@ -241,8 +237,6 @@ class MetalScheduler:
                 util = _query_iokit_gpu_utilization()
                 with self._util_lock:
                     self._external_util_pct = util
-                    self._util_cache = util
-                    self._util_cache_time = time.monotonic()
             except Exception:
                 pass  # Keep last known value
             self._iokit_stop.wait(self._poll_interval)
