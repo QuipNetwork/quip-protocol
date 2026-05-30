@@ -80,3 +80,34 @@ def build_fake_infinite_stream(**kwargs):
     """
     kwargs["n"] = 0
     return build_fake_production_stream(**kwargs)
+
+
+def build_fake_raising_stream(**_ignored):
+    """Fake factory that raises before returning a stream.
+
+    Stands in for a ``build_production_stream`` that fails on D-Wave auth /
+    embedding / topology errors. The stream-driver process must still send
+    the end-of-stream ``None`` sentinel so the consumer doesn't hang.
+    """
+    raise RuntimeError("simulated D-Wave factory failure")
+
+
+def build_fake_winning_stream(
+    *,
+    num_reads: int,
+    nodes,
+    n: int = 1,
+    stop_event=None,
+    **_ignored,
+):
+    """Fake factory whose samplesets are intended to evaluate as winners.
+
+    Identical shape to :func:`build_fake_production_stream`; the miner under
+    test supplies an ``evaluate_sampleset`` that returns a ``MiningResult``
+    so ``mine_work_item`` takes the win early-return path. Used to exercise
+    teardown after a win (the lingering shared-ring view must not trip
+    BufferError on close_unlink).
+    """
+    return build_fake_production_stream(
+        num_reads=num_reads, nodes=nodes, n=n, stop_event=stop_event,
+    )

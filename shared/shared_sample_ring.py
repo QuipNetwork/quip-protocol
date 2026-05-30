@@ -61,8 +61,20 @@ class SharedSampleRing:
         self.free_q.put(slot)
 
     def write(self, slot: int, sample: np.ndarray, energy: np.ndarray) -> None:
-        """Copy sample (int8) + energy (f64) into the slot's shared buffer."""
+        """Copy sample (int8) + energy (f64) into the slot's shared buffer.
+
+        Raises:
+            ValueError: if ``sample`` is larger than the slot
+                (``max_rows``×``max_cols``). Writing past the sample region
+                would silently corrupt the adjacent energy region, so reject
+                oversized samples loudly instead.
+        """
         n_rows, n_cols = sample.shape
+        if n_rows > self.max_rows or n_cols > self.max_cols:
+            raise ValueError(
+                f"sample {n_rows}x{n_cols} exceeds slot capacity "
+                f"{self.max_rows}x{self.max_cols}"
+            )
         buf = self._shm[slot].buf
         np.ndarray((n_rows, n_cols), np.int8, buf, 0)[:] = sample
         np.ndarray((n_rows,), np.float64, buf, self._sample_bytes)[:] = energy

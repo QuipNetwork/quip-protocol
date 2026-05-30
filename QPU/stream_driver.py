@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import logging
 from typing import Any, Dict
 
 import numpy as np
 
 from shared.shared_sample_ring import SharedSampleRing
+
+log = logging.getLogger(__name__)
 
 
 def _resolve(dotted: str):
@@ -53,20 +56,35 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, stop_event,
     on the queue signals end-of-stream.
     """
     ring = SharedSampleRing(**ring_args)
-    make_stream = _resolve(stream_factory_dotted)
-    result = make_stream(**_maybe_with_stop(make_stream, factory_kwargs, stop_event))
-    if isinstance(result, tuple):
-        stream, cleanup = result
-    else:
-        stream, cleanup = result, (lambda: None)
+    cleanup = lambda: None  # noqa: E731 — rebound below once the stream opens
     dropped = 0
+    # Factory construction (build_production_stream) can raise on D-Wave auth,
+    # embedding, or topology errors. Keep it inside the try so the finally
+    # always sends the end-of-stream sentinel; otherwise the consumer's
+    # desc_q.get loop would hang until external cancel.
     try:
+        make_stream = _resolve(stream_factory_dotted)
+        result = make_stream(
+            **_maybe_with_stop(make_stream, factory_kwargs, stop_event))
+        stream, cleanup = (
+            result if isinstance(result, tuple) else (result, cleanup))
         for model, sampleset in stream:
             if stop_event.is_set():
                 break
             sample = np.asarray(sampleset.record.sample, dtype=np.int8)
             energy = np.asarray(sampleset.record.energy, dtype=np.float64)
             n_rows, n_cols = sample.shape
+            # Drop oversized samples (D-Wave can return more rows than
+            # num_reads after unembed) instead of overflowing the slot into
+            # the adjacent energy region.
+            if n_rows > ring.max_rows or n_cols > ring.max_cols:
+                log.warning(
+                    "stream driver: dropping oversized sample %dx%d "
+                    "(slot capacity %dx%d)",
+                    n_rows, n_cols, ring.max_rows, ring.max_cols,
+                )
+                dropped += 1
+                continue
             slot = ring.claim_free(timeout=0.0 if dropped else 0.005)
             if slot is None:
                 dropped += 1
@@ -79,9 +97,15 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, stop_event,
             except Exception:
                 ring.release(slot)
                 dropped += 1
+    except Exception:
+        log.exception("stream driver failed")
     finally:
         try:
             cleanup()
         finally:
-            desc_q.put(None)
+            # Bounded so a wedged/closed consumer can't block driver teardown.
+            try:
+                desc_q.put(None, timeout=2.0)
+            except Exception:
+                pass
             ring.close_unlink()

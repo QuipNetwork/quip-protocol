@@ -533,17 +533,11 @@ class DWaveMiner(BaseMiner):
             submit_one()
 
         stop_event = self._stop_event
-        # getattr default guards tests that bypass BaseMiner.__init__ via
-        # object.__new__; production always has self._pump_stop set (to None
-        # until mine_work_item starts a pump).
-        pump_stop = getattr(self, "_pump_stop", None)
 
         def _stop_requested() -> bool:
-            # stop_event/pump_stop captured once at stream start; stable for
-            # this stream's lifetime (a new dispatch builds a fresh stream).
-            if stop_event is not None and stop_event.is_set():
-                return True
-            return pump_stop is not None and pump_stop.is_set()
+            # stop_event captured once at stream start; stable for this
+            # stream's lifetime (a new dispatch builds a fresh stream).
+            return stop_event is not None and stop_event.is_set()
 
         def _cancel_pending():
             """Abandon in-flight D-Wave futures on stop.
@@ -638,66 +632,6 @@ class DWaveMiner(BaseMiner):
                 sampleset = raw_ss
 
             yield model, sampleset
-
-    def _sample_batch(
-        self,
-        prev_hash: bytes,
-        miner_id: str,
-        cur_index: int,
-        nodes: List[int],
-        edges: List[Tuple[int, int]],
-        *,
-        num_reads: int,
-        num_sweeps: int,
-        **kwargs,
-    ) -> Optional[List[Tuple[int, bytes, dimod.SampleSet]]]:
-        """Stream one result from the QPU pipeline.
-
-        Lazily creates the streaming iterator on first call. Returns one
-        (nonce, salt, sampleset) per call — matching the GPU miner pattern.
-        """
-        annealing_time = kwargs.pop('annealing_time', 80.0)
-        energy_threshold = kwargs.pop('energy_threshold', 0.0)
-
-        if self._stream is None:
-            if self._feeder is None:
-                return None  # _pre_mine_setup not called
-            self._stream = self.sample_ising_streaming(
-                feeder=self._feeder,
-                num_reads=num_reads,
-                annealing_time=annealing_time,
-                queue_depth=self.queue_depth,
-                energy_threshold=energy_threshold,
-            )
-            self.logger.info(
-                f"[QPU] Streaming started: queue_depth={self.queue_depth}, "
-                f"num_reads={num_reads}, annealing_time={annealing_time}μs"
-            )
-
-        try:
-            model, sampleset = next(self._stream)
-        except StopIteration:
-            return None
-
-        self._record_qpu_timing(sampleset)
-        return [(model.nonce, model.salt, sampleset)]
-
-    def _record_qpu_timing(self, sampleset: dimod.SampleSet):
-        """Extract and record QPU timing from a sampleset."""
-        if not hasattr(sampleset, 'info') or 'timing' not in sampleset.info:
-            return
-        timing = sampleset.info['timing']
-        if 'qpu_anneal_time_per_sample' in timing:
-            self.timing_stats['quantum_annealing_time'].append(
-                timing['qpu_anneal_time_per_sample']
-            )
-        qpu_programming = timing.get('qpu_programming_time', 0)
-        qpu_sampling = timing.get('qpu_sampling_time', 0)
-        qpu_total_access = qpu_programming + qpu_sampling
-        if qpu_total_access > 0:
-            self.timing_stats['qpu_access_time'].append(qpu_total_access)
-            if self.time_manager is not None:
-                self.time_manager.record_block_time(qpu_total_access)
 
     def _sample(self, h, J, *, num_reads, num_sweeps, **kwargs):
         """Unused on the QPU path — sampling runs in the stream-driver process.

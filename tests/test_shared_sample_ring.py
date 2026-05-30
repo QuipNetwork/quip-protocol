@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from shared.shared_sample_ring import SharedSampleRing
 
@@ -34,5 +35,20 @@ def test_claim_blocks_when_full_then_frees():
         assert ring.claim_free(timeout=0.05) is None
         ring.release(s)
         assert ring.claim_free(timeout=1.0) is not None
+    finally:
+        ring.close_unlink()
+
+
+def test_write_rejects_oversized():
+    """A sample larger than the slot must raise, not silently overflow."""
+    ring = SharedSampleRing(slots=1, max_rows=4, max_cols=3)
+    try:
+        slot = ring.claim_free(timeout=1.0)
+        # Too many rows (D-Wave can return more rows than num_reads).
+        with pytest.raises(ValueError):
+            ring.write(slot, np.ones((5, 3), np.int8), np.zeros(5, np.float64))
+        # Too many cols.
+        with pytest.raises(ValueError):
+            ring.write(slot, np.ones((4, 4), np.int8), np.zeros(4, np.float64))
     finally:
         ring.close_unlink()

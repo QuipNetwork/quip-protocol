@@ -12,7 +12,6 @@ import multiprocessing
 import multiprocessing.synchronize
 import queue
 import sys
-import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -93,12 +92,17 @@ _ACQUIRE_DONE = "done"  # stream exhausted (trailing None) -> caller breaks
 _ACQUIRE_CONTINUE = "continue"  # recoverable sampling error -> caller continues
 
 
-@dataclass(frozen=True)
+@dataclass
 class _AcquireResult:
     """Outcome of one ``_acquire_result`` call.
 
     ``action`` is one of the ``_ACQUIRE_*`` constants. The payload fields are
     only meaningful when ``action`` is :data:`_ACQUIRE_OK`.
+
+    Intentionally NOT frozen: ``mine_work_item`` clears ``sampleset`` (the
+    zero-copy ``_SharedSampleSet`` view over a ring slot) on every path that
+    reaches its ``finally`` so no live view survives into the ring's
+    ``close_unlink`` — a lingering export raises ``BufferError`` there.
     """
 
     action: str
@@ -292,18 +296,17 @@ class BaseMiner(ABC):
         # Reset per dispatch by mine_work_item; logged at dispatch end.
         self._dropped_results: int = 0
 
-        # Streaming-pump shutdown signal. Read by the QPU streaming
-        # generator's ``_stop_requested`` helper via ``getattr`` so a
-        # caller can abort the stream independently of the block-level
-        # stop_event; None when no such signal is wired.
-        self._pump_stop: Optional[threading.Event] = None
-
         # Driver-path handles (DRIVER_OWNS_FEEDER). ``_start_result_pump``
         # populates these when it spawns the stream-driver process; the loop
         # releases slots on ``self._ring`` and ``_teardown_dispatch`` closes
         # it. ``None`` on the inline (CPU/GPU/Metal) path.
         self._ring: Optional[Any] = None
         self._driver_stop: Optional[Any] = None
+
+        # In-flight QPU job count forwarded to the stream-driver factory.
+        # QPU subclasses override; default 0 keeps ``_start_result_pump``'s
+        # ``self.queue_depth`` reference safe for any STREAMING_PUMP subclass.
+        self.queue_depth: int = 0
 
         # Throttle for the "_pre_mine_setup returned False" warning so
         # pacing during a budget exhaustion window doesn't produce one
@@ -666,6 +669,13 @@ class BaseMiner(ABC):
 
                 sampleset = self._post_sample(sampleset)
                 if stop_event.is_set():
+                    # Drop the shared-ring view before teardown: release the
+                    # slot and clear both the local and the _AcquireResult
+                    # references so close_unlink doesn't trip BufferError.
+                    if acquired.ring_slot is not None and self._ring is not None:
+                        self._ring.release(acquired.ring_slot)
+                    sampleset = None
+                    acquired.sampleset = None
                     return None
 
                 postprocess_start = time.time()
@@ -710,6 +720,11 @@ class BaseMiner(ABC):
                 if acquired.ring_slot is not None and self._ring is not None:
                     self._ring.release(acquired.ring_slot)
                 sampleset = None
+                # Clear the view held by ``acquired`` too: on the win / stop-
+                # after-result early returns below, ``acquired`` survives into
+                # the ``finally``; a live _SharedSampleSet view would make the
+                # ring's close_unlink raise BufferError.
+                acquired.sampleset = None
 
                 if result:
                     # Post-evaluation cancel check. evaluate_sampleset can
@@ -1097,19 +1112,26 @@ class BaseMiner(ABC):
                     return _AcquireResult(_ACQUIRE_DONE)
                 slot, n_rows, n_cols, nonce, salt, qpu_us = item
                 ring_slot = slot
+                # Stop raced with delivery of a descriptor: release the slot
+                # so the driver's free-list isn't leaked, then stop.
+                if stop_event.is_set():
+                    self._ring.release(slot)
+                    return _AcquireResult(_ACQUIRE_STOP)
                 sampleset = _SharedSampleSet(
                     *self._ring.read(slot, n_rows, n_cols),
                 )
-                # Feed the daily-budget gate: the driver process can't reach
-                # the worker's time_manager, so the QPU access time rides the
-                # descriptor and is recorded here (preserving the gate that
-                # previously relied on _record_qpu_timing in the worker).
-                if qpu_us:
+                # Always surface the per-attempt QPU access time scalar (even
+                # 0) for telemetry. Feed the daily-budget gate only when > 0:
+                # the driver process can't reach the worker's time_manager, so
+                # the QPU access time rides the descriptor and is recorded here
+                # (preserving the gate that previously relied on
+                # _record_qpu_timing in the worker).
+                qpu_access_time_us = int(qpu_us)
+                if qpu_us > 0:
                     self.timing_stats['qpu_access_time'].append(int(qpu_us))
                     time_manager = getattr(self, "time_manager", None)
                     if time_manager is not None:
                         time_manager.record_block_time(int(qpu_us))
-                    qpu_access_time_us = int(qpu_us)
             else:
                 # Inline path (CPU/GPU/Metal): unchanged.
                 qpu_access_len_before = len(
@@ -1193,7 +1215,6 @@ class BaseMiner(ABC):
                 self._ring.close_unlink()
             self._ring = None
         self._driver_stop = None
-        self._pump_stop = None
         # Tear down the worker feeder (inline path only) before delegating
         # to subclass cleanup. QPU has no worker feeder (the driver owns
         # it), so guard for None.
