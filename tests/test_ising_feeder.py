@@ -138,6 +138,13 @@ class TestRandomIsingFeeder:
         assert feeder._stopped
         assert len(feeder._futures) == 0
 
+    def test_stop_is_idempotent(self):
+        """A second stop() must not raise (pool._processes is None post-shutdown)."""
+        feeder = _make_feeder(seed=4)
+        feeder.stop()
+        feeder.stop()  # second call must early-return, not AttributeError
+        assert feeder._stopped
+
     def test_nonce_roundtrip(self):
         feeder = _make_feeder(seed=99)
         try:

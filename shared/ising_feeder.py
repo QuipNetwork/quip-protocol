@@ -387,7 +387,15 @@ class RandomIsingFeeder:
         return models
 
     def stop(self) -> None:
-        """Shutdown pool and force-kill any surviving workers."""
+        """Shutdown pool and force-kill any surviving workers.
+
+        Idempotent: a second call returns early. The first call already
+        shut down the pool (after which ``_pool._processes`` can be ``None``)
+        and detached the finalizer, so re-running the body would raise
+        ``AttributeError`` on ``_processes.values()``.
+        """
+        if self._stopped:
+            return
         self._stopped = True
         for f in self._futures:
             f.cancel()
@@ -409,6 +417,7 @@ class RandomIsingFeeder:
         # Detach the weakref finalizer so it doesn't double-shutdown the
         # already-closed pool when this feeder is later garbage-collected.
         self._finalizer.detach()
+
 
 class FixedIsingFeeder:
     """Cycles through a fixed list of pre-baked ``IsingModel``s forever.
