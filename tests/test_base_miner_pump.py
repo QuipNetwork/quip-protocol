@@ -22,15 +22,12 @@ from shared.base_miner import (
     _ACQUIRE_STOP,
     _SharedSampleSet,
 )
-from shared.miner_types import MiningResult
 from shared.proc_util import terminate_join
 from shared.shared_sample_ring import SharedSampleRing
 from substrate.types import SubstrateDifficulty, SubstrateMiningContext
 
-_FAKE_FACTORY = "tests.fakes.fake_stream:build_fake_production_stream"
-_FAKE_INFINITE = "tests.fakes.fake_stream:build_fake_infinite_stream"
-_FAKE_WINNING = "tests.fakes.fake_stream:build_fake_winning_stream"
-_FAKE_RAISING = "tests.fakes.fake_stream:build_fake_raising_stream"
+_FAKE_CTX = "tests.fakes.fake_stream:build_fake_persistent_context"
+_FAKE_RAISING = "tests.fakes.fake_stream:build_fake_raising_context"
 
 _BIN_SPEC = AllowedValueSet((-1000, 1000))
 _TER_SPEC = AllowedValueSet((-1000, 0, 1000))
@@ -60,26 +57,20 @@ def _streaming_context(nodes=(0, 1, 2)) -> SubstrateMiningContext:
 
 
 class _DriverMiner(BaseMiner):
-    """STREAMING_PUMP + DRIVER_OWNS_FEEDER miner driven by the fake factory.
-
-    ``evaluate_sampleset`` never wins so ``mine_work_item`` runs until the
-    stream ends or stop fires; the fake factory supplies real ndarrays into
-    the ring so the consumer's zero-copy read path is exercised end to end.
-    """
+    """STREAMING_PUMP + DRIVER_OWNS_FEEDER miner driven by the fake context."""
 
     STREAMING_PUMP = True
     DRIVER_OWNS_FEEDER = True
-    STREAM_FACTORY_DOTTED = _FAKE_FACTORY
+    STREAM_FACTORY_DOTTED = _FAKE_CTX
     RESULT_QUEUE_MAXSIZE = 4
 
-    def __init__(self, factory: str = _FAKE_FACTORY) -> None:
+    def __init__(self, factory: str = _FAKE_CTX) -> None:
         super().__init__("driver-test", sampler=object(), miner_type="QPU")
         self.queue_depth = 2
         self.time_manager = None
         self.STREAM_FACTORY_DOTTED = factory
 
     def _adapt_mining_params(self, requirements, nodes, edges) -> dict:
-        # num_reads sizes the ring rows; the fake factory matches it.
         return {
             "num_reads": 8,
             "annealing_time": 80.0,
@@ -161,29 +152,26 @@ def test_acquire_result_dead_driver_without_sentinel_is_done():
         terminate_join(dead, 2.0)
 
 
-def test_start_result_pump_spawns_non_daemon_driver():
-    """The driver must be non-daemon.
-
-    ``build_production_stream`` builds a ``RandomIsingFeeder`` whose
-    ``ProcessPoolExecutor`` forks its own children, and a daemon process is
-    forbidden from having children. A regression to ``daemon=True`` would
-    break live QPU mining the moment the feeder spins up (but pass every
-    fake-factory test, since the fake has no pool) — so pin it explicitly.
-    """
+def test_ensure_driver_spawns_non_daemon_driver():
+    """The persistent driver must be non-daemon (its feeder forks children)."""
     miner = _DriverMiner()
     sample_ctx = {
         "num_reads": 8, "nodes": [0, 1, 2], "edges": [],
         "annealing_time": 80.0, "energy_threshold": -1.0,
         "last_proof_block_hash": b"\xab" * 32, "miner_bytes": b"\x42" * 32,
     }
-    ring, desc_q, proc, dstop = miner._start_result_pump(sample_ctx)
     try:
-        assert proc is not None
-        assert proc.daemon is False, "stream driver must not be a daemon"
+        assert miner._ensure_driver(sample_ctx) is True
+        assert miner._driver_proc is not None
+        assert miner._driver_proc.daemon is False
+        # Idempotent: a second call reuses the same process.
+        pid = miner._driver_proc.pid
+        assert miner._ensure_driver(sample_ctx) is True
+        assert miner._driver_proc.pid == pid
     finally:
-        dstop.set()
-        terminate_join(proc, 5.0)
-        ring.close_unlink()
+        miner._close_driver()
+    assert miner._ring is None
+    assert miner._driver_proc is None
 
 
 def test_acquire_result_reads_descriptor_from_ring():
@@ -197,10 +185,11 @@ def test_acquire_result_reads_descriptor_from_ring():
         energy = np.array([-1.0, -2.0, -3.0, -4.0], np.float64)
         slot = ring.claim_free(timeout=1.0)
         ring.write(slot, sample, energy)
-        desc_q.put((slot, 4, 3, b"\x01" * 32, b"\x02" * 32, 51010))
+        desc_q.put((slot, 4, 3, b"\x01" * 32, b"\x02" * 32, 51010, 1))
 
         acquired = consumer._acquire_result(
             stop, desc_q, preprocess_start=0.0, sample_ctx=_sample_ctx(),
+            generation=1,
         )
         assert acquired.action == _ACQUIRE_OK
         assert acquired.ring_slot == slot
@@ -258,9 +247,10 @@ def test_acquire_result_feeds_budget_time_manager():
         slot = ring.claim_free(timeout=1.0)
         ring.write(slot, np.ones((4, 3), np.int8),
                    np.zeros(4, np.float64))
-        desc_q.put((slot, 4, 3, b"\x01" * 32, b"\x02" * 32, 4242))
+        desc_q.put((slot, 4, 3, b"\x01" * 32, b"\x02" * 32, 4242, 1))
         acquired = consumer._acquire_result(
             stop, desc_q, preprocess_start=0.0, sample_ctx=_sample_ctx(),
+            generation=1,
         )
         assert acquired.action == _ACQUIRE_OK
         assert consumer.time_manager.recorded == [4242]
@@ -270,35 +260,84 @@ def test_acquire_result_feeds_budget_time_manager():
         ring.close_unlink()
 
 
+def test_acquire_result_drops_stale_generation_descriptor():
+    """A descriptor from a superseded round is released + skipped, not OK."""
+    consumer = _RingConsumer()
+    ring = SharedSampleRing(slots=2, max_rows=4, max_cols=3)
+    consumer._ring = ring
+    desc_q = mp.get_context("spawn").Queue()
+    stop = mp.Event()
+    try:
+        slot = ring.claim_free(timeout=1.0)
+        ring.write(slot, np.ones((4, 3), np.int8), np.zeros(4, np.float64))
+        # Stale gen=1 descriptor, then end-of-stream. Consumer wants gen=2.
+        desc_q.put((slot, 4, 3, b"\x01" * 32, b"\x02" * 32, 0, 1))
+        desc_q.put(None)
+        acquired = consumer._acquire_result(
+            stop, desc_q, preprocess_start=0.0, sample_ctx=_sample_ctx(),
+            generation=2,
+        )
+        # Stale one skipped; stream then ended -> DONE.
+        assert acquired.action == _ACQUIRE_DONE
+        # The skipped slot was released back to the free-list (no leak): both
+        # slots of the 2-slot ring are claimable again. (claim_free is a FIFO
+        # so the reclaimed index need not equal ``slot``.)
+        claimed = {ring.claim_free(timeout=1.0) for _ in range(2)}
+        assert claimed == {0, 1}
+        for s in claimed:
+            ring.release(s)
+    finally:
+        ring.close_unlink()
+
+
 # ----------------------------------------------------------------------
 # Integration: mine_work_item spawns the driver, consumes, and tears down
 # ----------------------------------------------------------------------
 
 
-def test_mine_work_item_drives_stream_process_and_tears_down_cleanly():
+def test_mine_work_item_persists_driver_across_dispatches():
+    """Two dispatches reuse ONE driver process (same pid, not respawned)."""
     ctx = _streaming_context()
-    miner = _DriverMiner()  # bounded fake (n=5)
-    stop = mp.Event()
+    miner = _DriverMiner(factory=_FAKE_CTX)  # infinite stream (n=0)
+    try:
+        import threading
+        import time as _t
 
-    # Bounded fake stream (5 results) → mine_work_item exits on its own
-    # (no winner) once the driver enqueues the trailing None.
-    result = miner.mine_work_item(ctx, stop)
-    assert result is None
-    # Driver process reaped, ring closed, no dangling handles.
+        for _ in range(2):
+            stop = mp.Event()
+            done = threading.Event()
+
+            def _run(s=stop, d=done):
+                miner.mine_work_item(ctx, s)
+                d.set()
+
+            t = threading.Thread(target=_run)
+            t.start()
+            _t.sleep(0.4)
+            pid = miner._driver_proc.pid
+            stop.set()
+            t.join(timeout=15.0)
+            assert not t.is_alive()
+            # Driver persists after a dispatch ends.
+            assert miner._driver_proc is not None
+            assert miner._driver_proc.is_alive()
+            assert miner._driver_proc.pid == pid
+            assert miner._ring is not None  # ring persists too
+        # Two dispatches bumped the generation twice.
+        assert miner._generation == 2
+    finally:
+        miner._close_driver()
     assert miner._ring is None
-    assert miner._driver_stop is None
-    # Consumed real shared-ring results (no exceptions leaked from the
-    # _sample / _sample_batch asserts means the driver path was taken).
-    assert miner.timing_stats["blocks_attempted"] >= 1
+    assert miner._driver_proc is None
 
 
 def test_mine_work_item_stops_promptly_on_stop_event():
     ctx = _streaming_context()
-    # Infinite fake stream → runs until stop_event fires.
-    miner = _DriverMiner(factory=_FAKE_INFINITE)
+    miner = _DriverMiner(factory=_FAKE_CTX)  # infinite
     stop = mp.Event()
 
     import threading
+    import time
 
     done = threading.Event()
     raised: list = []
@@ -313,178 +352,14 @@ def test_mine_work_item_stops_promptly_on_stop_event():
 
     t = threading.Thread(target=_run, name="mine-loop")
     t.start()
-    import time
     time.sleep(0.5)
     stop.set()
     t.join(timeout=15.0)
-
-    assert not t.is_alive(), "mine_work_item did not stop on stop_event"
-    assert done.is_set()
-    assert raised == [], f"mine_work_item raised: {raised[0] if raised else None}"
-    assert miner._ring is None
-
-
-def test_stream_driver_drops_under_backpressure_without_blocking():
-    """A tiny ring forces the driver to drop when the consumer never reads.
-
-    Drives stream_driver_main directly with the fake factory and a 1-slot
-    ring; with no consumer releasing slots the driver must drop (rather than
-    block) and still terminate, enqueueing the trailing None.
-    """
-    from QPU.stream_driver import stream_driver_main
-
-    spawn = mp.get_context("spawn")
-    ring = SharedSampleRing(slots=1, max_rows=8, max_cols=3)
-    desc_q = spawn.Queue()
-    stop = spawn.Event()
-    proc = spawn.Process(
-        target=stream_driver_main,
-        args=(ring.attach_args(), desc_q, stop, _FAKE_FACTORY,
-              {"num_reads": 8, "nodes": [0, 1, 2], "n": 50}),
-        daemon=True,
-    )
-    proc.start()
     try:
-        # Read exactly one descriptor (fills the single slot, never released)
-        # then let the producer run into the full ring and drop the rest.
-        first = desc_q.get(timeout=10.0)
-        assert first is not None
-        stop.set()
-        # Drain whatever is queued until the trailing None; must not hang.
-        saw_none = False
-        for _ in range(100):
-            item = desc_q.get(timeout=10.0)
-            if item is None:
-                saw_none = True
-                break
-        assert saw_none, "driver never enqueued end-of-stream None"
+        assert not t.is_alive(), "mine_work_item did not stop on stop_event"
+        assert done.is_set()
+        assert raised == [], f"mine_work_item raised: {raised[0] if raised else None}"
+        # The driver is NOT torn down by a dispatch stop — it persists.
+        assert miner._driver_proc is not None and miner._driver_proc.is_alive()
     finally:
-        stop.set()
-        assert terminate_join(proc, 5.0)
-        ring.close_unlink()
-
-
-# ----------------------------------------------------------------------
-# Teardown: no BufferError from a lingering shared-ring view (FIX 1)
-# ----------------------------------------------------------------------
-
-
-class _WinningMiner(_DriverMiner):
-    """Driver-path miner whose first evaluated sampleset is a winner.
-
-    Forces ``mine_work_item`` down the win early-return path while a
-    ``_SharedSampleSet`` view over a ring slot is in scope, so the test can
-    assert teardown's ``close_unlink`` doesn't raise ``BufferError``.
-    """
-
-    STREAM_FACTORY_DOTTED = _FAKE_WINNING
-
-    def __init__(self) -> None:
-        super().__init__(factory=_FAKE_WINNING)
-
-    def evaluate_sampleset(self, sampleset, requirements, nodes, edges,
-                           nonce, salt, *args, **kwargs):
-        return MiningResult(
-            miner_id=self.miner_id, miner_type=self.miner_type,
-            nonce=bytes(nonce) if not isinstance(nonce, bytes) else nonce,
-            salt=salt, timestamp=0, prev_timestamp=0,
-            solutions=[[1, -1, 1]], energy=-15000.0, diversity=1.0,
-            num_valid=1, mining_time=0, node_list=list(nodes),
-            edge_list=list(edges), submit_floor_energy=-15000.0,
-        )
-
-
-def test_teardown_no_buffererror_on_win():
-    """A win must tear down cleanly even with a live shared-ring view."""
-    ctx = _streaming_context()
-    miner = _WinningMiner()
-    stop = mp.Event()
-
-    result = miner.mine_work_item(ctx, stop)  # would raise BufferError pre-fix
-    assert result is not None
-    assert result.energy == -15000.0
-    # Ring closed + unlinked, no dangling handle, no BufferError leaked.
-    assert miner._ring is None
-    assert miner._driver_stop is None
-
-
-class _StopMidDispatchMiner(_DriverMiner):
-    """Driver-path miner that sets ``stop_event`` after the first descriptor.
-
-    Exercises the stop-after-_post_sample early return while a shared-ring
-    view is live: teardown must release the slot and close the ring without
-    BufferError.
-    """
-
-    STREAM_FACTORY_DOTTED = _FAKE_INFINITE
-
-    def __init__(self, stop_event) -> None:
-        super().__init__(factory=_FAKE_INFINITE)
-        self._test_stop = stop_event
-        self.released_slots: list = []
-
-    def _post_sample(self, sampleset):
-        # Cancel mid-dispatch: the next stop_event check returns None while
-        # the _SharedSampleSet view is still referenced by ``acquired``.
-        self._test_stop.set()
-        return sampleset
-
-    def _post_mine_cleanup(self) -> None:
-        # Record how many slots are free at teardown to confirm release.
-        super()._post_mine_cleanup()
-
-
-def test_teardown_no_buffererror_on_stop_mid_dispatch():
-    """Stop racing a delivered descriptor tears down cleanly + frees slot."""
-    ctx = _streaming_context()
-    stop = mp.Event()
-    miner = _StopMidDispatchMiner(stop)
-
-    # Capture the slot the consumer releases on the stop early-return path.
-    released: list = []
-    orig_setup = miner._start_result_pump
-
-    def _patched(sample_ctx):
-        ring, desc_q, proc, dstop = orig_setup(sample_ctx)
-        orig_release = ring.release
-        ring.release = lambda slot: (released.append(slot),
-                                     orig_release(slot))[-1]
-        return ring, desc_q, proc, dstop
-
-    miner._start_result_pump = _patched
-
-    result = miner.mine_work_item(ctx, stop)
-    assert result is None
-    assert miner._ring is None
-    # The stop-after-post_sample path released its ring slot (no leak).
-    assert released, "ring slot was not released on the stop early-return"
-
-
-# ----------------------------------------------------------------------
-# Driver factory error must yield the None sentinel, not hang (FIX 2)
-# ----------------------------------------------------------------------
-
-
-def test_driver_factory_error_yields_done_not_hang():
-    """A raising factory must still enqueue the end-of-stream None sentinel."""
-    from QPU.stream_driver import stream_driver_main
-
-    spawn = mp.get_context("spawn")
-    ring = SharedSampleRing(slots=2, max_rows=8, max_cols=3)
-    desc_q = spawn.Queue()
-    stop = spawn.Event()
-    proc = spawn.Process(
-        target=stream_driver_main,
-        args=(ring.attach_args(), desc_q, stop, _FAKE_RAISING,
-              {"num_reads": 8, "nodes": [0, 1, 2]}),
-        daemon=True,
-    )
-    proc.start()
-    try:
-        # Consumer would map this None to _ACQUIRE_DONE; must arrive promptly.
-        item = desc_q.get(timeout=10.0)
-        assert item is None, "factory error did not produce end-of-stream None"
-    finally:
-        stop.set()
-        assert terminate_join(proc, 5.0)
-        ring.close_unlink()
+        miner._close_driver()

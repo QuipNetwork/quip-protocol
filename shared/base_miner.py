@@ -138,6 +138,9 @@ class _DispatchSetup:
     desc_q: Optional[Any]
     driver_proc: Optional[Any]
     driver_stop: Optional[Any]
+    # Round generation this dispatch accepts; descriptors tagged with any
+    # other generation are stale and dropped by the consumer.
+    generation: int = 0
 
 
 @dataclass
@@ -169,6 +172,9 @@ class _MiningLoopState:
     top_k_cap: int
     top_k: List[MiningResult]
     previewed_floor_milli: int
+    # Round generation (mirrors _DispatchSetup.generation) so the ratchet can
+    # forward same-generation live-threshold decay updates to the driver.
+    generation: int = 0
 
 
 class _SetupAbortThrottle:
@@ -296,15 +302,30 @@ class BaseMiner(ABC):
         # Reset per dispatch by mine_work_item; logged at dispatch end.
         self._dropped_results: int = 0
 
-        # Driver-path handles (DRIVER_OWNS_FEEDER). ``_start_result_pump``
-        # populates these when it spawns the stream-driver process; the loop
-        # releases slots on ``self._ring`` and ``_teardown_dispatch`` closes
-        # it. ``None`` on the inline (CPU/GPU/Metal) path.
+        # Persistent driver-path handles (DRIVER_OWNS_FEEDER). ``_ensure_driver``
+        # spawns ONE stream-driver process and keeps it alive across dispatches;
+        # ``_close_driver`` (miner shutdown) is the only thing that reaps it and
+        # close-unlinks the ring. All ``None`` on the inline (CPU/GPU/Metal) path
+        # and before the first driver dispatch.
         self._ring: Optional[Any] = None
+        self._desc_q: Optional[Any] = None
+        self._ctl_q: Optional[Any] = None
         self._driver_stop: Optional[Any] = None
+        self._driver_proc: Optional[Any] = None
+        # (max_rows, max_cols) the persistent ring was sized for; a dispatch
+        # whose dims differ forces a driver respawn (rare — num_reads and the
+        # topology are stable within a miner's life).
+        self._ring_dims: Optional[Tuple[int, int]] = None
+        # Monotonic per-miner round generation. Bumped once per dispatch in
+        # _setup_dispatch; tags every switch_round and every descriptor so a
+        # superseded round's results are dropped. Process-local; never persisted.
+        self._generation: int = 0
+        # Last live-threshold (milli) forwarded to the driver, so decay updates
+        # are only sent on change. Reset on driver (re)spawn.
+        self._last_forwarded_threshold_milli: Optional[int] = None
 
         # In-flight QPU job count forwarded to the stream-driver factory.
-        # QPU subclasses override; default 0 keeps ``_start_result_pump``'s
+        # QPU subclasses override; default 0 keeps the driver factory's
         # ``self.queue_depth`` reference safe for any STREAMING_PUMP subclass.
         self.queue_depth: int = 0
 
@@ -418,14 +439,14 @@ class BaseMiner(ABC):
     STREAMING_PUMP: bool = False
     # When True (QPU), the sampler + feeder live in a separate stream-driver
     # PROCESS (see QPU/stream_driver.py); ``_setup_dispatch`` skips building a
-    # worker-side feeder and ``_start_result_pump`` spawns the driver instead
+    # worker-side feeder and ``_ensure_driver`` spawns the driver instead
     # of a pump thread. CPU/GPU keep this False and run the in-worker feeder.
     DRIVER_OWNS_FEEDER: bool = False
     # Dotted ``module:attr`` of the stream factory the driver process
-    # resolves and calls. Overridden by QPU to point at
-    # ``QPU.dwave_miner:build_production_stream``; tests swap it for a fake
-    # so the driver path can be exercised without a QPU connection.
-    STREAM_FACTORY_DOTTED: str = "QPU.dwave_miner:build_production_stream"
+    # resolves and calls. Points at ``QPU.dwave_miner:build_persistent_context``
+    # for the QPU path; tests swap it for a fake so the driver path can be
+    # exercised without a QPU connection.
+    STREAM_FACTORY_DOTTED: str = "QPU.dwave_miner:build_persistent_context"
     # Bounded result queue depth. Sized to the in-flight QPU job count so
     # the consumer has headroom equal to what the cloud holds; on full the
     # pump drops the newest result (rare safety valve) and counts it.
@@ -655,6 +676,7 @@ class BaseMiner(ABC):
                 acquired = self._acquire_result(
                     stop_event, desc_q, preprocess_start,
                     sample_ctx=sample_ctx, driver_proc=setup.driver_proc,
+                    generation=setup.generation,
                 )
                 if acquired.action == _ACQUIRE_STOP:
                     return None
@@ -770,7 +792,7 @@ class BaseMiner(ABC):
             self.logger.info("mine_work_item: stopped, no valid result")
             return None
         finally:
-            self._teardown_dispatch(setup.driver_stop, setup.driver_proc)
+            self._teardown_dispatch()
 
     @staticmethod
     def _init_attempt_log_kwargs(
@@ -967,7 +989,7 @@ class BaseMiner(ABC):
                 )
                 return None
             # The stream-driver process builds its own RandomIsingFeeder
-            # (see build_production_stream); the worker keeps no feeder so
+            # (see build_persistent_context); the worker keeps no feeder so
             # the chain seed / miner identity are derived in exactly one
             # place. Capture the construction inputs into sample_ctx below.
             self._feeder = None
@@ -982,7 +1004,7 @@ class BaseMiner(ABC):
         # contract requires (prev_hash, miner_id, cur_index). The driver
         # path additionally forwards the feeder-construction inputs and the
         # QPU dispatch knobs (annealing_time / energy_threshold come from
-        # _adapt_mining_params' extra params) so _start_result_pump can hand
+        # _adapt_mining_params' extra params) so _ensure_driver can hand
         # them to the stream-driver process.
         sample_ctx = {
             "prev_hash": bridge_prev_block.hash,
@@ -1002,84 +1024,151 @@ class BaseMiner(ABC):
             "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
         }
 
-        ring, desc_q, driver_proc, driver_stop = self._start_result_pump(
-            sample_ctx,
-        )
+        self._dropped_results = 0
+        generation = 0
+        if self._ensure_driver(sample_ctx):
+            # New round: bump the generation and tell the persistent driver to
+            # switch (reseed feeder, cancel in-flight, set threshold). The
+            # driver keeps its D-Wave connection — no reconnect, no respawn.
+            self._generation += 1
+            generation = self._generation
+            threshold_milli = _energy_to_milli(sample_ctx["energy_threshold"])
+            try:
+                self._ctl_q.put(
+                    ("switch", generation, sample_ctx["last_proof_block_hash"],
+                     sample_ctx["miner_bytes"], threshold_milli,
+                     int(sample_ctx["num_reads"]),
+                     float(sample_ctx["annealing_time"])),
+                )
+            except Exception as exc:  # noqa: BLE001 — surface, don't hang
+                self.logger.error("switch_round send failed: %s", exc)
+                return None
+            self._last_forwarded_threshold_milli = threshold_milli
+        loop_state.generation = generation
         return _DispatchSetup(
             loop_state=loop_state,
             is_substrate=is_substrate,
             sample_ctx=sample_ctx,
             num_reads=num_reads,
             num_sweeps=current_num_sweeps,
-            ring=ring,
-            desc_q=desc_q,
-            driver_proc=driver_proc,
-            driver_stop=driver_stop,
+            ring=self._ring,
+            desc_q=self._desc_q,
+            driver_proc=self._driver_proc,
+            driver_stop=self._driver_stop,
+            generation=generation,
         )
 
-    def _start_result_pump(
-        self,
-        sample_ctx: Dict[str, Any],
-    ) -> Tuple[Optional[Any], Optional[Any], Optional[Any], Optional[Any]]:
-        """Start the stream-driver process for the streaming (QPU) backend.
+    def _ensure_driver(self, sample_ctx: Dict[str, Any]) -> bool:
+        """Ensure ONE persistent stream-driver process is running.
 
-        Creates a :class:`~shared.shared_sample_ring.SharedSampleRing` (owned
-        by this worker), a spawn-context descriptor queue, and a stop event,
-        then launches :func:`QPU.stream_driver.stream_driver_main` in a child
-        process. The driver builds its own sampler + feeder via
-        ``QPU.dwave_miner:build_production_stream`` and writes each result
-        into the ring; this worker reads the slot and releases it.
-
-        CPU/GPU/Metal (``STREAMING_PUMP=False``) keep the inline acquisition
-        path and get ``(None, None, None, None)``.
+        Idempotent. Spawns the driver (and its persistent ring / ctl_q /
+        desc_q / stop event) on first use, and respawns it if it died or if a
+        new dispatch needs a differently-sized ring (rare — ``num_reads`` and
+        the topology are stable within a miner's life). The driver builds its
+        own connected context via ``STREAM_FACTORY_DOTTED`` and keeps it alive
+        across dispatches; only ``_close_driver`` (miner shutdown) reaps it.
 
         Returns:
-            ``(ring, desc_q, driver_proc, driver_stop)`` on the streaming
-            path; all ``None`` otherwise.
+            ``True`` if a live driver is ready (streaming path); ``False`` for
+            the inline (CPU/GPU/Metal) path (``STREAMING_PUMP`` is False).
         """
-        self._dropped_results = 0
         if not self.STREAMING_PUMP:
-            return None, None, None, None
+            return False
+        nodes = sample_ctx["nodes"]
+        dims = (int(sample_ctx["num_reads"]), len(nodes))
+        alive = self._driver_proc is not None and self._driver_proc.is_alive()
+        if alive and self._ring_dims == dims:
+            return True  # reuse the running driver
+        # Dead, first-time, or dims changed: tear down any stale driver, spawn.
+        self._close_driver()
         import multiprocessing as _mp
         from QPU.stream_driver import stream_driver_main
         ctx = _mp.get_context("spawn")
-        nodes = sample_ctx["nodes"]
-        max_cols = len(nodes)
-        max_rows = int(sample_ctx["num_reads"])
-        ring = SharedSampleRing(slots=self.RESULT_QUEUE_MAXSIZE,
-                                max_rows=max_rows, max_cols=max_cols)
+        ring = SharedSampleRing(
+            slots=self.RESULT_QUEUE_MAXSIZE, max_rows=dims[0], max_cols=dims[1],
+        )
         desc_q = ctx.Queue(maxsize=self.RESULT_QUEUE_MAXSIZE)
+        ctl_q = ctx.Queue()
         driver_stop = ctx.Event()
-        self._ring = ring
-        self._driver_stop = driver_stop
         factory_kwargs = {
             "miner_id": self.miner_id,
-            "num_reads": sample_ctx["num_reads"],
-            "annealing_time": sample_ctx["annealing_time"],
             "queue_depth": self.queue_depth,
-            "energy_threshold": sample_ctx["energy_threshold"],
             "nodes": nodes,
             "edges": sample_ctx["edges"],
-            "last_proof_block_hash": sample_ctx["last_proof_block_hash"],
-            "miner_bytes": sample_ctx["miner_bytes"],
             "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
+            "num_reads": sample_ctx["num_reads"],
+            "annealing_time": sample_ctx["annealing_time"],
+            "energy_threshold_milli": _energy_to_milli(
+                sample_ctx["energy_threshold"],
+            ),
+            "precheck_margin_milli": self.RATCHET_PRECHECK_MARGIN_MILLI,
             "solver_name": getattr(self, "solver_name", None),
             "region": getattr(self, "region", None),
             "token": getattr(self, "token", None),
         }
         driver_proc = spawn_worker(
             stream_driver_main,
-            (ring.attach_args(), desc_q, driver_stop,
+            (ring.attach_args(), desc_q, ctl_q, driver_stop,
              self.STREAM_FACTORY_DOTTED, factory_kwargs),
             name=f"qpu-stream-driver-{self.miner_id}",
-            # Non-daemon: the driver builds a RandomIsingFeeder whose
-            # ProcessPoolExecutor forks its own children, and a daemon
-            # process is forbidden from having children. ``_teardown_dispatch``
-            # reaps this process explicitly via ``terminate_join``, so it
-            # never blocks interpreter shutdown despite being non-daemon.
+            # Non-daemon: the driver's RandomIsingFeeder forks pool children,
+            # which a daemon process is forbidden from doing. _close_driver
+            # reaps it explicitly so it never blocks interpreter shutdown.
             daemon=False,
         )
-        return ring, desc_q, driver_proc, driver_stop
+        self._ring = ring
+        self._desc_q = desc_q
+        self._ctl_q = ctl_q
+        self._driver_stop = driver_stop
+        self._driver_proc = driver_proc
+        self._ring_dims = dims
+        self._last_forwarded_threshold_milli = None
+        return True
+
+    def _close_driver(self) -> None:
+        """Reap the persistent driver and close+unlink the ring (shutdown only).
+
+        Sends the ctl_q shutdown sentinel, sets the stop event, joins the
+        driver, then close-unlinks the ring after a GC pass (so no lingering
+        ``_SharedSampleSet`` view keeps a segment exported — the MR !110
+        BufferError contract). Safe to call when no driver exists.
+        """
+        if self._ctl_q is not None:
+            try:
+                self._ctl_q.put(None)  # shutdown sentinel
+            except Exception:  # noqa: BLE001 — best-effort
+                pass
+        if self._driver_stop is not None:
+            self._driver_stop.set()
+        if self._driver_proc is not None:
+            terminate_join(self._driver_proc, 5.0)
+            self._driver_proc = None
+        if self._ring is not None:
+            import gc
+            gc.collect()
+            try:
+                self._ring.close_unlink()
+            except BufferError:
+                gc.collect()
+                try:
+                    self._ring.close_unlink()
+                except BufferError:
+                    self.logger.error(
+                        "shared ring close_unlink still blocked after GC; a "
+                        "sample view leaked. Closing handles without unlink "
+                        "(segments %s may persist).",
+                        getattr(self._ring, "names", "?"),
+                    )
+                    self._ring.close()
+            self._ring = None
+        self._desc_q = None
+        self._ctl_q = None
+        self._driver_stop = None
+        self._ring_dims = None
+
+    def close(self) -> None:
+        """Release all persistent resources (call on miner/worker shutdown)."""
+        self._close_driver()
 
     def _await_descriptor(
         self,
@@ -1124,6 +1213,7 @@ class BaseMiner(ABC):
         *,
         sample_ctx: Dict[str, Any],
         driver_proc: Optional[Any] = None,
+        generation: int = 0,
     ) -> _AcquireResult:
         """Source one ``(nonce, salt, sampleset)`` for a loop iteration.
 
@@ -1154,36 +1244,38 @@ class BaseMiner(ABC):
             if desc_q is not None:
                 # Driver mode: block on the descriptor queue, waking to check
                 # stop_event and driver liveness. A trailing None — or a dead
-                # driver — means the stream ended.
-                item = self._await_descriptor(stop_event, desc_q, driver_proc)
-                if item == _ACQUIRE_STOP:
-                    return _AcquireResult(_ACQUIRE_STOP)
-                if item is None or item == _ACQUIRE_DONE:
-                    return _AcquireResult(_ACQUIRE_DONE)
-                if self._ring is None:
-                    # A descriptor without a ring is a programming error
-                    # (driver path must set _ring in _start_result_pump).
-                    self.logger.error(
-                        "driver descriptor received but shared ring is None; "
-                        "ending dispatch",
+                # driver — means the stream ended. Descriptors tagged with a
+                # superseded generation are released + skipped (consumer-side
+                # generation filter, the second of the three).
+                while True:
+                    item = self._await_descriptor(
+                        stop_event, desc_q, driver_proc,
                     )
-                    return _AcquireResult(_ACQUIRE_DONE)
-                slot, n_rows, n_cols, nonce, salt, qpu_us = item
-                ring_slot = slot
-                # Stop raced with delivery of a descriptor: release the slot
-                # so the driver's free-list isn't leaked, then stop.
+                    if item == _ACQUIRE_STOP:
+                        return _AcquireResult(_ACQUIRE_STOP)
+                    if item is None or item == _ACQUIRE_DONE:
+                        return _AcquireResult(_ACQUIRE_DONE)
+                    if self._ring is None:
+                        self.logger.error(
+                            "driver descriptor received but shared ring is "
+                            "None; ending dispatch",
+                        )
+                        return _AcquireResult(_ACQUIRE_DONE)
+                    slot, n_rows, n_cols, nonce, salt, qpu_us, desc_gen = item
+                    if desc_gen != generation:
+                        # Straggler from a prior round; free the slot, keep
+                        # waiting for a current-generation descriptor.
+                        self._ring.release(slot)
+                        continue
+                    ring_slot = slot
+                    break
+                # Stop raced with delivery: release the slot and stop.
                 if stop_event.is_set():
-                    self._ring.release(slot)
+                    self._ring.release(ring_slot)
                     return _AcquireResult(_ACQUIRE_STOP)
                 sampleset = _SharedSampleSet(
-                    *self._ring.read(slot, n_rows, n_cols),
+                    *self._ring.read(ring_slot, n_rows, n_cols),
                 )
-                # Always surface the per-attempt QPU access time scalar (even
-                # 0) for telemetry. Feed the daily-budget gate only when > 0:
-                # the driver process can't reach the worker's time_manager, so
-                # the QPU access time rides the descriptor and is recorded here
-                # (preserving the gate that previously relied on
-                # _record_qpu_timing in the worker).
                 qpu_access_time_us = int(qpu_us)
                 if qpu_us > 0:
                     self.timing_stats['qpu_access_time'].append(int(qpu_us))
@@ -1235,18 +1327,14 @@ class BaseMiner(ABC):
             ring_slot=ring_slot,
         )
 
-    def _teardown_dispatch(
-        self,
-        driver_stop: Optional[Any],
-        driver_proc: Optional[Any],
-    ) -> None:
-        """Tear down per-dispatch state in ``mine_work_item``'s ``finally``.
+    def _teardown_dispatch(self) -> None:
+        """Tear down PER-DISPATCH state in ``mine_work_item``'s ``finally``.
 
-        Driver path: signal + reap the stream-driver process, then close and
-        unlink the shared ring (after a GC pass so no lingering
-        :class:`_SharedSampleSet` view keeps the segment exported). Inline
-        path: stop and clear the worker feeder. Always flushes the attempt
-        logger and delegates to subclass ``_post_mine_cleanup``.
+        On the persistent driver path this does NOT kill the driver or close
+        the ring — both persist across dispatches (that is the whole point of
+        the redesign; ``_close_driver`` reaps them on miner shutdown). On the
+        inline path it stops and clears the worker feeder. Always flushes the
+        attempt logger and delegates to subclass ``_post_mine_cleanup``.
         """
         self.mining = False
         if self._dropped_results:
@@ -1254,47 +1342,13 @@ class BaseMiner(ABC):
                 "mine_work_item: %d QPU results dropped under "
                 "result-queue backpressure", self._dropped_results,
             )
-        # Driver path: signal the stop event so the stream observes
-        # cancellation and returns from its in-flight next(), reap the
-        # process, then close+unlink the ring. The driver only attached to
-        # the ring (non-owner), so this worker's close_unlink is what frees
-        # the segments.
-        if driver_stop is not None:
-            driver_stop.set()
-        if driver_proc is not None:
-            terminate_join(driver_proc, 5.0)
-        if getattr(self, "_ring", None) is not None:
-            import gc
-            gc.collect()  # drop any lingering _SharedSampleSet views
-            try:
-                self._ring.close_unlink()
-            except BufferError:
-                gc.collect()
-                try:
-                    self._ring.close_unlink()
-                except BufferError:
-                    # A _SharedSampleSet view genuinely survived GC. Don't let
-                    # the BufferError escape the finally (it would mask the
-                    # real return/exception); close handles in this process
-                    # and log the segment leak so it's diagnosable.
-                    self.logger.error(
-                        "shared ring close_unlink still blocked after GC; "
-                        "a sample view leaked. Closing handles without unlink "
-                        "(shared-memory segments %s may persist).",
-                        getattr(self._ring, "names", "?"),
-                    )
-                    self._ring.close()  # best-effort; never raises
-            self._ring = None
-        self._driver_stop = None
-        # Tear down the worker feeder (inline path only) before delegating
-        # to subclass cleanup. QPU has no worker feeder (the driver owns
-        # it), so guard for None.
+        # Inline path only: tear down the worker feeder. The driver path has
+        # no worker feeder (the persistent driver owns it).
         if self._feeder is not None:
             try:
                 self._feeder.stop()
             finally:
                 self._feeder = None
-        # Persist any buffered aggregate metadata for this dispatch.
         attempt_logger = getattr(self, "_attempt_logger", None)
         if attempt_logger is not None:
             attempt_logger.flush()
@@ -1345,6 +1399,24 @@ class BaseMiner(ABC):
                 return candidate
         return None
 
+    def _forward_threshold_to_driver(
+        self, generation: int, live_threshold_milli: int,
+    ) -> None:
+        """Send a same-generation threshold update to the driver, on change.
+
+        No-op on the inline path (no ctl_q) or when the value is unchanged.
+        Best-effort: a queue hiccup must never break mining.
+        """
+        if self._ctl_q is None:
+            return
+        if live_threshold_milli == self._last_forwarded_threshold_milli:
+            return
+        try:
+            self._ctl_q.put(("threshold", generation, live_threshold_milli))
+            self._last_forwarded_threshold_milli = live_threshold_milli
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            self.logger.debug("threshold forward failed (ignored): %s", exc)
+
     def _run_substrate_ratchet(
         self,
         state: _MiningLoopState,
@@ -1376,6 +1448,12 @@ class BaseMiner(ABC):
             live_threshold_milli = int(
                 state.requirements.difficulty_energy * 1000,
             )
+
+        # Forward live-threshold decay to the persistent driver as a
+        # same-generation threshold update so its reconstruction gate tracks
+        # the decayed threshold (rule 2 of the decay contract). No reseed, no
+        # cancel, no generation bump — only what the driver reconstructs.
+        self._forward_threshold_to_driver(state.generation, live_threshold_milli)
 
         # Post-processing gate: stash the K best candidates we've mined, not
         # the best the chain wants. Until the stash is full, every iter
@@ -1854,6 +1932,18 @@ def _work_tag(context: WorkContext) -> str:
     if isinstance(context, MempoolJobContext):
         return f"order={context.order_id}"
     return f"last_proof_block_hash=0x{context.last_proof_block_hash.hex()[:16]}"
+
+
+def _energy_to_milli(energy: float) -> int:
+    """Convert a difficulty energy (float) to integer milli-units.
+
+    Non-finite thresholds (mempool jobs with no energy floor never reach the
+    driver path, but guard anyway) clamp to a large sentinel so the driver's
+    gate never reconstructs spuriously.
+    """
+    if not math.isfinite(energy):
+        return 1 << 62
+    return int(energy * 1000)
 
 
 
