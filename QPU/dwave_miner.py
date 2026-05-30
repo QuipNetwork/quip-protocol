@@ -7,7 +7,7 @@ import multiprocessing.synchronize
 import signal
 import sys
 import time
-from typing import Dict, Iterator, List, Optional, Tuple, cast, Mapping, Any
+from typing import Dict, Iterator, List, Optional, Tuple, Any
 
 import dimod
 
@@ -65,6 +65,89 @@ def _shift_energies(sampleset: dimod.SampleSet, offset: float) -> dimod.SampleSe
     return dimod.SampleSet(
         new_record, sampleset.variables, sampleset.info, sampleset.vartype,
     )
+
+
+def build_production_stream(
+    *,
+    miner_id: str,
+    num_reads: int,
+    annealing_time: float,
+    queue_depth: int,
+    energy_threshold: float,
+    nodes: List[int],
+    edges: List[Tuple[int, int]],
+    last_proof_block_hash: bytes,
+    miner_bytes: bytes,
+    feeder_buffer_size: int,
+    solver_name: Optional[str] = None,
+    region: Optional[str] = None,
+    token: Optional[str] = None,
+    stop_event: Optional[multiprocessing.synchronize.Event] = None,
+) -> Tuple[Iterator[Tuple[IsingModel, dimod.SampleSet]], Any]:
+    """Build the production QPU stream inside the stream-driver process.
+
+    Constructs a :class:`DWaveMiner` (its own D-Wave client), a
+    :class:`RandomIsingFeeder`, and returns ``(stream, cleanup)`` where
+    ``stream`` is the iterator from
+    :meth:`DWaveMiner.sample_ising_streaming` and ``cleanup()`` stops the
+    feeder and closes the sampler. Runs ONLY in the stream-driver process;
+    it is never instantiated in tests because it connects to D-Wave.
+
+    Args:
+        miner_id: Unique identifier for this miner.
+        num_reads: QPU reads per submission.
+        annealing_time: Annealing time in microseconds.
+        queue_depth: Number of concurrent in-flight QPU jobs.
+        energy_threshold: Current difficulty energy gate.
+        nodes: Topology node list (must match the configured solver).
+        edges: Topology edge list.
+        last_proof_block_hash: 32-byte ``block_hash(LastProofBlock)`` seed.
+        miner_bytes: Canonical 32-byte miner identity.
+        feeder_buffer_size: Target ready + in-flight feeder depth.
+        solver_name: Optional D-Wave solver name.
+        region: Optional D-Wave region.
+        token: Optional D-Wave API token (passed through verbatim).
+        stop_event: Optional event the streaming loop polls for cancellation.
+
+    Returns:
+        Tuple of ``(stream, cleanup)``.
+    """
+    miner = DWaveMiner(
+        miner_id=miner_id,
+        queue_depth=queue_depth,
+        solver_name=solver_name,
+        region=region,
+        token=token,
+    )
+    feeder = RandomIsingFeeder(
+        last_proof_block_hash=last_proof_block_hash,
+        miner_bytes=miner_bytes,
+        nodes=nodes,
+        edges=edges,
+        buffer_size=feeder_buffer_size,
+    )
+    if stop_event is not None:
+        miner._stop_event = stop_event
+    stream = miner.sample_ising_streaming(
+        feeder,
+        num_reads=num_reads,
+        annealing_time=annealing_time,
+        queue_depth=queue_depth,
+        energy_threshold=energy_threshold,
+    )
+
+    def cleanup() -> None:
+        try:
+            feeder.stop()
+        except Exception as exc:  # noqa: BLE001 — log; a leak must be visible
+            init_logger.warning("stream cleanup: feeder.stop failed: %s", exc)
+        try:
+            if hasattr(miner, "sampler") and hasattr(miner.sampler, "close"):
+                miner.sampler.close()
+        except Exception as exc:  # noqa: BLE001 — log; connection may leak
+            init_logger.warning("stream cleanup: sampler.close failed: %s", exc)
+
+    return stream, cleanup
 
 
 # Default interval between repeated pacing log lines (seconds).
@@ -128,9 +211,13 @@ class DWaveMiner(BaseMiner):
     # Keep that headroom so the streaming sampler can saturate the
     # D-Wave cloud queue without blocking on Python-side derivation.
     FEEDER_BUFFER_SIZE = 60
-    # QPU is the async-streaming backend: drive the stream on a pump thread
-    # so per-result processing never blocks the cloud pipeline.
+    # QPU is the async-streaming backend: drive the stream in a separate
+    # process so per-result processing never blocks the cloud pipeline.
     STREAMING_PUMP = True
+    # The sampler + feeder live in the stream-driver process (see
+    # QPU/stream_driver.py + build_production_stream); BaseMiner skips the
+    # worker-side feeder and spawns that process instead of a pump thread.
+    DRIVER_OWNS_FEEDER = True
 
     def __init__(
         self,
@@ -145,6 +232,7 @@ class DWaveMiner(BaseMiner):
         drain_on_stop: bool = False,
         num_reads: Optional[int] = None,
         annealing_time_us: Optional[float] = None,
+        connect: bool = True,
         **cfg
     ):
         """Initialize D-Wave QPU miner.
@@ -175,25 +263,38 @@ class DWaveMiner(BaseMiner):
             annealing_time_us: Optional override for anneal duration in
                 microseconds. ``None`` uses the hardcoded default. Set
                 via TOML ``[dwave].annealing_time_us``.
+            connect: When True (default) build a live ``DWaveSamplerWrapper``
+                and own the D-Wave connection. When False, construct without
+                a sampler (``self.sampler = None``) for the worker/orchestrator
+                instance: the single D-Wave connection lives in the
+                stream-driver process. All non-sampler machinery (budget gate,
+                param overrides, time manager, pacing) still initializes so the
+                connection-less miner can run the dispatch loop.
         """
         init_logger.info(
             f"[QPU] Initializing DWaveMiner with topology: {topology.solver_name}"
         )
-        try:
-            sampler = DWaveSamplerWrapper(
-                topology=topology,
-                embedding_file=embedding_file,
-                solver_name=solver_name,
-                region=region,
-                token=token,
-            )
+        if connect:
+            try:
+                sampler = DWaveSamplerWrapper(
+                    topology=topology,
+                    embedding_file=embedding_file,
+                    solver_name=solver_name,
+                    region=region,
+                    token=token,
+                )
+                init_logger.info(
+                    f"[QPU] Sampler ready: {len(sampler.nodes)} nodes, "
+                    f"{len(sampler.edges)} edges"
+                )
+            except Exception as e:
+                init_logger.error(f"[QPU] Failed to initialize sampler: {e}")
+                raise
+        else:
+            sampler = None
             init_logger.info(
-                f"[QPU] Sampler ready: {len(sampler.nodes)} nodes, "
-                f"{len(sampler.edges)} edges"
+                "[QPU] constructed without sampler (orchestrator mode)"
             )
-        except Exception as e:
-            init_logger.error(f"[QPU] Failed to initialize sampler: {e}")
-            raise
         super().__init__(miner_id, sampler, miner_type="QPU")
         self.miner_type = "QPU"
         self.topology = topology
@@ -213,6 +314,13 @@ class DWaveMiner(BaseMiner):
 
         self.queue_depth = queue_depth
         self.drain_on_stop = drain_on_stop
+        # Connection config for the stream-driver process. The worker-side
+        # miner is built with connect=False (no sampler); BaseMiner's
+        # _start_result_pump forwards these to build_production_stream so the
+        # driver process can construct its own connected DWaveMiner.
+        self.solver_name = solver_name
+        self.region = region
+        self.token = token
         # Operator-tunable overrides for the per-submission cost knobs.
         # Validated lightly here; the D-Wave SDK rejects out-of-range
         # values per-solver with a clear error at first submission.
@@ -263,7 +371,9 @@ class DWaveMiner(BaseMiner):
             if self._feeder is not None:
                 self._feeder.stop()
                 self._feeder = None
-            if hasattr(self, 'sampler') and hasattr(self.sampler, 'close'):
+            if getattr(self, 'sampler', None) is not None and hasattr(
+                self.sampler, 'close'
+            ):
                 self.sampler.close()
             if hasattr(self, 'top_attempts'):
                 self.top_attempts.clear()
@@ -423,17 +533,11 @@ class DWaveMiner(BaseMiner):
             submit_one()
 
         stop_event = self._stop_event
-        # getattr default guards tests that bypass BaseMiner.__init__ via
-        # object.__new__; production always has self._pump_stop set (to None
-        # until mine_work_item starts a pump).
-        pump_stop = getattr(self, "_pump_stop", None)
 
         def _stop_requested() -> bool:
-            # stop_event/pump_stop captured once at stream start; stable for
-            # this stream's lifetime (a new dispatch builds a fresh stream).
-            if stop_event is not None and stop_event.is_set():
-                return True
-            return pump_stop is not None and pump_stop.is_set()
+            # stop_event captured once at stream start; stable for this
+            # stream's lifetime (a new dispatch builds a fresh stream).
+            return stop_event is not None and stop_event.is_set()
 
         def _cancel_pending():
             """Abandon in-flight D-Wave futures on stop.
@@ -529,133 +633,16 @@ class DWaveMiner(BaseMiner):
 
             yield model, sampleset
 
-    def _sample_batch(
-        self,
-        prev_hash: bytes,
-        miner_id: str,
-        cur_index: int,
-        nodes: List[int],
-        edges: List[Tuple[int, int]],
-        *,
-        num_reads: int,
-        num_sweeps: int,
-        **kwargs,
-    ) -> Optional[List[Tuple[int, bytes, dimod.SampleSet]]]:
-        """Stream one result from the QPU pipeline.
+    def _sample(self, h, J, *, num_reads, num_sweeps, **kwargs):
+        """Unused on the QPU path — sampling runs in the stream-driver process.
 
-        Lazily creates the streaming iterator on first call. Returns one
-        (nonce, salt, sampleset) per call — matching the GPU miner pattern.
+        QPU mining is STREAMING_PUMP=True and is sourced exclusively from the
+        stream-driver descriptor queue; the legacy synchronous fallback was
+        removed. Kept only to satisfy the BaseMiner ABC.
         """
-        annealing_time = kwargs.pop('annealing_time', 80.0)
-        energy_threshold = kwargs.pop('energy_threshold', 0.0)
-
-        if self._stream is None:
-            if self._feeder is None:
-                return None  # _pre_mine_setup not called
-            self._stream = self.sample_ising_streaming(
-                feeder=self._feeder,
-                num_reads=num_reads,
-                annealing_time=annealing_time,
-                queue_depth=self.queue_depth,
-                energy_threshold=energy_threshold,
-            )
-            self.logger.info(
-                f"[QPU] Streaming started: queue_depth={self.queue_depth}, "
-                f"num_reads={num_reads}, annealing_time={annealing_time}μs"
-            )
-
-        try:
-            model, sampleset = next(self._stream)
-        except StopIteration:
-            return None
-
-        self._record_qpu_timing(sampleset)
-        return [(model.nonce, model.salt, sampleset)]
-
-    def _record_qpu_timing(self, sampleset: dimod.SampleSet):
-        """Extract and record QPU timing from a sampleset."""
-        if not hasattr(sampleset, 'info') or 'timing' not in sampleset.info:
-            return
-        timing = sampleset.info['timing']
-        if 'qpu_anneal_time_per_sample' in timing:
-            self.timing_stats['quantum_annealing_time'].append(
-                timing['qpu_anneal_time_per_sample']
-            )
-        qpu_programming = timing.get('qpu_programming_time', 0)
-        qpu_sampling = timing.get('qpu_sampling_time', 0)
-        qpu_total_access = qpu_programming + qpu_sampling
-        if qpu_total_access > 0:
-            self.timing_stats['qpu_access_time'].append(qpu_total_access)
-            if self.time_manager is not None:
-                self.time_manager.record_block_time(qpu_total_access)
-
-    #: Hard wall-time cap on the synchronous fallback _sample path.
-    #: Without this, the mining child can block indefinitely inside
-    #: the D-Wave SDK (the underlying sample call has no timeout)
-    #: and stop_event is never observed — which looks to the
-    #: orchestrator like mining silently stopped.
-    SYNC_SAMPLE_TIMEOUT = 60.0
-
-    def _sample(
-        self,
-        h: Dict[int, float],
-        J: Dict[Tuple[int, int], float],
-        *,
-        num_reads: int,
-        num_sweeps: int,
-        annealing_time: float = 80.0,
-        **kwargs,
-    ) -> dimod.SampleSet:
-        """Fallback synchronous QPU sampling with cancel + timeout.
-
-        Uses sample_ising_async + polling so this path is cancellable
-        via stop_event and bounded by SYNC_SAMPLE_TIMEOUT. Used when
-        the streaming _sample_batch path is unavailable (e.g. after
-        a feeder exception tore down the stream generator).
-        """
-        h_cast = cast(Mapping[Any, float], h)
-        J_cast = cast(Mapping[Tuple[Any, Any], float], J)
-
-        topology_label = self.sampler.job_label
-        nonce_seed = kwargs.pop('nonce_seed', None)
-
-        t0 = time.monotonic()
-        future, defect_info = self.sampler.sample_ising_async(
-            h_cast, J_cast,
-            num_reads=num_reads,
-            answer_mode='raw',
-            annealing_time=annealing_time,
-            label=f"{topology_label}_sync",
-            nonce_seed=nonce_seed,
+        raise NotImplementedError(
+            "DWaveMiner does not sample synchronously; use the stream driver"
         )
-
-        deadline = t0 + self.SYNC_SAMPLE_TIMEOUT
-        stop_event = self._stop_event
-        while not future.done():
-            if stop_event is not None and stop_event.is_set():
-                _best_effort_cancel(future)
-                raise RuntimeError("mining cancelled during _sample")
-            if time.monotonic() >= deadline:
-                _best_effort_cancel(future)
-                raise TimeoutError(
-                    f"QPU _sample exceeded {self.SYNC_SAMPLE_TIMEOUT:.1f}s "
-                    f"(label={topology_label}_sync)"
-                )
-            time.sleep(0.05)
-
-        elapsed = time.monotonic() - t0
-        raw_ss = future.sampleset
-        if defect_info is not None:
-            sampleset = self.sampler.reconstruct_full_sampleset(
-                raw_ss, defect_info,
-            )
-        else:
-            sampleset = raw_ss
-        self._record_qpu_timing(sampleset)
-        self.logger.info(
-            f"[QPU] _sample (sync fallback) completed in {elapsed:.2f}s"
-        )
-        return sampleset
 
     def _post_mine_cleanup(self) -> None:
         """Stop the streaming pipeline and feeder."""

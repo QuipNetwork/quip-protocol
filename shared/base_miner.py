@@ -12,7 +12,6 @@ import multiprocessing
 import multiprocessing.synchronize
 import queue
 import sys
-import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -39,6 +38,8 @@ from shared.work_context import (
     WorkContext,
     requirements_from_context,
 )
+from shared.shared_sample_ring import SharedSampleRing
+from shared.proc_util import spawn_worker, terminate_join
 
 # Global logger for this module
 log = logging.getLogger(__name__)
@@ -53,25 +54,31 @@ PROGRESS_LOG_INTERVAL = 10
 _MILLI_INF = 1 << 62
 
 
-@dataclass(frozen=True)
-class _PumpedResult:
-    """One QPU result handed from the pump thread to the consumer loop.
+class _SharedRecord:
+    """record-like facade exposing ``.sample`` / ``.energy`` ndarrays."""
 
-    Carries the QPU access time extracted on the pump thread so the
-    consumer doesn't have to race the shared ``timing_stats`` list.
+    __slots__ = ("sample", "energy")
+
+    def __init__(self, sample, energy):
+        self.sample = sample
+        self.energy = energy
+
+
+class _SharedSampleSet:
+    """Minimal sampleset facade over zero-copy shared-ring views.
+
+    ``evaluate_sampleset`` / ``compute_solution_meta`` only read
+    ``record.sample`` and ``record.energy``; QPU timing is carried
+    out-of-band in the descriptor, so ``.info`` is an empty dict on this
+    path.
     """
 
-    nonce: int | bytes
-    salt: bytes
-    sampleset: Any
-    qpu_access_time_us: Optional[int]
+    __slots__ = ("record", "info")
 
+    def __init__(self, sample, energy):
+        self.record = _SharedRecord(sample, energy)
+        self.info: Dict[str, Any] = {}
 
-# Sentinel pushed by the pump when the stream is exhausted so the
-# consumer's blocking get() unblocks and the loop can exit. Module-level
-# (not a class attribute) so subclasses can't accidentally shadow it and
-# break the consumer's ``is`` identity check.
-_PUMP_DONE = object()
 
 # Maximum number of work-tags remembered by _SetupAbortThrottle.
 _SETUP_ABORT_TAG_LIMIT = 32
@@ -81,16 +88,21 @@ _SETUP_ABORT_TAG_LIMIT = 32
 # / ``break`` / ``continue`` semantics without a helper hijacking control flow.
 _ACQUIRE_OK = "ok"  # payload present; process this iteration
 _ACQUIRE_STOP = "stop"  # stop_event fired -> caller returns None
-_ACQUIRE_DONE = "done"  # stream exhausted (_PUMP_DONE) -> caller breaks
+_ACQUIRE_DONE = "done"  # stream exhausted (trailing None) -> caller breaks
 _ACQUIRE_CONTINUE = "continue"  # recoverable sampling error -> caller continues
 
 
-@dataclass(frozen=True)
+@dataclass
 class _AcquireResult:
     """Outcome of one ``_acquire_result`` call.
 
     ``action`` is one of the ``_ACQUIRE_*`` constants. The payload fields are
     only meaningful when ``action`` is :data:`_ACQUIRE_OK`.
+
+    Intentionally NOT frozen: ``mine_work_item`` clears ``sampleset`` (the
+    zero-copy ``_SharedSampleSet`` view over a ring slot) on every path that
+    reaches its ``finally`` so no live view survives into the ring's
+    ``close_unlink`` — a lingering export raises ``BufferError`` there.
     """
 
     action: str
@@ -98,6 +110,10 @@ class _AcquireResult:
     salt: bytes = b""
     sampleset: Any = None
     qpu_access_time_us: Optional[int] = None
+    # Ring slot backing ``sampleset`` on the driver path; the consumer
+    # releases it after ``_finalize_iteration_logging`` reads the set.
+    # ``None`` on the inline path (no shared ring).
+    ring_slot: Optional[int] = None
 
 
 @dataclass
@@ -115,9 +131,13 @@ class _DispatchSetup:
     sample_ctx: Dict[str, Any]
     num_reads: int
     num_sweeps: int
-    result_queue: Optional["queue.Queue"]
-    pump_thread: Optional[threading.Thread]
-    pump_stop: Optional[threading.Event]
+    # Driver path (STREAMING_PUMP + DRIVER_OWNS_FEEDER): the shared-sample
+    # ring, the descriptor queue, the stream-driver process and its stop
+    # event. All ``None`` on the inline (CPU/GPU/Metal) path.
+    ring: Optional[Any]
+    desc_q: Optional[Any]
+    driver_proc: Optional[Any]
+    driver_stop: Optional[Any]
 
 
 @dataclass
@@ -276,10 +296,17 @@ class BaseMiner(ABC):
         # Reset per dispatch by mine_work_item; logged at dispatch end.
         self._dropped_results: int = 0
 
-        # Streaming-pump shutdown signal. Set while a pump thread is
-        # running so the QPU stream can observe shutdown (Task 3 reads
-        # this); None when no pump is active.
-        self._pump_stop: Optional[threading.Event] = None
+        # Driver-path handles (DRIVER_OWNS_FEEDER). ``_start_result_pump``
+        # populates these when it spawns the stream-driver process; the loop
+        # releases slots on ``self._ring`` and ``_teardown_dispatch`` closes
+        # it. ``None`` on the inline (CPU/GPU/Metal) path.
+        self._ring: Optional[Any] = None
+        self._driver_stop: Optional[Any] = None
+
+        # In-flight QPU job count forwarded to the stream-driver factory.
+        # QPU subclasses override; default 0 keeps ``_start_result_pump``'s
+        # ``self.queue_depth`` reference safe for any STREAMING_PUMP subclass.
+        self.queue_depth: int = 0
 
         # Throttle for the "_pre_mine_setup returned False" warning so
         # pacing during a budget exhaustion window doesn't produce one
@@ -389,6 +416,16 @@ class BaseMiner(ABC):
     # processing never blocks the QPU pipeline. CPU/GPU/Metal keep the
     # inline single-shot / batch path (STREAMING_PUMP stays False).
     STREAMING_PUMP: bool = False
+    # When True (QPU), the sampler + feeder live in a separate stream-driver
+    # PROCESS (see QPU/stream_driver.py); ``_setup_dispatch`` skips building a
+    # worker-side feeder and ``_start_result_pump`` spawns the driver instead
+    # of a pump thread. CPU/GPU keep this False and run the in-worker feeder.
+    DRIVER_OWNS_FEEDER: bool = False
+    # Dotted ``module:attr`` of the stream factory the driver process
+    # resolves and calls. Overridden by QPU to point at
+    # ``QPU.dwave_miner:build_production_stream``; tests swap it for a fake
+    # so the driver path can be exercised without a QPU connection.
+    STREAM_FACTORY_DOTTED: str = "QPU.dwave_miner:build_production_stream"
     # Bounded result queue depth. Sized to the in-flight QPU job count so
     # the consumer has headroom equal to what the cloud holds; on full the
     # pump drops the newest result (rare safety valve) and counts it.
@@ -596,9 +633,7 @@ class BaseMiner(ABC):
         loop_state = setup.loop_state
         is_substrate = setup.is_substrate
         sample_ctx = setup.sample_ctx
-        result_queue = setup.result_queue
-        pump_thread = setup.pump_thread
-        pump_stop = setup.pump_stop
+        desc_q = setup.desc_q
 
         progress = 0
         try:
@@ -618,8 +653,8 @@ class BaseMiner(ABC):
                 # QPU access time. The returned signal directs the loop's
                 # stop / stream-exhausted / sampling-error control flow.
                 acquired = self._acquire_result(
-                    stop_event, result_queue, preprocess_start,
-                    sample_ctx=sample_ctx,
+                    stop_event, desc_q, preprocess_start,
+                    sample_ctx=sample_ctx, driver_proc=setup.driver_proc,
                 )
                 if acquired.action == _ACQUIRE_STOP:
                     return None
@@ -634,6 +669,13 @@ class BaseMiner(ABC):
 
                 sampleset = self._post_sample(sampleset)
                 if stop_event.is_set():
+                    # Drop the shared-ring view before teardown: release the
+                    # slot and clear both the local and the _AcquireResult
+                    # references so close_unlink doesn't trip BufferError.
+                    if acquired.ring_slot is not None and self._ring is not None:
+                        self._ring.release(acquired.ring_slot)
+                    sampleset = None
+                    acquired.sampleset = None
                     return None
 
                 postprocess_start = time.time()
@@ -669,6 +711,20 @@ class BaseMiner(ABC):
                     qpu_access_time_us=qpu_access_time_us,
                     attempt_log_kwargs=attempt_log_kwargs,
                 )
+
+                # Driver path: the consumer is done with the shared-ring
+                # views (compute_solution_meta / evaluate copied the top-5
+                # out as Python lists), so return the slot to the free-list
+                # and drop the local view before teardown — otherwise a
+                # lingering export would trip BufferError on close_unlink.
+                if acquired.ring_slot is not None and self._ring is not None:
+                    self._ring.release(acquired.ring_slot)
+                sampleset = None
+                # Clear the view held by ``acquired`` too: on the win / stop-
+                # after-result early returns below, ``acquired`` survives into
+                # the ``finally``; a live _SharedSampleSet view would make the
+                # ring's close_unlink raise BufferError.
+                acquired.sampleset = None
 
                 if result:
                     # Post-evaluation cancel check. evaluate_sampleset can
@@ -714,7 +770,7 @@ class BaseMiner(ABC):
             self.logger.info("mine_work_item: stopped, no valid result")
             return None
         finally:
-            self._teardown_dispatch(pump_stop, pump_thread)
+            self._teardown_dispatch(setup.driver_stop, setup.driver_proc)
 
     @staticmethod
     def _init_attempt_log_kwargs(
@@ -896,14 +952,38 @@ class BaseMiner(ABC):
         # ``_sample_batch`` and keep ``queue_depth`` jobs in flight — that
         # is what gives the QPU its throughput. Backends without batch
         # streaming pop the feeder one model at a time (see the loop).
-        self._feeder = context.make_feeder(
-            nodes, edges, buffer_size=self.FEEDER_BUFFER_SIZE,
-        )
+        if self.DRIVER_OWNS_FEEDER:
+            if not is_substrate:
+                # The stream driver only builds a RandomIsingFeeder (PoW). A
+                # mempool job needs the order's fixed (h, J); mining random
+                # models against the order's evaluator would be silently
+                # wrong. Abort this dispatch loudly — mempool work must be
+                # routed to a CPU/GPU miner, not the QPU driver path.
+                self.logger.error(
+                    "QPU driver path cannot mine mempool job %s: only "
+                    "PoW/substrate contexts are supported (the stream driver "
+                    "has no fixed-model feeder). Skipping this dispatch.",
+                    _work_tag(context),
+                )
+                return None
+            # The stream-driver process builds its own RandomIsingFeeder
+            # (see build_production_stream); the worker keeps no feeder so
+            # the chain seed / miner identity are derived in exactly one
+            # place. Capture the construction inputs into sample_ctx below.
+            self._feeder = None
+        else:
+            self._feeder = context.make_feeder(
+                nodes, edges, buffer_size=self.FEEDER_BUFFER_SIZE,
+            )
 
         # Positional args for the legacy ``_sample_batch`` signature. The
         # QPU/GPU streaming impls ignore them — their feeder already
         # encapsulates the round seed and miner identity — but the base
-        # contract requires (prev_hash, miner_id, cur_index).
+        # contract requires (prev_hash, miner_id, cur_index). The driver
+        # path additionally forwards the feeder-construction inputs and the
+        # QPU dispatch knobs (annealing_time / energy_threshold come from
+        # _adapt_mining_params' extra params) so _start_result_pump can hand
+        # them to the stream-driver process.
         sample_ctx = {
             "prev_hash": bridge_prev_block.hash,
             "miner_id": bridge_node_info.miner_id,
@@ -913,9 +993,16 @@ class BaseMiner(ABC):
             "num_reads": num_reads,
             "num_sweeps": current_num_sweeps,
             "extra": extra_params,
+            "annealing_time": extra_params.get("annealing_time"),
+            "energy_threshold": extra_params.get("energy_threshold"),
+            "last_proof_block_hash": getattr(
+                context, "last_proof_block_hash", None,
+            ),
+            "miner_bytes": getattr(context, "miner_account_bytes", None),
+            "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
         }
 
-        result_queue, pump_thread, pump_stop = self._start_result_pump(
+        ring, desc_q, driver_proc, driver_stop = self._start_result_pump(
             sample_ctx,
         )
         return _DispatchSetup(
@@ -924,58 +1011,128 @@ class BaseMiner(ABC):
             sample_ctx=sample_ctx,
             num_reads=num_reads,
             num_sweeps=current_num_sweeps,
-            result_queue=result_queue,
-            pump_thread=pump_thread,
-            pump_stop=pump_stop,
+            ring=ring,
+            desc_q=desc_q,
+            driver_proc=driver_proc,
+            driver_stop=driver_stop,
         )
 
     def _start_result_pump(
         self,
         sample_ctx: Dict[str, Any],
-    ) -> Tuple[
-        Optional["queue.Queue"],
-        Optional[threading.Thread],
-        Optional[threading.Event],
-    ]:
-        """Start the out-of-band result pump for streaming backends.
+    ) -> Tuple[Optional[Any], Optional[Any], Optional[Any], Optional[Any]]:
+        """Start the stream-driver process for the streaming (QPU) backend.
+
+        Creates a :class:`~shared.shared_sample_ring.SharedSampleRing` (owned
+        by this worker), a spawn-context descriptor queue, and a stop event,
+        then launches :func:`QPU.stream_driver.stream_driver_main` in a child
+        process. The driver builds its own sampler + feeder via
+        ``QPU.dwave_miner:build_production_stream`` and writes each result
+        into the ring; this worker reads the slot and releases it.
 
         CPU/GPU/Metal (``STREAMING_PUMP=False``) keep the inline acquisition
-        path and get ``(None, None, None)``. Behaviour matches the original
-        inline pump-setup block.
+        path and get ``(None, None, None, None)``.
+
+        Returns:
+            ``(ring, desc_q, driver_proc, driver_stop)`` on the streaming
+            path; all ``None`` otherwise.
         """
         self._dropped_results = 0
         if not self.STREAMING_PUMP:
-            return None, None, None
-        result_queue: "queue.Queue" = queue.Queue(
-            maxsize=self.RESULT_QUEUE_MAXSIZE,
+            return None, None, None, None
+        import multiprocessing as _mp
+        from QPU.stream_driver import stream_driver_main
+        ctx = _mp.get_context("spawn")
+        nodes = sample_ctx["nodes"]
+        max_cols = len(nodes)
+        max_rows = int(sample_ctx["num_reads"])
+        ring = SharedSampleRing(slots=self.RESULT_QUEUE_MAXSIZE,
+                                max_rows=max_rows, max_cols=max_cols)
+        desc_q = ctx.Queue(maxsize=self.RESULT_QUEUE_MAXSIZE)
+        driver_stop = ctx.Event()
+        self._ring = ring
+        self._driver_stop = driver_stop
+        factory_kwargs = {
+            "miner_id": self.miner_id,
+            "num_reads": sample_ctx["num_reads"],
+            "annealing_time": sample_ctx["annealing_time"],
+            "queue_depth": self.queue_depth,
+            "energy_threshold": sample_ctx["energy_threshold"],
+            "nodes": nodes,
+            "edges": sample_ctx["edges"],
+            "last_proof_block_hash": sample_ctx["last_proof_block_hash"],
+            "miner_bytes": sample_ctx["miner_bytes"],
+            "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
+            "solver_name": getattr(self, "solver_name", None),
+            "region": getattr(self, "region", None),
+            "token": getattr(self, "token", None),
+        }
+        driver_proc = spawn_worker(
+            stream_driver_main,
+            (ring.attach_args(), desc_q, driver_stop,
+             self.STREAM_FACTORY_DOTTED, factory_kwargs),
+            name=f"qpu-stream-driver-{self.miner_id}",
+            # Non-daemon: the driver builds a RandomIsingFeeder whose
+            # ProcessPoolExecutor forks its own children, and a daemon
+            # process is forbidden from having children. ``_teardown_dispatch``
+            # reaps this process explicitly via ``terminate_join``, so it
+            # never blocks interpreter shutdown despite being non-daemon.
+            daemon=False,
         )
-        pump_stop = threading.Event()
-        # The QPU stream observes this so its in-flight next() unblocks
-        # on shutdown before we join the pump and close the generator.
-        self._pump_stop = pump_stop
-        pump_thread = threading.Thread(
-            target=self._result_pump,
-            args=(result_queue, pump_stop, sample_ctx),
-            name=f"qpu-pump-{self.miner_id}",
-            daemon=True,
-        )
-        pump_thread.start()
-        return result_queue, pump_thread, pump_stop
+        return ring, desc_q, driver_proc, driver_stop
+
+    def _await_descriptor(
+        self,
+        stop_event: multiprocessing.synchronize.Event,
+        desc_q: Any,
+        driver_proc: Optional[Any],
+    ) -> Any:
+        """Block on the descriptor queue until an item, stop, or driver death.
+
+        Returns the dequeued descriptor (which may be the ``None``
+        end-of-stream sentinel), or one of :data:`_ACQUIRE_STOP` /
+        :data:`_ACQUIRE_DONE` when the dispatch should end. The driver
+        normally signals end-of-stream by enqueuing ``None`` from its
+        ``finally``; but a hard crash (SIGKILL / OOM / C-extension abort)
+        skips that ``finally`` entirely. Without a liveness check the
+        consumer would drain an empty queue forever — the silent "miner
+        looks stuck" failure mode. Detecting a dead ``driver_proc`` (after a
+        final non-blocking drain in case the sentinel raced the exit) ends
+        the dispatch instead.
+        """
+        while not stop_event.is_set():
+            try:
+                return desc_q.get(timeout=0.1)
+            except queue.Empty:
+                if driver_proc is not None and not driver_proc.is_alive():
+                    try:
+                        return desc_q.get_nowait()
+                    except queue.Empty:
+                        self.logger.error(
+                            "stream driver pid=%s exited (exitcode=%s) without "
+                            "end-of-stream sentinel; ending dispatch",
+                            driver_proc.pid, driver_proc.exitcode,
+                        )
+                        return _ACQUIRE_DONE
+        return _ACQUIRE_STOP
 
     def _acquire_result(
         self,
         stop_event: multiprocessing.synchronize.Event,
-        result_queue: Optional["queue.Queue"],
+        desc_q: Optional[Any],
         preprocess_start: float,
         *,
         sample_ctx: Dict[str, Any],
+        driver_proc: Optional[Any] = None,
     ) -> _AcquireResult:
         """Source one ``(nonce, salt, sampleset)`` for a loop iteration.
 
-        Pump mode (``result_queue`` set) blocks on the queue, waking to check
-        ``stop_event``; the inline path calls ``_sample_batch`` (falling back
-        to a single ``_sample`` on the popped feeder model). Appends the
-        sampling / preprocessing timings on success. Returns an
+        Driver mode (``desc_q`` set) blocks on the descriptor queue, waking to
+        check ``stop_event``; each descriptor names a ring slot whose
+        sample/energy matrices the consumer reads zero-copy into a
+        :class:`_SharedSampleSet`. The inline path calls ``_sample_batch``
+        (falling back to a single ``_sample`` on the popped feeder model).
+        Appends the sampling / preprocessing timings on success. Returns an
         :class:`_AcquireResult` whose ``action`` reproduces the original
         inline control flow exactly:
 
@@ -989,28 +1146,50 @@ class BaseMiner(ABC):
         :data:`_ACQUIRE_STOP` (the original ``return None``).
         """
         qpu_access_time_us: Optional[int] = None
+        ring_slot: Optional[int] = None
         try:
             sample_start = time.time()
             self.current_stage = 'sampling'
             self.current_stage_start = sample_start
-            if result_queue is not None:
-                # Pump mode: block on the queue, but wake to check
-                # stop_event. _PUMP_DONE means the stream ended.
-                item = None
-                while not stop_event.is_set():
-                    try:
-                        item = result_queue.get(timeout=0.1)
-                        break
-                    except queue.Empty:
-                        continue
-                if stop_event.is_set():
+            if desc_q is not None:
+                # Driver mode: block on the descriptor queue, waking to check
+                # stop_event and driver liveness. A trailing None — or a dead
+                # driver — means the stream ended.
+                item = self._await_descriptor(stop_event, desc_q, driver_proc)
+                if item == _ACQUIRE_STOP:
                     return _AcquireResult(_ACQUIRE_STOP)
-                if item is _PUMP_DONE:
+                if item is None or item == _ACQUIRE_DONE:
                     return _AcquireResult(_ACQUIRE_DONE)
-                nonce = item.nonce
-                salt = item.salt
-                sampleset = item.sampleset
-                qpu_access_time_us = item.qpu_access_time_us
+                if self._ring is None:
+                    # A descriptor without a ring is a programming error
+                    # (driver path must set _ring in _start_result_pump).
+                    self.logger.error(
+                        "driver descriptor received but shared ring is None; "
+                        "ending dispatch",
+                    )
+                    return _AcquireResult(_ACQUIRE_DONE)
+                slot, n_rows, n_cols, nonce, salt, qpu_us = item
+                ring_slot = slot
+                # Stop raced with delivery of a descriptor: release the slot
+                # so the driver's free-list isn't leaked, then stop.
+                if stop_event.is_set():
+                    self._ring.release(slot)
+                    return _AcquireResult(_ACQUIRE_STOP)
+                sampleset = _SharedSampleSet(
+                    *self._ring.read(slot, n_rows, n_cols),
+                )
+                # Always surface the per-attempt QPU access time scalar (even
+                # 0) for telemetry. Feed the daily-budget gate only when > 0:
+                # the driver process can't reach the worker's time_manager, so
+                # the QPU access time rides the descriptor and is recorded here
+                # (preserving the gate that previously relied on
+                # _record_qpu_timing in the worker).
+                qpu_access_time_us = int(qpu_us)
+                if qpu_us > 0:
+                    self.timing_stats['qpu_access_time'].append(int(qpu_us))
+                    time_manager = getattr(self, "time_manager", None)
+                    if time_manager is not None:
+                        time_manager.record_block_time(int(qpu_us))
             else:
                 # Inline path (CPU/GPU/Metal): unchanged.
                 qpu_access_len_before = len(
@@ -1053,19 +1232,21 @@ class BaseMiner(ABC):
             return _AcquireResult(_ACQUIRE_CONTINUE)
         return _AcquireResult(
             _ACQUIRE_OK, nonce, salt, sampleset, qpu_access_time_us,
+            ring_slot=ring_slot,
         )
 
     def _teardown_dispatch(
         self,
-        pump_stop: Optional[threading.Event],
-        pump_thread: Optional[threading.Thread],
+        driver_stop: Optional[Any],
+        driver_proc: Optional[Any],
     ) -> None:
         """Tear down per-dispatch state in ``mine_work_item``'s ``finally``.
 
-        Stops and joins the result pump (if any), clears the pump-stop
-        reference, stops and clears the feeder, flushes the attempt logger,
-        and delegates to subclass ``_post_mine_cleanup``. Behaviour matches
-        the original inline ``finally`` block exactly.
+        Driver path: signal + reap the stream-driver process, then close and
+        unlink the shared ring (after a GC pass so no lingering
+        :class:`_SharedSampleSet` view keeps the segment exported). Inline
+        path: stop and clear the worker feeder. Always flushes the attempt
+        logger and delegates to subclass ``_post_mine_cleanup``.
         """
         self.mining = False
         if self._dropped_results:
@@ -1073,23 +1254,41 @@ class BaseMiner(ABC):
                 "mine_work_item: %d QPU results dropped under "
                 "result-queue backpressure", self._dropped_results,
             )
-        # Stop the pump first: signal it, let the QPU stream observe the
-        # stop and return from its in-flight next(), then join. Only
-        # after the pump thread is dead is it safe for _post_mine_cleanup
-        # to close the generator (close() on a generator executing in
-        # another thread raises "already executing").
-        if pump_stop is not None:
-            pump_stop.set()
-        if pump_thread is not None:
-            pump_thread.join(timeout=5.0)
-            if pump_thread.is_alive():
-                self.logger.warning(
-                    "mine_work_item: result pump did not join in 5s — "
-                    "pump thread still alive (QPU stream pump-stop wiring "
-                    "closes this race)",
-                )
-        self._pump_stop = None
-        # Tear down the feeder before delegating to subclass cleanup.
+        # Driver path: signal the stop event so the stream observes
+        # cancellation and returns from its in-flight next(), reap the
+        # process, then close+unlink the ring. The driver only attached to
+        # the ring (non-owner), so this worker's close_unlink is what frees
+        # the segments.
+        if driver_stop is not None:
+            driver_stop.set()
+        if driver_proc is not None:
+            terminate_join(driver_proc, 5.0)
+        if getattr(self, "_ring", None) is not None:
+            import gc
+            gc.collect()  # drop any lingering _SharedSampleSet views
+            try:
+                self._ring.close_unlink()
+            except BufferError:
+                gc.collect()
+                try:
+                    self._ring.close_unlink()
+                except BufferError:
+                    # A _SharedSampleSet view genuinely survived GC. Don't let
+                    # the BufferError escape the finally (it would mask the
+                    # real return/exception); close handles in this process
+                    # and log the segment leak so it's diagnosable.
+                    self.logger.error(
+                        "shared ring close_unlink still blocked after GC; "
+                        "a sample view leaked. Closing handles without unlink "
+                        "(shared-memory segments %s may persist).",
+                        getattr(self._ring, "names", "?"),
+                    )
+                    self._ring.close()  # best-effort; never raises
+            self._ring = None
+        self._driver_stop = None
+        # Tear down the worker feeder (inline path only) before delegating
+        # to subclass cleanup. QPU has no worker feeder (the driver owns
+        # it), so guard for None.
         if self._feeder is not None:
             try:
                 self._feeder.stop()
@@ -1378,6 +1577,12 @@ class BaseMiner(ABC):
             attempt_log_kwargs["feeder_pop_wait_total_s"] = (
                 fstats["pop_wait_total_s"]
             )
+        else:
+            # Driver path (QPU): the feeder lives in the stream-driver
+            # process, so its stats aren't reachable here. Record None.
+            attempt_log_kwargs["feeder_ready"] = None
+            attempt_log_kwargs["feeder_drained_count"] = None
+            attempt_log_kwargs["feeder_pop_wait_total_s"] = None
         # Compute solution_meta scalars + capture top-5 solutions. Meta is
         # always embedded in the attempt log; top-5 spins go to disk only
         # when this iter is stored or submitted (see write below).
@@ -1474,65 +1679,6 @@ class BaseMiner(ABC):
             # improvement still gets a chance to emit.
             return previewed_floor_milli
         return best_floor_milli
-
-    # ------------------------------------------------------------------
-    # Out-of-band result pump
-    # ------------------------------------------------------------------
-
-    def _result_pump(
-        self,
-        result_queue: "queue.Queue",
-        pump_stop: threading.Event,
-        sample_kwargs: Dict[str, Any],
-    ) -> None:
-        """Drive the streaming sampler on a background thread.
-
-        Repeatedly calls ``_sample_batch`` (the only ``next()`` driver of
-        the QPU generator) and pushes ``_PumpedResult`` onto a bounded
-        queue. On a full queue the newest result is dropped and counted —
-        the QPU pump must never block. Pushes ``_PUMP_DONE`` on exit so the
-        consumer's blocking ``get`` always unblocks.
-        """
-        try:
-            while not pump_stop.is_set():
-                before = len(self.timing_stats["qpu_access_time"])
-                batch = self._sample_batch(
-                    sample_kwargs["prev_hash"],
-                    sample_kwargs["miner_id"],
-                    sample_kwargs["cur_index"],
-                    sample_kwargs["nodes"],
-                    sample_kwargs["edges"],
-                    num_reads=sample_kwargs["num_reads"],
-                    num_sweeps=sample_kwargs["num_sweeps"],
-                    **sample_kwargs["extra"],
-                )
-                if batch is None:
-                    break  # stream exhausted
-                nonce, salt, sampleset = batch[0]
-                qpu_list = self.timing_stats["qpu_access_time"]
-                qpu_us = (
-                    int(qpu_list[-1]) if len(qpu_list) > before else None
-                )
-                item = _PumpedResult(nonce, salt, sampleset, qpu_us)
-                try:
-                    result_queue.put_nowait(item)
-                except queue.Full:
-                    self._dropped_results += 1
-        except Exception as exc:  # pump must not crash silently
-            self.logger.error("result pump error: %s", exc)
-        finally:
-            try:
-                result_queue.put_nowait(_PUMP_DONE)
-            except queue.Full:
-                # Consumer already gone; drain one slot and signal. The
-                # evicted slot held a real _PumpedResult, so count it as
-                # dropped before reusing the freed space for the sentinel.
-                try:
-                    result_queue.get_nowait()
-                    self._dropped_results += 1
-                    result_queue.put_nowait(_PUMP_DONE)
-                except queue.Empty:
-                    pass
 
     # ------------------------------------------------------------------
     # Hook methods (override in subclasses as needed)

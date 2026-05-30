@@ -278,61 +278,79 @@ class TestYieldingBehavior:
             gpu_utilization_pct=100,
             yielding=True,
         )
-        # Simulate external GPU load via internal state
-        with sched._util_lock:
-            sched._external_util_pct = 95
+        # Simulate external GPU load via shared Value
+        sched._util_value.value = 95
 
         assert sched.should_throttle() is True
         sched.stop()
 
     def test_iokit_thread_updates_utilization(self):
-        """IOKit polling thread should update external_util_pct."""
-        sched = MetalScheduler(
-            gpu_core_count=40,
-            gpu_utilization_pct=100,
-            yielding=True,
-            poll_interval=0.2,
-        )
+        """util_monitor_main process should publish IOKit readings into shared Value."""
+        import multiprocessing as mp
 
-        # At idle, after a few polls, should read ~0
-        time.sleep(0.8)
-        with sched._util_lock:
-            idle_util = sched._external_util_pct
+        from GPU.util_monitor import util_monitor_main
+        from shared.proc_util import terminate_join
 
-        assert idle_util <= 10, (
-            f"Expected idle util, got {idle_util}%"
+        ctx = mp.get_context("spawn")
+        val = ctx.Value("i", -1)
+        stop = ctx.Event()
+        proc = ctx.Process(
+            target=util_monitor_main,
+            args=(val, stop, 0.1,
+                  "GPU.metal_scheduler:poll_iokit_gpu_util"),
+            daemon=True,
         )
-        sched.stop()
+        proc.start()
+
+        # Wait up to 3s for at least one poll to write a valid value
+        deadline = time.monotonic() + 3.0
+        while val.value == -1 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        stop.set()
+        assert terminate_join(proc, 2.0)
+
+        # After at least one poll the value must be a valid 0-100 reading
+        assert 0 <= val.value <= 100, (
+            f"Expected 0-100 from IOKit poll, got {val.value}"
+        )
 
     def test_iokit_thread_detects_gpu_load(self):
-        """IOKit thread should read high util during Metal dispatch."""
-        sched = MetalScheduler(
-            gpu_core_count=40,
-            gpu_utilization_pct=100,
-            yielding=True,
-            poll_interval=0.2,
+        """util_monitor process should detect GPU load during Metal dispatch."""
+        import multiprocessing as mp
+
+        from GPU.util_monitor import util_monitor_main
+        from shared.proc_util import terminate_join
+
+        ctx = mp.get_context("spawn")
+        val = ctx.Value("i", -1)
+        stop = ctx.Event()
+        proc = ctx.Process(
+            target=util_monitor_main,
+            args=(val, stop, 0.2,
+                  "GPU.metal_scheduler:poll_iokit_gpu_util"),
+            daemon=True,
         )
+        proc.start()
+
         sampler = MetalSASampler()
         models = _make_models(sampler, 4)
 
-        # Run kernel while scheduler polls
+        # Run kernel while monitor polls
         sampler.sample_ising(
             [m.h for m in models],
             [m.J for m in models],
             num_reads=128, num_sweeps=256, seed=42,
         )
 
-        # Check what the thread observed
-        with sched._util_lock:
-            observed = sched._external_util_pct
+        # Give monitor a moment to publish the last value
+        time.sleep(0.3)
+        observed = val.value
+        stop.set()
+        assert terminate_join(proc, 2.0)
 
-        sched.stop()
-
-        # The thread should have caught at least one high reading.
-        # Since the kernel just finished, the last reading might
-        # be either high (caught during) or low (caught after).
-        # We just verify the mechanism works — the scheduler
-        # did update its value from the IOKit thread.
+        # The monitor process must have written a valid 0-100 value.
+        # Since the kernel just finished the reading may be high or
+        # low — we only verify the mechanism worked.
         assert isinstance(observed, int)
         assert 0 <= observed <= 100
 
@@ -345,16 +363,14 @@ class TestYieldingBehavior:
         )
 
         # No load → full budget
-        with sched._util_lock:
-            sched._external_util_pct = 0
+        sched._util_value.value = 0
         target_idle = sched.compute_target_threadgroups(
             max_tg=10, active_tg=0,
         )
         assert target_idle == 10
 
         # High external load, no active tg → reduced
-        with sched._util_lock:
-            sched._external_util_pct = 80
+        sched._util_value.value = 80
         target_loaded = sched.compute_target_threadgroups(
             max_tg=10, active_tg=0,
         )

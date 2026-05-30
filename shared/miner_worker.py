@@ -131,7 +131,13 @@ def build_miner_from_spec(spec: Dict[str, Any]):
         if "solver" in cfg:
             cfg = {**cfg, "solver_name": cfg["solver"]}
             cfg.pop("solver")
-        return QPU.DWaveMiner(miner_id, time_config=time_config, **cfg)
+        # connect=False: the worker miner owns the budget gate, param
+        # adaptation, and dispatch loop but holds NO D-Wave connection. The
+        # single D-Wave connection lives in the stream-driver process, which
+        # build_production_stream builds with the default connect=True.
+        return QPU.DWaveMiner(
+            miner_id, time_config=time_config, connect=False, **cfg
+        )
     else:
         raise ValueError(f"Unknown miner kind '{kind}'")
 

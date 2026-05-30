@@ -11,12 +11,10 @@ This module provides:
 
 import logging
 import logging.handlers
-import multiprocessing as mp
 import sys
 from datetime import datetime
-from logging.handlers import QueueListener, QueueHandler
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict
 
 
 class QuipFormatter(logging.Formatter):
@@ -209,34 +207,6 @@ def update_log_level(loggers: Dict[str, logging.Logger], level: str):
         logger.setLevel(numeric_level)
 
 
-def setup_multiprocess_logging() -> Tuple[mp.Queue, QueueListener]:
-    """Set up logging for multiprocessing environment.
-
-    Returns:
-        Tuple of (log_queue, listener) for multiprocessing logging.
-    """
-    # Create queue for inter-process communication
-    log_queue = mp.Queue()
-
-    # Handler that sends log records to queue
-    queue_handler = QueueHandler(log_queue)
-
-    # Get root logger and add queue handler
-    root_logger = logging.getLogger()
-    root_logger.addHandler(queue_handler)
-    root_logger.setLevel(logging.INFO)
-
-    # Create listener that processes queue in main process
-    formatter = QuipFormatter()
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-
-    listener = QueueListener(log_queue, console_handler)
-    listener.start()
-
-    return log_queue, listener
-
-
 def init_component_logger(component: str, identifier: str) -> logging.Logger:
     """
     Initialize a component logger with proper setup.
@@ -268,3 +238,68 @@ def init_component_logger(component: str, identifier: str) -> logging.Logger:
 def shutdown_logging():
     """Shutdown logging system and close all handlers."""
     logging.shutdown()
+
+
+def log_writer_main(log_queue, stop_event, log_file_path, level) -> None:
+    """Sole owner of the file/console log handlers; drains the shared queue.
+
+    Replaces the in-process QueueListener thread. All processes (controller
+    + workers) route records here via QueueHandler, so this is the only
+    writer of the log file — no double-write or rotation race. A None on the
+    queue or a set stop_event ends the loop.
+
+    Args:
+        log_queue: Multiprocessing queue of LogRecord objects.
+        stop_event: Multiprocessing Event; when set the loop exits after
+            draining any pending records.
+        log_file_path: Absolute path for the RotatingFileHandler, or None to
+            skip file output (console-only mode).
+        level: Numeric logging level applied to all handlers.
+    """
+    import queue as _queue
+
+    fmt = QuipFormatter()
+    console = logging.StreamHandler()
+    console.setLevel(level)
+    console.setFormatter(fmt)
+    handlers = [console]
+    if log_file_path:
+        fh = logging.handlers.RotatingFileHandler(
+            log_file_path, maxBytes=10 * 1024 * 1024, backupCount=5,
+        )
+        fh.setLevel(level)
+        fh.setFormatter(fmt)
+        handlers.append(fh)
+
+    def _emit(record) -> None:
+        for h in handlers:
+            if record.levelno >= h.level:
+                try:
+                    h.handle(record)
+                except Exception as exc:  # noqa: BLE001
+                    # One unformattable record must not kill the sole log
+                    # writer — that would silently lose ALL logging. Report
+                    # to stderr and keep draining.
+                    print(f"log_writer: failed to emit record: {exc}",
+                          file=sys.stderr)
+
+    while not stop_event.is_set():
+        try:
+            record = log_queue.get(timeout=0.2)
+        except _queue.Empty:
+            continue
+        if record is None:
+            break
+        _emit(record)
+    # Drain anything still queued at shutdown (stop_event may fire before the
+    # None sentinel is dequeued) so the final records aren't lost.
+    while True:
+        try:
+            record = log_queue.get_nowait()
+        except _queue.Empty:
+            break
+        if record is None:
+            break
+        _emit(record)
+    for h in handlers:
+        h.close()

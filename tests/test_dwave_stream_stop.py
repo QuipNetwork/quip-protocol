@@ -1,6 +1,6 @@
 """Unit tests for DWaveMiner's streaming-iterator cancellation behaviour.
 
-Covers three modes:
+Covers two modes:
 - Default discard: stop_event fires → iterator abandons pending futures
   and returns within one poll cycle. This is what the production node
   wants so we can pivot to the next block immediately when a peer wins.
@@ -8,9 +8,6 @@ Covers three modes:
   QPU jobs but yields results for whatever is already in flight. This is
   the test-only escape hatch for workflows that want to inspect partial
   results.
-- pump_stop path: _pump_stop threading.Event fires (mp stop_event NOT set)
-  → iterator aborts promptly, proving _stop_requested() honors the
-  pump-stop signal independently of the block-level stop_event.
 """
 from __future__ import annotations
 
@@ -160,54 +157,4 @@ def test_streaming_drains_on_stop_when_flag_set():
     assert sampler.submissions == 3, (
         f"drain_on_stop must stop submitting new jobs; "
         f"submissions={sampler.submissions}"
-    )
-
-
-@pytest.mark.timeout(10)
-def test_streaming_aborts_on_pump_stop_without_mp_stop_event():
-    """pump_stop path: _pump_stop fires (mp stop_event NOT set) → prompt abort.
-
-    This validates the _stop_requested() helper introduced in Task 3:
-    the pump-stop threading.Event is enough on its own to unblock the
-    streaming generator and let the pump thread join promptly.
-    """
-    # Futures that never complete — stream would block forever without stop.
-    sampler = _FakeSampler(lambda: _FakeFuture(ready_after=None))
-    miner = _miner_with_sampler(sampler, drain_on_stop=False)
-
-    # mp stop_event is NOT set — block is NOT won, just the pump is stopping.
-    miner._stop_event = mp.Event()  # created but never .set()
-
-    pump_stop = threading.Event()
-    miner._pump_stop = pump_stop
-
-    stream = miner.sample_ising_streaming(
-        feeder=_FakeFeeder(),
-        num_reads=1,
-        annealing_time=1.0,
-        queue_depth=3,
-        energy_threshold=0.0,
-    )
-
-    # Advance the generator on a background thread to avoid blocking the test.
-    result: list = []
-
-    def _consume():
-        try:
-            next(stream)
-        except StopIteration:
-            result.append("stopped")
-
-    t = threading.Thread(target=_consume, daemon=True)
-    t.start()
-
-    # Give the generator time to enter its poll loop before triggering stop.
-    time.sleep(0.05)
-    pump_stop.set()
-
-    t.join(timeout=2.0)
-    assert not t.is_alive(), "stream did not abort after pump_stop.set()"
-    assert result == ["stopped"], (
-        "expected StopIteration from the stream when pump_stop fires; "
-        f"got {result!r}"
     )

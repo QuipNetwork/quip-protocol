@@ -200,8 +200,10 @@ def energies_for_solutions(solutions: List[List[int]], h: Dict[int, float], J: D
     Converts h and J to arrays and computes all energies in one pass.
     ~10x faster than calling energy_of_solution() in a loop for large
     solution counts.
+
+    Accepts either a list of spin lists or a 2D numpy array (n × n_nodes).
     """
-    if not solutions:
+    if len(solutions) == 0:
         return []
 
     n = len(nodes)
@@ -270,19 +272,25 @@ def calculate_hamming_distance(s1: List[int], s2: List[int]) -> int:
 
 
 def calculate_diversity(solutions: List[List[int]]) -> float:
-    """Calculate average normalized Hamming distance between all pairs of solutions."""
+    """Average normalized flip-invariant Hamming distance over all pairs.
+
+    Routes through the BLAS distance matrix (one GEMM) rather than a
+    Python pairwise loop: at the full mining pool size (~112 solutions ×
+    ~4578 spins) the loop converted two 4578-element Python lists to
+    arrays per pair across ~6200 pairs, costing ~1.1s/attempt — the
+    dominant consumer cost per mining iteration. The GEMM is ~1ms and
+    yields identical values (``calculate_hamming_distance`` and the
+    matrix both use the flip-invariant metric).
+    """
     if len(solutions) < 2:
         return 0.0
+    n_features = len(solutions[0])
+    if n_features == 0:
+        return 0.0
 
-    distances = []
-    n = len(solutions[0])
-
-    for i in range(len(solutions)):
-        for j in range(i + 1, len(solutions)):
-            dist = calculate_hamming_distance(solutions[i], solutions[j])
-            distances.append(dist / n)
-
-    return float(np.mean(distances)) if distances else 0.0
+    dist = _compute_distance_matrix_vectorized(solutions)
+    iu = np.triu_indices(dist.shape[0], k=1)
+    return float(dist[iu].mean() / n_features)
 
 
 def pack_spins_hex(solution: List[int]) -> str:
@@ -296,6 +304,28 @@ def pack_spins_hex(solution: List[int]) -> str:
         [(s + 1) // 2 for s in solution], dtype=np.uint8,
     )
     return np.packbits(bits).tobytes().hex()
+
+
+def _unique_rows(samples: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Dedup the rows of a 2D spin matrix via a byte (void) view.
+
+    Equivalent to ``np.unique(samples, axis=0, return_index=True,
+    return_inverse=True)`` but ~150x faster on wide spin matrices
+    (112×4578): viewing each contiguous row as a single opaque ``void``
+    scalar turns the per-axis lexsort into a plain 1D sort.
+
+    Returns ``(uniq, first_index, inverse)`` where ``uniq`` are the unique
+    rows (byte-sorted order), ``first_index[j]`` is the index of the first
+    occurrence of ``uniq[j]`` in ``samples``, and ``uniq[inverse[i]] ==
+    samples[i]`` for every row ``i``.
+    """
+    contiguous = np.ascontiguousarray(samples)
+    void_dtype = np.dtype((np.void, contiguous.dtype.itemsize * contiguous.shape[1]))
+    view = contiguous.view(void_dtype).ravel()
+    _, first_index, inverse = np.unique(
+        view, return_index=True, return_inverse=True,
+    )
+    return contiguous[first_index], first_index, np.asarray(inverse).ravel()
 
 
 def compute_solution_meta(
@@ -321,26 +351,35 @@ def compute_solution_meta(
     sampler is producing diverse enough below-target candidates.
     """
     try:
-        energies = list(sampleset.record.energy)
+        record = sampleset.record
+        energies = np.asarray(record.energy, dtype=np.float64)
     except AttributeError:
         return {}, [], []
-    if not energies:
+    if energies.size == 0:
         return {}, [], []
 
-    seen: Dict[Tuple[int, ...], float] = {}
-    for idx in range(len(energies)):
-        spins = tuple(sampleset.record.sample[idx])
-        if spins not in seen or energies[idx] < seen[spins]:
-            seen[spins] = float(energies[idx])
-    unique_sorted = sorted(seen.items(), key=lambda kv: kv[1])
-    sols = [list(s) for s, _ in unique_sorted]
-    es = [e for _, e in unique_sorted]
+    # Dedup spin rows at C speed and keep the minimum energy per unique
+    # row. The previous pure-Python version materialized one ~N-element
+    # tuple per read (N≈4578 on full-topology Advantage2) and hashed it,
+    # costing ~1s/attempt on CPU-starved nodes — paid on *every* attempt,
+    # which defeated the streaming layer's reconstruction-skip. The byte-
+    # view dedup runs in ~0.1ms at 112×4578.
+    samples = np.asarray(record.sample)
+    uniq, _, inverse = _unique_rows(samples)
+    min_energy = np.full(uniq.shape[0], np.inf, dtype=np.float64)
+    np.minimum.at(min_energy, inverse, energies)
 
-    top_5 = sols[:5]
-    top_5_es = es[:5]
+    # Unique rows by ascending (minimum) energy; best-energy first.
+    order = np.argsort(min_energy, kind="stable")
+    top_5_arr = uniq[order[:5]]
+    top_5_es = [float(e) for e in min_energy[order[:5]]]
+    # Only the top-5 rows are materialized as Python lists — diversity
+    # reuses the existing flip-invariant metric (≤10 pairs, negligible).
+    top_5 = [row.tolist() for row in top_5_arr]
+
     meta = {
-        "n_unique_total": len(sols),
-        "n_unique_below_threshold": sum(1 for e in es if e < threshold),
+        "n_unique_total": int(uniq.shape[0]),
+        "n_unique_below_threshold": int(np.count_nonzero(min_energy < threshold)),
         "top_5_diversity": (
             calculate_diversity(top_5) if len(top_5) >= 2 else 0.0
         ),
@@ -768,25 +807,32 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         # Dedup the FULL batch into the constraint-valid set, BEFORE any
         # target filter. The dedup pool feeds both ``num_valid``
         # (count of below-target solutions) and the diverse-K selection
-        # used to compute diversity.
-        full_unique_solutions: List[List[int]] = []
-        full_unique_energies: List[float] = []
-        seen: set = set()
+        # used to compute diversity. The pool is kept as an int8 ndarray
+        # end-to-end: the diversity GEMM and farthest-point selection take
+        # ndarrays directly, so the hot loop never pays the list<->array
+        # conversion that dominated per-attempt cost (~1s on full-topology
+        # samplesets) before.
+        sample_arr = np.asarray(sampleset.record.sample)
+        energy_arr = np.asarray(all_energies, dtype=np.float64)
 
         if skip_validation:
             # FAST PATH: Trust sampler output, skip per-solution validation
-            # This is safe during mining since we control the sampler
-            for idx in range(len(all_energies)):
-                solution = tuple(sampleset.record.sample[idx])
-                if solution not in seen:
-                    seen.add(solution)
-                    full_unique_solutions.append(list(solution))
-                    full_unique_energies.append(all_energies[idx])
+            # (safe during mining — we control the sampler). _unique_rows
+            # dedups rows at C speed; first_index + a stable argsort reproduce
+            # the legacy dict loop exactly: unique rows in first-seen order,
+            # each carrying its first occurrence's energy.
+            uniq, first_idx, _ = _unique_rows(sample_arr)
+            first_seen = np.argsort(first_idx, kind="stable")
+            full_unique_solutions = uniq[first_seen]
+            full_unique_energies = energy_arr[first_idx[first_seen]]
         else:
-            # SLOW PATH: Full validation for untrusted sources (block validation)
-            # Use pre-computed Ising model if provided, otherwise regenerate.
-            # Requirements may carry `allowed_h_values` / `allowed_j_values`
-            # (post-MR-!20) for non-default sampling distributions.
+            # SLOW PATH: Full validation for untrusted sources (block
+            # validation). Per-solution validate_solution needs Python lists;
+            # this path is not the mining hot loop, so it stays list-based
+            # and is converted to an ndarray pool at the end for the shared
+            # downstream. Use pre-computed Ising model if provided, otherwise
+            # regenerate. Requirements may carry `allowed_h_values` /
+            # `allowed_j_values` (post-MR-!20) for non-default distributions.
             if h is None or J is None:
                 allowed_h = getattr(requirements, "allowed_h_values", DEFAULT_ALLOWED_H)
                 allowed_j = getattr(requirements, "allowed_j_values", DEFAULT_ALLOWED_J)
@@ -794,9 +840,12 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
                     nonce, nodes, edges, allowed_h=allowed_h, allowed_j=allowed_j,
                 )
 
+            seen: set = set()
+            valid_rows: List[List[int]] = []
+            valid_row_energies: List[float] = []
             invalid_solutions = []
-            for idx in range(len(all_energies)):
-                solution = tuple(sampleset.record.sample[idx])
+            for idx in range(len(energy_arr)):
+                solution = tuple(sample_arr[idx])
                 if solution not in seen:
                     seen.add(solution)
                     solution_list = list(solution)
@@ -804,8 +853,8 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
                     # Validate solution format and correctness
                     validation_result = validate_solution(solution_list, h, J, nodes, edges)
                     if validation_result["valid"]:
-                        full_unique_solutions.append(solution_list)
-                        full_unique_energies.append(all_energies[idx])
+                        valid_rows.append(solution_list)
+                        valid_row_energies.append(float(energy_arr[idx]))
                     else:
                         invalid_solutions.append({
                             "solution": solution_list,
@@ -817,6 +866,13 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
                 local_logger = logging.getLogger(__name__)
                 local_logger.warning(f"Found {len(invalid_solutions)} invalid solutions with errors: {[s['errors'] for s in invalid_solutions[:3]]}")
 
+            full_unique_solutions = (
+                np.asarray(valid_rows, dtype=sample_arr.dtype)
+                if valid_rows
+                else np.empty((0, sample_arr.shape[1]), dtype=sample_arr.dtype)
+            )
+            full_unique_energies = np.asarray(valid_row_energies, dtype=np.float64)
+
         # Set num_valid here so it reflects actual sampleset shape even
         # when later validation raises. Without this, the finally-block
         # log line would print "Valid: 0" on any "insufficient valid
@@ -825,9 +881,7 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         # min_solutions=5). In ratchet mode this gets recomputed against
         # the live decayed threshold using chain-recomputed energies; see
         # the post-success-path block below.
-        num_valid = sum(
-            1 for e in full_unique_energies if e < difficulty_energy
-        )
+        num_valid = int(np.count_nonzero(full_unique_energies < difficulty_energy))
 
         # Pool selection for diverse-K. Three modes:
         #
@@ -847,24 +901,20 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         #
         # 3. Lenient + no live (tests / legacy): use full pool.
         if strict_energy:
-            pool_indices = [
-                i for i, e in enumerate(full_unique_energies)
-                if e < difficulty_energy
-            ]
+            pool_indices = np.flatnonzero(full_unique_energies < difficulty_energy)
         elif live_threshold_energy is not None:
-            below_target = [
-                i for i, e in enumerate(full_unique_energies)
-                if e < live_threshold_energy
-            ]
+            below_target = np.flatnonzero(
+                full_unique_energies < live_threshold_energy
+            )
             if len(below_target) >= min_solutions:
                 pool_indices = below_target
             else:
-                pool_indices = list(range(len(full_unique_solutions)))
+                pool_indices = np.arange(len(full_unique_solutions))
         else:
-            pool_indices = list(range(len(full_unique_solutions)))
+            pool_indices = np.arange(len(full_unique_solutions))
 
-        valid_solutions = [full_unique_solutions[i] for i in pool_indices]
-        valid_energies = [full_unique_energies[i] for i in pool_indices]
+        valid_solutions = full_unique_solutions[pool_indices]
+        valid_energies = full_unique_energies[pool_indices]
 
         # Diversity snapshot over whatever below-target solutions we
         # have, even if fewer than min_solutions. Without this the log
@@ -886,9 +936,9 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
             selected_indices = select_diverse_solutions(
                 valid_solutions, min_solutions,
             )
-            filtered_solutions = [valid_solutions[i] for i in selected_indices]
+            filtered_solutions = valid_solutions[selected_indices]
             diversity = calculate_diversity(filtered_solutions)
-            best_energy = min(valid_energies[i] for i in selected_indices)
+            best_energy = float(valid_energies[selected_indices].min())
 
             # Fallback: if farthest-point selection doesn't meet diversity,
             # try energy-stratified selection. Solutions at different energy
@@ -899,19 +949,17 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
                 )
                 if stratified is not None:
                     strat_div = calculate_diversity(
-                        [valid_solutions[i] for i in stratified]
+                        valid_solutions[stratified]
                     )
                     if strat_div >= min_diversity:
                         selected_indices = stratified
-                        filtered_solutions = [
-                            valid_solutions[i] for i in selected_indices
-                        ]
+                        filtered_solutions = valid_solutions[selected_indices]
                         diversity = strat_div
-                        best_energy = min(
-                            valid_energies[i] for i in selected_indices
+                        best_energy = float(
+                            valid_energies[selected_indices].min()
                         )
-        elif valid_energies:
-            best_energy = min(valid_energies)
+        elif len(valid_energies):
+            best_energy = float(valid_energies.min())
 
         if diversity < min_diversity:
             raise ValueError(f"Insufficient diversity: {diversity} < {min_diversity}")
@@ -950,7 +998,7 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         # the diagnostic honest. Skipped for mempool / snapshot-only
         # paths — num_valid stays as the sampler-energy count set
         # right after dedup.
-        if live_threshold_energy is not None and full_unique_solutions:
+        if live_threshold_energy is not None and len(full_unique_solutions):
             full_recomputed = energies_for_solutions(
                 full_unique_solutions, h_for_floor, J_for_floor, nodes,
             )
@@ -969,7 +1017,10 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
             salt=salt,
             timestamp=int(time.time()),
             prev_timestamp=prev_timestamp,
-            solutions=filtered_solutions,
+            # Materialize the ≤min_solutions selected rows as Python lists
+            # for the result contract (the only list conversion left, and
+            # it's tiny — the hot pool stayed an ndarray throughout).
+            solutions=[row.tolist() for row in filtered_solutions],
             energy=best_energy,
             diversity=diversity,
             num_valid=num_valid,
