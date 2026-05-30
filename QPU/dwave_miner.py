@@ -139,13 +139,13 @@ def build_production_stream(
     def cleanup() -> None:
         try:
             feeder.stop()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001 — log; a leak must be visible
+            init_logger.warning("stream cleanup: feeder.stop failed: %s", exc)
         try:
             if hasattr(miner, "sampler") and hasattr(miner.sampler, "close"):
                 miner.sampler.close()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001 — log; connection may leak
+            init_logger.warning("stream cleanup: sampler.close failed: %s", exc)
 
     return stream, cleanup
 

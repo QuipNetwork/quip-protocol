@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
+import queue as _queue
 from typing import Any, Dict
 
 import numpy as np
@@ -94,12 +95,20 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, stop_event,
                 desc_q.put_nowait(
                     (slot, n_rows, n_cols, bytes(model.nonce), bytes(model.salt),
                      _extract_qpu_us(sampleset)))
-            except Exception:
+            except _queue.Full:
+                # Consumer backpressure: release the slot and drop. Any other
+                # exception (closed/broken queue) propagates to the outer
+                # handler so it's logged + the stream tears down cleanly.
                 ring.release(slot)
                 dropped += 1
     except Exception:
         log.exception("stream driver failed")
     finally:
+        if dropped:
+            # The worker can't see this counter (separate process), so log it
+            # here — silent drops would otherwise be invisible on both sides.
+            log.warning("stream driver dropped %d samples (backpressure / "
+                        "oversized)", dropped)
         try:
             cleanup()
         finally:

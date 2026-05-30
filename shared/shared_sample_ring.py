@@ -11,6 +11,7 @@ the ~512 KB sample matrix per attempt. See AGENTS.md.
 from __future__ import annotations
 
 import multiprocessing as mp
+import queue as _queue
 from multiprocessing import shared_memory
 from typing import Optional, Tuple
 
@@ -53,7 +54,11 @@ class SharedSampleRing:
         """Return a free slot index, or None if none free within timeout."""
         try:
             return self.free_q.get(timeout=timeout)
-        except Exception:
+        except _queue.Empty:
+            # Only a genuine timeout means "no free slot". A broken/closed
+            # free-queue (OSError, ValueError) must propagate so the driver's
+            # outer handler logs and tears down, rather than masquerading as
+            # permanent backpressure that silently drops every sample.
             return None
 
     def release(self, slot: int) -> None:
@@ -85,6 +90,19 @@ class SharedSampleRing:
         s = np.ndarray((n_rows, n_cols), np.int8, buf, 0)
         e = np.ndarray((n_rows,), np.float64, buf, self._sample_bytes)
         return s, e
+
+    def close(self) -> None:
+        """Close all slot handles without unlinking (best-effort).
+
+        Used as the fallback when ``close_unlink`` cannot release a segment
+        (a buffer view survived): close the handles we can so this process
+        leaks nothing further, even though the named segments may persist.
+        """
+        for s in self._shm:
+            try:
+                s.close()
+            except Exception:  # noqa: BLE001 — best-effort; segment may leak
+                pass
 
     def close_unlink(self) -> None:
         """Close all slots; unlink them if this instance owns them."""

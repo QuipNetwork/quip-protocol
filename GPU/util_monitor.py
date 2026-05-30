@@ -11,7 +11,10 @@ Each backend's poll fn does its own nvmlInit/IOKit setup in the child.
 from __future__ import annotations
 
 import importlib
+import logging
 from typing import Callable
+
+log = logging.getLogger(__name__)
 
 
 def _resolve(dotted: str) -> Callable[[], int]:
@@ -46,9 +49,18 @@ def util_monitor_main(
         poll_dotted: Dotted path ``"module:attr"`` for the zero-arg poll fn.
     """
     poll = _resolve(poll_dotted)
+    failures = 0
     while not stop_event.is_set():
         try:
             out_value.value = int(poll())
-        except Exception:  # noqa: BLE001 — a monitor must never crash the miner
-            pass
+            failures = 0
+        except Exception as exc:  # noqa: BLE001 — must never crash the miner
+            # A monitor must never crash the miner, but a *permanent* failure
+            # (handle invalidated, driver reset) would silently freeze the
+            # value forever. Keep running, but log at escalating thresholds so
+            # a stuck monitor is observable instead of invisible.
+            failures += 1
+            if failures in (1, 10, 100) or failures % 1000 == 0:
+                log.warning("%s poll failed (%d consecutive), holding last "
+                            "value: %s", poll_dotted, failures, exc)
         stop_event.wait(interval_s)

@@ -654,7 +654,7 @@ class BaseMiner(ABC):
                 # stop / stream-exhausted / sampling-error control flow.
                 acquired = self._acquire_result(
                     stop_event, desc_q, preprocess_start,
-                    sample_ctx=sample_ctx,
+                    sample_ctx=sample_ctx, driver_proc=setup.driver_proc,
                 )
                 if acquired.action == _ACQUIRE_STOP:
                     return None
@@ -953,6 +953,19 @@ class BaseMiner(ABC):
         # is what gives the QPU its throughput. Backends without batch
         # streaming pop the feeder one model at a time (see the loop).
         if self.DRIVER_OWNS_FEEDER:
+            if not is_substrate:
+                # The stream driver only builds a RandomIsingFeeder (PoW). A
+                # mempool job needs the order's fixed (h, J); mining random
+                # models against the order's evaluator would be silently
+                # wrong. Abort this dispatch loudly — mempool work must be
+                # routed to a CPU/GPU miner, not the QPU driver path.
+                self.logger.error(
+                    "QPU driver path cannot mine mempool job %s: only "
+                    "PoW/substrate contexts are supported (the stream driver "
+                    "has no fixed-model feeder). Skipping this dispatch.",
+                    _work_tag(context),
+                )
+                return None
             # The stream-driver process builds its own RandomIsingFeeder
             # (see build_production_stream); the worker keeps no feeder so
             # the chain seed / miner identity are derived in exactly one
@@ -1059,8 +1072,49 @@ class BaseMiner(ABC):
             (ring.attach_args(), desc_q, driver_stop,
              self.STREAM_FACTORY_DOTTED, factory_kwargs),
             name=f"qpu-stream-driver-{self.miner_id}",
+            # Non-daemon: the driver builds a RandomIsingFeeder whose
+            # ProcessPoolExecutor forks its own children, and a daemon
+            # process is forbidden from having children. ``_teardown_dispatch``
+            # reaps this process explicitly via ``terminate_join``, so it
+            # never blocks interpreter shutdown despite being non-daemon.
+            daemon=False,
         )
         return ring, desc_q, driver_proc, driver_stop
+
+    def _await_descriptor(
+        self,
+        stop_event: multiprocessing.synchronize.Event,
+        desc_q: Any,
+        driver_proc: Optional[Any],
+    ) -> Any:
+        """Block on the descriptor queue until an item, stop, or driver death.
+
+        Returns the dequeued descriptor (which may be the ``None``
+        end-of-stream sentinel), or one of :data:`_ACQUIRE_STOP` /
+        :data:`_ACQUIRE_DONE` when the dispatch should end. The driver
+        normally signals end-of-stream by enqueuing ``None`` from its
+        ``finally``; but a hard crash (SIGKILL / OOM / C-extension abort)
+        skips that ``finally`` entirely. Without a liveness check the
+        consumer would drain an empty queue forever — the silent "miner
+        looks stuck" failure mode. Detecting a dead ``driver_proc`` (after a
+        final non-blocking drain in case the sentinel raced the exit) ends
+        the dispatch instead.
+        """
+        while not stop_event.is_set():
+            try:
+                return desc_q.get(timeout=0.1)
+            except queue.Empty:
+                if driver_proc is not None and not driver_proc.is_alive():
+                    try:
+                        return desc_q.get_nowait()
+                    except queue.Empty:
+                        self.logger.error(
+                            "stream driver pid=%s exited (exitcode=%s) without "
+                            "end-of-stream sentinel; ending dispatch",
+                            driver_proc.pid, driver_proc.exitcode,
+                        )
+                        return _ACQUIRE_DONE
+        return _ACQUIRE_STOP
 
     def _acquire_result(
         self,
@@ -1069,6 +1123,7 @@ class BaseMiner(ABC):
         preprocess_start: float,
         *,
         sample_ctx: Dict[str, Any],
+        driver_proc: Optional[Any] = None,
     ) -> _AcquireResult:
         """Source one ``(nonce, salt, sampleset)`` for a loop iteration.
 
@@ -1097,18 +1152,21 @@ class BaseMiner(ABC):
             self.current_stage = 'sampling'
             self.current_stage_start = sample_start
             if desc_q is not None:
-                # Driver mode: block on the descriptor queue, waking to
-                # check stop_event. A trailing None means the stream ended.
-                item = None
-                while not stop_event.is_set():
-                    try:
-                        item = desc_q.get(timeout=0.1)
-                        break
-                    except queue.Empty:
-                        continue
-                if stop_event.is_set():
+                # Driver mode: block on the descriptor queue, waking to check
+                # stop_event and driver liveness. A trailing None — or a dead
+                # driver — means the stream ended.
+                item = self._await_descriptor(stop_event, desc_q, driver_proc)
+                if item == _ACQUIRE_STOP:
                     return _AcquireResult(_ACQUIRE_STOP)
-                if item is None:
+                if item is None or item == _ACQUIRE_DONE:
+                    return _AcquireResult(_ACQUIRE_DONE)
+                if self._ring is None:
+                    # A descriptor without a ring is a programming error
+                    # (driver path must set _ring in _start_result_pump).
+                    self.logger.error(
+                        "driver descriptor received but shared ring is None; "
+                        "ending dispatch",
+                    )
                     return _AcquireResult(_ACQUIRE_DONE)
                 slot, n_rows, n_cols, nonce, salt, qpu_us = item
                 ring_slot = slot
@@ -1212,7 +1270,20 @@ class BaseMiner(ABC):
                 self._ring.close_unlink()
             except BufferError:
                 gc.collect()
-                self._ring.close_unlink()
+                try:
+                    self._ring.close_unlink()
+                except BufferError:
+                    # A _SharedSampleSet view genuinely survived GC. Don't let
+                    # the BufferError escape the finally (it would mask the
+                    # real return/exception); close handles in this process
+                    # and log the segment leak so it's diagnosable.
+                    self.logger.error(
+                        "shared ring close_unlink still blocked after GC; "
+                        "a sample view leaked. Closing handles without unlink "
+                        "(shared-memory segments %s may persist).",
+                        getattr(self._ring, "names", "?"),
+                    )
+                    self._ring.close()  # best-effort; never raises
             self._ring = None
         self._driver_stop = None
         # Tear down the worker feeder (inline path only) before delegating

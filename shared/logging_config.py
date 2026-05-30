@@ -270,6 +270,19 @@ def log_writer_main(log_queue, stop_event, log_file_path, level) -> None:
         fh.setLevel(level)
         fh.setFormatter(fmt)
         handlers.append(fh)
+
+    def _emit(record) -> None:
+        for h in handlers:
+            if record.levelno >= h.level:
+                try:
+                    h.handle(record)
+                except Exception as exc:  # noqa: BLE001
+                    # One unformattable record must not kill the sole log
+                    # writer — that would silently lose ALL logging. Report
+                    # to stderr and keep draining.
+                    print(f"log_writer: failed to emit record: {exc}",
+                          file=sys.stderr)
+
     while not stop_event.is_set():
         try:
             record = log_queue.get(timeout=0.2)
@@ -277,8 +290,16 @@ def log_writer_main(log_queue, stop_event, log_file_path, level) -> None:
             continue
         if record is None:
             break
-        for h in handlers:
-            if record.levelno >= h.level:
-                h.handle(record)
+        _emit(record)
+    # Drain anything still queued at shutdown (stop_event may fire before the
+    # None sentinel is dequeued) so the final records aren't lost.
+    while True:
+        try:
+            record = log_queue.get_nowait()
+        except _queue.Empty:
+            break
+        if record is None:
+            break
+        _emit(record)
     for h in handlers:
         h.close()

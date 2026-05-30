@@ -129,6 +129,63 @@ def _sample_ctx() -> dict:
     }
 
 
+def _noop() -> None:
+    """Module-level target so spawn can pickle it (used for the dead-driver
+    liveness test — the process exits immediately)."""
+    return None
+
+
+def test_acquire_result_dead_driver_without_sentinel_is_done():
+    """A driver that died without enqueuing None must not hang the consumer.
+
+    The cooperative end-of-stream path sends a trailing ``None`` from the
+    driver's ``finally``; a hard crash (SIGKILL/OOM/C-extension abort) skips
+    it. ``_acquire_result`` must detect the dead ``driver_proc`` and return
+    DONE rather than draining an empty queue forever.
+    """
+    consumer = _RingConsumer()
+    # Empty queue: no descriptor and no None sentinel ever arrives.
+    desc_q: "mp.Queue" = mp.get_context("spawn").Queue()
+    stop = mp.Event()
+    dead = mp.get_context("spawn").Process(target=_noop)
+    dead.start()
+    dead.join(timeout=5.0)
+    assert not dead.is_alive()
+    try:
+        acquired = consumer._acquire_result(
+            stop, desc_q, preprocess_start=0.0, sample_ctx=_sample_ctx(),
+            driver_proc=dead,
+        )
+        assert acquired.action == _ACQUIRE_DONE
+    finally:
+        terminate_join(dead, 2.0)
+
+
+def test_start_result_pump_spawns_non_daemon_driver():
+    """The driver must be non-daemon.
+
+    ``build_production_stream`` builds a ``RandomIsingFeeder`` whose
+    ``ProcessPoolExecutor`` forks its own children, and a daemon process is
+    forbidden from having children. A regression to ``daemon=True`` would
+    break live QPU mining the moment the feeder spins up (but pass every
+    fake-factory test, since the fake has no pool) — so pin it explicitly.
+    """
+    miner = _DriverMiner()
+    sample_ctx = {
+        "num_reads": 8, "nodes": [0, 1, 2], "edges": [],
+        "annealing_time": 80.0, "energy_threshold": -1.0,
+        "last_proof_block_hash": b"\xab" * 32, "miner_bytes": b"\x42" * 32,
+    }
+    ring, desc_q, proc, dstop = miner._start_result_pump(sample_ctx)
+    try:
+        assert proc is not None
+        assert proc.daemon is False, "stream driver must not be a daemon"
+    finally:
+        dstop.set()
+        terminate_join(proc, 5.0)
+        ring.close_unlink()
+
+
 def test_acquire_result_reads_descriptor_from_ring():
     consumer = _RingConsumer()
     ring = SharedSampleRing(slots=2, max_rows=4, max_cols=3)
