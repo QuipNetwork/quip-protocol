@@ -98,3 +98,43 @@ def pytest_runtest_teardown(item: pytest.Item):
             signal.signal(signal.SIGALRM, old)
         except Exception:
             pass
+
+
+# --- TEMP DIAGNOSTIC: attribute leaked ProcessPoolExecutors to tests -------
+# concurrent.futures.process._threads_wakeups holds one entry per live
+# executor manager thread; the thread removes itself on termination. A
+# count that rises across a test and never drains is an executor whose
+# manager thread survives to interpreter shutdown, where _python_exit
+# joins it and hangs. Reported so CI names the offending test(s).
+import concurrent.futures.process as _cf_process
+
+_executor_count_before: dict = {}
+
+
+def _live_executor_count() -> int:
+    try:
+        return len(_cf_process._threads_wakeups)
+    except Exception:
+        return -1
+
+
+def pytest_runtest_logstart(nodeid, location):
+    _executor_count_before[nodeid] = _live_executor_count()
+
+
+def pytest_runtest_logfinish(nodeid, location):
+    before = _executor_count_before.pop(nodeid, None)
+    after = _live_executor_count()
+    if before is not None and after > before:
+        import sys
+        sys.stderr.write(
+            f"\n!!! EXECUTOR-LEAK {nodeid}: _threads_wakeups {before} -> {after}\n"
+        )
+        sys.stderr.flush()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    import sys
+    n = _live_executor_count()
+    sys.stderr.write(f"\n!!! SESSION-END live ProcessPoolExecutors: {n}\n")
+    sys.stderr.flush()
