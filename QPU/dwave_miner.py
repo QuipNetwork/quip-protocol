@@ -641,6 +641,10 @@ class DWaveMiner(BaseMiner):
     ) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
         """Stream Ising model solutions via async QPU submission.
 
+        Diagnostic/tooling path only — the production miner streams via
+        ``PersistentStreamContext`` (see ``build_persistent_context``); this
+        method is retained for the QPU canary/sweep tools and their tests.
+
         Maintains queue_depth jobs in-flight on the D-Wave cloud.
         As each completes, checks whether the best QPU energy (plus
         the defect offset) could meet the threshold. Only reconstructs

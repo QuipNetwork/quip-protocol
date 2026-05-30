@@ -1937,9 +1937,11 @@ def _work_tag(context: WorkContext) -> str:
 def _energy_to_milli(energy: float) -> int:
     """Convert a difficulty energy (float) to integer milli-units.
 
-    Non-finite thresholds (mempool jobs with no energy floor never reach the
-    driver path, but guard anyway) clamp to a large sentinel so the driver's
-    gate never reconstructs spuriously.
+    Non-finite thresholds clamp to a large positive sentinel. This branch is
+    effectively unreachable on the driver path (mempool jobs, the only source
+    of a non-finite energy floor, are never routed to the QPU driver), so the
+    value only needs to be a safe, JSON/pickle-friendly int; it is not a tuned
+    gate value.
     """
     if not math.isfinite(energy):
         return 1 << 62
