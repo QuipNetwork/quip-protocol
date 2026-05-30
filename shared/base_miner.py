@@ -1006,6 +1006,51 @@ class BaseMiner(ABC):
             attempt_logger.flush()
         self._post_mine_cleanup()
 
+    @staticmethod
+    def _insert_into_stash(
+        top_k: List[MiningResult],
+        top_k_cap: int,
+        result: MiningResult,
+    ) -> bool:
+        """Insert ``result`` into the bounded, energy-ascending ``top_k``.
+
+        Always admits when there's room; otherwise (the caller only reaches
+        here when ``result`` beat the worst-energy entry) evicts the tail.
+        Re-sorts in place. Returns True when the stash changed. Behaviour
+        matches the original inline heap-insert.
+        """
+        if len(top_k) < top_k_cap:
+            top_k.append(result)
+            top_k.sort(key=lambda r: r.energy)
+            return True
+        if result.energy < top_k[-1].energy:
+            top_k[-1] = result
+            top_k.sort(key=lambda r: r.energy)
+            return True
+        return False
+
+    @staticmethod
+    def _select_submittable_candidate(
+        top_k: List[MiningResult],
+        live_threshold_milli: int,
+    ) -> Optional[MiningResult]:
+        """Return the first stash entry whose chain floor clears the threshold.
+
+        Walks ``top_k`` (energy-ascending) and returns the first candidate
+        whose ``submit_floor_energy`` (falling back to ``energy``) is strictly
+        below ``live_threshold_milli``, or ``None``. Behaviour matches the
+        original inline submit-gate walk.
+        """
+        for candidate in top_k:
+            floor_energy = (
+                candidate.submit_floor_energy
+                if candidate.submit_floor_energy is not None
+                else candidate.energy
+            )
+            if int(floor_energy * 1000) < live_threshold_milli:
+                return candidate
+        return None
+
     def _run_substrate_ratchet(
         self,
         state: _MiningLoopState,
@@ -1089,18 +1134,9 @@ class BaseMiner(ABC):
             if result is not None:
                 post_num_valid = result.num_valid
                 post_diversity_milli = int(result.diversity * 1000)
-                # Insert into the bounded heap. Always admits when there's
-                # room; otherwise the iter only got here because it beat the
-                # worst-energy entry (ratchet gate above), so we evict that
-                # tail and re-sort.
-                if len(state.top_k) < state.top_k_cap:
-                    state.top_k.append(result)
-                    state.top_k.sort(key=lambda r: r.energy)
-                    stored_replaced = True
-                elif result.energy < state.top_k[-1].energy:
-                    state.top_k[-1] = result
-                    state.top_k.sort(key=lambda r: r.energy)
-                    stored_replaced = True
+                stored_replaced = self._insert_into_stash(
+                    state.top_k, state.top_k_cap, result,
+                )
 
         # Anticipatory-submission preview. When the stash gains a candidate
         # whose best-by-floor improves on anything we've previewed, hand the
@@ -1127,16 +1163,9 @@ class BaseMiner(ABC):
         # prefer the best candidate whose floor clears, falling back to
         # worse-energy stash entries when a better candidate's floor sits
         # above the live threshold (the two can diverge).
-        result = None
-        for candidate in state.top_k:
-            floor_energy = (
-                candidate.submit_floor_energy
-                if candidate.submit_floor_energy is not None
-                else candidate.energy
-            )
-            if int(floor_energy * 1000) < live_threshold_milli:
-                result = candidate
-                break
+        result = self._select_submittable_candidate(
+            state.top_k, live_threshold_milli,
+        )
 
         # ratchet_threshold is float("inf") on the first iter before anything
         # is stored — log None there since there's no meaningful prior.
