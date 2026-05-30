@@ -218,6 +218,34 @@ class TestRandomIsingFeeder:
             assert feeder._last_proof_block_hash == b"\x09" * 32
             m_new = feeder.pop_blocking()
             assert len(m_new.nonce) == 32
+            # Provenance check: the popped model must have been derived under
+            # the NEW seed. A dropped buffer drain would surface a stale
+            # old-seed model, whose nonce would not match this recompute.
+            from shared.quantum_proof_of_work import derive_nonce
+
+            assert m_new.nonce == derive_nonce(
+                b"\x09" * 32, b"\x02" * 32, m_new.salt
+            )
+        finally:
+            feeder.stop()
+
+    def test_reseed_cancels_pending_futures(self):
+        """reseed before any pop cancels old-seed in-flight futures.
+
+        Reseeding immediately after construction exercises the cancel-loop
+        over a populated ``self._futures``; the next popped model must be
+        new-seed provenance and the pool unchanged.
+        """
+        feeder = _make_feeder(seed=44)
+        try:
+            from shared.quantum_proof_of_work import derive_nonce
+
+            pool_before = feeder._pool
+            # Reseed before popping: _futures is populated with old-seed work.
+            feeder.reseed(b"\x09" * 32, b"\x02" * 32)
+            assert feeder._pool is pool_before
+            m = feeder.pop_blocking()
+            assert m.nonce == derive_nonce(b"\x09" * 32, b"\x02" * 32, m.salt)
         finally:
             feeder.stop()
 
