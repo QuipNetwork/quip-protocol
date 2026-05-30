@@ -4,10 +4,27 @@
 """Tests for SharedSampleRing zero-copy shared-memory transport."""
 from __future__ import annotations
 
+import multiprocessing as mp
+
 import numpy as np
 import pytest
 
 from shared.shared_sample_ring import SharedSampleRing
+
+
+def _create_and_teardown_ring() -> None:
+    """Owner-side ring lifecycle in a child process (must exit cleanly).
+
+    Constructing the ring puts the initial slot ints into ``free_q``, which
+    starts that queue's feeder thread; ``release`` adds more. Without
+    ``close_unlink`` detaching the feeder-thread join, this process would hang
+    forever at interpreter exit (the join never completes). Module-level so
+    spawn can pickle it.
+    """
+    ring = SharedSampleRing(slots=4, max_rows=4, max_cols=4)
+    slot = ring.claim_free(timeout=1.0)
+    ring.release(slot)
+    ring.close_unlink()
 
 
 def test_roundtrip_zero_copy():
@@ -52,3 +69,14 @@ def test_write_rejects_oversized():
             ring.write(slot, np.ones((4, 4), np.int8), np.zeros(4, np.float64))
     finally:
         ring.close_unlink()
+
+
+def test_owner_exits_cleanly_after_teardown():
+    """An owner process must exit after close_unlink (no feeder-thread join hang)."""
+    proc = mp.get_context("spawn").Process(target=_create_and_teardown_ring)
+    proc.start()
+    proc.join(timeout=15.0)
+    assert not proc.is_alive(), (
+        "ring owner hung at exit — free_q feeder-thread join was not cancelled"
+    )
+    assert proc.exitcode == 0

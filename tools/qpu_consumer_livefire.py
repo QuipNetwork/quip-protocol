@@ -41,7 +41,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -70,6 +72,7 @@ from shared.base_miner import (  # noqa: E402
 )
 from shared.ising_feeder import RandomIsingFeeder  # noqa: E402
 from shared.miner_types import BlockRequirements  # noqa: E402
+from shared.proc_util import terminate_join  # noqa: E402
 from shared.quantum_proof_of_work import compute_solution_meta  # noqa: E402
 
 # A hard-killed driver must let the consumer end the dispatch within this many
@@ -174,6 +177,25 @@ def _release(consumer: DWaveMiner, acquired) -> None:
     acquired.sampleset = None
 
 
+def _child_pids(pid: int) -> List[int]:
+    """Direct child PIDs of ``pid`` via pgrep (best-effort, POSIX only)."""
+    try:
+        out = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True,
+                             text=True, timeout=5)
+        return [int(x) for x in out.stdout.split()]
+    except Exception:  # noqa: BLE001 — pgrep absent → orphans simply leak
+        return []
+
+
+def _hard_kill(pids: List[int]) -> None:
+    """SIGKILL each pid, ignoring those already gone."""
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGKILL)
+        except OSError:
+            pass
+
+
 def _consume(consumer, desc_q, driver_proc, sample_ctx, nodes, edges,
              requirements, args) -> Dict[str, Any]:
     """Read ``args.n`` results through the real ``_acquire_result`` path."""
@@ -249,10 +271,16 @@ def _liveness_check(consumer, nodes, edges, args) -> Dict[str, Any]:
             driver_proc=proc)
         flowing = first.action == _ACQUIRE_OK
         _release(consumer, first)
+        # Capture the driver's feeder ProcessPoolExecutor workers before the
+        # kill: SIGKILL skips the driver's cleanup, orphaning them (reparented
+        # to init). Reap them explicitly so the smoke check leaves nothing
+        # behind — a real hard crash would leak these until the OS reaps them.
+        workers = _child_pids(proc.pid)
         # Simulate a hard crash: kill without setting the stop event so no
         # sentinel is ever sent.
         proc.kill()
         proc.join(timeout=5.0)
+        _hard_kill(workers)
         # The consumer must reach DONE within the bound. It may first drain a
         # few buffered descriptors (release them); a hang would blow the bound.
         t0 = time.perf_counter()
@@ -349,6 +377,10 @@ def run_driver(args: argparse.Namespace) -> int:
         print("\n[smoke] fault-injection: hard-killing a driver mid-stream...",
               file=sys.stderr)
         live = _liveness_check(consumer, nodes, edges, args)
+
+    # Best-effort reap of anything we still own so the CLI exits cleanly.
+    for child in multiprocessing.active_children():
+        terminate_join(child, 2.0)
 
     return _emit_verdict(spawn_ok, consume_ok, res, buffererror, orphans_ok,
                          leftover, shm_ok, base_shm, shm_after, live)

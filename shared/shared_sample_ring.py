@@ -91,6 +91,22 @@ class SharedSampleRing:
         e = np.ndarray((n_rows,), np.float64, buf, self._sample_bytes)
         return s, e
 
+    def _release_free_q(self) -> None:
+        """Detach this process's free-queue feeder thread.
+
+        ``free_q`` is an ``mp.Queue``; every ``put`` (the initial slot list,
+        plus each ``release``) starts a background feeder thread, and the
+        queue registers an ``atexit`` finalizer that *joins* it. That join
+        blocks forever because the feeder never receives a close sentinel —
+        so an owner that exits cleanly would hang at interpreter shutdown.
+        ``cancel_join_thread`` drops the join (the buffered free-slot ints are
+        worthless once we're tearing the ring down).
+        """
+        try:
+            self.free_q.cancel_join_thread()
+        except Exception:  # noqa: BLE001 — best-effort; nothing left to flush
+            pass
+
     def close(self) -> None:
         """Close all slot handles without unlinking (best-effort).
 
@@ -98,6 +114,7 @@ class SharedSampleRing:
         (a buffer view survived): close the handles we can so this process
         leaks nothing further, even though the named segments may persist.
         """
+        self._release_free_q()
         for s in self._shm:
             try:
                 s.close()
@@ -106,6 +123,7 @@ class SharedSampleRing:
 
     def close_unlink(self) -> None:
         """Close all slots; unlink them if this instance owns them."""
+        self._release_free_q()
         for s in self._shm:
             s.close()
             if self._owner:
