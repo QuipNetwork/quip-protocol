@@ -17,7 +17,7 @@ Yielding modes:
 import ctypes
 import ctypes.util
 import logging
-import threading
+import multiprocessing as mp
 from typing import Optional
 
 
@@ -161,6 +161,18 @@ def _query_iokit_gpu_utilization() -> int:
         return 0
 
 
+def poll_iokit_gpu_util() -> int:
+    """Zero-arg IOKit utilization poll for the monitor process.
+
+    ``_query_iokit_gpu_utilization`` recreates its ctypes handles per call, so
+    nothing IOKit-related needs to survive between calls or cross processes.
+
+    Returns:
+        GPU utilization percentage 0-100, or 0 on error.
+    """
+    return int(_query_iokit_gpu_utilization())
+
+
 class MetalScheduler:
     """GPU core budget + IOKit utilization monitoring for Metal.
 
@@ -194,10 +206,9 @@ class MetalScheduler:
         )
 
         # IOKit polling state
-        self._external_util_pct = 0
-        self._iokit_thread: Optional[threading.Thread] = None
-        self._iokit_stop = threading.Event()
-        self._util_lock = threading.Lock()
+        self._util_value = mp.get_context("spawn").Value("i", 0)
+        self._util_proc: Optional[mp.process.BaseProcess] = None
+        self._util_stop = None
 
         # Hysteresis for stable target threadgroups
         self._prev_target = 0
@@ -207,8 +218,8 @@ class MetalScheduler:
             self._start_iokit_monitor()
 
     def _start_iokit_monitor(self) -> None:
-        """Start IOKit polling daemon thread."""
-        # Verify IOKit works before starting thread
+        """Start IOKit utilization monitor process for yielding mode."""
+        # Verify IOKit works before starting process
         test_util = _query_iokit_gpu_utilization()
         if test_util == 0:
             logger.warning(
@@ -216,30 +227,23 @@ class MetalScheduler:
                 "probe — yielding may use static budget only"
             )
 
-        self._iokit_thread = threading.Thread(
-            target=self._poll_loop,
-            daemon=True,
-            name="MetalUtilMonitor",
+        from GPU.util_monitor import util_monitor_main
+        from shared.proc_util import spawn_worker
+
+        self._util_stop = mp.get_context("spawn").Event()
+        self._util_proc = spawn_worker(
+            util_monitor_main,
+            (self._util_value, self._util_stop, self._poll_interval,
+             "GPU.metal_scheduler:poll_iokit_gpu_util"),
+            name="metal-util-monitor",
         )
-        self._iokit_thread.start()
         logger.info(
-            "IOKit monitor started (yielding, ceiling=%d%%, "
+            "IOKit monitor process started (yielding, ceiling=%d%%, "
             "cores=%d, poll=%.1fs)",
             self._gpu_utilization_pct,
             self._gpu_core_count,
             self._poll_interval,
         )
-
-    def _poll_loop(self) -> None:
-        """Daemon thread: poll IOKit utilization."""
-        while not self._iokit_stop.is_set():
-            try:
-                util = _query_iokit_gpu_utilization()
-                with self._util_lock:
-                    self._external_util_pct = util
-            except Exception:
-                pass  # Keep last known value
-            self._iokit_stop.wait(self._poll_interval)
 
     def get_core_budget(self) -> int:
         """Static budget: gpu_utilization% x core_count.
@@ -259,8 +263,7 @@ class MetalScheduler:
         """
         if not self._yielding:
             return False
-        with self._util_lock:
-            return self._external_util_pct > 90
+        return self._util_value.value > 90
 
     def compute_target_threadgroups(
         self,
@@ -279,8 +282,7 @@ class MetalScheduler:
         if not self._yielding:
             return max_tg
 
-        with self._util_lock:
-            ext_util = self._external_util_pct
+        ext_util = self._util_value.value
 
         if ext_util <= 0:
             return max_tg
@@ -338,14 +340,14 @@ class MetalScheduler:
         Returns:
             Cached utilization 0-100, or 0 if unavailable.
         """
-        with self._util_lock:
-            return self._external_util_pct
+        return self._util_value.value
 
     def stop(self) -> None:
-        """Stop IOKit polling thread."""
-        self._iokit_stop.set()
-        if self._iokit_thread is not None:
-            self._iokit_thread.join(timeout=2.0)
+        """Stop IOKit utilization monitor process."""
+        if self._util_proc is not None:
+            self._util_stop.set()
+            from shared.proc_util import terminate_join
+            terminate_join(self._util_proc, 2.0)
 
 
 class DutyCycleController:

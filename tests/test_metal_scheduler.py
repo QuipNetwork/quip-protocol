@@ -83,7 +83,7 @@ class TestMetalSchedulerThrottle:
             yielding=True,
         )
         # Simulate high external load
-        sched._external_util_pct = 95
+        sched._util_value.value = 95
         assert sched.should_throttle() is True
         sched.stop()
 
@@ -94,7 +94,7 @@ class TestMetalSchedulerThrottle:
             gpu_utilization_pct=100,
             yielding=True,
         )
-        sched._external_util_pct = 50
+        sched._util_value.value = 50
         assert sched.should_throttle() is False
         sched.stop()
 
@@ -120,7 +120,7 @@ class TestMetalSchedulerTargetThreadgroups:
             gpu_utilization_pct=100,
             yielding=True,
         )
-        sched._external_util_pct = 80
+        sched._util_value.value = 80
         target = sched.compute_target_threadgroups(
             max_tg=10, active_tg=0,
         )
@@ -135,7 +135,7 @@ class TestMetalSchedulerTargetThreadgroups:
             gpu_utilization_pct=100,
             yielding=True,
         )
-        sched._external_util_pct = 99
+        sched._util_value.value = 99
         target = sched.compute_target_threadgroups(
             max_tg=10, active_tg=0,
         )
@@ -153,7 +153,7 @@ class TestStableTargetHysteresis:
             gpu_utilization_pct=100,
             yielding=True,
         )
-        sched._external_util_pct = 80
+        sched._util_value.value = 80
         result = sched.check_stable_target_threadgroups(
             max_tg=10, active_tg=0,
         )
@@ -167,7 +167,7 @@ class TestStableTargetHysteresis:
             gpu_utilization_pct=100,
             yielding=True,
         )
-        sched._external_util_pct = 80
+        sched._util_value.value = 80
         sched.check_stable_target_threadgroups(10, 0)
         result = sched.check_stable_target_threadgroups(10, 0)
         assert result is not None
@@ -181,10 +181,10 @@ class TestStableTargetHysteresis:
             gpu_utilization_pct=100,
             yielding=True,
         )
-        sched._external_util_pct = 80
+        sched._util_value.value = 80
         sched.check_stable_target_threadgroups(10, 0)
         # Change external load → different target
-        sched._external_util_pct = 20
+        sched._util_value.value = 20
         result = sched.check_stable_target_threadgroups(10, 0)
         assert result is None  # Reset, need 2 stable again
         sched.stop()
@@ -238,8 +238,9 @@ class TestMetalSchedulerStop:
             gpu_utilization_pct=100,
             yielding=True,
         )
+        # _start_iokit_monitor is patched by the autouse fixture, so
+        # _util_proc stays None and stop() is a no-op — just verify no raise.
         sched.stop()
-        assert sched._iokit_stop.is_set()
 
 
 class TestMetalSchedulerCachedUtilization:
@@ -261,7 +262,7 @@ class TestMetalSchedulerCachedUtilization:
             gpu_utilization_pct=100,
             yielding=True,
         )
-        sched._external_util_pct = 42
+        sched._util_value.value = 42
         assert sched.get_cached_utilization() == 42
         sched.stop()
 
