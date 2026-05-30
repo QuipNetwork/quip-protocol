@@ -76,6 +76,32 @@ _PUMP_DONE = object()
 _SETUP_ABORT_TAG_LIMIT = 32
 
 
+@dataclass
+class _MiningLoopState:
+    """Per-dispatch state bundle for ``mine_work_item``'s loop helpers.
+
+    Groups the locals the extracted per-iteration helpers
+    (``_run_substrate_ratchet``, ``_run_mempool_eval``,
+    ``_finalize_iteration_logging``) need so each stays under the
+    positional-param limit. Constructed once per ``mine_work_item`` call
+    and mutated in place (``top_k``, ``previewed_floor_milli``) by the
+    ratchet helper, mirroring the original inline locals exactly.
+    """
+
+    requirements: BlockRequirements
+    nodes: List[int]
+    edges: List[Tuple[int, int]]
+    prev_timestamp: int
+    start_time: float
+    dispatch_id_for_log: int
+    attempt_log: AttemptLogger
+    solution_store: SolutionStore
+    live_threshold_var: Optional[Any]
+    top_k_cap: int
+    top_k: List[MiningResult]
+    previewed_floor_milli: int
+
+
 class _SetupAbortThrottle:
     """Rate-limiter for the ``_pre_mine_setup`` returned-False warning.
 
@@ -619,6 +645,21 @@ class BaseMiner(ABC):
             self._solution_store = solution_store
         dispatch_id_for_log = int(getattr(self, '_current_dispatch_id', 0))
 
+        loop_state = _MiningLoopState(
+            requirements=requirements,
+            nodes=nodes,
+            edges=edges,
+            prev_timestamp=prev_timestamp,
+            start_time=start_time,
+            dispatch_id_for_log=dispatch_id_for_log,
+            attempt_log=attempt_log,
+            solution_store=solution_store,
+            live_threshold_var=live_threshold_var,
+            top_k_cap=top_k_cap,
+            top_k=top_k,
+            previewed_floor_milli=previewed_floor_milli,
+        )
+
         # Build the feeder for this attempt. Each context flavor picks
         # the right backing implementation (RandomIsingFeeder for PoW,
         # FixedIsingFeeder for mempool). We own the lifecycle here —
@@ -949,34 +990,9 @@ class BaseMiner(ABC):
                         ),
                     )
                 else:
-                    # ---- Mempool path (unchanged strict semantics) ---
-                    result = self.evaluate_sampleset(
-                        sampleset, requirements, nodes, edges,
-                        nonce, salt, prev_timestamp, start_time,
-                    )
-
-                    self.timing_stats['postprocessing'].append(
-                        (time.time() - postprocess_start) * 1e6,
-                    )
-                    # Mempool path may have ``difficulty_energy = +inf``
-                    # (unbounded threshold for jobs with no min_energy
-                    # floor). int() would overflow — use None instead.
-                    threshold_milli_log: Optional[int] = None
-                    if math.isfinite(requirements.difficulty_energy):
-                        threshold_milli_log = int(
-                            requirements.difficulty_energy * 1000,
-                        )
-                    attempt_log_kwargs.update(
-                        post_processed=True,
-                        threshold_milli=threshold_milli_log,
-                        num_valid=(result.num_valid if result is not None else None),
-                        diversity_milli=(
-                            int(result.diversity * 1000)
-                            if result is not None else None
-                        ),
-                        result_kind=(
-                            "submitted" if result is not None else "rejected"
-                        ),
+                    result = self._run_mempool_eval(
+                        loop_state, sampleset, nonce, salt, postprocess_start,
+                        attempt_log_kwargs=attempt_log_kwargs,
                     )
 
                 attempt_log_kwargs["mining_time_us"] = int(
@@ -1116,6 +1132,53 @@ class BaseMiner(ABC):
         if attempt_logger is not None:
             attempt_logger.flush()
         self._post_mine_cleanup()
+
+    def _run_mempool_eval(
+        self,
+        state: _MiningLoopState,
+        sampleset: Any,
+        nonce: Any,
+        salt: bytes,
+        postprocess_start: float,
+        *,
+        attempt_log_kwargs: Dict[str, Any],
+    ) -> Optional[MiningResult]:
+        """Mempool-path strict evaluation (the ``else`` of ``is_substrate``).
+
+        Runs ``evaluate_sampleset`` with strict semantics, appends the
+        post-processing timing, and updates ``attempt_log_kwargs`` in place.
+        Returns the evaluated ``MiningResult`` (or ``None``). Behaviour is
+        identical to the original inline mempool branch.
+        """
+        result = self.evaluate_sampleset(
+            sampleset, state.requirements, state.nodes, state.edges,
+            nonce, salt, state.prev_timestamp, state.start_time,
+        )
+
+        self.timing_stats['postprocessing'].append(
+            (time.time() - postprocess_start) * 1e6,
+        )
+        # Mempool path may have ``difficulty_energy = +inf``
+        # (unbounded threshold for jobs with no min_energy
+        # floor). int() would overflow — use None instead.
+        threshold_milli_log: Optional[int] = None
+        if math.isfinite(state.requirements.difficulty_energy):
+            threshold_milli_log = int(
+                state.requirements.difficulty_energy * 1000,
+            )
+        attempt_log_kwargs.update(
+            post_processed=True,
+            threshold_milli=threshold_milli_log,
+            num_valid=(result.num_valid if result is not None else None),
+            diversity_milli=(
+                int(result.diversity * 1000)
+                if result is not None else None
+            ),
+            result_kind=(
+                "submitted" if result is not None else "rejected"
+            ),
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Anticipatory-submission preview (substrate / PoW ratchet path)
