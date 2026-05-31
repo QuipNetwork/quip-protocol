@@ -814,7 +814,7 @@ def test_ratchet_skips_attempt_outside_top5(monkeypatch):
 
 def test_ratchet_skips_under_reconstructed_sample(monkeypatch):
     """Width guard: a sample narrower than the topology (an under-reconstructed
-    QPU driver result returned via _shift_energies) must NOT be evaluated or
+    QPU driver result without defect_info) must NOT be evaluated or
     stashed, even when its energy WOULD enter the top-5.
 
     A reduced-width sample drops the clamped fixed-spin columns; passing it to

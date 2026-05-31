@@ -1165,9 +1165,7 @@ class BaseMiner(ABC):
             threshold_milli = _energy_to_milli(thr) if thr is not None else 0
             anneal = sample_ctx["annealing_time"]
             # The 9th element is the feeder spec the generic StreamContext builds
-            # its feeder from (PoW: random-model derivation seed). The legacy QPU
-            # PersistentStreamContext unpacks cmd[:7] and ignores it; it moves to
-            # the spec when QPU joins the generic context (unification step 3).
+            # its feeder from (PoW: random-model derivation seed).
             feeder_spec = (
                 "pow", sample_ctx["last_proof_block_hash"],
                 sample_ctx["miner_bytes"],

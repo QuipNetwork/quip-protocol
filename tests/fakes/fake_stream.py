@@ -12,7 +12,7 @@ import numpy as np
 
 
 class _FakePersistentContext:
-    """No-QPU stand-in for ``PersistentStreamContext``.
+    """No-QPU stand-in for the stream driver context.
 
     Implements the duck-typed driver contract: ``apply_command`` /
     ``iter_results`` / ``cleanup`` / ``generation``. ``iter_results`` yields
