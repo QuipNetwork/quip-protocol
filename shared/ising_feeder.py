@@ -544,7 +544,40 @@ class FixedIsingFeeder:
         """No-op for API parity with :class:`RandomIsingFeeder`."""
 
 
+def build_feeder(spec, nodes, edges, buffer_size):
+    """Build an IsingFeeder from a switch ``feeder_spec`` tuple.
+
+    ``("pow", last_proof_block_hash, miner_bytes)`` -> ``RandomIsingFeeder``.
+    ``("mempool", problem_slot)`` and ``("oneshot", models)`` are wired in
+    later unification steps; for now they raise so a missing case fails loudly.
+
+    Args:
+        spec: A feeder-spec tuple whose first element is the kind string.
+        nodes: Topology node list passed through to the feeder.
+        edges: Topology edge list passed through to the feeder.
+        buffer_size: Target number of ready + in-flight models.
+
+    Returns:
+        A configured feeder implementing the pop/stop interface.
+
+    Raises:
+        NotImplementedError: If ``spec[0]`` is not ``"pow"``.
+    """
+    kind = spec[0]
+    if kind == "pow":
+        _, last_proof_block_hash, miner_bytes = spec
+        return RandomIsingFeeder(
+            last_proof_block_hash=last_proof_block_hash,
+            miner_bytes=miner_bytes,
+            nodes=nodes,
+            edges=edges,
+            buffer_size=buffer_size,
+        )
+    raise NotImplementedError(f"feeder spec kind not yet supported: {kind!r}")
+
+
 __all__ = [
     "FixedIsingFeeder",
     "RandomIsingFeeder",
+    "build_feeder",
 ]
