@@ -22,7 +22,25 @@ import enum
 import logging
 import multiprocessing as mp
 import os
-from typing import List, Optional
+import time
+from typing import Any, List, Optional
+
+_THROTTLE_SLEEP_S = 0.5
+
+
+def throttle_if_busy(
+    scheduler: Any, *, sleep_fn: Any = time.sleep, sleep_s: float = _THROTTLE_SLEEP_S
+) -> None:
+    """Pause briefly when the GPU is externally busy (yielding mode).
+
+    No-op when ``scheduler`` is None or yielding is off (``should_throttle()``
+    returns False). The streaming samplers call this once before pulling each
+    result, restoring the back-off the old inline ``_sample_batch`` did — the
+    unified driver path bypasses that wrapper, so the throttle moved into the
+    sampler. ``sleep_fn`` is injectable for tests.
+    """
+    if scheduler is not None and scheduler.should_throttle():
+        sleep_fn(sleep_s)
 
 try:
     import cupy as cp

@@ -41,12 +41,13 @@ def build_persistent_context(
     """
     from GPU.cuda_miner import CudaMiner
 
-    # Known limitation (mirrors Metal's dropped threadgroup-rescale): the
-    # generic StreamContext fixes num_kernels per round and only reopens the
-    # stream on a switch, so the inline path's adaptive nonce rescaling /
-    # should_throttle valve is not honored here. With yielding=True the
-    # KernelScheduler still starts its NVML monitor but its feedback is unused.
-    # Track for a future StreamContext throttle hook; harmless for yielding=False.
+    # The scheduler is passed into the sampler via sampler_kwargs so the
+    # streaming generator honors should_throttle (yielding mode) — restoring the
+    # back-off the old inline _sample_batch did — AND so the StreamContext
+    # retains the scheduler + its NVML monitor (the built CudaMiner is dropped
+    # after we take its sampler). The inline path's adaptive num_kernels rescale
+    # is intentionally NOT carried over (fixed per round), mirroring Metal's
+    # dropped threadgroup-rescale.
     miner = CudaMiner(
         miner_id,
         device=device,
@@ -71,6 +72,7 @@ def build_persistent_context(
         sampler_kwargs={
             "num_kernels": num_kernels,
             "poll_timeout": _CUDA_POLL_TIMEOUT_S,
+            "scheduler": miner._scheduler,
         },
         stop_event=stop_event,
     )

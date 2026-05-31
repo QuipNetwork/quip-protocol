@@ -13,7 +13,7 @@ signaling needed.
 import time
 from itertools import chain
 from typing import (
-    Dict, Iterable, Iterator, List, Optional, Tuple,
+    Any, Dict, Iterable, Iterator, List, Optional, Tuple,
 )
 
 import cupy as cp
@@ -21,6 +21,7 @@ import dimod
 import numpy as np
 
 from GPU.base_cuda_sampler import BaseCudaSampler
+from GPU.gpu_scheduler import throttle_if_busy
 from shared.ising_model import IsingModel
 
 
@@ -121,6 +122,7 @@ class CudaSASampler(BaseCudaSampler):
         seed: Optional[int] = None,
         num_kernels: Optional[int] = None,
         poll_timeout: Optional[float] = None,
+        scheduler: Any = None,
     ) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
         """Stream Ising model solutions via SA kernel.
 
@@ -172,13 +174,22 @@ class CudaSASampler(BaseCudaSampler):
             beta_schedule_type,
         )
 
-        yield from self._run_streaming_loop(
+        # Throttle before pulling each result (yielding mode): the unified
+        # driver path bypasses the old _sample_batch back-off, so honor it here.
+        gen = self._run_streaming_loop(
             chain([first], model_iter),
             num_k=num_k,
             num_betas=num_betas,
             seed=seed,
             poll_timeout=poll_timeout,
         )
+        while True:
+            throttle_if_busy(scheduler)
+            try:
+                model, sampleset = next(gen)
+            except StopIteration:
+                return
+            yield model, sampleset
 
     # -- SA-specific sample_ising --
 
