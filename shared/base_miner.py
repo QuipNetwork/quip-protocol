@@ -116,6 +116,19 @@ class _AcquireResult:
     ring_slot: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class MidstreamBudget:
+    """Result of the in-loop QPU budget check (`_midstream_budget_ok`).
+
+    ``should_mine`` is False once the daily budget is exhausted (forward QPU
+    submission should pause). ``stats`` is the live budget snapshot (the
+    ``QPUTimeManager.get_stats`` shape) for the progress log + telemetry push.
+    """
+
+    should_mine: bool
+    stats: Dict[str, Any]
+
+
 @dataclass
 class _DispatchSetup:
     """Everything ``_setup_dispatch`` hands back to ``mine_work_item``.
@@ -323,6 +336,10 @@ class BaseMiner(ABC):
         # Last live-threshold (milli) forwarded to the driver, so decay updates
         # are only sent on change. Reset on driver (re)spawn.
         self._last_forwarded_threshold_milli: Optional[int] = None
+        # Generation for which a budget-exhaustion ("pause", gen) has already
+        # been sent to the driver, so the in-loop gate sends it at most once
+        # per dispatch. Reset when a new dispatch bumps the generation.
+        self._budget_paused_generation: Optional[int] = None
 
         # In-flight QPU job count forwarded to the stream-driver factory.
         # QPU subclasses override; default 0 keeps the driver factory's
@@ -600,6 +617,7 @@ class BaseMiner(ABC):
         context: WorkContext,
         stop_event: multiprocessing.synchronize.Event,
         preview_cb: Optional[Any] = None,
+        budget_cb: Optional[Any] = None,
         **kwargs,
     ) -> Optional[MiningResult]:
         """Protocol-neutral mining loop.
@@ -642,6 +660,11 @@ class BaseMiner(ABC):
                 encode+submit the candidate later. Default ``None`` = no-op
                 so existing callers are unaffected. A failing callback never
                 breaks mining (wrapped in try/except, logged at debug).
+            budget_cb: Optional callable invoked at the progress-log cadence
+                with the live QPU budget stats dict (the
+                ``QPUTimeManager.get_stats`` shape) so the controller can
+                surface live usage on telemetry. Default ``None`` = no-op. A
+                failing callback never breaks mining.
             **kwargs: Forwarded to ``_pre_mine_setup``.
 
         Returns:
@@ -784,11 +807,41 @@ class BaseMiner(ABC):
                 if progress % PROGRESS_LOG_INTERVAL == 0:
                     # `self.top_attempts` is intentionally not maintained in
                     # substrate mode — no best-energy field to surface here.
-                    self.logger.info(
-                        "mine_work_item progress: %d attempts | "
-                        "sweeps=%d reads=%d",
-                        progress, setup.num_sweeps, setup.num_reads,
+                    budget = self._midstream_budget_ok(
+                        loop_state.solution_number_for_log,
                     )
+                    if budget is None:
+                        self.logger.info(
+                            "mine_work_item progress: %d attempts | "
+                            "sweeps=%d reads=%d",
+                            progress, setup.num_sweeps, setup.num_reads,
+                        )
+                    else:
+                        s = budget.stats
+                        self.logger.info(
+                            "mine_work_item progress: %d attempts | "
+                            "sweeps=%d reads=%d | qpu_budget used=%.2fs/"
+                            "%.2fs limit (%.0f%% day) skipped=%d",
+                            progress, setup.num_sweeps, setup.num_reads,
+                            s.get("cumulative_used_seconds", 0.0),
+                            s.get("proportional_limit_seconds", 0.0),
+                            s.get("elapsed_fraction", 0.0) * 100.0,
+                            s.get("blocks_skipped", 0),
+                        )
+                        if budget_cb is not None:
+                            try:
+                                budget_cb(s)
+                            except Exception as exc:  # noqa: BLE001
+                                self.logger.debug(
+                                    "budget_cb failed (ignored): %s", exc,
+                                )
+                        if not budget.should_mine:
+                            # Budget exhausted: stop the driver submitting NEW
+                            # work (idempotent per dispatch), but KEEP consuming
+                            # so the draining in-flight attempts still flow
+                            # through the decay/stash/submit ratchet — a winner
+                            # already paid for can still be submitted.
+                            self._pause_driver(loop_state.generation)
             self.logger.info("mine_work_item: stopped, no valid result")
             return None
         finally:
@@ -880,6 +933,11 @@ class BaseMiner(ABC):
                     "mine_work_item: _pre_mine_setup returned False, aborting "
                     "attempt for %s", tag,
                 )
+            # A budget-exhausted head must also idle a driver still running the
+            # PRIOR round — otherwise it keeps burning QPU on a generation the
+            # worker no longer consumes. Drain-and-idle (no cancel); the next
+            # eligible head's switch resumes it.
+            self._pause_driver(self._generation)
             return None
 
         # Topology comes from the chain snapshot, not the local sampler.
@@ -1032,6 +1090,9 @@ class BaseMiner(ABC):
             # driver keeps its D-Wave connection — no reconnect, no respawn.
             self._generation += 1
             generation = self._generation
+            # Fresh round: clear the budget-pause tracker so the in-loop gate
+            # can send a new ("pause", gen) for this generation if needed.
+            self._budget_paused_generation = None
             threshold_milli = _energy_to_milli(sample_ctx["energy_threshold"])
             try:
                 self._ctl_q.put(
@@ -1399,6 +1460,41 @@ class BaseMiner(ABC):
             if int(floor_energy * 1000) < live_threshold_milli:
                 return candidate
         return None
+
+    def _midstream_budget_ok(
+        self, solution_number: int,
+    ) -> Optional[MidstreamBudget]:
+        """Per-loop QPU budget check; ``None`` when no budget applies.
+
+        Base no-op (CPU/GPU have no ``time_manager``). The QPU subclass
+        overrides this to consult its ``QPUTimeManager`` and return a
+        :class:`MidstreamBudget` carrying the live decision + stats. Returning
+        ``None`` means "no budget gating for this backend".
+        """
+        return None
+
+    def _pause_driver(self, generation: int) -> None:
+        """Tell the persistent driver to stop submitting NEW work (drain-idle).
+
+        Sends a same-generation ``("pause", gen)`` so the driver stops calling
+        ``_submit_one`` but leaves in-flight work to complete — the consumer
+        keeps draining every already-paid-for attempt. Idempotent per
+        dispatch (guarded by ``_budget_paused_generation``). No-op on the
+        inline path (no ctl_q) or when no live driver exists. Best-effort: a
+        queue hiccup must never break mining.
+        """
+        if self._ctl_q is None:
+            return
+        if self._budget_paused_generation == generation:
+            return  # already paused this dispatch
+        driver = self._driver_proc
+        if driver is None or not driver.is_alive():
+            return
+        try:
+            self._ctl_q.put(("pause", int(generation)))
+            self._budget_paused_generation = generation
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            self.logger.debug("budget pause forward failed (ignored): %s", exc)
 
     def _forward_threshold_to_driver(
         self, generation: int, live_threshold_milli: int,

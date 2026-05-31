@@ -243,6 +243,83 @@ def test_driver_gate_reconstructs_after_loosening_threshold():
         ctx.cleanup()
 
 
+def test_pause_command_does_not_cancel_inflight():
+    """A 'pause' is a drain-and-idle signal: it stops NEW submissions but must
+    leave every in-flight future in place so we still consume what we paid for.
+    """
+    stop = mp.get_context("spawn").Event()
+    ctx = _make_ctx(stop)
+    try:
+        ctx.apply_command(("switch", 4, b"\x01" * 32, b"\x02" * 32, 0, 4, 80.0))
+        ctx._submit_one()
+        ctx._submit_one()
+        pending_before = dict(ctx._pending)
+        assert len(pending_before) == 2
+
+        ctx.apply_command(("pause", 4))
+
+        assert ctx._paused is True
+        assert ctx._pending == pending_before  # NOT cancelled — drains normally
+        assert ctx.generation == 4  # pause does not bump the generation
+    finally:
+        stop.set()
+        ctx.cleanup()
+
+
+def test_pause_stops_new_submissions_and_drains_then_returns():
+    """While paused, iter_results refills nothing new, yields the existing
+    in-flight set until it empties, then returns so the driver can idle.
+    """
+    stop = mp.get_context("spawn").Event()
+    ctx = _make_ctx(stop)
+    try:
+        ctx.apply_command(("switch", 9, b"\x01" * 32, b"\x02" * 32, 0, 4, 80.0))
+        ctx._submit_one()
+        ctx._submit_one()
+        submitted_before = ctx._job_index
+        assert submitted_before == 2
+
+        ctx.apply_command(("pause", 9))
+        drained = list(ctx.iter_results())  # fake futures are 'done' → drains
+
+        assert len(drained) == 2  # exactly the two in-flight, nothing more
+        assert ctx._job_index == submitted_before  # no new _submit_one calls
+        assert not ctx._pending  # fully drained
+    finally:
+        stop.set()
+        ctx.cleanup()
+
+
+def test_pause_with_empty_pending_returns_immediately():
+    """Paused with nothing in flight → iter_results returns at once (idle)."""
+    stop = mp.get_context("spawn").Event()
+    ctx = _make_ctx(stop)
+    try:
+        ctx.apply_command(("switch", 1, b"\x01" * 32, b"\x02" * 32, 0, 4, 80.0))
+        ctx.apply_command(("pause", 1))
+        assert list(ctx.iter_results()) == []
+        assert ctx._job_index == 0  # never submitted anything
+    finally:
+        stop.set()
+        ctx.cleanup()
+
+
+def test_switch_clears_paused_to_resume():
+    """A subsequent switch (new head) resumes a paused context."""
+    stop = mp.get_context("spawn").Event()
+    ctx = _make_ctx(stop)
+    try:
+        ctx.apply_command(("switch", 1, b"\x01" * 32, b"\x02" * 32, 0, 4, 80.0))
+        ctx.apply_command(("pause", 1))
+        assert ctx._paused is True
+        ctx.apply_command(("switch", 2, b"\x09" * 32, b"\x02" * 32, 0, 4, 80.0))
+        assert ctx._paused is False
+        assert ctx.generation == 2
+    finally:
+        stop.set()
+        ctx.cleanup()
+
+
 def test_build_persistent_context_forwards_topology():
     from unittest.mock import patch
     from dwave_topologies import DEFAULT_TOPOLOGY

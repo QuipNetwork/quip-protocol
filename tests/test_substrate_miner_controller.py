@@ -163,6 +163,7 @@ def _bare_controller() -> SubstrateMinerController:
     )
     # Anticipatory-submission state (Task 6b).
     c._latest_preview = {}
+    c._latest_budget = {}
     c._pow_constants = None
     c._base_difficulty_by_key = {}
     c._anticipatory_fired = set()
@@ -1718,3 +1719,65 @@ async def test_anticipatory_fire_paced_worker_idle(monkeypatch):
     assert key in controller._closed_work_keys
     # Worker was never dispatched (the SUCCESS fire closed the round first).
     assert handle.mine_calls == []
+
+
+# ----------------------------------------------------------------------
+# Live QPU budget: store + telemetry snapshot surfacing
+# ----------------------------------------------------------------------
+
+
+def test_store_budget_lands_in_latest_budget_by_miner_id():
+    """A `{"op":"budget"}` push lands in `_latest_budget` keyed by miner id."""
+    from types import SimpleNamespace
+
+    controller = _bare_controller()
+    handle = SimpleNamespace(miner_id="qpu-1")
+    stats = {"cumulative_used_seconds": 12.5, "blocks_skipped": 2}
+    controller._store_budget(handle, {"op": "budget", "data": stats})
+    assert controller._latest_budget["qpu-1"] == stats
+
+
+def test_store_budget_ignores_malformed_payload():
+    """A non-dict payload is dropped, not stored (can't poison telemetry)."""
+    from types import SimpleNamespace
+
+    controller = _bare_controller()
+    handle = SimpleNamespace(miner_id="qpu-1")
+    controller._store_budget(handle, {"op": "budget", "data": None})
+    assert controller._latest_budget == {}
+
+
+def test_snapshot_surfaces_per_miner_qpu_budget():
+    """build_stats_snapshot_for_telemetry attaches the live budget per miner."""
+    from types import SimpleNamespace
+    from substrate.miner_controller import build_stats_snapshot_for_telemetry
+
+    controller = _bare_controller()
+    controller.signer = None  # skip the survey path
+    budget = {"cumulative_used_seconds": 12.5, "blocks_skipped": 2}
+    controller._latest_budget = {"qpu-1": budget}
+    controller.core = SimpleNamespace(
+        node_id="node-x",
+        miner_handles=[SimpleNamespace(miner_id="qpu-1", miner_type="QPU")],
+        descriptor=lambda: {},
+    )
+    snap = build_stats_snapshot_for_telemetry(controller)
+    miner = snap["miners"][0]
+    assert miner["id"] == "qpu-1"
+    assert miner["qpu_budget"] == budget
+
+
+def test_snapshot_qpu_budget_is_none_when_unreported():
+    """A miner that never pushed budget shows qpu_budget=None (not missing)."""
+    from types import SimpleNamespace
+    from substrate.miner_controller import build_stats_snapshot_for_telemetry
+
+    controller = _bare_controller()
+    controller.signer = None
+    controller.core = SimpleNamespace(
+        node_id="node-x",
+        miner_handles=[SimpleNamespace(miner_id="cpu-1", miner_type="CPU")],
+        descriptor=lambda: {},
+    )
+    snap = build_stats_snapshot_for_telemetry(controller)
+    assert snap["miners"][0]["qpu_budget"] is None

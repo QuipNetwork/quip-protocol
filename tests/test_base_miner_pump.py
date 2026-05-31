@@ -17,6 +17,7 @@ import numpy as np
 from shared.allowed_value_spec import AllowedValueSet
 from shared.base_miner import (
     BaseMiner,
+    MidstreamBudget,
     _ACQUIRE_DONE,
     _ACQUIRE_OK,
     _ACQUIRE_STOP,
@@ -29,6 +30,36 @@ from substrate.types import SubstrateDifficulty, SubstrateMiningContext
 
 _FAKE_CTX = "tests.fakes.fake_stream:build_fake_persistent_context"
 _FAKE_RAISING = "tests.fakes.fake_stream:build_fake_raising_context"
+_FAKE_NONSTOP = "tests.fakes.fake_stream:build_fake_nonstop_persistent_context"
+
+_GATE_STATS = {
+    "cumulative_used_seconds": 45.0,
+    "proportional_limit_seconds": 40.0,
+    "elapsed_fraction": 0.5,
+    "blocks_skipped": 3,
+}
+
+
+def _spy_ctl_q(miner, sent: list):
+    """Wrap the miner's ctl_q.put to record command kinds (after _ensure)."""
+    orig_ensure = miner._ensure_driver
+
+    def _ensure_spy(sample_ctx):
+        ready = orig_ensure(sample_ctx)
+        if ready and miner._ctl_q is not None and not getattr(
+            miner._ctl_q, "_quip_spied", False,
+        ):
+            real_put = miner._ctl_q.put
+
+            def _put(item, *a, **k):
+                sent.append(item[0] if isinstance(item, tuple) else item)
+                return real_put(item, *a, **k)
+
+            miner._ctl_q.put = _put
+            miner._ctl_q._quip_spied = True
+        return ready
+
+    miner._ensure_driver = _ensure_spy
 
 _BIN_SPEC = AllowedValueSet((-1000, 1000))
 _TER_SPEC = AllowedValueSet((-1000, 0, 1000))
@@ -481,6 +512,142 @@ def test_aggressive_submit_on_decay_end_to_end():
         assert miner._driver_proc.pid == pid
         assert sent.count("switch") == 1, "decay caused a spurious round switch"
         assert "threshold" in sent, "decay was not forwarded to the driver gate"
+    finally:
+        stop.set()
+        t.join(timeout=15.0)
+        miner._close_driver()
+
+
+# ----------------------------------------------------------------------
+# In-loop QPU budget gate: pause-once + keep consuming (no break)
+# ----------------------------------------------------------------------
+
+
+class _BudgetGateMiner(_DriverMiner):
+    """Driver miner whose in-loop budget gate reports exhaustion immediately."""
+
+    def __init__(self, factory: str = _FAKE_CTX):
+        super().__init__(factory=factory)
+        self.gate_should_mine = False
+
+    def _midstream_budget_ok(self, solution_number):
+        return MidstreamBudget(
+            should_mine=self.gate_should_mine, stats=dict(_GATE_STATS),
+        )
+
+
+def test_inloop_budget_gate_pauses_once_and_keeps_consuming():
+    """Exhaustion sends ONE ('pause', gen) to the driver and feeds budget_cb,
+    but does NOT break the loop (the worker keeps draining in-flight work)."""
+    import threading
+    import time as _t
+
+    ctx = _streaming_context()
+    miner = _BudgetGateMiner()
+    sent: list = []
+    _spy_ctl_q(miner, sent)
+    budget_pushes: list = []
+    stop = mp.Event()
+    result_box: list = []
+
+    def _run():
+        result_box.append(
+            miner.mine_work_item(ctx, stop, budget_cb=budget_pushes.append),
+        )
+
+    t = threading.Thread(target=_run, name="budget-gate")
+    t.start()
+    try:
+        deadline = _t.monotonic() + 10.0
+        while "pause" not in sent and _t.monotonic() < deadline:
+            _t.sleep(0.02)
+        assert "pause" in sent, "exhaustion did not pause the driver"
+        # Did NOT break: the loop is still running a moment after pausing.
+        _t.sleep(0.3)
+        assert t.is_alive(), "loop broke on budget exhaustion (must keep draining)"
+        assert not result_box, "returned a result without a win"
+        assert budget_pushes, "budget_cb was never invoked"
+        assert budget_pushes[0]["blocks_skipped"] == 3
+    finally:
+        stop.set()
+        t.join(timeout=15.0)
+        miner._close_driver()
+    assert result_box == [None]
+    assert sent.count("pause") == 1, "pause must be sent at most once per dispatch"
+
+
+class _BudgetDecayMiner(_DriverMiner):
+    """Exhausted-budget miner that still stashes a decay-only candidate.
+
+    The in-loop gate reports exhaustion (pause), but the worker must keep
+    consuming the (continuously-draining) in-flight set so the stashed
+    candidate is still submitted once the live threshold decays past it.
+    """
+
+    def __init__(self):
+        super().__init__(factory=_FAKE_NONSTOP)  # production survives 'pause'
+        self._eval_calls = 0
+
+    def _midstream_budget_ok(self, solution_number):
+        return MidstreamBudget(should_mine=False, stats=dict(_GATE_STATS))
+
+    def evaluate_sampleset(self, sampleset, requirements, nodes, edges,
+                           nonce, salt, *args, **kwargs):
+        self._eval_calls += 1
+        if self._eval_calls > 1:
+            return None  # stash exactly once; candidate must persist
+        return MiningResult(
+            miner_id=self.miner_id, miner_type=self.miner_type,
+            nonce=bytes(nonce) if not isinstance(nonce, bytes) else nonce,
+            salt=salt, timestamp=0, prev_timestamp=0,
+            solutions=[[1, -1, 1]], energy=-14600.0, diversity=1.0,
+            num_valid=1, mining_time=0, node_list=list(nodes),
+            edge_list=list(edges), submit_floor_energy=-14500.0,
+        )
+
+
+def test_decay_submit_still_fires_after_budget_pause():
+    """After the budget gate pauses the driver, a stashed candidate is STILL
+    submitted when the live threshold decays past it — the decay regime keeps
+    monitoring already-paid-for attempts during the drain."""
+    import threading
+    import time as _t
+
+    ctx = _streaming_context()
+    miner = _BudgetDecayMiner()
+    miner._live_max_energy_milli = mp.Value("q", -14800_000)  # strict
+    sent: list = []
+    _spy_ctl_q(miner, sent)
+    previews: list = []
+    result_box: list = []
+    stop = mp.Event()
+
+    def _run():
+        result_box.append(
+            miner.mine_work_item(ctx, stop, preview_cb=previews.append),
+        )
+
+    t = threading.Thread(target=_run, name="budget-decay")
+    t.start()
+    try:
+        # Wait until the gate has paused the driver (budget exhausted).
+        deadline = _t.monotonic() + 10.0
+        while "pause" not in sent and _t.monotonic() < deadline:
+            _t.sleep(0.02)
+        assert "pause" in sent, "gate never paused the driver"
+        assert not result_box, "submitted under the strict threshold"
+
+        # Decay past the candidate floor WITH NO head change → submit fires
+        # even though the budget is exhausted (we keep draining in-flight).
+        with miner._live_max_energy_milli.get_lock():
+            miner._live_max_energy_milli.value = -14400_000
+        t.join(timeout=15.0)
+        assert not t.is_alive(), "decay submit did not fire after pause"
+        result = result_box[0]
+        assert result is not None and result.submit_floor_energy == -14500.0
+        # Pause was sent at most once despite many gate checks while draining.
+        assert sent.count("pause") == 1
+        assert sent.count("switch") == 1, "decay caused a spurious round switch"
     finally:
         stop.set()
         t.join(timeout=15.0)

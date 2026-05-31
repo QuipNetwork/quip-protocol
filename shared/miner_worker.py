@@ -276,9 +276,28 @@ def miner_worker_main(
                 except Exception as exc:  # noqa: BLE001 — best-effort
                     logger.debug("preview put failed (ignored): %s", exc)
 
+            # Live QPU budget channel. The miner calls this at the progress-log
+            # cadence with its ``QPUTimeManager.get_stats`` snapshot; we forward
+            # it to the controller as a worker-initiated ``{"op": "budget"}``
+            # push (never blocks the serial op-loop, unlike a get_stats RPC).
+            # Best-effort: a put failure must not break mining.
+            def _emit_budget(stats: Dict[str, Any]) -> None:
+                try:
+                    resp_q.put(
+                        {
+                            "op": "budget",
+                            "id": spec.get("id"),
+                            "dispatch_id": dispatch_id,
+                            "data": stats,
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001 — best-effort
+                    logger.debug("budget put failed (ignored): %s", exc)
+
             try:
                 result = miner.mine_work_item(
                     context, stop_event, preview_cb=_emit_preview,
+                    budget_cb=_emit_budget,
                 )
             except Exception as exc:
                 logger.error(

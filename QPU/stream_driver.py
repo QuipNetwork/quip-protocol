@@ -47,14 +47,18 @@ def _extract_qpu_us(sampleset) -> int:
 
 
 def _coalesce_ctl_q(ctx, ctl_q) -> str:
-    """Drain ctl_q, applying the newest switch + latest threshold.
+    """Drain ctl_q, applying the newest switch + latest threshold + pause.
 
     Returns ``"shutdown"`` if a ``None`` sentinel was seen, else ``"ok"``.
     A burst of switches coalesces to the highest generation (dead
     intermediate rounds are skipped); a trailing threshold still applies.
+    A ``("pause", gen)`` (budget-exhaustion stall) stops new submissions but
+    is superseded by a switch in the same drain (a fresh head outranks a
+    stall) and ignored if stale for an older generation.
     """
     latest_switch = None
     latest_threshold = None
+    latest_pause = None
     shutdown = False
     while True:
         try:
@@ -69,6 +73,9 @@ def _coalesce_ctl_q(ctx, ctl_q) -> str:
                 latest_switch = cmd
         elif cmd[0] == "threshold":
             latest_threshold = cmd
+        elif cmd[0] == "pause":
+            if latest_pause is None or cmd[1] >= latest_pause[1]:
+                latest_pause = cmd
     # Apply switch BEFORE threshold: when both target the live generation in
     # one drain, the threshold update must override the threshold embedded in
     # the switch tuple (a decay that landed in the same tick as the head
@@ -79,6 +86,14 @@ def _coalesce_ctl_q(ctx, ctl_q) -> str:
         latest_switch is None or latest_threshold[1] >= ctx.generation
     ):
         ctx.apply_command(latest_threshold)
+    # Pause only when no switch superseded it this drain (a switch resumes the
+    # driver for a new head) and it is not stale for an older generation.
+    if (
+        latest_pause is not None
+        and latest_switch is None
+        and latest_pause[1] >= ctx.generation
+    ):
+        ctx.apply_command(latest_pause)
     return "shutdown" if shutdown else "ok"
 
 
@@ -117,6 +132,7 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, ctl_q, stop_event,
     ring = SharedSampleRing(**ring_args)
     ctx = None
     dropped = 0
+    shutdown = False
     # Context construction can raise on D-Wave auth/topology errors; keep it
     # inside the try so the finally always sends the end-of-stream sentinel.
     try:
@@ -124,40 +140,54 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, ctl_q, stop_event,
         ctx = factory(**_maybe_with_stop(factory, factory_kwargs, stop_event))
         if not _wait_for_first_switch(ctx, ctl_q, stop_event):
             return  # shutdown/stop before any round began
-        for model, sampleset, submit_gen in ctx.iter_results():
-            if stop_event.is_set():
+        # Outer loop: ``iter_results`` returns when the round ends OR when a
+        # budget-exhaustion pause has drained the in-flight queue. On a paused
+        # drain we idle on ctl_q (NOT exit) until the next switch resumes us;
+        # the persistent D-Wave connection is kept alive throughout.
+        while not stop_event.is_set() and not shutdown:
+            for model, sampleset, submit_gen in ctx.iter_results():
+                if stop_event.is_set():
+                    break
+                if _coalesce_ctl_q(ctx, ctl_q) == "shutdown":
+                    shutdown = True
+                    break
+                # Discard completions from a superseded round (driver-side
+                # generation filter — the first of the three independent
+                # filters).
+                if submit_gen != ctx.generation:
+                    continue
+                sample = np.asarray(sampleset.record.sample, dtype=np.int8)
+                energy = np.asarray(sampleset.record.energy, dtype=np.float64)
+                n_rows, n_cols = sample.shape
+                if n_rows > ring.max_rows or n_cols > ring.max_cols:
+                    log.warning(
+                        "stream driver: dropping oversized sample %dx%d "
+                        "(slot capacity %dx%d)",
+                        n_rows, n_cols, ring.max_rows, ring.max_cols,
+                    )
+                    dropped += 1
+                    continue
+                slot = ring.claim_free(timeout=0.0 if dropped else 0.005)
+                if slot is None:
+                    dropped += 1
+                    continue
+                ring.write(slot, sample, energy)
+                try:
+                    desc_q.put_nowait(
+                        (slot, n_rows, n_cols, bytes(model.nonce),
+                         bytes(model.salt), _extract_qpu_us(sampleset),
+                         ctx.generation))
+                except _queue.Full:
+                    # Consumer backpressure: release the slot and drop.
+                    ring.release(slot)
+                    dropped += 1
+            # iter_results returned. If stop/shutdown, fall through to cleanup;
+            # otherwise the driver paused-and-drained (or the round ended) —
+            # idle until the next switch (resume) or None (shutdown).
+            if stop_event.is_set() or shutdown:
                 break
-            if _coalesce_ctl_q(ctx, ctl_q) == "shutdown":
-                break
-            # Discard completions from a superseded round (driver-side
-            # generation filter — the first of the three independent filters).
-            if submit_gen != ctx.generation:
-                continue
-            sample = np.asarray(sampleset.record.sample, dtype=np.int8)
-            energy = np.asarray(sampleset.record.energy, dtype=np.float64)
-            n_rows, n_cols = sample.shape
-            if n_rows > ring.max_rows or n_cols > ring.max_cols:
-                log.warning(
-                    "stream driver: dropping oversized sample %dx%d "
-                    "(slot capacity %dx%d)",
-                    n_rows, n_cols, ring.max_rows, ring.max_cols,
-                )
-                dropped += 1
-                continue
-            slot = ring.claim_free(timeout=0.0 if dropped else 0.005)
-            if slot is None:
-                dropped += 1
-                continue
-            ring.write(slot, sample, energy)
-            try:
-                desc_q.put_nowait(
-                    (slot, n_rows, n_cols, bytes(model.nonce),
-                     bytes(model.salt), _extract_qpu_us(sampleset),
-                     ctx.generation))
-            except _queue.Full:
-                # Consumer backpressure: release the slot and drop.
-                ring.release(slot)
-                dropped += 1
+            if not _wait_for_first_switch(ctx, ctl_q, stop_event):
+                break  # shutdown/stop arrived while idle
     except Exception:
         log.exception("stream driver failed")
     finally:

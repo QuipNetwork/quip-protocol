@@ -151,8 +151,13 @@ def build_stats_snapshot_for_telemetry(controller) -> dict[str, Any]:
     survey: dict[str, Any] = {}
     if core is not None:
         node_id = getattr(core, "node_id", None)
+        latest_budget = getattr(controller, "_latest_budget", {})
         miners_list = [
-            {"id": h.miner_id, "type": h.miner_type}
+            {
+                "id": h.miner_id,
+                "type": h.miner_type,
+                "qpu_budget": latest_budget.get(h.miner_id),
+            }
             for h in getattr(core, "miner_handles", [])
         ]
         try:
@@ -553,6 +558,10 @@ class SubstrateMinerController:
         # decay-block at which the candidate clears and pre-submit. Keeps
         # the lowest ``submit_floor_energy`` seen for each work key.
         self._latest_preview: dict[WorkKey, dict] = {}
+        # Latest live QPU budget snapshot per miner id (worker-initiated
+        # ``{"op": "budget"}`` pushes). Surfaced in the telemetry snapshot so
+        # operators can see live daily-budget usage; never drives submission.
+        self._latest_budget: dict[str, Any] = {}
         # Anticipatory-submission state (Task 6b).
         # ``_pow_constants`` caches the four decay constants
         # (epoch_length + curve c-triple) for the session — they only
@@ -1673,6 +1682,23 @@ class SubstrateMinerController:
         for key in stale:
             self._dispatch_contexts.pop(key, None)
 
+    def _store_budget(self, handle: MinerHandle, msg: dict) -> None:
+        """Stash a worker's latest live QPU budget snapshot, keyed by miner id.
+
+        Pure storage for the telemetry snapshot (surfaced as
+        ``miners[].qpu_budget``). A malformed payload is ignored so a stray
+        message can't poison the dashboard. Never submits, never blocks.
+        """
+        data = msg.get("data")
+        if not isinstance(data, dict):
+            logger.warning(
+                "budget from %s ignored: malformed data (type=%s)",
+                handle.miner_id,
+                type(data).__name__,
+            )
+            return
+        self._latest_budget[handle.miner_id] = data
+
     def _store_preview(self, handle: MinerHandle, msg: dict) -> None:
         """Stash a worker best-candidate preview keyed by work key.
 
@@ -2293,6 +2319,11 @@ class SubstrateMinerController:
                 # _ResultEnvelope and do NOT submit — that's Task 6b's
                 # job; this drainer only delivers the primitive.
                 self._store_preview(handle, msg)
+            elif isinstance(msg, dict) and msg.get("op") == "budget":
+                # Live QPU budget snapshot (worker-initiated push). Stash the
+                # latest per-miner stats so the telemetry snapshot can surface
+                # live usage; never blocks, never submits.
+                self._store_budget(handle, msg)
             elif isinstance(msg, dict) and msg.get("op") == "stats":
                 # Stats responses are pulled directly by callers of
                 # handle.get_stats(); if one lands here it just means

@@ -15,7 +15,7 @@ init_logger = logging.getLogger(__name__)
 
 from QPU.dwave_sampler import DWaveSamplerWrapper, DefectInfo
 from QPU.qpu_time_manager import QPUTimeManager, QPUTimeConfig
-from shared.base_miner import BaseMiner
+from shared.base_miner import BaseMiner, MidstreamBudget
 from shared.miner_types import BlockRequirements
 from shared.ising_feeder import RandomIsingFeeder
 from shared.ising_model import IsingModel
@@ -133,6 +133,11 @@ class PersistentStreamContext:
         # pending[id(future)] = (model, future, defect_info, job_index, gen)
         self._pending: Dict[int, Tuple[Any, Any, Any, int, int]] = {}
         self._job_index = 0
+        # Drain-and-idle pause: a ("pause", gen) command stops NEW submissions
+        # (no _submit_one) but leaves in-flight work to complete; cleared by the
+        # next switch. Lets the QPU budget gate halt forward spend while the
+        # consumer still drains every already-paid-for attempt.
+        self._paused = False
 
     # -- control ----------------------------------------------------------
 
@@ -151,8 +156,10 @@ class PersistentStreamContext:
 
         ``("switch", gen, last_proof_block_hash, miner_bytes, thr_milli,
         num_reads, annealing_time)`` bumps the generation, cancels in-flight
-        work, and (re)seeds the feeder. ``("threshold", gen, thr_milli)``
-        updates the gate only.
+        work, (re)seeds the feeder, and resumes (clears pause).
+        ``("threshold", gen, thr_milli)`` updates the gate only.
+        ``("pause", gen)`` stops new submissions without cancelling in-flight
+        (drain-and-idle); the next switch resumes.
         """
         kind = cmd[0]
         if kind == "switch":
@@ -162,6 +169,7 @@ class PersistentStreamContext:
             self._num_reads = int(num_reads)
             self._annealing_time = float(annealing_time)
             self._energy_threshold_milli = int(thr_milli)
+            self._paused = False  # a new head resumes a paused driver
             self.cancel_inflight()
             if self._feeder is None:
                 self._feeder = RandomIsingFeeder(
@@ -175,6 +183,11 @@ class PersistentStreamContext:
                 self._feeder.reseed(lpbh, miner_bytes)
         elif kind == "threshold":
             self.set_threshold(cmd[2])
+        elif kind == "pause":
+            # Drain-and-idle: stop submitting new work; in-flight is left to
+            # complete (NOT cancelled) so the consumer still drains every
+            # already-submitted attempt.
+            self._paused = True
 
     # -- streaming --------------------------------------------------------
 
@@ -222,7 +235,12 @@ class PersistentStreamContext:
         while not self._stop():
             if self._feeder is None:
                 return  # no round yet; driver waits on ctl_q before iterating
-            while len(self._pending) < self._queue_depth and not self._stop():
+            if self._paused and not self._pending:
+                # Drained while paused: end the generator so the driver loop
+                # idles on ctl_q until the next switch resumes us.
+                return
+            while (len(self._pending) < self._queue_depth and not self._stop()
+                   and not self._paused):
                 self._submit_one()
             completed_id = None
             while completed_id is None and not self._stop():
@@ -537,6 +555,9 @@ class DWaveMiner(BaseMiner):
         # exhausted; the first entry and any bucket/interval change still
         # surface. reset() is called when mining resumes.
         self._pacing_rl = _PacingRateLimiter()
+        # Separate rate-limiter for the in-loop (mid-dispatch) budget stall
+        # log, so it doesn't share state with the per-head pacing limiter.
+        self._inloop_pacing_rl = _PacingRateLimiter()
 
         # Register SIGTERM handler for graceful cleanup
         signal.signal(signal.SIGTERM, self._cleanup_handler)
@@ -621,6 +642,55 @@ class DWaveMiner(BaseMiner):
                 f"({estimate.confidence} confidence)"
             )
         return True
+
+    def _midstream_budget_ok(
+        self, solution_number: int,
+    ) -> Optional[MidstreamBudget]:
+        """In-loop QPU budget check (called at the progress-log cadence).
+
+        Consults the ``QPUTimeManager`` mid-dispatch so a head whose budget is
+        exhausted *while mining* stops submitting NEW QPU work without waiting
+        for the next head. Returns ``None`` when no budget is configured (so
+        the base loop logs its plain progress line). On exhaustion, emits a
+        rate-limited stall WARNING; the base loop then pauses the driver
+        (drain-and-idle) but keeps consuming the in-flight queue.
+        """
+        if self.time_manager is None:
+            return None
+        # Read-only snapshot: unlike should_mine_block(), get_stats() does not
+        # mutate blocks_skipped, so polling every progress interval while we
+        # keep draining doesn't inflate the counter. The in-loop decision is
+        # the literal "have we exceeded the proportional limit now" — the
+        # next-block lookahead reserve belongs to the per-head gate, not here.
+        stats = self.time_manager.get_stats()
+        should_mine = stats.get("budget_remaining_seconds", 0.0) > 0.0
+        if not should_mine:
+            used = stats.get("cumulative_used_seconds", 0.0)
+            limit = stats.get("proportional_limit_seconds", 0.0)
+            daily = stats.get("daily_budget_seconds", 0.0)
+            # Seconds for the proportional limit to grow back up to cumulative
+            # usage (it accrues at daily_budget / 86400 per second).
+            rate = (daily / 86400.0) if daily else 0.0
+            deficit = max(0.0, used - limit)
+            wait_s = (deficit / rate) if rate > 0 else 0.0
+            wait_str = (
+                f"{wait_s:.0f}s" if wait_s < 3600 else f"{wait_s / 3600:.1f}h"
+            )
+            if self._inloop_pacing_rl.should_log(
+                now=time.monotonic(), wait_bucket=wait_str
+            ):
+                self.logger.warning(
+                    "mine_work_item: stalled — QPU daily budget exhausted "
+                    "(used=%.2fs / %.2fs limit, %.1f%% of day); pausing driver "
+                    "(in-flight will drain), resume in ~%s",
+                    used, limit,
+                    stats.get("elapsed_fraction", 0.0) * 100.0,
+                    wait_str,
+                )
+        else:
+            # Mining proceeding again — reset so the next stall logs fresh.
+            self._inloop_pacing_rl.reset()
+        return MidstreamBudget(should_mine=should_mine, stats=stats)
 
     def _adapt_mining_params(
         self,

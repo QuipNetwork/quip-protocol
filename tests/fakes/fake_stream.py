@@ -32,6 +32,7 @@ class _FakePersistentContext:
         n=0,
         energy_mean=-14800.0,
         stop_event=None,
+        idle_on_pause=True,
         **_ignored,
     ):
         self._rows = int(num_reads)
@@ -39,8 +40,14 @@ class _FakePersistentContext:
         self._n = n
         self._energy_mean = energy_mean
         self._stop_event = stop_event
+        # When False, a 'pause' is recorded but production continues — models a
+        # continuously-draining in-flight queue so worker-side tests can drive
+        # decay-after-pause deterministically (the driver's real stop-on-pause
+        # is covered separately in test_stream_driver_process).
+        self._idle_on_pause = idle_on_pause
         self.generation = 0
         self._seeded = False
+        self._paused = False
         self._produced = 0
         self._rng = np.random.default_rng(0)
         self.cleaned_up = False
@@ -50,13 +57,20 @@ class _FakePersistentContext:
         if kind == "switch":
             self.generation = int(cmd[1])
             self._seeded = True
+            self._paused = False  # a new head resumes a paused driver
+        elif kind == "pause":
+            # Drain-and-idle: the fake has no in-flight concept, so pausing
+            # just stops production (iter_results returns → driver idles).
+            self._paused = True
         # 'threshold' is a no-op for the fake (no real reconstruction gate).
 
     def _stop(self):
         return self._stop_event is not None and self._stop_event.is_set()
 
     def iter_results(self):
-        while self._seeded and not self._stop():
+        while self._seeded and not self._stop() and not (
+            self._paused and self._idle_on_pause
+        ):
             if self._n > 0 and self._produced >= self._n:
                 return
             sample = self._rng.choice(
@@ -96,6 +110,26 @@ def build_fake_persistent_context(
         n=n,
         energy_mean=energy_mean,
         stop_event=stop_event,
+    )
+
+
+def build_fake_nonstop_persistent_context(
+    *, num_reads, nodes, n=0, energy_mean=-14800.0, stop_event=None, **_ignored
+):
+    """Fake whose production does NOT stop on 'pause' (continuous drain).
+
+    For worker-side budget-gate tests that need the stream to keep delivering
+    after the gate sends a pause, so decay-after-pause submission can be driven
+    deterministically. The pause is still recorded (``_paused``); only
+    production is unaffected.
+    """
+    return _FakePersistentContext(
+        num_reads=num_reads,
+        nodes=nodes,
+        n=n,
+        energy_mean=energy_mean,
+        stop_event=stop_event,
+        idle_on_pause=False,
     )
 
 
