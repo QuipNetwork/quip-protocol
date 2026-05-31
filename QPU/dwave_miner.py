@@ -959,6 +959,25 @@ class DWaveMiner(BaseMiner):
             "DWaveMiner does not sample synchronously; use the stream driver"
         )
 
+    def _finalize_sample(self, sampleset: Any, defect_info: Any) -> Any:
+        """Reconstruct a reduced D-Wave sampleset to full topology (survivor-only).
+
+        Called by ``BaseMiner._run_substrate_ratchet`` when a promising sample
+        has fewer variables than the topology — i.e. the QPU driver stripped
+        offline qubits before writing to the ring.  ``defect_info`` carries the
+        fixed-spin assignments and energy offset needed for reconstruction.
+
+        Args:
+            sampleset: The reduced sampleset from the QPU driver.
+            defect_info: :class:`~QPU.dwave_sampler.DefectInfo` with
+                ``fixed_spins``, ``energy_offset``, and ``removed_edges``.
+
+        Returns:
+            Full-topology sampleset with all variables present and energies
+            corrected.
+        """
+        return self.sampler.reconstruct_full_sampleset(sampleset, defect_info)
+
     def _post_mine_cleanup(self) -> None:
         """Stop the streaming pipeline and feeder."""
         if self._stream is not None:
