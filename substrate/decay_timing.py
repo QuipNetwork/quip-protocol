@@ -81,6 +81,18 @@ class TimingTracker:
         self._anchor_chain_ts_s = chain_ts_s
         self._anchor_monotonic_s = monotonic_now
 
+    def estimate_block(self, *, now_monotonic: float) -> Optional[int]:
+        """Estimate the current chain block from the monotonic anchor + interval.
+
+        ``anchor_block + floor((now - anchor_monotonic) / interval)``. Returns
+        ``None`` until at least one head has been observed. Never goes below the
+        anchor block (clamped at 0 elapsed).
+        """
+        if self._anchor_block is None or self.interval_s <= 0.0:
+            return None
+        elapsed = max(0.0, now_monotonic - self._anchor_monotonic_s)
+        return self._anchor_block + int(elapsed // self.interval_s)
+
     def fire_deadline_monotonic(
         self, *, b_star: int, now_monotonic: float
     ) -> Optional[float]:
