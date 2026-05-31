@@ -473,6 +473,49 @@ def test_block_when_energy_clears_respects_search_limit_boundary(
     ) == clearing_block
 
 
+# ----------------------------------------------------------------------
+# build_decay_schedule + step_for_energy
+# ----------------------------------------------------------------------
+
+
+def _curve() -> EnergyCurve:
+    return EnergyCurve(min_milli=-16000_000, knee_milli=-15500_000, max_milli=-14000_000)
+
+
+def _base() -> SubstrateDifficulty:
+    return SubstrateDifficulty(
+        min_solutions=5, max_energy_milli=-15123_000, min_diversity_milli=200,
+    )
+
+
+def test_schedule_matches_stepwise_apply_decay() -> None:
+    from substrate.difficulty_decay import build_decay_schedule
+
+    base, curve, horizon = _base(), _curve(), 20
+    sched = build_decay_schedule(base.max_energy_milli, curve, horizon)
+    assert len(sched) == horizon + 1
+    assert sched[0] == base.max_energy_milli
+    for s in range(horizon + 1):
+        assert sched[s] == apply_decay(base, s, curve).max_energy_milli
+    assert all(sched[i] <= sched[i + 1] for i in range(horizon))
+
+
+def test_step_for_energy_first_strictly_greater() -> None:
+    from substrate.difficulty_decay import step_for_energy
+
+    sched = [-15123_000, -15100_000, -15000_000, -14900_000, -14800_000]
+    assert step_for_energy(sched, -15000_000) == 3
+    assert step_for_energy(sched, -16000_000) == 0
+    assert step_for_energy(sched, -14000_000) is None
+
+
+def test_none_curve_is_flat_schedule() -> None:
+    from substrate.difficulty_decay import build_decay_schedule
+
+    sched = build_decay_schedule(-15123_000, None, 5)
+    assert sched == [-15123_000] * 6
+
+
 def test_libm_round_half_away_from_zero() -> None:
     """If we ever swap to Python's built-in round, these would flip.
 

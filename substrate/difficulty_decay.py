@@ -26,6 +26,7 @@ helper, still used by the legacy tests).
 """
 from __future__ import annotations
 
+import bisect
 import math
 from dataclasses import dataclass
 from enum import Enum
@@ -295,6 +296,44 @@ def block_when_energy_clears(
     return None
 
 
+def build_decay_schedule(
+    base_max_energy_milli: int,
+    curve: Optional[EnergyCurve],
+    horizon: int,
+) -> list[int]:
+    """Max-energy threshold at each decay step ``0..horizon`` (inclusive).
+
+    Built incrementally — each step is one ``adjust_energy_along_curve`` from
+    the prior — so the whole array is O(horizon). Monotonic non-decreasing
+    (decay only eases ``max_energy_milli`` upward). A ``None`` curve yields a
+    flat schedule (decay disabled), matching ``current_difficulty``.
+    """
+    sched = [base_max_energy_milli]
+    if curve is None:
+        return sched + [base_max_energy_milli] * horizon
+    cur = base_max_energy_milli
+    for _ in range(horizon):
+        cur = adjust_energy_along_curve(
+            cur, DECAY_RATE_MILLI, Direction.EASIER, curve, MIN_DECAY_DELTA_MILLI,
+        )
+        sched.append(cur)
+    return sched
+
+
+def step_for_energy(
+    decay_schedule: list[int], floor_energy_milli: int
+) -> Optional[int]:
+    """First decay step ``s`` where ``schedule[s] > floor_energy_milli``.
+
+    Mirrors the chain's strict ``best_energy_milli < max_energy_milli`` gate:
+    the candidate clears at the first step whose threshold is *strictly* above
+    its floor. ``None`` when it never clears within the schedule's horizon.
+    The schedule is monotonic non-decreasing, so this is a binary search.
+    """
+    i = bisect.bisect_right(decay_schedule, floor_energy_milli)
+    return i if i < len(decay_schedule) else None
+
+
 # ----------------------------------------------------------------------
 # Internal helpers
 # ----------------------------------------------------------------------
@@ -358,4 +397,6 @@ __all__ = [
     "apply_decay",
     "current_difficulty",
     "block_when_energy_clears",
+    "build_decay_schedule",
+    "step_for_energy",
 ]
