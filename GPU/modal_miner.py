@@ -22,6 +22,8 @@ class ModalMiner(BaseMiner):
     ADAPT_MAX_READS = 256
     ADAPT_READS_SOLUTION_FLOOR_FACTOR = 3
 
+    STREAM_FACTORY_DOTTED = "GPU.modal_stream:build_persistent_context"
+
     def __init__(self, miner_id: str, gpu_type: str = "t4", **cfg):
         sampler = ModalSampler(gpu_type)
         super().__init__(miner_id, sampler)
@@ -87,3 +89,15 @@ class ModalMiner(BaseMiner):
         return self.sampler.sample_ising(
             h=h, J=J, num_reads=num_reads, num_sweeps=num_sweeps,
         )
+
+    def _stream_factory_kwargs(self, sample_ctx, nodes):
+        """Kwargs forwarded to GPU.modal_stream:build_persistent_context."""
+        return {
+            "miner_id": self.miner_id,
+            "nodes": nodes,
+            "edges": sample_ctx["edges"],
+            "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
+            "num_reads": sample_ctx["num_reads"],
+            "num_sweeps": sample_ctx["num_sweeps"],
+            "gpu_type": self.gpu_type,
+        }
