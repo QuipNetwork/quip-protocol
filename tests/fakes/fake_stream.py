@@ -33,12 +33,24 @@ class _FakePersistentContext:
         energy_mean=-14800.0,
         stop_event=None,
         idle_on_pause=True,
+        energies=None,
+        qpu_sampling_time=51000,
         **_ignored,
     ):
         self._rows = int(num_reads)
         self._cols = len(nodes)
         self._n = n
         self._energy_mean = energy_mean
+        # Optional deterministic per-iteration best energy. When provided the
+        # context produces exactly len(energies) samplesets (row-0 carries the
+        # given energy, the rest are slightly higher so np.min picks it) then
+        # stops — used by precheck/preview tests that count iterations.
+        self._energies = list(energies) if energies is not None else None
+        if self._energies is not None:
+            self._n = len(self._energies)
+        # Lets a test zero out the QPU timing so the descriptor's qpu_us is 0
+        # (non-QPU-backend behaviour) instead of the default ~51010.
+        self._qpu_sampling_time = int(qpu_sampling_time)
         self._stop_event = stop_event
         # When False, a 'pause' is recorded but production continues — models a
         # continuously-draining in-flight queue so worker-side tests can drive
@@ -77,15 +89,23 @@ class _FakePersistentContext:
                 np.array([-1, 1], np.int8),
                 size=(self._rows, self._cols),
             )
-            energy = self._rng.normal(
-                self._energy_mean,
-                50,
-                size=self._rows,
-            ).astype(np.float64)
+            if self._energies is not None:
+                best = float(self._energies[self._produced])
+                energy = np.full(self._rows, best + 1.0, np.float64)
+                energy[0] = best
+            else:
+                energy = self._rng.normal(
+                    self._energy_mean,
+                    50,
+                    size=self._rows,
+                ).astype(np.float64)
             ss = SimpleNamespace(
                 record=SimpleNamespace(sample=sample, energy=energy),
                 info={
-                    "timing": {"qpu_programming_time": 10, "qpu_sampling_time": 51000}
+                    "timing": {
+                        "qpu_programming_time": 10 if self._qpu_sampling_time else 0,
+                        "qpu_sampling_time": self._qpu_sampling_time,
+                    }
                 },
             )
             model = SimpleNamespace(
@@ -130,6 +150,42 @@ def build_fake_nonstop_persistent_context(
         energy_mean=energy_mean,
         stop_event=stop_event,
         idle_on_pause=False,
+    )
+
+
+def build_fake_energies_context(
+    *, num_reads, nodes, energies, stop_event=None, **_ignored
+):
+    """Fake whose row-0 best energy follows a deterministic ``energies`` list.
+
+    Produces exactly ``len(energies)`` samplesets (one per entry, in order)
+    then stops — so worker-side tests can count iterations and present an
+    exact best-energy per iteration without the random ``energy_mean`` draw.
+    """
+    return _FakePersistentContext(
+        num_reads=num_reads,
+        nodes=nodes,
+        energies=energies,
+        stop_event=stop_event,
+    )
+
+
+def build_fake_zero_qpu_context(
+    *, num_reads, nodes, n=0, energy_mean=-14800.0, stop_event=None, **_ignored
+):
+    """Fake whose descriptor carries ZERO qpu time (non-QPU-backend timing).
+
+    Models a CPU/CUDA/Metal stream-driver: the sampleset info reports no QPU
+    sampling time, so ``QPU/stream_driver._extract_qpu_us`` yields 0 and the
+    consumer records ``qpu_access_time_us == 0`` (not a positive figure).
+    """
+    return _FakePersistentContext(
+        num_reads=num_reads,
+        nodes=nodes,
+        n=n,
+        energy_mean=energy_mean,
+        stop_event=stop_event,
+        qpu_sampling_time=0,
     )
 
 

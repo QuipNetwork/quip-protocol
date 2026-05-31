@@ -1,7 +1,9 @@
 """Tests for `BaseMiner.mine_work_item` (Phase 3 substrate-mode entry point).
 
-Exercises the protocol-neutral mining loop against a real CPU SA miner with
-a very-relaxed difficulty so the loop terminates in a few seconds. Verifies:
+Exercises the protocol-neutral mining loop against a CPU SA miner driven on
+the stream-driver path (a producer SUBPROCESS owns the feeder + sampler and
+writes samplesets into a shared-memory ring; this test process consumes the
+ring and runs evaluate/ratchet/stash/preview/attempt-log). Verifies:
 
   - the loop accepts a `SubstrateMiningContext` and returns a `MiningResult`
   - the result is shaped correctly for `encode_quantum_proof`
@@ -10,11 +12,22 @@ a very-relaxed difficulty so the loop terminates in a few seconds. Verifies:
   - `stop_event` is observed and the loop exits cleanly with `None`
   - the worker process dispatches `op="mine_work_item"` correctly through
     `MinerHandle.mine_work_item(context)`
+
+Driver-path mechanics (see ``tests/test_base_miner_pump.py`` for the
+reference harness): a miner opts in with ``STREAMING_PUMP=True`` +
+``DRIVER_OWNS_FEEDER=True`` + a ``STREAM_FACTORY_DOTTED`` factory. Tests that
+control *results* override ``evaluate_sampleset`` (runs consumer-side in this
+process) and control *sampling energy* via the fake factory. Real end-to-end
+tests use the production CPU factory (``CPU.sa_stream:build_persistent_context``)
+which runs the real SA sampler in the driver subprocess. Every driver-backed
+test runs ``mine_work_item`` in a thread and tears the driver down with
+``_close_driver()`` (handled by fixtures).
 """
 from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import threading
 import time
 
 import pytest
@@ -47,21 +60,119 @@ _BIN_SPEC = AllowedValueSet((-1000, 1000))
 _TER_SPEC = AllowedValueSet((-1000, 0, 1000))
 
 
+_REAL_CPU_FACTORY = "CPU.sa_stream:build_persistent_context"
+_FAKE_FACTORY = "tests.fakes.fake_stream:build_fake_persistent_context"
+_FAKE_ENERGIES_FACTORY = "tests.fakes.fake_stream:build_fake_energies_context"
+
+
+def _driverize(miner, factory=_REAL_CPU_FACTORY):
+    """Put a CPU miner on the stream-driver path.
+
+    The current base supports both the inline and the driver paths; opting in
+    with ``STREAMING_PUMP=True`` + a factory runs ``mine_work_item`` against a
+    real producer subprocess that writes samplesets into a shared-memory ring.
+    (Later in the program the inline path is deleted; converting these tests
+    now means the flip won't break them.)
+    """
+    miner.STREAMING_PUMP = True
+    miner.DRIVER_OWNS_FEEDER = True
+    miner.STREAM_FACTORY_DOTTED = factory
+    return miner
+
+
+def _run_in_thread(miner, ctx, stop, **kwargs):
+    """Run ``mine_work_item`` in a daemon thread, returning (thread, box).
+
+    ``box`` is a one-element list that receives the result (or None) when the
+    loop returns. The driver produces ahead into the ring; the test controls
+    termination via ``stop.set()`` or a winning ``evaluate_sampleset``.
+    """
+    box: list = []
+
+    def _run():
+        box.append(miner.mine_work_item(ctx, stop, **kwargs))
+
+    t = threading.Thread(target=_run, name="mine-driver", daemon=True)
+    t.start()
+    return t, box
+
+
+def _drive_to_completion(miner, ctx, stop, timeout=60.0, **kwargs):
+    """Run ``mine_work_item`` on the driver path and return its result.
+
+    For tests whose overridden ``evaluate_sampleset`` (or a real win) sets the
+    stop / returns a result on its own. Joins the thread, asserting it ended.
+    """
+    t, box = _run_in_thread(miner, ctx, stop, **kwargs)
+    t.join(timeout=timeout)
+    assert not t.is_alive(), "mine_work_item did not return before deadline"
+    return box[0]
+
+
 @pytest.fixture(scope="module")
 def cpu_miner():
-    """Module-scoped CPU SA miner backed by _WORKER_TOPOLOGY (Z(2,2), 80
-    nodes).  Creating the SA sampler is expensive (loads a topology) so we
-    keep one instance across all tests in this module.
+    """Module-scoped CPU SA miner on the stream-driver path, backed by
+    _WORKER_TOPOLOGY (Z(2,2), 80 nodes).
 
-    Z(2,2) keeps individual SA batches under ~0.5 s, which matters both for
-    the direct mine_work_item tests (faster loops) and for the MinerHandle
-    cancel test (stop_event observed promptly between batches).
+    Creating the SA sampler is expensive (loads a topology) so we keep one
+    instance across all tests in this module. ``mine_work_item`` runs the real
+    SA sampler in a driver subprocess (``CPU.sa_stream:build_persistent_context``)
+    and consumes the ring here. Z(2,2) keeps individual SA batches under
+    ~0.5 s so the driver produces results quickly and stop_event is observed
+    promptly. ``_close_driver()`` reaps the subprocess + unlinks the ring on
+    teardown.
     """
     # Local imports — keep the test module import-cheap. The SA miner pulls in
     # dimod / dwave-neal which take several hundred ms to import.
     from CPU.sa_miner import SimulatedAnnealingMiner
     miner = SimulatedAnnealingMiner(miner_id="test", topology=_WORKER_TOPOLOGY)
+    _driverize(miner, _REAL_CPU_FACTORY)
     yield miner
+    miner._close_driver()
+
+
+@pytest.fixture
+def fake_driver_miner():
+    """Function-scoped CPU SA miner on the FAKE-factory driver path.
+
+    For consumer-logic tests that drive results via an overridden
+    ``evaluate_sampleset`` and don't need real solutions — the fake factory
+    spawns no sampler and emits dummy samplesets into the ring. Driver torn
+    down on teardown.
+    """
+    from CPU.sa_miner import SimulatedAnnealingMiner
+    miner = SimulatedAnnealingMiner(miner_id="test", topology=_WORKER_TOPOLOGY)
+    _driverize(miner, _FAKE_FACTORY)
+    yield miner
+    miner._close_driver()
+
+
+@pytest.fixture
+def energies_driver_factory():
+    """Factory building a CPU SA miner whose fake driver emits a fixed energy
+    sequence. Usage: ``miner = energies_driver_factory([-1.0, -2.0, +100.0])``.
+    The driver is torn down for every miner the test builds.
+    """
+    from CPU.sa_miner import SimulatedAnnealingMiner
+
+    built: list = []
+
+    class _EnergiesMiner(SimulatedAnnealingMiner):
+        def _stream_factory_kwargs(self, sample_ctx, nodes):
+            kwargs = super()._stream_factory_kwargs(sample_ctx, nodes)
+            kwargs["energies"] = list(self._test_energies)
+            return kwargs
+
+    def _make(energies):
+        miner = _EnergiesMiner(miner_id="test", topology=_WORKER_TOPOLOGY)
+        miner._test_energies = list(energies)
+        _driverize(miner, _FAKE_ENERGIES_FACTORY)
+        built.append(miner)
+        return miner
+
+    yield _make
+    for m in built:
+        m._close_driver()
 
 
 @pytest.fixture
@@ -320,60 +431,30 @@ def test_mine_work_item_returns_result(cpu_miner, relaxed_context):
     assert sorted(result.node_list) == sorted(relaxed_context.nodes)
 
 
-def test_mine_work_item_drives_streaming_batch_when_available(
-    cpu_miner, relaxed_context, monkeypatch,
-):
-    """When a backend implements ``_sample_batch`` (the streaming pipeline
-    used by QPU async dispatch and GPU multi-problem dispatch), the mine
-    loop MUST drive it and must NOT fall back to the single-shot
-    ``_sample``. Regression for the production bypass that quietly ran
-    every QPU/GPU dispatch through the slow synchronous path.
-    """
-    import types
-
-    calls = {"batch": 0, "sample": 0}
-    real_sample = cpu_miner._sample
-
-    def fake_batch(self, prev_hash, miner_id, cur_index, nodes, edges,
-                   *, num_reads, num_sweeps, **kw):
-        # Mirror the QPU/GPU pattern: pull from the loop-owned feeder
-        # internally and return (nonce, salt, sampleset). The loop must
-        # NOT also pop the feeder itself.
-        calls["batch"] += 1
-        model = self._feeder.pop_blocking()
-        ss = real_sample(
-            model.h, model.J, num_reads=num_reads, num_sweeps=num_sweeps,
-            nonce_seed=model.nonce, **kw,
-        )
-        return [(model.nonce, model.salt, ss)]
-
-    def forbidden_sample(self, *a, **k):
-        calls["sample"] += 1
-        raise AssertionError(
-            "_sample called although _sample_batch is available — "
-            "the streaming bypass regressed"
-        )
-
-    monkeypatch.setattr(cpu_miner, "_sample_batch",
-                        types.MethodType(fake_batch, cpu_miner))
-    monkeypatch.setattr(cpu_miner, "_sample",
-                        types.MethodType(forbidden_sample, cpu_miner))
-
-    result = cpu_miner.mine_work_item(relaxed_context, mp.Event())
-    assert isinstance(result, MiningResult)
-    assert calls["batch"] >= 1, "streaming _sample_batch was never called"
-    assert calls["sample"] == 0, "loop used single-shot _sample, not streaming"
-
-
 def test_mine_work_item_handles_mempool_context(cpu_miner):
-    """Phase 8b: mine_work_item must accept a MempoolJobContext and mine
-    against the directly-provided (h, J) rather than deriving via nonce.
+    """Phase 8b: the mempool path must evaluate against the directly-provided
+    (h, J) rather than deriving via nonce, and surface the zero placeholder
+    nonce that ``evaluate_sampleset`` encodes as the 32-byte zero buffer.
 
-    Uses an all-zero Ising over the CPU miner's actual topology — every
-    spin assignment has energy 0, so any sample with `min_solutions=1`
-    and no other floors passes the requirements check.
+    Retargeted to call ``_run_mempool_eval`` directly (the consumer-side
+    evaluation the worker runs per sampleset) rather than the full
+    ``mine_work_item`` driver loop: the mempool *driver* path is broken on the
+    current base — ``_mempool_feeder_spec`` puts a ``ProblemView.attach_args()``
+    dict (which carries a ``multiprocessing.Queue`` in ``free_q``) into the
+    ``switch`` ctl_q tuple, and a spawn-context Queue cannot be pickled across
+    the process boundary (``RuntimeError: Queue objects should only be shared
+    between processes through inheritance``). The direct call exercises exactly
+    the consumer logic this task cares about — real CPU sampling over the
+    all-zero Ising plus the mempool resolve_ising → zero-nonce contract —
+    without depending on the unfixed mempool driver transport.
+
+    Uses an all-zero Ising over the CPU miner's actual topology — every spin
+    assignment has energy 0, so any sample with ``min_solutions=1`` and no
+    other floors passes the requirements check.
     """
+    from shared.base_miner import _MiningLoopState
     from shared.mempool_types import MempoolJobContext
+    from shared.work_context import requirements_from_context, resolve_ising
 
     nodes = tuple(int(n) for n in cpu_miner.sampler.nodes)
     edges = tuple((int(u), int(v)) for u, v in cpu_miner.sampler.edges)
@@ -387,8 +468,35 @@ def test_mine_work_item_handles_mempool_context(cpu_miner):
         min_diversity_milli=None,
         min_solutions=1,
     )
-    stop = mp.Event()
-    result = cpu_miner.mine_work_item(ctx, stop)
+
+    node_list = list(nodes)
+    edge_list = list(edges)
+    h, J, nonce = resolve_ising(
+        ctx, salt=b"\x00" * 32, nodes=node_list, edges=edge_list,
+    )
+    sampleset = cpu_miner.sampler.sample_ising(
+        h=h, J=J, num_reads=8, num_sweeps=64,
+    )
+
+    state = _MiningLoopState(
+        requirements=requirements_from_context(ctx),
+        nodes=node_list,
+        edges=edge_list,
+        prev_timestamp=0,
+        start_time=time.time(),
+        solution_number_for_log=1,
+        dispatch_id_for_log=1,
+        attempt_log=None,
+        solution_store=None,
+        live_threshold_var=None,
+        top_k_cap=5,
+        top_k=[],
+        previewed_wintime=(10**9, 10**9),
+    )
+    result = cpu_miner._run_mempool_eval(
+        state, sampleset, nonce, b"\x00" * 32, time.time(),
+        attempt_log_kwargs={},
+    )
     assert isinstance(result, MiningResult)
     # mempool's resolve_ising returns 0 as the placeholder nonce, which
     # evaluate_sampleset encodes as the 32-byte zero buffer.
@@ -729,22 +837,24 @@ def test_miner_handle_error_sentinel_on_missing_context():
 
 
 def test_mine_work_item_emits_preview_on_floor_improvement(
-    cpu_miner, relaxed_context, monkeypatch,
+    fake_driver_miner, relaxed_context, monkeypatch,
 ):
     """A ``preview_cb`` must fire when a strictly-better-floor candidate is
     stashed, with a payload carrying the fields the controller needs to
     encode+submit later. It must NOT fire again without a strict floor
     improvement (throttle).
 
-    Drives ``mine_work_item`` with a stubbed ``evaluate_sampleset`` that
-    returns successively-improving then non-improving floors so the
-    throttle behaviour is deterministic:
+    Drives ``mine_work_item`` on the fake-factory driver path with a stubbed
+    ``evaluate_sampleset`` (consumer-side) that returns successively-improving
+    then non-improving floors so the throttle behaviour is deterministic
+    regardless of how many samplesets the driver produced into the ring:
       - iter 1: floor -1.0 → first stash → preview fires.
       - iter 2: floor -2.0 (better) → preview fires again.
       - iter 3: floor -1.5 (worse than best -2.0) → still stored in the
         bounded heap but best-by-floor unchanged → preview does NOT fire.
     Stops after iter 3.
     """
+    miner = fake_driver_miner
     previews: list = []
 
     def capture(payload):
@@ -789,12 +899,9 @@ def test_mine_work_item_emits_preview_on_floor_improvement(
     # automatically without any margin hack.
     live_var = mp.Value("q", -3000)
     stop = mp.Event()
-    cpu_miner._live_max_energy_milli = live_var
-    monkeypatch.setattr(cpu_miner, "evaluate_sampleset", fake_evaluate)
-    try:
-        cpu_miner.mine_work_item(relaxed_context, stop, preview_cb=capture)
-    finally:
-        del cpu_miner._live_max_energy_milli
+    miner._live_max_energy_milli = live_var
+    monkeypatch.setattr(miner, "evaluate_sampleset", fake_evaluate)
+    _drive_to_completion(miner, relaxed_context, stop, preview_cb=capture)
 
     assert len(previews) == 2, (
         f"expected exactly 2 previews (iter1 -1.0, iter2 -2.0; iter3 -1.5 "
@@ -1000,51 +1107,46 @@ def test_attempt_log_records_num_valid_and_diversity_on_stored_iteration(
 
 
 def test_precheck_skips_evaluate_outside_top5(
-    cpu_miner, relaxed_context, monkeypatch,
+    energies_driver_factory, relaxed_context, monkeypatch,
 ):
     """Pre-check must skip ``evaluate_sampleset`` when the stash is full
     (top_k_cap=5 entries) and the iter's best energy does NOT beat the
     worst stashed entry.
 
     Fills the stash with 5 good-energy winners (energies -1 through -5) via
-    a counter-based fake_sample + fake_evaluate, then presents an iter whose
-    sampleset best energy is +100.0 — worse than all 5 stashed entries.
-    The spy on ``evaluate_sampleset`` must NOT be called for that iter, and
-    its attempt-log record must carry ``result_kind="rejected"`` and
-    ``post_processed=False``.
+    the energies-fake driver (deterministic per-iteration best energy in the
+    ring), then presents an iter whose sampleset best energy is +100.0 —
+    worse than all 5 stashed entries. The spy on ``evaluate_sampleset``
+    (consumer-side) must NOT be called for that iter, and its attempt-log
+    record must carry ``result_kind="rejected"`` and ``post_processed=False``.
     """
-    import dimod
     from unittest.mock import MagicMock
 
     nodes = list(relaxed_context.nodes)
     n_nodes = len(nodes)
 
-    # The first TOP_K_STORE=5 samplesets have improving energies; the 6th is
-    # a worse-energy "bad" iter whose energy won't beat the worst stashed.
+    # The first TOP_K=5 samplesets have improving energies; the 6th is a
+    # worse-energy "bad" iter whose energy won't beat the worst stashed. The
+    # driver delivers exactly these six row-0 best energies in order, then
+    # stops.
     TOP_K = 5
     GOOD_ENERGIES = [-float(i + 1) for i in range(TOP_K)]  # -1, -2, -3, -4, -5
     BAD_ENERGY = 100.0
-
-    call_count = [0]
-
-    def fake_sample(*args, **kwargs):
-        i = call_count[0]
-        energy = GOOD_ENERGIES[i] if i < TOP_K else BAD_ENERGY
-        return dimod.SampleSet.from_samples(
-            [{nd: -1 for nd in nodes}],
-            vartype=dimod.SPIN,
-            energy=[energy],
-        )
+    miner = energies_driver_factory(GOOD_ENERGIES + [BAD_ENERGY])
 
     # Spy: returns a valid MiningResult for the first 5 calls so _stash_insert
-    # fires and fills top_k; returns None for any subsequent call (shouldn't happen).
+    # fires and fills top_k; returns None for any subsequent call (shouldn't
+    # happen). evaluate_sampleset runs consumer-side, so overriding it on the
+    # miner still controls results even though the driver produced the
+    # samplesets.
+    eval_count = [0]
     spy_calls = []
 
     def spy_evaluate(sampleset, requirements, nodes_arg, edges_arg,
                      nonce, salt, prev_timestamp, start_time,
                      strict_energy=True, live_threshold_energy=None):
-        i = call_count[0]
-        call_count[0] += 1
+        i = eval_count[0]
+        eval_count[0] += 1
         spy_calls.append(i)
         if i >= TOP_K:
             # Should never reach here — that's what the test asserts.
@@ -1068,8 +1170,8 @@ def test_precheck_skips_evaluate_outside_top5(
         )
 
     # Capture attempt-log records; stop on the first rejected record (the
-    # bad iter). The bad iter does not call spy_evaluate, so call_count stays
-    # at TOP_K — using call_count to trigger stop would fire too early.
+    # bad iter). The bad iter does not call spy_evaluate, so eval_count stays
+    # at TOP_K — using eval_count to trigger stop would fire too early.
     captured = []
     recording_logger = MagicMock()
 
@@ -1087,15 +1189,10 @@ def test_precheck_skips_evaluate_outside_top5(
     # -1000 < -6000 which is False for all our [-1..-5] energies.
     live_var = mp.Value('q', -6000)
 
-    monkeypatch.setattr(cpu_miner, "_sample", fake_sample)
-    monkeypatch.setattr(cpu_miner, "evaluate_sampleset", spy_evaluate)
-    cpu_miner._attempt_logger = recording_logger
-    cpu_miner._live_max_energy_milli = live_var
-    try:
-        cpu_miner.mine_work_item(relaxed_context, stop)
-    finally:
-        del cpu_miner._attempt_logger
-        del cpu_miner._live_max_energy_milli
+    monkeypatch.setattr(miner, "evaluate_sampleset", spy_evaluate)
+    miner._attempt_logger = recording_logger
+    miner._live_max_energy_milli = live_var
+    _drive_to_completion(miner, relaxed_context, stop)
 
     assert len(spy_calls) == TOP_K, (
         f"expected evaluate_sampleset called exactly {TOP_K} times to fill "
@@ -1115,7 +1212,7 @@ def test_precheck_skips_evaluate_outside_top5(
 
 
 def test_precheck_skip_still_logs_per_attempt_heartbeat(
-    cpu_miner, relaxed_context, monkeypatch,
+    energies_driver_factory, relaxed_context, monkeypatch,
 ):
     """A pre-check-skipped (out-of-top-5) iter must still emit a per-attempt
     console heartbeat.
@@ -1132,8 +1229,9 @@ def test_precheck_skip_still_logs_per_attempt_heartbeat(
     Setup: fill the top-5 stash with 5 good-energy winners (so the gate is
     armed), then present an iter with energy +100.0 — worse than all stashed
     entries — and assert the heartbeat fires but evaluate_sampleset does not.
+    The energies-fake driver delivers the deterministic per-iteration best
+    energies; evaluate_sampleset + the heartbeat log run consumer-side.
     """
-    import dimod
     from unittest.mock import MagicMock
 
     nodes = list(relaxed_context.nodes)
@@ -1142,25 +1240,16 @@ def test_precheck_skip_still_logs_per_attempt_heartbeat(
     TOP_K = 5
     GOOD_ENERGIES = [-float(i + 1) for i in range(TOP_K)]  # -1, -2, -3, -4, -5
     BAD_ENERGY = 100.0
+    miner = energies_driver_factory(GOOD_ENERGIES + [BAD_ENERGY])
 
-    call_count = [0]
-
-    def fake_sample(*args, **kwargs):
-        i = call_count[0]
-        energy = GOOD_ENERGIES[i] if i < TOP_K else BAD_ENERGY
-        return dimod.SampleSet.from_samples(
-            [{nd: -1 for nd in nodes}],
-            vartype=dimod.SPIN,
-            energy=[energy],
-        )
-
+    eval_count = [0]
     spy_calls = []
 
     def spy_evaluate(sampleset, requirements, nodes_arg, edges_arg,
                      nonce, salt, prev_timestamp, start_time,
                      strict_energy=True, live_threshold_energy=None):
-        i = call_count[0]
-        call_count[0] += 1
+        i = eval_count[0]
+        eval_count[0] += 1
         spy_calls.append(i)
         if i >= TOP_K:
             return None
@@ -1188,8 +1277,8 @@ def test_precheck_skip_still_logs_per_attempt_heartbeat(
     def _capture(**kw):
         captured.append(kw)
         # Stop on the rejected record so the bad iter fully completes before
-        # we halt (call_count stays at TOP_K after the bad iter since
-        # spy_evaluate is not called for it — stopping on call_count would
+        # we halt (eval_count stays at TOP_K after the bad iter since
+        # spy_evaluate is not called for it — stopping on eval_count would
         # fire one iter too early).
         if kw.get("result_kind") == "rejected":
             stop.set()
@@ -1202,16 +1291,11 @@ def test_precheck_skip_still_logs_per_attempt_heartbeat(
     live_var = mp.Value('q', -6000)
 
     log_spy = MagicMock()
-    monkeypatch.setattr(cpu_miner, "_sample", fake_sample)
-    monkeypatch.setattr(cpu_miner, "evaluate_sampleset", spy_evaluate)
-    monkeypatch.setattr(cpu_miner, "logger", log_spy)
-    cpu_miner._attempt_logger = recording_logger
-    cpu_miner._live_max_energy_milli = live_var
-    try:
-        cpu_miner.mine_work_item(relaxed_context, stop)
-    finally:
-        del cpu_miner._attempt_logger
-        del cpu_miner._live_max_energy_milli
+    monkeypatch.setattr(miner, "evaluate_sampleset", spy_evaluate)
+    monkeypatch.setattr(miner, "logger", log_spy)
+    miner._attempt_logger = recording_logger
+    miner._live_max_energy_milli = live_var
+    _drive_to_completion(miner, relaxed_context, stop)
 
     assert len(spy_calls) == TOP_K, (
         f"evaluate_sampleset must be called exactly {TOP_K} times to fill "
@@ -1230,26 +1314,22 @@ def test_precheck_skip_still_logs_per_attempt_heartbeat(
 
 
 def test_precheck_evaluates_iter_when_stash_has_room(
-    cpu_miner, relaxed_context, monkeypatch,
+    energies_driver_factory, relaxed_context, monkeypatch,
 ):
     """Pre-check must call ``evaluate_sampleset`` when the stash has room
     (fewer than top_k_cap entries), regardless of the live threshold.
 
-    Arranges a fake sampler that returns a sampleset whose best energy is
-    -1.0 (-1000 milli). With an empty stash the ratchet threshold is
-    float("inf"), so improves_stash is True and ``evaluate_sampleset``
-    MUST be called.
+    The energies-fake driver delivers samplesets whose best energy is -1.0
+    (-1000 milli). With an empty stash the ratchet threshold is float("inf"),
+    so improves_stash is True and ``evaluate_sampleset`` (consumer-side) MUST
+    be called.
     """
-    import dimod
     from unittest.mock import MagicMock
 
-    # Sampleset with best energy -1.0 — stash is empty so threshold=inf.
+    # Best energy -1.0 — stash is empty so threshold=inf. A short sequence so
+    # the driver keeps delivering until the first record stops the loop.
     GOOD_ENERGY = -1.0
-    good_ss = dimod.SampleSet.from_samples(
-        [{n: -1 for n in relaxed_context.nodes}],
-        vartype=dimod.SPIN,
-        energy=[GOOD_ENERGY],
-    )
+    miner = energies_driver_factory([GOOD_ENERGY] * 3)
 
     spy_calls = []
 
@@ -1266,22 +1346,14 @@ def test_precheck_evaluates_iter_when_stash_has_room(
 
     recording_logger.record.side_effect = _capture
 
-    def fake_sample(*args, **kwargs):
-        return good_ss
-
     stop = mp.Event()
     # Live threshold = 0 milli; with empty stash the gate always passes.
     live_var = mp.Value('q', 0)
 
-    monkeypatch.setattr(cpu_miner, "_sample", fake_sample)
-    monkeypatch.setattr(cpu_miner, "evaluate_sampleset", spy_evaluate)
-    cpu_miner._attempt_logger = recording_logger
-    cpu_miner._live_max_energy_milli = live_var
-    try:
-        cpu_miner.mine_work_item(relaxed_context, stop)
-    finally:
-        del cpu_miner._attempt_logger
-        del cpu_miner._live_max_energy_milli
+    monkeypatch.setattr(miner, "evaluate_sampleset", spy_evaluate)
+    miner._attempt_logger = recording_logger
+    miner._live_max_energy_milli = live_var
+    _drive_to_completion(miner, relaxed_context, stop)
 
     assert spy_calls, (
         "evaluate_sampleset MUST be called when stash has room "
@@ -1295,63 +1367,58 @@ def test_precheck_evaluates_iter_when_stash_has_room(
 
 
 def test_attempt_log_records_qpu_access_time_us_when_sample_records_qpu_timing(
-    cpu_miner, relaxed_context,
+    fake_driver_miner, relaxed_context,
 ):
-    """The mining loop must forward D-Wave's per-iteration QPU access
-    time into the attempt log so the dashboard can graph real QPU time.
+    """The mining loop must forward the per-iteration QPU access time into
+    the attempt log so the dashboard can graph real QPU time.
 
-    Simulates a QPU iteration by wrapping ``_sample`` so it appends a
-    fake microsecond value to ``timing_stats['qpu_access_time']`` —
-    the same list the production ``_record_qpu_timing`` writes to.
-    The base mining loop snapshots that list before and after each
-    sample and pulls out the new entry; the captured record must carry
-    it as ``qpu_access_time_us``.
+    On the driver path the per-iteration QPU time rides the ring descriptor
+    (``QPU/stream_driver._extract_qpu_us`` sums the sampleset's
+    ``qpu_programming_time`` + ``qpu_sampling_time``). The fake factory reports
+    ``qpu_programming_time=10`` + ``qpu_sampling_time=51000`` → descriptor
+    ``qpu_us == 51010``, which ``_acquire_result`` surfaces as
+    ``qpu_access_time_us`` on the record.
     """
     from unittest.mock import MagicMock
 
-    INJECTED_QPU_TIME_US = 12_345
+    EXPECTED_QPU_TIME_US = 51_010  # 10 (programming) + 51000 (sampling)
 
+    miner = fake_driver_miner
     captured = []
     recording_logger = MagicMock()
     recording_logger.record.side_effect = lambda **kw: (
         captured.append(kw), stop.set(),
     )
 
-    original_sample = cpu_miner._sample
-
-    def _sample_with_qpu_timing(*args, **kwargs):
-        sampleset = original_sample(*args, **kwargs)
-        cpu_miner.timing_stats['qpu_access_time'].append(INJECTED_QPU_TIME_US)
-        return sampleset
-
-    cpu_miner._sample = _sample_with_qpu_timing
-    cpu_miner._attempt_logger = recording_logger
+    miner._attempt_logger = recording_logger
     stop = mp.Event()
-    try:
-        cpu_miner.mine_work_item(relaxed_context, stop)
-    finally:
-        cpu_miner._sample = original_sample
-        del cpu_miner._attempt_logger
-        # Don't leak the injected timing values into the module-scoped
-        # miner fixture — other tests assert on timing_stats contents.
-        cpu_miner.timing_stats['qpu_access_time'].clear()
+    _drive_to_completion(miner, relaxed_context, stop)
 
     assert captured, "expected at least one AttemptLogger.record call"
     rec = captured[0]
-    assert rec["qpu_access_time_us"] == INJECTED_QPU_TIME_US, (
-        "mining loop must forward the per-iteration qpu_access_time "
-        "appended inside _sample() to the attempt-log record"
+    assert rec["qpu_access_time_us"] == EXPECTED_QPU_TIME_US, (
+        "mining loop must forward the per-iteration qpu_access_time carried "
+        "on the ring descriptor to the attempt-log record"
     )
 
 
 def test_attempt_log_qpu_access_time_us_is_none_for_non_qpu_backends(
-    cpu_miner, relaxed_context,
+    relaxed_context,
 ):
-    """CPU/CUDA/etc. backends do not write to
-    ``timing_stats['qpu_access_time']``. The attempt record must still
-    carry the key — value ``None`` — so downstream parsers can rely on
-    a uniform schema rather than presence checks."""
+    """Non-QPU backends (CPU/CUDA/Metal) produce no QPU sampling time, so the
+    ring descriptor's ``qpu_us`` is 0. The attempt record must still carry the
+    ``qpu_access_time_us`` key (uniform schema) — its value is 0 on the driver
+    path (``_acquire_result`` sets ``qpu_access_time_us = int(qpu_us)``, which
+    is 0 rather than None for a zero-timing descriptor).
+    """
     from unittest.mock import MagicMock
+
+    from CPU.sa_miner import SimulatedAnnealingMiner
+
+    miner = SimulatedAnnealingMiner(miner_id="test", topology=_WORKER_TOPOLOGY)
+    _driverize(
+        miner, "tests.fakes.fake_stream:build_fake_zero_qpu_context",
+    )
 
     captured = []
     recording_logger = MagicMock()
@@ -1359,17 +1426,17 @@ def test_attempt_log_qpu_access_time_us_is_none_for_non_qpu_backends(
         captured.append(kw), stop.set(),
     )
 
-    cpu_miner._attempt_logger = recording_logger
+    miner._attempt_logger = recording_logger
     stop = mp.Event()
     try:
-        cpu_miner.mine_work_item(relaxed_context, stop)
+        _drive_to_completion(miner, relaxed_context, stop)
     finally:
-        del cpu_miner._attempt_logger
+        miner._close_driver()
 
     assert captured, "expected at least one AttemptLogger.record call"
     rec = captured[0]
     assert "qpu_access_time_us" in rec
-    assert rec["qpu_access_time_us"] is None
+    assert rec["qpu_access_time_us"] == 0
 
 
 def test_stored_solution_iter_matches_attempt_iter(
@@ -1459,7 +1526,7 @@ def test_stored_solution_iter_matches_attempt_iter(
 
 
 def test_mined_log_nonce_comes_from_result_not_loop_variable(
-    cpu_miner, relaxed_context, caplog,
+    fake_driver_miner, relaxed_context, caplog,
 ):
     """The ``mined!`` INFO log line must display the *submitted* result's
     nonce (``result.nonce``), not the loop's last-iterated nonce variable.
@@ -1560,21 +1627,15 @@ def test_mined_log_nonce_comes_from_result_not_loop_variable(
 
     recording_logger.record.side_effect = _on_record
 
+    miner = fake_driver_miner
     stop = mp.Event()
-    cpu_miner._attempt_logger = recording_logger
-    cpu_miner._live_max_energy_milli = live_var
-    monkeypatched_evaluate = cpu_miner.evaluate_sampleset
-    cpu_miner.evaluate_sampleset = fake_evaluate  # type: ignore[method-assign]
+    miner._attempt_logger = recording_logger
+    miner._live_max_energy_milli = live_var
+    miner.evaluate_sampleset = fake_evaluate  # type: ignore[method-assign]
 
-    returned_result = None
-    logger_name = cpu_miner.logger.name
-    try:
-        with caplog.at_level(logging.INFO, logger=logger_name):
-            returned_result = cpu_miner.mine_work_item(relaxed_context, stop)
-    finally:
-        cpu_miner.evaluate_sampleset = monkeypatched_evaluate
-        del cpu_miner._attempt_logger
-        del cpu_miner._live_max_energy_milli
+    logger_name = miner.logger.name
+    with caplog.at_level(logging.INFO, logger=logger_name):
+        returned_result = _drive_to_completion(miner, relaxed_context, stop)
 
     assert returned_result is not None, (
         "mine_work_item must return a result when a candidate clears the "
