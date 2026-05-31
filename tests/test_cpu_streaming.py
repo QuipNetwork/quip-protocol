@@ -15,9 +15,16 @@ _TOPO = zephyr(2, 2)
 def _fixed_feeder(sampler):
     nodes = list(sampler.nodes)
     edges = list(sampler.edges)
+    # Small non-zero biases keep the SA sampler from warning on an all-zero
+    # bqm while leaving the sampleset shape (reads x nodes) unchanged.
+    h = {int(n): 0.0 for n in nodes}
+    for n in nodes[:2]:
+        h[int(n)] = 1.0
+    J = {(int(u), int(v)): 0.0 for u, v in edges}
+    for u, v in edges[:2]:
+        J[(int(u), int(v))] = -1.0
     model = IsingModel(
-        h={int(n): 0.0 for n in nodes},
-        J={(int(u), int(v)): 0.0 for u, v in edges},
+        h=h, J=J,
         nonce=b"\x01" * 32, salt=b"\x02" * 32,
     )
     return FixedIsingFeeder(models=[model]), model
@@ -42,8 +49,8 @@ def test_sample_ising_streaming_yields_model_and_sampleset():
 
 def test_build_persistent_context_returns_stream_context():
     from CPU.sa_stream import build_persistent_context
-    nodes = [int(n) for n in zephyr(2, 2).graph.nodes()]
-    edges = [(int(u), int(v)) for u, v in zephyr(2, 2).graph.edges()]
+    nodes = [int(n) for n in _TOPO.nodes]
+    edges = [(int(u), int(v)) for u, v in _TOPO.edges]
     ctx = build_persistent_context(
         miner_id="cpu-test", nodes=nodes, edges=edges,
         feeder_buffer_size=4, num_reads=4, num_sweeps=8,

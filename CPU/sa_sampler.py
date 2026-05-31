@@ -64,7 +64,13 @@ class SimulatedAnnealingStructuredSampler(MockDWaveSampler):
         absorbs any sampler_kwargs a generic driver may pass.
         """
         while True:
-            model = feeder.pop_blocking()
+            try:
+                model = feeder.pop_blocking()
+            except StopIteration:
+                # PEP 479: a bare StopIteration escaping a generator body
+                # becomes RuntimeError. Returning lets StreamContext reseed
+                # cleanly instead of crashing the stream driver.
+                return
             ss = self.sample_ising(
                 h=model.h, J=model.J,
                 num_reads=num_reads, num_sweeps=num_sweeps,
