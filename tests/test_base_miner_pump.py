@@ -34,8 +34,10 @@ _FAKE_NONSTOP = "tests.fakes.fake_stream:build_fake_nonstop_persistent_context"
 
 _GATE_STATS = {
     "cumulative_used_seconds": 45.0,
-    "proportional_limit_seconds": 40.0,
-    "elapsed_fraction": 0.5,
+    "pool_seconds": 12.0,
+    "pool_cap_seconds": 1800.0,
+    "min_block_budget_seconds": 90.0,
+    "burst_active": True,
     "blocks_skipped": 3,
 }
 

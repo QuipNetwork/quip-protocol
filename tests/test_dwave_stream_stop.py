@@ -131,21 +131,28 @@ class _FakeTimeManager:
     """Read-only get_stats() stand-in driving the in-loop budget decision."""
 
     def __init__(self, should_mine):
-        # remaining > 0 → mine; remaining == 0 → exhausted.
-        remaining = 5.0 if should_mine else 0.0
+        # pool > 0 → mine; pool == 0 → drained.
+        pool = 5.0 if should_mine else 0.0
         used = 35.0 if should_mine else 45.0
+        self.end_burst_calls = 0
         self._stats = {
-            "daily_budget_seconds": 60.0,
+            "daily_budget_seconds": 1800.0,
             "cumulative_used_seconds": used,
-            "proportional_limit_seconds": 40.0,
-            "budget_remaining_seconds": remaining,
-            "elapsed_fraction": 0.5,
+            "pool_seconds": pool,
+            "budget_remaining_seconds": pool,
+            "pool_cap_seconds": 1800.0,
+            "min_block_budget_seconds": 90.0,
+            "burst_active": should_mine,
+            "seconds_until_buffer": 0.0 if should_mine else 4080.0,
             "blocks_mined": 7,
             "blocks_skipped": 3,
         }
 
     def get_stats(self):
         return dict(self._stats)
+
+    def end_burst(self):
+        self.end_burst_calls += 1
 
 
 def _dwave_with_time_manager(tm) -> DWaveMiner:
@@ -168,21 +175,24 @@ def test_midstream_budget_ok_passes_when_budget_available():
     assert status.should_mine is True
     # Stats carry the live (get_stats) snapshot for the log + telemetry push.
     assert status.stats["budget_remaining_seconds"] == 5.0
-    assert status.stats["proportional_limit_seconds"] == 40.0
+    assert status.stats["pool_seconds"] == 5.0
     assert status.stats["blocks_skipped"] == 3
-    assert status.stats["daily_budget_seconds"] == 60.0
+    assert status.stats["daily_budget_seconds"] == 1800.0
 
 
 def test_midstream_budget_ok_stalls_and_logs_when_exhausted(caplog):
-    miner = _dwave_with_time_manager(_FakeTimeManager(should_mine=False))
+    tm = _FakeTimeManager(should_mine=False)
+    miner = _dwave_with_time_manager(tm)
     with caplog.at_level(logging.WARNING):
         status = miner._midstream_budget_ok(solution_number=1)
     assert status is not None
     assert status.should_mine is False
+    # Drain must end the burst so the pool re-accumulates the full buffer.
+    assert tm.end_burst_calls == 1
     assert any(
-        "stalled" in r.message and "budget exhausted" in r.message
+        "burst drained" in r.message and "re-accumulating" in r.message
         for r in caplog.records
-    ), "exhaustion did not emit the stall WARNING"
+    ), "drain did not emit the burst-drained WARNING"
 
 
 @pytest.mark.timeout(10)

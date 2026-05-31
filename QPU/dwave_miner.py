@@ -650,11 +650,13 @@ class DWaveMiner(BaseMiner):
                     now=time.monotonic(), wait_bucket=wait_str
                 ):
                     self.logger.info(
-                        f"[QPU] Pacing block {cur_index} - waiting {wait_str} "
-                        f"for limit to catch up. "
-                        f"Used: {estimate.cumulative_used_us / 1e6:.2f}s, "
-                        f"Limit: {estimate.proportional_limit_us / 1e6:.2f}s "
-                        f"({estimate.elapsed_fraction * 100:.1f}% of day)"
+                        "[QPU] Accumulating block %d - pool %.2fs/%.2fs cap, "
+                        "need %.0fs buffer; ~%s to go.",
+                        cur_index,
+                        estimate.pool_us / 1e6,
+                        estimate.pool_cap_us / 1e6,
+                        self.time_manager.config.min_block_budget_seconds,
+                        wait_str,
                     )
                 return False
 
@@ -662,12 +664,12 @@ class DWaveMiner(BaseMiner):
             # next pacing episode is treated as a fresh entry.
             self._pacing_rl.reset()
             self.logger.info(
-                f"[QPU] Budget check passed. Used: "
-                f"{estimate.cumulative_used_us / 1e6:.2f}s / "
-                f"{estimate.proportional_limit_us / 1e6:.2f}s limit "
-                f"({estimate.elapsed_fraction * 100:.1f}% of day), "
-                f"Estimated: {estimate.estimated_block_time_us / 1e6:.2f}s "
-                f"({estimate.confidence} confidence)"
+                "[QPU] Burst budget ready: pool %.2fs (cap %.2fs), "
+                "est/block %.2fs (%s confidence)",
+                estimate.pool_us / 1e6,
+                estimate.pool_cap_us / 1e6,
+                estimate.estimated_block_time_us / 1e6,
+                estimate.confidence,
             )
         return True
 
@@ -693,14 +695,13 @@ class DWaveMiner(BaseMiner):
         stats = self.time_manager.get_stats()
         should_mine = stats.get("budget_remaining_seconds", 0.0) > 0.0
         if not should_mine:
-            used = stats.get("cumulative_used_seconds", 0.0)
-            limit = stats.get("proportional_limit_seconds", 0.0)
-            daily = stats.get("daily_budget_seconds", 0.0)
-            # Seconds for the proportional limit to grow back up to cumulative
-            # usage (it accrues at daily_budget / 86400 per second).
-            rate = (daily / 86400.0) if daily else 0.0
-            deficit = max(0.0, used - limit)
-            wait_s = (deficit / rate) if rate > 0 else 0.0
+            # Burst drained: end it so the pool must re-accumulate the full
+            # buffer before the next head restarts a burst (no micro-bursts as
+            # accrual creeps the pool back above 0).
+            self.time_manager.end_burst()
+            pool = stats.get("pool_seconds", 0.0)
+            buf = stats.get("min_block_budget_seconds", 0.0)
+            wait_s = stats.get("seconds_until_buffer", 0.0)
             wait_str = (
                 f"{wait_s:.0f}s" if wait_s < 3600 else f"{wait_s / 3600:.1f}h"
             )
@@ -708,12 +709,10 @@ class DWaveMiner(BaseMiner):
                 now=time.monotonic(), wait_bucket=wait_str
             ):
                 self.logger.warning(
-                    "mine_work_item: stalled — QPU daily budget exhausted "
-                    "(used=%.2fs / %.2fs limit, %.1f%% of day); pausing driver "
-                    "(in-flight will drain), resume in ~%s",
-                    used, limit,
-                    stats.get("elapsed_fraction", 0.0) * 100.0,
-                    wait_str,
+                    "mine_work_item: burst drained — QPU pool at %.2fs; pausing "
+                    "driver (in-flight will drain), re-accumulating to %.0fs "
+                    "buffer (~%s)",
+                    pool, buf, wait_str,
                 )
         else:
             # Mining proceeding again — reset so the next stall logs fresh.

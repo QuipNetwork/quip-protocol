@@ -848,12 +848,14 @@ class BaseMiner(ABC):
                         s = budget.stats
                         self.logger.info(
                             "mine_work_item progress: %d attempts | "
-                            "sweeps=%d reads=%d | qpu_budget used=%.2fs/"
-                            "%.2fs limit (%.0f%% day) skipped=%d",
+                            "sweeps=%d reads=%d | qpu_pool=%.2fs/%.2fs cap "
+                            "(buffer %.0fs) burst=%s used=%.2fs skipped=%d",
                             progress, setup.num_sweeps, setup.num_reads,
+                            s.get("pool_seconds", 0.0),
+                            s.get("pool_cap_seconds", 0.0),
+                            s.get("min_block_budget_seconds", 0.0),
+                            s.get("burst_active", False),
                             s.get("cumulative_used_seconds", 0.0),
-                            s.get("proportional_limit_seconds", 0.0),
-                            s.get("elapsed_fraction", 0.0) * 100.0,
                             s.get("blocks_skipped", 0),
                         )
                         if budget_cb is not None:
