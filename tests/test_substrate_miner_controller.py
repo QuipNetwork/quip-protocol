@@ -22,6 +22,7 @@ All integration tests auto-skip when the docker chain isn't reachable.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import socket
 from contextlib import asynccontextmanager
@@ -166,6 +167,7 @@ def _bare_controller() -> SubstrateMinerController:
     # Anticipatory-submission state (Task 6b).
     c._latest_preview = {}
     c._latest_budget = {}
+    c._participated = set()
     c._pow_constants = None
     c._base_difficulty_by_key = {}
     c._decay_schedule_by_key = {}  # WorkKey -> (schedule, last_proof_block, epoch_length)
@@ -1897,3 +1899,89 @@ def test_evict_resets_fire_status_key():
     controller._evict_anticipatory_state(key)
 
     assert controller._last_fire_status_key is None
+
+
+# ----------------------------------------------------------------------
+# Participation marker (write-once System.remark per (miner, solution#))
+# ----------------------------------------------------------------------
+
+
+async def test_participation_remark_submits_with_payload():
+    controller = _bare_controller()
+    controller.build_client.has_call = AsyncMock(return_value=True)
+    controller.build_client.submit_extrinsic = AsyncMock(
+        return_value=MagicMock(error=None)
+    )
+    await controller._submit_participation_remark(
+        {"schema": "quip-participation", "solution": 7, "miner": "qpu-0",
+         "kind": "qpu", "budget_seconds": 90.0}
+    )
+    controller.build_client.submit_extrinsic.assert_awaited_once()
+    args, kwargs = controller.build_client.submit_extrinsic.call_args
+    assert args[0] == "System"
+    assert args[1] == "remark_with_event"
+    body = args[2]["remark"]
+    payload = json.loads(body)
+    assert payload["schema"] == "quip-participation"
+    assert payload["solution"] == 7
+    assert payload["miner"] == "qpu-0"
+    assert payload["kind"] == "qpu"
+    assert payload["budget_seconds"] == 90.0
+
+
+async def test_participation_remark_falls_back_to_plain_remark():
+    controller = _bare_controller()
+    controller.build_client.has_call = AsyncMock(return_value=True)
+    # remark_with_event raises; plain remark succeeds.
+    controller.build_client.submit_extrinsic = AsyncMock(
+        side_effect=[RuntimeError("no event variant"), MagicMock(error=None)]
+    )
+    await controller._submit_participation_remark(
+        {"schema": "quip-participation", "solution": 1, "miner": "cpu-0",
+         "kind": "cpu"}
+    )
+    assert controller.build_client.submit_extrinsic.await_count == 2
+    second_call = controller.build_client.submit_extrinsic.call_args_list[1]
+    assert second_call.args[1] == "remark"
+
+
+async def test_participation_remark_swallows_failure():
+    controller = _bare_controller()
+    controller.build_client.has_call = AsyncMock(return_value=False)
+    controller.build_client.submit_extrinsic = AsyncMock(
+        side_effect=RuntimeError("rpc down")
+    )
+    # Must not raise — observability path.
+    await controller._submit_participation_remark(
+        {"schema": "quip-participation", "solution": 2, "miner": "qpu-0",
+         "kind": "qpu"}
+    )
+
+
+async def test_mark_participating_dedups_per_solution():
+    controller = _bare_controller()
+    controller._submit_participation_remark = AsyncMock(return_value=None)
+    msg = {"solution_number": 5, "kind": "qpu", "budget_seconds": 90.0}
+    controller._mark_participating("qpu-0", msg)
+    controller._mark_participating("qpu-0", dict(msg))  # duplicate
+    await asyncio.sleep(0)  # let the spawned task run
+    controller._submit_participation_remark.assert_awaited_once()
+    payload = controller._submit_participation_remark.call_args.args[0]
+    assert payload == {
+        "schema": "quip-participation", "solution": 5, "miner": "qpu-0",
+        "kind": "qpu", "budget_seconds": 90.0,
+    }
+    # A different solution # for the same miner fires again.
+    controller._mark_participating("qpu-0", {"solution_number": 6, "kind": "qpu"})
+    await asyncio.sleep(0)
+    assert controller._submit_participation_remark.await_count == 2
+
+
+async def test_mark_participating_cpu_omits_budget():
+    controller = _bare_controller()
+    controller._submit_participation_remark = AsyncMock(return_value=None)
+    controller._mark_participating("cpu-0", {"solution_number": 9, "kind": "cpu"})
+    await asyncio.sleep(0)
+    payload = controller._submit_participation_remark.call_args.args[0]
+    assert "budget_seconds" not in payload
+    assert payload["kind"] == "cpu"

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import multiprocessing as mp
 import os
 import queue as _queue
@@ -231,6 +232,10 @@ _CLOSED_WORK_KEYS_CAP = 16
 # to absorb late results from a few cancelled dispatches without ever
 # losing the immutable mapping for an in-flight one.
 _DISPATCH_CONTEXT_RETENTION = 4
+
+# Upper bound on the write-once participation dedup set. Generous because
+# solution numbers are monotonic — eviction can never re-admit an active key.
+_PARTICIPATION_RETENTION = 2048
 
 
 # How far ahead (in blocks) the anticipatory predictor looks for the
@@ -569,6 +574,10 @@ class SubstrateMinerController:
         # ``{"op": "budget"}`` pushes). Surfaced in the telemetry snapshot so
         # operators can see live daily-budget usage; never drives submission.
         self._latest_budget: dict[str, Any] = {}
+        # Write-once participation dedup: (miner_id, solution_number) already
+        # marked via a System.remark. Solution numbers are monotonic, so the
+        # arbitrary-pop bound below can never re-admit a still-active key.
+        self._participated: set[tuple[str, int]] = set()
         # Anticipatory-submission state (Task 6b).
         # ``_pow_constants`` caches the four decay constants
         # (epoch_length + curve c-triple) for the session — they only
@@ -1762,6 +1771,86 @@ class SubstrateMinerController:
             return
         self._latest_budget[handle.miner_id] = data
 
+    def _mark_participating(self, miner_id: str, msg: dict) -> None:
+        """Submit a write-once participation remark for ``(miner_id, sol#)``.
+
+        Dedups on ``(miner_id, solution_number)`` so each miner publishes at
+        most one marker per solution #. Spawns a best-effort, supervised task
+        to submit the remark (never blocks the drain loop; failures are
+        swallowed — participation is observability, not consensus).
+        """
+        try:
+            solution_number = int(msg.get("solution_number", 0))
+        except (TypeError, ValueError):
+            return
+        key = (miner_id, solution_number)
+        if key in self._participated:
+            return
+        self._participated.add(key)
+        while len(self._participated) > _PARTICIPATION_RETENTION:
+            self._participated.pop()
+
+        payload: dict[str, Any] = {
+            "schema": "quip-participation",
+            "solution": solution_number,
+            "miner": miner_id,
+            "kind": msg.get("kind"),
+        }
+        if "budget_seconds" in msg:
+            payload["budget_seconds"] = msg["budget_seconds"]
+        asyncio.create_task(
+            supervise(
+                self._submit_participation_remark(payload),
+                name=f"participate-{miner_id}-{solution_number}",
+                on_failure=lambda: None,
+            ),
+            name=f"participate-{miner_id}-{solution_number}",
+        )
+
+    async def _submit_participation_remark(self, payload: dict) -> None:
+        """Submit one participation remark (best-effort, never raises).
+
+        Prefers ``System.remark_with_event`` (observable in block events),
+        falling back to plain ``System.remark`` — the same pattern as the
+        auto-identify flow. Logs and swallows any failure so mining continues.
+        """
+        if self.build_client is None:
+            return
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        try:
+            prefer_event = await self.build_client.has_call(
+                "System", "remark_with_event"
+            )
+            call_function = "remark_with_event" if prefer_event else "remark"
+            try:
+                receipt = await self.build_client.submit_extrinsic(
+                    "System", call_function, {"remark": body}, self.signer,
+                    wait_for="inblock",
+                )
+            except Exception:  # noqa: BLE001 — retry plain remark or warn below
+                if call_function == "remark":
+                    raise
+                receipt = await self.build_client.submit_extrinsic(
+                    "System", "remark", {"remark": body}, self.signer,
+                    wait_for="inblock",
+                )
+            if receipt.error:
+                logger.warning(
+                    "participation remark rejected for %s (%s); mining continues",
+                    payload.get("miner"), receipt.error,
+                )
+                return
+            logger.info(
+                "participation remark submitted: miner=%s solution=%s budget=%s",
+                payload.get("miner"), payload.get("solution"),
+                payload.get("budget_seconds"),
+            )
+        except Exception as exc:  # noqa: BLE001 — observability path
+            logger.warning(
+                "participation remark failed for %s (%s: %s); mining continues",
+                payload.get("miner"), type(exc).__name__, exc,
+            )
+
     def _store_preview(self, handle: MinerHandle, msg: dict) -> None:
         """Stash a worker best-candidate preview keyed by work key.
 
@@ -2406,6 +2495,10 @@ class SubstrateMinerController:
                 # latest per-miner stats so the telemetry snapshot can surface
                 # live usage; never blocks, never submits.
                 self._store_budget(handle, msg)
+            elif isinstance(msg, dict) and msg.get("op") == "participating":
+                # Write-once participation marker for a solution #. Dedup +
+                # submit a best-effort System.remark; never blocks the drain.
+                self._mark_participating(handle.miner_id, msg)
             elif isinstance(msg, dict) and msg.get("op") == "stats":
                 # Stats responses are pulled directly by callers of
                 # handle.get_stats(); if one lands here it just means
