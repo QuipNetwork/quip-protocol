@@ -31,7 +31,7 @@ def test_metal_driver_produces_descriptor_and_ring_sample():
     """stream_driver_main + generic StreamContext writes samples into the ring.
 
     The fake yields 1 read × 2 spins: sample=[[1, -1]], energy=[0.0].
-    We assert the descriptor 7-tuple fields and round-trip one sample from the
+    We assert the first 7 descriptor fields and round-trip one sample from the
     ring to confirm zero-copy write/read works end-to-end.
     """
     ctx = mp.get_context("spawn")
@@ -52,7 +52,7 @@ def test_metal_driver_produces_descriptor_and_ring_sample():
         item = desc_q.get(timeout=15.0)
         assert item is not None, "expected a descriptor, got end-of-stream None"
 
-        slot, n_rows, n_cols, nonce, salt, qpu_us, generation = item
+        slot, n_rows, n_cols, nonce, salt, qpu_us, generation = item[:7]
 
         assert generation == 1
         assert n_rows == 1

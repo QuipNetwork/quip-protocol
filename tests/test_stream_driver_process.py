@@ -100,7 +100,7 @@ def test_driver_produces_generation_tagged_descriptors():
         for _ in range(5):
             item = desc_q.get(timeout=10.0)
             assert item is not None
-            slot, nr, nc, nonce, salt, qpu, gen = item
+            slot, nr, nc, nonce, salt, qpu, gen = item[:7]
             assert gen == 3  # tagged with the live generation
             s, _e = ring.read(slot, nr, nc)
             assert s.shape == (nr, nc)

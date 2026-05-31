@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
+import pickle
 import queue as _queue
 from typing import Any, Dict
 
@@ -173,10 +174,15 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, ctl_q, stop_event,
                     continue
                 ring.write(slot, sample, energy)
                 try:
+                    _defect = None
+                    _info = getattr(sampleset, "info", None)
+                    if _info:
+                        _defect = _info.get("defect_info")
                     desc_q.put_nowait(
                         (slot, n_rows, n_cols, bytes(model.nonce),
                          bytes(model.salt), _extract_qpu_us(sampleset),
-                         ctx.generation))
+                         ctx.generation,
+                         pickle.dumps(_defect) if _defect is not None else None))
                 except _queue.Full:
                     # Consumer backpressure: release the slot and drop.
                     ring.release(slot)

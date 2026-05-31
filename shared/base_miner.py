@@ -10,6 +10,7 @@ import logging
 import math
 import multiprocessing
 import multiprocessing.synchronize
+import pickle
 import queue
 import sys
 import time
@@ -115,6 +116,11 @@ class _AcquireResult:
     # releases it after ``_finalize_iteration_logging`` reads the set.
     # ``None`` on the inline path (no shared ring).
     ring_slot: Optional[int] = None
+    # Unpickled DefectInfo from the descriptor's 8th element (driver path).
+    # ``None`` for all current code paths (CPU/GPU/Metal/inline); will be
+    # populated by DWaveMiner once that path lands. Consumer-side only —
+    # never crosses a process boundary after this point.
+    defect_info: Any = None
 
 
 @dataclass(frozen=True)
@@ -759,6 +765,7 @@ class BaseMiner(ABC):
                 salt = acquired.salt
                 sampleset = acquired.sampleset
                 qpu_access_time_us = acquired.qpu_access_time_us
+                defect_info = acquired.defect_info
 
                 sampleset = self._post_sample(sampleset)
                 if stop_event.is_set():
@@ -791,6 +798,7 @@ class BaseMiner(ABC):
                         loop_state, sampleset, nonce, salt, postprocess_start,
                         preview_cb=preview_cb,
                         attempt_log_kwargs=attempt_log_kwargs,
+                        defect_info=defect_info,
                     )
                 else:
                     result = self._run_mempool_eval(
@@ -1367,6 +1375,7 @@ class BaseMiner(ABC):
         """
         qpu_access_time_us: Optional[int] = None
         ring_slot: Optional[int] = None
+        defect_info: Any = None
         try:
             sample_start = time.time()
             self.current_stage = 'sampling'
@@ -1391,7 +1400,8 @@ class BaseMiner(ABC):
                             "None; ending dispatch",
                         )
                         return _AcquireResult(_ACQUIRE_DONE)
-                    slot, n_rows, n_cols, nonce, salt, qpu_us, desc_gen = item
+                    slot, n_rows, n_cols, nonce, salt, qpu_us, desc_gen = item[:7]
+                    defect_pickle = item[7] if len(item) > 7 else None
                     if desc_gen != generation:
                         # Straggler from a prior round; free the slot, keep
                         # waiting for a current-generation descriptor.
@@ -1405,6 +1415,14 @@ class BaseMiner(ABC):
                     return _AcquireResult(_ACQUIRE_STOP)
                 sampleset = _SharedSampleSet(
                     *self._ring.read(ring_slot, n_rows, n_cols),
+                )
+                # pickle.loads is safe here: defect_pickle was written by the
+                # stream-driver subprocess (same operator-controlled process
+                # tree) and travels only over a local multiprocessing.Queue —
+                # there is no network boundary or untrusted input source.
+                defect_info = (
+                    pickle.loads(defect_pickle)
+                    if defect_pickle is not None else None
                 )
                 qpu_access_time_us = int(qpu_us)
                 if qpu_us > 0:
@@ -1455,6 +1473,7 @@ class BaseMiner(ABC):
         return _AcquireResult(
             _ACQUIRE_OK, nonce, salt, sampleset, qpu_access_time_us,
             ring_slot=ring_slot,
+            defect_info=defect_info,
         )
 
     def _teardown_dispatch(self) -> None:
@@ -1612,13 +1631,10 @@ class BaseMiner(ABC):
         submit floor — a sample whose best energy can't clear by the furthest
         stashed step can never produce a stashable floor.
 
-        Width guard: the QPU stream driver returns non-promising samples
-        cheaply via ``_shift_energies`` with the REDUCED variable set (clamped
-        fixed-spins dropped). ``evaluate_sampleset`` indexes full-topology edge
-        positions into the sample matrix, so a reduced-width sample yields an
-        IndexError or a silently wrong recomputed energy — never evaluate one
-        that wasn't fully reconstructed. CPU/GPU inline backends are always
-        full width. Pure read of ``state.top_k``; does not mutate.
+        Energy-only gate; width handling has moved to ``_run_substrate_ratchet``
+        where ``_finalize_sample`` can reconstruct a reduced QPU sampleset after
+        the pre-check but before evaluation. Pure read of ``state.top_k``; does
+        not mutate.
         """
         decay_schedule = state.decay_schedule
         if decay_schedule is None:
@@ -1635,14 +1651,6 @@ class BaseMiner(ABC):
             s_min = step_for_energy(decay_schedule, iter_best_milli)
             admit = s_min is not None and s_min <= s_max
 
-        if admit and sampleset.record.sample.shape[1] != len(state.nodes):
-            self.logger.info(
-                "[%s] Mining attempt - Energy: %.0f (under-reconstructed: "
-                "sample width %d != topology %d; skipping evaluation)",
-                self.miner_id, iter_best_energy,
-                sampleset.record.sample.shape[1], len(state.nodes),
-            )
-            return False
         return admit
 
     def _compute_stash_entry(
@@ -1673,6 +1681,7 @@ class BaseMiner(ABC):
         self, state: _MiningLoopState, sampleset: Any, nonce: Any, salt: bytes,
         postprocess_start: float, *, preview_cb: Optional[Any],
         attempt_log_kwargs: Dict[str, Any],
+        defect_info: Any = None,
     ) -> Optional[MiningResult]:
         """Substrate / PoW ratchet path (the ``is_substrate`` branch).
 
@@ -1694,7 +1703,12 @@ class BaseMiner(ABC):
         self._forward_threshold_to_driver(state.generation, live_threshold_milli)
 
         # ``_stash_pre_check`` gates the expensive ``evaluate_sampleset``.
-        iter_best_energy = float(np.min(sampleset.record.energy))
+        # Apply the energy offset for QPU defect clamping: reduced samplesets
+        # omit clamped spins whose fixed-spin energy contribution is in the
+        # offset. With defect_info=None (all current paths) offset=0 so
+        # behaviour is identical to before.
+        offset = float(defect_info.energy_offset) if defect_info is not None else 0.0
+        iter_best_energy = float(np.min(sampleset.record.energy)) + offset
         iter_best_milli = int(iter_best_energy * 1000)
         # ratchet_threshold (legacy energy gate the attempt log records):
         # +inf until the stash is full, then the worst stashed energy.
@@ -1706,6 +1720,21 @@ class BaseMiner(ABC):
         improves_stash = self._stash_pre_check(
             state, sampleset, iter_best_energy, iter_best_milli,
         )
+        # Width handling: a reduced sampleset (clamped QPU qubits dropped)
+        # must be reconstructed before evaluate_sampleset indexes topology
+        # positions. With defect_info, reconstruct here; without it, the
+        # sample is unexpectedly narrow — skip evaluation and log a warning.
+        if improves_stash and sampleset.record.sample.shape[1] != len(state.nodes):
+            if defect_info is not None:
+                sampleset = self._finalize_sample(sampleset, defect_info)
+            else:
+                self.logger.info(
+                    "[%s] Mining attempt - Energy: %.0f (under-reconstructed: "
+                    "sample width %d != topology %d; skipping evaluation)",
+                    self.miner_id, iter_best_energy,
+                    sampleset.record.sample.shape[1], len(state.nodes),
+                )
+                improves_stash = False
 
         result = None
         stored_replaced = False
@@ -2006,6 +2035,21 @@ class BaseMiner(ABC):
     # ------------------------------------------------------------------
     # Hook methods (override in subclasses as needed)
     # ------------------------------------------------------------------
+
+    def _finalize_sample(self, sampleset: Any, defect_info: Any) -> Any:
+        """Reconstruct a reduced sampleset to full topology (survivor-only).
+
+        Called in ``_run_substrate_ratchet`` only when a sample passes the
+        energy pre-check but its width is narrower than the topology (i.e. the
+        QPU stream driver clamped offline qubits out before writing to the
+        ring). ``defect_info`` carries the fixed-spin assignments and energy
+        offset needed for reconstruction.
+
+        The base implementation is the identity (CPU/GPU/Metal samples are
+        always full width; the ratchet's width guard never triggers for them).
+        ``DWaveMiner`` overrides this to call ``reconstruct_full_sampleset``.
+        """
+        return sampleset
 
     def _pre_mine_setup(
         self,
