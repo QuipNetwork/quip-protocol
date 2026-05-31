@@ -365,6 +365,11 @@ class BaseMiner(ABC):
         self._ctl_q: Optional[Any] = None
         self._driver_stop: Optional[Any] = None
         self._driver_proc: Optional[Any] = None
+        # ProblemView written by _mempool_feeder_spec for the current mempool
+        # order. The worker owns the shared memory; the driver reads it on the
+        # switch. Replaced (and previous freed) on each mempool dispatch;
+        # close-unlinked in _close_driver on shutdown.
+        self._mempool_problem_view: Optional[Any] = None
         # (max_rows, max_cols) the persistent ring was sized for; a dispatch
         # whose dims differ forces a driver respawn (rare — num_reads and the
         # topology are stable within a miner's life).
@@ -1096,23 +1101,10 @@ class BaseMiner(ABC):
         # is what gives the QPU its throughput. Backends without batch
         # streaming pop the feeder one model at a time (see the loop).
         if self.DRIVER_OWNS_FEEDER:
-            if not is_substrate:
-                # The stream driver only builds a RandomIsingFeeder (PoW). A
-                # mempool job needs the order's fixed (h, J); mining random
-                # models against the order's evaluator would be silently
-                # wrong. Abort this dispatch loudly — mempool work must be
-                # routed to a CPU/GPU miner, not the QPU driver path.
-                self.logger.error(
-                    "QPU driver path cannot mine mempool job %s: only "
-                    "PoW/substrate contexts are supported (the stream driver "
-                    "has no fixed-model feeder). Skipping this dispatch.",
-                    _work_tag(context),
-                )
-                return None
-            # The stream-driver process builds its own RandomIsingFeeder
-            # (see build_persistent_context); the worker keeps no feeder so
-            # the chain seed / miner identity are derived in exactly one
-            # place. Capture the construction inputs into sample_ctx below.
+            # The stream-driver process builds its own feeder (RandomIsingFeeder
+            # for PoW, FixedIsingFeeder for mempool via ProblemView); the worker
+            # keeps no feeder so the model is derived in exactly one place.
+            # Capture the construction inputs into sample_ctx below.
             self._feeder = None
         else:
             self._feeder = context.make_feeder(
@@ -1165,11 +1157,15 @@ class BaseMiner(ABC):
             threshold_milli = _energy_to_milli(thr) if thr is not None else 0
             anneal = sample_ctx["annealing_time"]
             # The 9th element is the feeder spec the generic StreamContext builds
-            # its feeder from (PoW: random-model derivation seed).
-            feeder_spec = (
-                "pow", sample_ctx["last_proof_block_hash"],
-                sample_ctx["miner_bytes"],
-            )
+            # its feeder from (PoW: random-model derivation seed; mempool: a
+            # ProblemView slot written by the worker with the order's fixed h/J).
+            if is_substrate:
+                feeder_spec = (
+                    "pow", sample_ctx["last_proof_block_hash"],
+                    sample_ctx["miner_bytes"],
+                )
+            else:
+                feeder_spec = self._mempool_feeder_spec(context)
             try:
                 self._ctl_q.put(
                     ("switch", generation, sample_ctx["last_proof_block_hash"],
@@ -1301,6 +1297,61 @@ class BaseMiner(ABC):
         self._ctl_q = None
         self._driver_stop = None
         self._ring_dims = None
+        pv = getattr(self, "_mempool_problem_view", None)
+        if pv is not None:
+            try:
+                pv.close_unlink()
+            except Exception:  # noqa: BLE001 — best-effort
+                pass
+            self._mempool_problem_view = None
+
+    def _mempool_feeder_spec(self, context) -> Tuple[Any, ...]:
+        """Write the order's fixed (h, J) into a ProblemView slot for the driver.
+
+        The mempool model is fixed per order, so it is transferred once via a
+        zero-copy ProblemView (the worker owns the slot; the driver reads it on
+        the switch and reconstructs a FixedIsingFeeder). The previous slot is
+        freed here — the driver read it on the prior mempool switch.
+
+        Args:
+            context: A MempoolJobContext with .nodes, .edges, .h_values,
+                .j_values (i32 millivalues).
+
+        Returns:
+            A ``("mempool", attach_args, slot)`` tuple suitable for passing as
+            ``feeder_spec`` in the ``("switch", ...)`` ctl_q command.
+
+        Raises:
+            RuntimeError: If no free slot is available in the new ProblemView
+                (should not happen for a freshly created 1-slot view).
+        """
+        import numpy as np
+        from shared.ring_views import ProblemView
+        h_vec = np.asarray(
+            [hv / 1000.0 for hv in context.h_values], dtype=np.float64,
+        )
+        j_vec = np.asarray(
+            [jv / 1000.0 for jv in context.j_values], dtype=np.float64,
+        )
+        pv = ProblemView(
+            slots=1, n_nodes=len(context.nodes), n_edges=len(context.edges),
+        )
+        slot = pv.claim_free(timeout=1.0)
+        if slot is None:
+            pv.close_unlink()
+            raise RuntimeError(
+                "ProblemView.claim_free returned None for a fresh 1-slot view; "
+                "cannot write mempool model for driver"
+            )
+        pv.write(slot, h_vec, j_vec)
+        prev = getattr(self, "_mempool_problem_view", None)
+        if prev is not None:
+            try:
+                prev.close_unlink()
+            except Exception:  # noqa: BLE001 — best-effort
+                pass
+        self._mempool_problem_view = pv
+        return ("mempool", pv.attach_args(), slot)
 
     def close(self) -> None:
         """Release all persistent resources (call on miner/worker shutdown)."""
