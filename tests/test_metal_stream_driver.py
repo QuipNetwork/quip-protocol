@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
 
-"""Integration test: stream_driver_main drives MetalStreamContext into a ring."""
+"""Integration test: stream_driver_main drives StreamContext (Metal) into a ring."""
 from __future__ import annotations
 
 import multiprocessing as mp
@@ -28,7 +28,7 @@ def _spawn_driver(ring, desc_q, ctl_q, stop, factory, factory_kwargs):
 
 @pytest.mark.timeout(30)
 def test_metal_driver_produces_descriptor_and_ring_sample():
-    """stream_driver_main + MetalStreamContext writes samples into the ring.
+    """stream_driver_main + generic StreamContext writes samples into the ring.
 
     The fake yields 1 read × 2 spins: sample=[[1, -1]], energy=[0.0].
     We assert the descriptor 7-tuple fields and round-trip one sample from the
@@ -42,8 +42,11 @@ def test_metal_driver_produces_descriptor_and_ring_sample():
     stop = ctx.Event()
 
     proc = _spawn_driver(ring, desc_q, ctl_q, stop, _FAKE_FACTORY, {})
-    # gen=1, nonce/salt, threshold=0, num_reads=1, anneal=0.0
-    ctl_q.put(("switch", 1, b"\x00" * 32, b"\x01" * 32, 0, 1, 0.0))
+    # 9-tuple: gen, lpbh, miner_bytes, threshold, num_reads, anneal, num_sweeps, feeder_spec
+    ctl_q.put(
+        ("switch", 1, b"\x00" * 32, b"\x01" * 32, 0, 1, 0.0, 8,
+         ("pow", b"\x00" * 32, b"\x01" * 32))
+    )
 
     try:
         item = desc_q.get(timeout=15.0)

@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
 
-"""Shared no-GPU fakes for MetalStreamContext tests + a driver-resolvable factory."""
+"""Shared no-GPU fakes for Metal stream driver integration tests."""
 from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
 
-from GPU.metal_stream import MetalStreamContext
+from shared.stream_context import StreamContext
 
 
 class FakeModel:
@@ -50,16 +50,15 @@ class FakeSampler:
 
 def build_fake_context(
     *, stop_event: Any = None, **_ignored: Any
-) -> MetalStreamContext:
-    """A no-GPU MetalStreamContext factory resolvable by stream_driver_main."""
-    return MetalStreamContext(
+) -> StreamContext:
+    """A no-GPU StreamContext factory resolvable by stream_driver_main."""
+    return StreamContext(
         sampler=FakeSampler(),
         nodes=[0, 1],
         edges=[(0, 1)],
         feeder_buffer_size=4,
         num_reads=1,
         num_sweeps=8,
-        max_threadgroups=4,
-        feeder_factory=FakeFeeder,
+        feeder_builder=lambda spec, nodes, edges, buffer_size: FakeFeeder(),
         stop_event=stop_event,
     )
