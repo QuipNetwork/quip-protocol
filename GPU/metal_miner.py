@@ -71,6 +71,12 @@ class MetalMiner(BaseMiner):
     # of ``budget * 2`` for typical Apple Silicon core counts (~10).
     FEEDER_BUFFER_SIZE = 16
 
+    # Dotted path to the stream-driver producer factory (GPU/metal_stream.py).
+    # STREAMING_PUMP / DRIVER_OWNS_FEEDER are set as INSTANCE attributes on the
+    # Metal-success path only, so CPU-fallback instances keep the class defaults
+    # (False) and stay on the inline sampling path.
+    STREAM_FACTORY_DOTTED = "GPU.metal_stream:build_persistent_context"
+
     # Metal MPS strategy: fewer sweeps, more reads
     ADAPT_MIN_SWEEPS = 64
     ADAPT_MAX_SWEEPS = 512
@@ -82,6 +88,10 @@ class MetalMiner(BaseMiner):
         yielding = cfg.pop('yielding', True)
         # Remove CUDA-only keys that flow through common_cfg
         cfg.pop('sms_per_nonce', None)
+
+        # Store topology before try so it's available on both success and
+        # fallback paths (harmless on fallback).
+        self.topology = topology
 
         try:
             sampler = MetalSASampler(topology=topology)
@@ -143,6 +153,13 @@ class MetalMiner(BaseMiner):
 
         signal.signal(signal.SIGTERM, self._cleanup_handler)
 
+        # Sampling runs in a stream-driver process (GPU/metal_stream.py) so the
+        # GPU keeps filling the ring while the worker evaluates concurrently.
+        # Instance-level (not class) so the CPU-fallback path keeps the inline
+        # path (class defaults remain False).
+        self.STREAMING_PUMP = True
+        self.DRIVER_OWNS_FEEDER = True
+
     # ── BaseMiner hooks ──────────────────────────────────
 
     def _pre_mine_setup(self, *args, **kwargs) -> bool:
@@ -177,6 +194,22 @@ class MetalMiner(BaseMiner):
             num_nodes=len(nodes),
             num_edges=len(edges),
         )
+
+    def _stream_factory_kwargs(self, sample_ctx, nodes):
+        """Return kwargs forwarded to GPU.metal_stream:build_persistent_context.
+
+        Called by BaseMiner._ensure_driver when STREAMING_PUMP is True.
+        """
+        return {
+            "miner_id": self.miner_id,
+            "nodes": nodes,
+            "edges": sample_ctx["edges"],
+            "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
+            "num_reads": sample_ctx["num_reads"],
+            "num_sweeps": sample_ctx["num_sweeps"],
+            "topology": getattr(self, "topology", None),
+            "utilization": getattr(self, "gpu_utilization", 100),
+        }
 
     def _sample_batch(
         self,
