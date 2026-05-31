@@ -1174,6 +1174,19 @@ class BaseMiner(ABC):
             generation=generation,
         )
 
+    def _stream_factory_kwargs(
+        self, sample_ctx: Dict[str, Any], nodes: List[int]
+    ) -> Dict[str, Any]:
+        """Kwargs for the stream-driver context factory (backend-specific).
+
+        Base raises: a backend that sets ``STREAMING_PUMP`` must override this
+        to supply exactly the kwargs its ``build_persistent_context`` accepts.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} sets STREAMING_PUMP but does not override "
+            "_stream_factory_kwargs"
+        )
+
     def _ensure_driver(self, sample_ctx: Dict[str, Any]) -> bool:
         """Ensure ONE persistent stream-driver process is running.
 
@@ -1206,22 +1219,7 @@ class BaseMiner(ABC):
         desc_q = ctx.Queue(maxsize=self.RESULT_QUEUE_MAXSIZE)
         ctl_q = ctx.Queue()
         driver_stop = ctx.Event()
-        factory_kwargs = {
-            "miner_id": self.miner_id,
-            "queue_depth": self.queue_depth,
-            "nodes": nodes,
-            "edges": sample_ctx["edges"],
-            "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
-            "num_reads": sample_ctx["num_reads"],
-            "annealing_time": sample_ctx["annealing_time"],
-            "energy_threshold_milli": _energy_to_milli(
-                sample_ctx["energy_threshold"],
-            ),
-            "solver_name": getattr(self, "solver_name", None),
-            "region": getattr(self, "region", None),
-            "token": getattr(self, "token", None),
-            "topology": getattr(self, "topology", None),
-        }
+        factory_kwargs = self._stream_factory_kwargs(sample_ctx, nodes)
         driver_proc = spawn_worker(
             stream_driver_main,
             (ring.attach_args(), desc_q, ctl_q, driver_stop,

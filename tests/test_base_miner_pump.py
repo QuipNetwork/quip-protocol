@@ -111,6 +111,13 @@ class _DriverMiner(BaseMiner):
             "energy_threshold": requirements.difficulty_energy,
         }
 
+    def _stream_factory_kwargs(self, sample_ctx, nodes):
+        return {
+            "num_reads": sample_ctx["num_reads"],
+            "nodes": nodes,
+            "topology": getattr(self, "topology", None),
+        }
+
     def _sample(self, *a, **k):
         raise AssertionError("single-shot _sample must not run on driver path")
 

@@ -15,7 +15,7 @@ init_logger = logging.getLogger(__name__)
 
 from QPU.dwave_sampler import DWaveSamplerWrapper, DefectInfo
 from QPU.qpu_time_manager import QPUTimeManager, QPUTimeConfig
-from shared.base_miner import BaseMiner, MidstreamBudget
+from shared.base_miner import BaseMiner, MidstreamBudget, _energy_to_milli
 from shared.miner_types import BlockRequirements
 from shared.ising_feeder import RandomIsingFeeder
 from shared.ising_model import IsingModel
@@ -766,6 +766,24 @@ class DWaveMiner(BaseMiner):
             'num_reads': num_reads,
             'annealing_time': annealing_time,
             'energy_threshold': current_requirements.difficulty_energy,
+        }
+
+    def _stream_factory_kwargs(self, sample_ctx, nodes):
+        return {
+            "miner_id": self.miner_id,
+            "queue_depth": self.queue_depth,
+            "nodes": nodes,
+            "edges": sample_ctx["edges"],
+            "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
+            "num_reads": sample_ctx["num_reads"],
+            "annealing_time": sample_ctx["annealing_time"],
+            "energy_threshold_milli": _energy_to_milli(
+                sample_ctx["energy_threshold"],
+            ),
+            "solver_name": getattr(self, "solver_name", None),
+            "region": getattr(self, "region", None),
+            "token": getattr(self, "token", None),
+            "topology": getattr(self, "topology", None),
         }
 
     def sample_ising_streaming(
