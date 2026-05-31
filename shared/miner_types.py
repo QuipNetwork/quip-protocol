@@ -97,6 +97,15 @@ class MiningResult:
     # ``energy`` (legacy behavior) at the cost of possible chain rejection.
     submit_floor_energy: Optional[float] = None
 
+    @property
+    def effective_floor(self) -> float:
+        """Chain-gated floor: submit_floor_energy when set, else best energy."""
+        return (
+            self.submit_floor_energy
+            if self.submit_floor_energy is not None
+            else self.energy
+        )
+
 
 @dataclass
 class IsingSample:
