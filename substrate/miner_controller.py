@@ -1895,8 +1895,8 @@ class SubstrateMinerController:
 
         Reads the worker-computed ``valid_at_block`` from the active preview,
         converts it to a monotonic deadline via the TimingTracker anchor, and
-        fires at ``T* - lag``. With no timing anchor yet, falls back to an
-        estimated-block floor so a paused head feed still fires eventually.
+        fires at ``T* - lag``. With no timing anchor yet (no head observed),
+        waits for ``observe_head`` to seed one before firing.
         """
         key = self._current_work_key
         if (
@@ -1920,10 +1920,7 @@ class SubstrateMinerController:
             b_star=valid_at, now_monotonic=now,
         )
         if deadline is None:
-            # No timing anchor yet: fall back to an estimated-block event floor.
-            if cur_block is not None and cur_block >= valid_at:
-                await self._fire_preview(ctx, key, preview, valid_at)
-            return
+            return  # no timing anchor yet — wait for observe_head to seed one
         if deadline <= now:
             await self._fire_preview(ctx, key, preview, valid_at)
 
@@ -1936,7 +1933,7 @@ class SubstrateMinerController:
         logger.info(
             "best candidate: floor=%.0f submittable at block %d (decay #%s); "
             "current ~block %s",
-            float(preview.get("submit_floor_energy", 0.0)) * 1000,
+            float(preview.get("submit_floor_energy", 0.0)),
             valid_at,
             preview.get("decay_num"),
             cur_block if cur_block is not None else "?",

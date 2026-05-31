@@ -1597,35 +1597,6 @@ async def test_cadence_no_fire_before_deadline(monkeypatch):
     assert fired == []
 
 
-async def test_cadence_fires_via_estimate_when_no_deadline_anchor(monkeypatch):
-    """With no timing anchor (deadline None) the cadence path still fires once
-    an estimated block reaches valid_at_block — via the estimate floor."""
-    from substrate.decay_timing import TimingTracker
-
-    controller = _bare_controller()
-    ctx, key = _seed_cadence_state(controller, valid_at_block=20)
-
-    class _NoAnchorTiming(TimingTracker):
-        def fire_deadline_monotonic(self, *, b_star, now_monotonic):
-            return None
-
-        def estimate_block(self, *, now_monotonic):
-            return 25
-
-    controller._timing = _NoAnchorTiming()
-
-    fired = []
-
-    async def fake_fire(c, k, p, b):
-        fired.append((k, b))
-
-    monkeypatch.setattr(controller, "_fire_preview", fake_fire)
-
-    await controller._maybe_fire_on_cadence()
-
-    assert fired == [(key, 20)]
-
-
 async def test_cadence_timer_dedups_when_already_fired(monkeypatch):
     """A key already in ``_anticipatory_fired`` does not re-fire."""
     controller = _bare_controller()
