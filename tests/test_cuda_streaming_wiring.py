@@ -21,8 +21,11 @@ def test_cuda_stream_factory_kwargs_keys():
         gpu_utilization=100, _update_mode="sa", sms_per_nonce=4, device="0",
         _yielding=False,
     )
+    # The hook reads only plain attrs, so a stand-in stands in for ``self``
+    # (a real CudaMiner can't be built without cupy/CUDA here).
     kw = CudaMiner._stream_factory_kwargs(
-        stub, {"edges": [(0, 1)], "num_reads": 64, "num_sweeps": 256}, [0, 1])
+        stub,  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
+        {"edges": [(0, 1)], "num_reads": 64, "num_sweeps": 256}, [0, 1])
     assert kw["num_reads"] == 64 and kw["num_sweeps"] == 256
     assert kw["nodes"] == [0, 1]
     assert kw["update_mode"] == "sa" and kw["sms_per_nonce"] == 4

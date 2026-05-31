@@ -41,6 +41,12 @@ def build_persistent_context(
     """
     from GPU.cuda_miner import CudaMiner
 
+    # Known limitation (mirrors Metal's dropped threadgroup-rescale): the
+    # generic StreamContext fixes num_kernels per round and only reopens the
+    # stream on a switch, so the inline path's adaptive nonce rescaling /
+    # should_throttle valve is not honored here. With yielding=True the
+    # KernelScheduler still starts its NVML monitor but its feedback is unused.
+    # Track for a future StreamContext throttle hook; harmless for yielding=False.
     miner = CudaMiner(
         miner_id,
         device=device,
