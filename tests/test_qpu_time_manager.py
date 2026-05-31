@@ -5,6 +5,8 @@ import os
 import importlib.util
 import logging
 
+import pytest
+
 # Load qpu_time_manager module directly without triggering QPU/__init__.py
 # This avoids the D-Wave dependency which may not be installed in test environments
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19,8 +21,6 @@ parse_duration = _module.parse_duration
 QPUTimeConfig = _module.QPUTimeConfig
 QPUTimeEstimate = _module.QPUTimeEstimate
 QPUTimeManager = _module.QPUTimeManager
-
-import pytest
 
 
 def _tm(daily=86400.0, buffer=90.0, cap=None):
