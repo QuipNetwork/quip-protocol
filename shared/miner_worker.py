@@ -118,6 +118,14 @@ def build_miner_from_spec(spec: Dict[str, Any]):
                 daily_budget_seconds=parse_duration(cfg["daily_budget"]),
                 min_blocks_for_estimation=cfg.get("qpu_min_blocks_for_estimation", 5),
                 ema_alpha=cfg.get("qpu_ema_alpha", 0.3),
+                min_block_budget_seconds=parse_duration(
+                    cfg.get("min_block_budget", "90s")
+                ),
+                budget_cap_seconds=(
+                    parse_duration(cfg["budget_cap"])
+                    if cfg.get("budget_cap")
+                    else None
+                ),
             )
             # Remove time config keys from cfg to avoid passing them to miner
             cfg = {
@@ -128,6 +136,8 @@ def build_miner_from_spec(spec: Dict[str, Any]):
                     "daily_budget",
                     "qpu_min_blocks_for_estimation",
                     "qpu_ema_alpha",
+                    "min_block_budget",
+                    "budget_cap",
                     "qpu_type",
                 )
             }

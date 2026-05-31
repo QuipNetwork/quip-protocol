@@ -38,14 +38,26 @@ max_retries      = 3
 retry_backoff_ms = 250
 
 # ── D-Wave annealer ───────────────────────────────────────────────────
-# QPU access-time budget (per UTC day) is the main knob. The sampler's
-# active solver and region come from environment variables —
+# QPU access-time budget (per UTC day) is the main knob — it sets the rate
+# at which the budget reservoir accrues (daily_budget / 86400 per second).
+# The miner banks unused budget into the reservoir and pauses until it has
+# `min_block_budget` of QPU runway accrued, then bursts until the pool
+# drains to 0 (accumulate-then-burst, to amortize D-Wave queue warmup).
+# The sampler's active solver and region come from environment variables —
 # DWAVE_API_SOLVER and DWAVE_REGION_URL — at runtime; `solver` and
 # `dwave_region_url` here are operator-asserted pass-through values
 # surfaced to dashboards. EMA + min-blocks tune the pacing estimator
 # inside QPUTimeManager.
 [dwave]
-daily_budget                   = "60s"
+daily_budget                   = "30m"
+# min_block_budget: QPU runway (access seconds) that must accrue before a
+# burst starts. Mining then continues until the pool drains to 0. Must be
+# < daily_budget or the reservoir fills only across multiple days (a
+# startup warning fires). Default "90s".
+min_block_budget               = "90s"
+# budget_cap: max banked pool size. Bounds a post-downtime catch-up burst.
+# Defaults to max(daily_budget, min_block_budget) when unset.
+# budget_cap                     = "30m"
 # solver                         = "Advantage2_system1"
 # dwave_region_url               = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
 # qpu_min_blocks_for_estimation  = 5
