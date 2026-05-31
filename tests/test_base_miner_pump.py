@@ -400,6 +400,60 @@ def test_mine_work_item_stops_promptly_on_stop_event():
 
 
 # ----------------------------------------------------------------------
+# Participation marker: write-once per accepted dispatch
+# ----------------------------------------------------------------------
+
+
+class _AbortMiner(_DriverMiner):
+    """Driver miner whose budget gate aborts the dispatch (no mining)."""
+
+    def _pre_mine_setup(self, *a, **k) -> bool:
+        return False
+
+
+def test_participating_cb_fires_once_on_accepted_dispatch():
+    import threading
+    import time as _t
+
+    ctx = _streaming_context()
+    miner = _DriverMiner(factory=_FAKE_CTX)  # infinite stream
+    calls: list = []
+    stop = mp.Event()
+    try:
+        t = threading.Thread(
+            target=lambda: miner.mine_work_item(
+                ctx, stop, participating_cb=lambda n, e: calls.append((n, e)),
+            )
+        )
+        t.start()
+        _t.sleep(0.4)
+        stop.set()
+        t.join(timeout=15.0)
+        assert not t.is_alive()
+        assert len(calls) == 1, f"expected one participation emit, got {calls}"
+        solution_number, extra = calls[0]
+        assert isinstance(solution_number, int)
+        # _DriverMiner has no time_manager -> base _participation_extra -> {}.
+        assert extra == {}
+    finally:
+        miner._close_driver()
+
+
+def test_participating_cb_not_fired_when_setup_aborts():
+    ctx = _streaming_context()
+    miner = _AbortMiner(factory=_FAKE_CTX)
+    calls: list = []
+    stop = mp.Event()
+    # _pre_mine_setup returns False => _setup_dispatch returns None => the
+    # participation emit is never reached. Returns promptly (no driver loop).
+    result = miner.mine_work_item(
+        ctx, stop, participating_cb=lambda n, e: calls.append((n, e)),
+    )
+    assert result is None
+    assert calls == []
+
+
+# ----------------------------------------------------------------------
 # Headline regression: lookahead -> decay -> aggressive submit (end-to-end)
 # ----------------------------------------------------------------------
 

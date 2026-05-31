@@ -168,6 +168,17 @@ def test_midstream_budget_ok_returns_none_without_time_manager():
     assert miner._midstream_budget_ok(solution_number=1) is None
 
 
+def test_participation_extra_carries_pool_budget():
+    miner = _dwave_with_time_manager(_FakeTimeManager(should_mine=True))
+    extra = miner._participation_extra()
+    assert extra == {"budget_seconds": 5.0}  # pool_seconds from the stub
+
+
+def test_participation_extra_empty_without_time_manager():
+    miner = _dwave_with_time_manager(None)
+    assert miner._participation_extra() == {}
+
+
 def test_midstream_budget_ok_passes_when_budget_available():
     miner = _dwave_with_time_manager(_FakeTimeManager(should_mine=True))
     status = miner._midstream_budget_ok(solution_number=1)

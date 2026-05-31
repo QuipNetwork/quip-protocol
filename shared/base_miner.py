@@ -646,6 +646,7 @@ class BaseMiner(ABC):
         stop_event: multiprocessing.synchronize.Event,
         preview_cb: Optional[Any] = None,
         budget_cb: Optional[Any] = None,
+        participating_cb: Optional[Any] = None,
         **kwargs,
     ) -> Optional[MiningResult]:
         """Protocol-neutral mining loop.
@@ -693,6 +694,13 @@ class BaseMiner(ABC):
                 ``QPUTimeManager.get_stats`` shape) so the controller can
                 surface live usage on telemetry. Default ``None`` = no-op. A
                 failing callback never breaks mining.
+            participating_cb: Optional callable invoked exactly once per
+                accepted dispatch (after ``_pre_mine_setup`` passes its gate,
+                so a budget-starved QPU dispatch that aborts never fires it).
+                Receives ``(solution_number, extra_dict)`` where ``extra_dict``
+                is ``self._participation_extra()`` (QPU adds ``budget_seconds``).
+                Drives the controller's write-once participation remark.
+                Default ``None`` = no-op; a failing callback never breaks mining.
             **kwargs: Forwarded to ``_pre_mine_setup``.
 
         Returns:
@@ -706,6 +714,18 @@ class BaseMiner(ABC):
         is_substrate = setup.is_substrate
         sample_ctx = setup.sample_ctx
         desc_q = setup.desc_q
+
+        # Dispatch accepted (gate passed): emit the write-once participation
+        # signal. For QPU this only runs once the reservoir buffer is reached,
+        # since a budget-starved dispatch aborts in _setup_dispatch above.
+        if participating_cb is not None:
+            try:
+                participating_cb(
+                    loop_state.solution_number_for_log,
+                    self._participation_extra(),
+                )
+            except Exception as exc:  # noqa: BLE001 — observability path
+                self.logger.debug("participating_cb failed (ignored): %s", exc)
 
         progress = 0
         try:
@@ -1510,6 +1530,15 @@ class BaseMiner(ABC):
         ``None`` means "no budget gating for this backend".
         """
         return None
+
+    def _participation_extra(self) -> Dict[str, Any]:
+        """Extra fields for the per-dispatch participation marker.
+
+        Base returns ``{}`` (CPU/GPU have no reservoir). The QPU subclass adds
+        ``{"budget_seconds": <pool at dispatch>}`` so the controller's remark
+        records the QPU runway committed to this solution #.
+        """
+        return {}
 
     def _pause_driver(self, generation: int) -> None:
         """Tell the persistent driver to stop submitting NEW work (drain-idle).
