@@ -1572,6 +1572,38 @@ async def test_cadence_timer_fires_at_deadline(monkeypatch):
     assert fired[0][1] == 20
 
 
+async def test_cadence_no_fire_when_valid_at_block_zero(monkeypatch):
+    """A non-decay preview carries ``valid_at_block=0`` (the legacy/sentinel
+    path, or a schedule-less round after a transient RPC failure). Firing on
+    it would make ``fire_deadline_monotonic(b_star=0)`` resolve to the distant
+    past — with a real positive anchor block — and submit an un-gated
+    candidate every tick (submission storm). The guard must suppress it."""
+    controller = _bare_controller()
+    ctx, key = _seed_cadence_state(controller, valid_at_block=0, decay_num=0)
+
+    # Realistic positive anchor: two heads near block 1000. Without the guard,
+    # fire_deadline_monotonic(b_star=0) = anchor_mono + (0 - 1000)*interval -
+    # lag => far in the past => deadline <= now => it WOULD fire.
+    now = asyncio.get_running_loop().time()
+    controller._timing.observe_head(
+        block_number=999, chain_ts_s=5994.0,
+        monotonic_now=now - 6.0, wallclock_now=5994.0,
+    )
+    controller._timing.observe_head(
+        block_number=1000, chain_ts_s=6000.0,
+        monotonic_now=now, wallclock_now=6000.0,
+    )
+
+    fired = []
+    monkeypatch.setattr(
+        controller, "_fire_preview",
+        lambda *a, **k: fired.append(a),
+    )
+
+    await controller._maybe_fire_on_cadence()
+    assert fired == []
+
+
 async def test_cadence_no_fire_before_deadline(monkeypatch):
     """A deadline in the future (anchor block far below valid_at) does not
     fire on this tick."""

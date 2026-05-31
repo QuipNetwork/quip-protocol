@@ -1910,7 +1910,15 @@ class SubstrateMinerController:
         if preview is None or ctx is None:
             return
         valid_at = preview.get("valid_at_block")
-        if valid_at is None:
+        # Reject the non-decay sentinel (0) and any non-positive block. A
+        # real decay candidate has valid_at = last_proof_block + decay_num *
+        # epoch_length with last_proof_block > 0 in normal operation, so
+        # valid_at > 0 always. valid_at == 0 means the worker emitted a
+        # non-decay preview (legacy path, or a schedule-less round after a
+        # transient RPC failure in _anticipatory_inputs); firing on it would
+        # make fire_deadline_monotonic(b_star=0) resolve to the distant past
+        # and submit an un-gated candidate every tick. Suppress instead.
+        if valid_at is None or int(valid_at) <= 0:
             return
         valid_at = int(valid_at)
         now = asyncio.get_running_loop().time()
