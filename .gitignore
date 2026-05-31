@@ -80,3 +80,6 @@ data/certs/private/
 
 # Node runtime output (local telemetry JSON written by TelemetryManager)
 telemetry/
+
+# Downloaded + validated PoW win archives (tools/download_and_validate_wins.py)
+qpu_results_wins/
