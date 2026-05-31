@@ -573,6 +573,23 @@ def build_feeder(spec, nodes, edges, buffer_size):
             edges=edges,
             buffer_size=buffer_size,
         )
+    elif kind == "mempool":
+        from shared.ring_views import ProblemView
+        from shared.ising_model import IsingModel
+        _, attach_args, slot = spec
+        pv = ProblemView(**attach_args)  # non-owner attach
+        try:
+            h_vec, j_vec = pv.read(slot)
+            model = IsingModel(
+                h={int(n): float(h_vec[i]) for i, n in enumerate(nodes)},
+                J={(int(e[0]), int(e[1])): float(j_vec[k])
+                   for k, e in enumerate(edges)},
+                nonce=b"\x00" * 32,
+                salt=b"\x00" * 32,
+            )
+        finally:
+            pv.close()  # non-owner: close (never unlink — the worker owns it)
+        return FixedIsingFeeder(models=[model])
     raise NotImplementedError(f"feeder spec kind not yet supported: {kind!r}")
 
 
