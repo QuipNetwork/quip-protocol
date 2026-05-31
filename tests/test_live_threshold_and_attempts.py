@@ -690,7 +690,7 @@ def test_ratchet_stashes_top5_energy_regardless_of_threshold(monkeypatch):
     assert len(state.top_k) == 1, (
         "candidate was not stashed despite being the best so far"
     )
-    assert state.top_k[0].energy == -14889.0
+    assert state.top_k[0].result.energy == -14889.0
 
 
 def test_ratchet_skips_attempt_outside_top5(monkeypatch):
@@ -727,20 +727,24 @@ def test_ratchet_skips_attempt_outside_top5(monkeypatch):
         submit_floor_energy=-15000.0,
     )
     # Build 5 distinct candidates with energies -15000, -14999, ..., -14996
+    from shared.base_miner import StashEntry
     from shared.miner_types import MiningResult as MR
     top_k = []
     for i in range(5):
-        top_k.append(MR(
-            miner_id=miner.miner_id, miner_type="QPU",
-            nonce=bytes([i]) * 32, salt=bytes([i + 10]) * 32,
-            timestamp=0, prev_timestamp=0,
-            solutions=[[1, -1, 1]], energy=-15000.0 + i,
-            diversity=1.0, num_valid=1, mining_time=0,
-            node_list=[0, 1, 2], edge_list=[(0, 1), (1, 2)],
-            submit_floor_energy=-15000.0 + i,
+        top_k.append(StashEntry(
+            decay_num=0, valid_at_block=0,
+            result=MR(
+                miner_id=miner.miner_id, miner_type="QPU",
+                nonce=bytes([i]) * 32, salt=bytes([i + 10]) * 32,
+                timestamp=0, prev_timestamp=0,
+                solutions=[[1, -1, 1]], energy=-15000.0 + i,
+                diversity=1.0, num_valid=1, mining_time=0,
+                node_list=[0, 1, 2], edge_list=[(0, 1), (1, 2)],
+                submit_floor_energy=-15000.0 + i,
+            ),
         ))
-    # Sort descending by energy so top_k[-1] is the worst (highest energy).
-    top_k.sort(key=lambda r: r.energy, reverse=True)
+    # Legacy (energy) ranking: top_k[-1] is the worst (highest energy).
+    top_k.sort(key=lambda e: e.result.energy)
 
     state = _MiningLoopState(
         requirements=req, nodes=[0, 1, 2], edges=[(0, 1), (1, 2)],
@@ -849,3 +853,255 @@ def test_ratchet_skips_under_reconstructed_sample(monkeypatch):
         "an under-reconstructed sample was stashed — the width guard must "
         "skip both evaluation and stashing"
     )
+
+
+# ── Decay-aware eval gate + win-time stash ranking (Task 5) ──────────────
+
+
+# Monotonic non-decreasing milli schedule (decay eases max_energy upward).
+# step_for_energy returns the first index whose threshold is strictly above
+# the candidate's floor: e.g. floor -14500 -> step 1 (-14000 > -14500),
+# floor -11500 -> step 4 (-11000 > -11500).
+_DECAY_SCHED = [-15000, -14000, -13000, -12000, -11000]
+
+
+def _decay_result(miner, energy: float, floor: float, tag: int):
+    from shared.miner_types import MiningResult
+    return MiningResult(
+        miner_id=miner.miner_id, miner_type="QPU",
+        nonce=bytes([tag]) * 32, salt=bytes([tag + 1]) * 32,
+        timestamp=0, prev_timestamp=0,
+        solutions=[[1, -1, 1]], energy=energy, diversity=1.0, num_valid=1,
+        mining_time=0, node_list=[0, 1, 2], edge_list=[(0, 1), (1, 2)],
+        submit_floor_energy=floor,
+    )
+
+
+def _decay_state(miner, top_k, *, last_proof_block=100, epoch_length=10):
+    from shared.base_miner import _MiningLoopState
+    from shared.miner_types import BlockRequirements
+    req = BlockRequirements(
+        difficulty_energy=-11.0, min_diversity=0.0, min_solutions=1,
+        timeout_to_difficulty_adjustment_decay=10 ** 9,
+    )
+    return _MiningLoopState(
+        requirements=req, nodes=[0, 1, 2], edges=[(0, 1), (1, 2)],
+        prev_timestamp=0, start_time=0.0, solution_number_for_log=0,
+        dispatch_id_for_log=0,
+        attempt_log=_make_attempt_logger(miner),
+        solution_store=_make_solution_store(miner),
+        live_threshold_var=miner._live_max_energy_milli,
+        top_k_cap=5, top_k=top_k, previewed_floor_milli=1 << 62, generation=1,
+        decay_schedule=list(_DECAY_SCHED),
+        last_proof_block=last_proof_block, epoch_length=epoch_length,
+    )
+
+
+def test_gate_skips_when_min_energy_cannot_beat_furthest_stash(
+    monkeypatch, caplog,
+):
+    """Decay gate: an iter whose best energy maps to s_min > s_max (the
+    furthest stashed win-time) must NOT call evaluate_sampleset, and must log
+    a pre-check skip heartbeat."""
+    import logging
+
+    import multiprocessing as mp
+
+    import numpy as np
+
+    from shared.base_miner import StashEntry
+    from tests.test_base_miner_pump import _DriverMiner
+
+    miner = _DriverMiner()
+    miner._live_max_energy_milli = mp.Value("q", -11_000_000)
+    miner._ctl_q = None
+
+    # Full stash, all at decay step 1 -> s_max = 1.
+    top_k = [
+        StashEntry(1, 110, _decay_result(miner, -14.5, -14.5, i))
+        for i in range(5)
+    ]
+    state = _decay_state(miner, top_k)
+
+    evaluate_called = []
+    monkeypatch.setattr(
+        miner, "evaluate_sampleset",
+        lambda *a, **k: evaluate_called.append(True),
+    )
+
+    # iter best energy -11.5 -> milli -11500 -> step_for_energy -> 4 (s_min).
+    # s_min (4) > s_max (1) -> must skip.
+    ss = _energy_sampleset(np.full(4, -11.5))
+    with caplog.at_level(logging.INFO, logger=miner.logger.name):
+        miner._run_substrate_ratchet(
+            state, ss, b"\x01" * 32, b"\x02" * 32, 0.0,
+            preview_cb=None, attempt_log_kwargs={},
+        )
+
+    assert not evaluate_called, (
+        "evaluate_sampleset was called for an iter that cannot clear within "
+        "the furthest stashed win-time — the decay gate must block it"
+    )
+    assert any("pre-check skip" in r.message for r in caplog.records), (
+        "expected a pre-check skip heartbeat log line"
+    )
+    assert len(state.top_k) == 5
+
+
+def test_gate_admits_weaker_energy_that_clears_within_window(monkeypatch):
+    """Decay gate: an iter weaker in *raw energy* than the worst stashed
+    energy, but whose s_min <= s_max, MUST be evaluated.
+
+    Regression vs the old energy-only gate, which would have skipped it
+    because its energy is worse than every stashed entry.
+    """
+    import multiprocessing as mp
+
+    import numpy as np
+
+    from shared.base_miner import StashEntry
+    from tests.test_base_miner_pump import _DriverMiner
+
+    miner = _DriverMiner()
+    miner._live_max_energy_milli = mp.Value("q", -11_000_000)
+    miner._ctl_q = None
+
+    # Full stash: strong energies (-15.0) all at decay step 4 -> s_max = 4.
+    top_k = [
+        StashEntry(4, 140, _decay_result(miner, -15.0, -11.5, i))
+        for i in range(5)
+    ]
+    state = _decay_state(miner, top_k)
+
+    cand = _decay_result(miner, -12.0, -12.0, 9)
+    evaluate_called = []
+
+    def _fake_evaluate(*a, **k):
+        evaluate_called.append(True)
+        return cand
+
+    monkeypatch.setattr(miner, "evaluate_sampleset", _fake_evaluate)
+
+    # iter best -12.0 -> milli -12000 -> step_for_energy -> 4 (s_min == s_max).
+    # Worse raw energy than every stashed (-15.0) so the old energy gate would
+    # have skipped; the decay gate admits it.
+    ss = _energy_sampleset(np.full(4, -12.0))
+    miner._run_substrate_ratchet(
+        state, ss, b"\x09" * 32, b"\x0a" * 32, 0.0,
+        preview_cb=None, attempt_log_kwargs={},
+    )
+
+    assert evaluate_called, (
+        "evaluate_sampleset was NOT called for an iter that clears within the "
+        "stash's furthest win-time — the decay gate must admit it"
+    )
+
+
+def test_stash_insert_orders_by_win_time_then_energy():
+    """Decay inserts order by (decay_num, energy); eviction targets the
+    furthest (largest decay_num, then highest energy) entry."""
+    from shared.base_miner import BaseMiner, StashEntry
+    from tests.test_base_miner_pump import _DriverMiner
+
+    miner = _DriverMiner()
+    top_k: list = []
+    # decay_num, energy
+    seed = [(2, -10.0), (1, -9.0), (3, -20.0), (1, -12.0), (2, -8.0)]
+    for i, (d, e) in enumerate(seed):
+        BaseMiner._stash_insert(
+            top_k, 5, StashEntry(d, d * 10, _decay_result(miner, e, e, i)),
+            True,
+        )
+    assert len(top_k) == 5
+    # Ordered by (decay_num, energy) ascending.
+    keys = [(s.decay_num, s.result.energy) for s in top_k]
+    assert keys == sorted(keys)
+    assert keys[0] == (1, -12.0)  # nearest win-time, then lowest energy
+
+    # Full: a nearer-win-time entry evicts the furthest (decay_num 3).
+    changed = BaseMiner._stash_insert(
+        top_k, 5, StashEntry(1, 10, _decay_result(miner, -5.0, -5.0, 99)),
+        True,
+    )
+    assert changed is True
+    assert all(s.decay_num != 3 for s in top_k), (
+        "the furthest (decay_num=3) entry must have been evicted"
+    )
+
+    # A further-win-time entry than the current worst is rejected.
+    worst = max((s.decay_num, s.result.energy) for s in top_k)
+    rejected = BaseMiner._stash_insert(
+        top_k, 5,
+        StashEntry(worst[0] + 1, 99, _decay_result(miner, -99.0, -99.0, 50)),
+        True,
+    )
+    assert rejected is False
+
+
+def test_stash_insert_tiebreak_lower_energy_incumbent():
+    """Equal decay_num: a strictly-lower-energy entry replaces the worst;
+    an equal-energy entry does NOT replace it."""
+    from shared.base_miner import BaseMiner, StashEntry
+    from tests.test_base_miner_pump import _DriverMiner
+
+    miner = _DriverMiner()
+    top_k: list = []
+    for i in range(5):
+        BaseMiner._stash_insert(
+            top_k, 5,
+            StashEntry(2, 20, _decay_result(miner, -10.0 - i, -10.0 - i, i)),
+            True,
+        )
+    # Energies: -10..-14 at decay_num 2; worst is -10.0.
+    worst_energy = max(s.result.energy for s in top_k)
+    assert worst_energy == -10.0
+
+    # Equal step, strictly lower energy than worst (-10.5 < -10.0) -> replaces.
+    changed = BaseMiner._stash_insert(
+        top_k, 5, StashEntry(2, 20, _decay_result(miner, -10.5, -10.5, 20)),
+        True,
+    )
+    assert changed is True
+    assert all(s.result.energy != -10.0 for s in top_k)
+
+    # Equal step, equal energy to the current worst -> NOT replaced.
+    new_worst = max(s.result.energy for s in top_k)
+    unchanged = BaseMiner._stash_insert(
+        top_k, 5,
+        StashEntry(2, 20, _decay_result(miner, new_worst, new_worst, 21)),
+        True,
+    )
+    assert unchanged is False
+
+
+def test_legacy_path_still_energy_ranked():
+    """is_decay_ranked False: inserts/evicts purely by energy, ignoring
+    decay_num (which is 0 on the legacy path)."""
+    from shared.base_miner import BaseMiner, StashEntry
+    from tests.test_base_miner_pump import _DriverMiner
+
+    miner = _DriverMiner()
+    top_k: list = []
+    for i, e in enumerate([-5.0, -1.0, -9.0, -3.0, -7.0]):
+        BaseMiner._stash_insert(
+            top_k, 5, StashEntry(0, 0, _decay_result(miner, e, e, i)), False,
+        )
+    energies = [s.result.energy for s in top_k]
+    assert energies == sorted(energies)
+    assert energies[0] == -9.0 and energies[-1] == -1.0
+
+    # Better energy than worst (-1.0) -> evicts the worst.
+    changed = BaseMiner._stash_insert(
+        top_k, 5, StashEntry(0, 0, _decay_result(miner, -6.0, -6.0, 50)), False,
+    )
+    assert changed is True
+    assert all(s.result.energy != -1.0 for s in top_k)
+
+    # Worse energy than the new worst -> rejected.
+    worst = max(s.result.energy for s in top_k)
+    rejected = BaseMiner._stash_insert(
+        top_k, 5,
+        StashEntry(0, 0, _decay_result(miner, worst + 1.0, worst + 1.0, 51)),
+        False,
+    )
+    assert rejected is False

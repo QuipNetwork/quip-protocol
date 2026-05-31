@@ -1036,7 +1036,7 @@ def test_precheck_skips_evaluate_outside_top5(
             energy=[energy],
         )
 
-    # Spy: returns a valid MiningResult for the first 5 calls so _insert_into_stash
+    # Spy: returns a valid MiningResult for the first 5 calls so _stash_insert
     # fires and fills top_k; returns None for any subsequent call (shouldn't happen).
     spy_calls = []
 

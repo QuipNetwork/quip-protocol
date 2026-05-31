@@ -33,6 +33,7 @@ from shared.quantum_proof_of_work import (
     evaluate_sampleset,
     pack_spins_hex,
 )
+from substrate.difficulty_decay import step_for_energy
 from substrate.types import SubstrateMiningContext
 from shared.work_context import (
     WorkContext,
@@ -198,7 +199,7 @@ class _MiningLoopState:
     solution_store: SolutionStore
     live_threshold_var: Optional[Any]
     top_k_cap: int
-    top_k: List[MiningResult]
+    top_k: List[StashEntry]
     previewed_floor_milli: int
     # Round generation (mirrors _DispatchSetup.generation) so the ratchet can
     # forward same-generation live-threshold decay updates to the driver.
@@ -991,9 +992,9 @@ class BaseMiner(ABC):
             with live_threshold_var.get_lock():
                 if live_threshold_var.value == 0:
                     live_threshold_var.value = context.difficulty.max_energy_milli
-        # Sorted ASC by energy; len <= TOP_K_STORE. ``top_k[0]`` is the
-        # best candidate; ``top_k[-1]`` is the eviction target.
-        top_k: List[MiningResult] = []
+        # Win-time/energy-ordered stash; len <= TOP_K_STORE. ``top_k[0]`` is
+        # the best candidate; the worst entry is the eviction target.
+        top_k: List[StashEntry] = []
         top_k_cap: int = self.TOP_K_STORE
         # Anticipatory-submission preview throttle. Tracks the best
         # (lowest) ``submit_floor_energy`` we've previewed to the
@@ -1439,48 +1440,57 @@ class BaseMiner(ABC):
         self._post_mine_cleanup()
 
     @staticmethod
-    def _insert_into_stash(
-        top_k: List[MiningResult],
+    def _stash_insert(
+        top_k: List[StashEntry],
         top_k_cap: int,
-        result: MiningResult,
+        entry: StashEntry,
+        is_decay_ranked: bool,
     ) -> bool:
-        """Insert ``result`` into the bounded, energy-ascending ``top_k``.
+        """Insert ``entry`` into the bounded, win-time-ordered ``top_k``.
 
-        Always admits when there's room; otherwise (the caller only reaches
-        here when ``result`` beat the worst-energy entry) evicts the tail.
-        Re-sorts in place. Returns True when the stash changed. Behaviour
-        matches the original inline heap-insert.
+        Ranked by ``(decay_num, energy)`` when decay-ranked, else by raw
+        ``energy``. Admits unconditionally while there's room; once full,
+        evicts the furthest/worst entry only when ``entry`` strictly beats it
+        (a nearer win-time, or the same step with a lower energy). Re-sorts in
+        place. Returns True when the stash changed.
         """
+        sort_key = (
+            (lambda e: (e.decay_num, e.result.energy)) if is_decay_ranked
+            else (lambda e: e.result.energy)
+        )
         if len(top_k) < top_k_cap:
-            top_k.append(result)
-            top_k.sort(key=lambda r: r.energy)
+            top_k.append(entry)
+            top_k.sort(key=sort_key)
             return True
-        if result.energy < top_k[-1].energy:
-            top_k[-1] = result
-            top_k.sort(key=lambda r: r.energy)
+        worst = max(top_k, key=sort_key)
+        if sort_key(entry) < sort_key(worst):
+            top_k.remove(worst)
+            top_k.append(entry)
+            top_k.sort(key=sort_key)
             return True
         return False
 
     @staticmethod
     def _select_submittable_candidate(
-        top_k: List[MiningResult],
+        top_k: List[StashEntry],
         live_threshold_milli: int,
     ) -> Optional[MiningResult]:
         """Return the first stash entry whose chain floor clears the threshold.
 
-        Walks ``top_k`` (energy-ascending) and returns the first candidate
-        whose ``submit_floor_energy`` (falling back to ``energy``) is strictly
-        below ``live_threshold_milli``, or ``None``. Behaviour matches the
-        original inline submit-gate walk.
+        Walks ``top_k`` (already win-time/energy ordered, best first) and
+        returns the first candidate's ``MiningResult`` whose
+        ``submit_floor_energy`` (falling back to ``energy``) is strictly below
+        ``live_threshold_milli``, or ``None``.
         """
-        for candidate in top_k:
+        for entry in top_k:
+            r = entry.result
             floor_energy = (
-                candidate.submit_floor_energy
-                if candidate.submit_floor_energy is not None
-                else candidate.energy
+                r.submit_floor_energy
+                if r.submit_floor_energy is not None
+                else r.energy
             )
             if int(floor_energy * 1000) < live_threshold_milli:
-                return candidate
+                return r
         return None
 
     def _midstream_budget_ok(
@@ -1584,29 +1594,45 @@ class BaseMiner(ABC):
         # miner out of building a baseline whenever the live threshold is
         # harder than what SA is producing.
         iter_best_energy = float(np.min(sampleset.record.energy))
+        iter_best_milli = int(iter_best_energy * 1000)
+        # Top-5 gate: we keep our best candidates independent of the current
+        # live threshold. The chain's difficulty decays to meet our stash — the
+        # controller's predictor fires whichever candidate clears the falling
+        # threshold. Gating stash entry on proximity to the live target would
+        # starve the stash whenever the QPU is producing energies better than
+        # SA-at-launch but not yet inside the threshold window, which is exactly
+        # the window decay is designed to cover. Once top_k is seeded,
+        # improvements and evaluations become rare.
+        #
+        # Accepted I-1 cost: while the stash holds fewer than 5 valid
+        # candidates every improving iter runs ``evaluate_sampleset`` (a CPU
+        # cost). This is inherent to "always keep the top-5" and self-resolves
+        # once 5 valid candidates land. It is CPU-bound and ring-backpressured —
+        # never a QPU-spend or unbounded-memory issue.
+        #
+        # ratchet_threshold is the legacy energy gate the attempt log records;
+        # +inf until the stash is full, then the worst stashed energy.
         ratchet_threshold = (
-            state.top_k[-1].energy
+            state.top_k[-1].result.energy
             if len(state.top_k) >= state.top_k_cap
             else float("inf")
         )
-        # Top-5-by-energy gate: we keep our best candidates independent of the
-        # current live threshold. The chain's difficulty decays to meet our
-        # stash — the controller's predictor fires whichever candidate clears
-        # the falling threshold. Gating stash entry on proximity to the live
-        # target would starve the stash whenever the QPU is producing energies
-        # that are better than SA-at-launch but not yet inside threshold window,
-        # which is exactly the window decay is designed to cover. Once top_k is
-        # seeded, improvements and evaluations become rare (only iters that beat
-        # the heap's worst entry reach evaluate_sampleset).
-        #
-        # Accepted I-1 cost: while the stash holds fewer than 5 valid
-        # candidates, ``ratchet_threshold`` is ``inf`` so every improving-energy
-        # iter runs ``evaluate_sampleset`` (a CPU cost). This is inherent to
-        # "always keep the top-5" and self-resolves once 5 valid candidates
-        # land. It is CPU-bound and ring-backpressured — never a QPU-spend or
-        # unbounded-memory issue — so we do NOT reintroduce a threshold/margin
-        # gate; top-5-by-energy is the intended design.
-        improves_stash = iter_best_energy < ratchet_threshold
+        decay_schedule = state.decay_schedule
+        if decay_schedule is None:
+            # Legacy path: rank purely by energy, exactly as before.
+            improves_stash = iter_best_energy < ratchet_threshold
+        else:
+            # Decay-aware gate: an iter is worth evaluating when its best
+            # energy could clear within the stash's furthest win-time. Using
+            # iter_best_milli as an optimistic proxy for the not-yet-computed
+            # submit floor — a sample whose best energy can't clear by the
+            # furthest stashed step can never produce a stashable floor.
+            if len(state.top_k) < state.top_k_cap:
+                improves_stash = True
+            else:
+                s_max = max(e.decay_num for e in state.top_k)
+                s_min = step_for_energy(decay_schedule, iter_best_milli)
+                improves_stash = s_min is not None and s_min <= s_max
 
         # Width guard: the QPU stream driver only fully reconstructs (full
         # topology) the samples it ranks into its own best-5; non-promising
@@ -1653,9 +1679,32 @@ class BaseMiner(ABC):
             if result is not None:
                 post_num_valid = result.num_valid
                 post_diversity_milli = int(result.diversity * 1000)
-                stored_replaced = self._insert_into_stash(
-                    state.top_k, state.top_k_cap, result,
-                )
+                if decay_schedule is not None:
+                    floor = (
+                        result.submit_floor_energy
+                        if result.submit_floor_energy is not None
+                        else result.energy
+                    )
+                    s_floor = step_for_energy(
+                        decay_schedule, int(floor * 1000),
+                    )
+                    if s_floor is None:
+                        # Never clears within the schedule horizon — not stashed.
+                        stored_replaced = False
+                    else:
+                        valid_at = (
+                            state.last_proof_block
+                            + s_floor * state.epoch_length
+                        )
+                        stored_replaced = self._stash_insert(
+                            state.top_k, state.top_k_cap,
+                            StashEntry(s_floor, valid_at, result), True,
+                        )
+                else:
+                    stored_replaced = self._stash_insert(
+                        state.top_k, state.top_k_cap,
+                        StashEntry(0, 0, result), False,
+                    )
         else:
             # Pre-check skipped the expensive lenient evaluate — and with
             # it the per-attempt line evaluate_sampleset logs from its
@@ -1669,7 +1718,8 @@ class BaseMiner(ABC):
                 "[%s] Mining attempt - Energy: %.0f (pre-check skip: "
                 "not in top-5, worst stashed=%.0f)",
                 self.miner_id, iter_best_energy,
-                (state.top_k[-1].energy if len(state.top_k) >= state.top_k_cap
+                (state.top_k[-1].result.energy
+                 if len(state.top_k) >= state.top_k_cap
                  else float("inf")),
             )
 
@@ -1847,7 +1897,7 @@ class BaseMiner(ABC):
     def _maybe_emit_preview(
         self,
         preview_cb: Any,
-        top_k: List[MiningResult],
+        top_k: List[StashEntry],
         previewed_floor_milli: int,
         dispatch_id: int,
     ) -> int:
@@ -1871,16 +1921,17 @@ class BaseMiner(ABC):
         # candidate could be submitted as decay eases.
         best = min(
             top_k,
-            key=lambda r: (
-                r.submit_floor_energy
-                if r.submit_floor_energy is not None
-                else r.energy
+            key=lambda e: (
+                e.result.submit_floor_energy
+                if e.result.submit_floor_energy is not None
+                else e.result.energy
             ),
         )
+        best_result = best.result
         best_floor = (
-            best.submit_floor_energy
-            if best.submit_floor_energy is not None
-            else best.energy
+            best_result.submit_floor_energy
+            if best_result.submit_floor_energy is not None
+            else best_result.energy
         )
         best_floor_milli = int(best_floor * 1000)
         if best_floor_milli >= previewed_floor_milli:
@@ -1890,13 +1941,13 @@ class BaseMiner(ABC):
             payload = {
                 "dispatch_id": dispatch_id,
                 "miner_type": self.miner_type,
-                "nonce": best.nonce,
-                "salt": best.salt,
-                "solutions": best.solutions,
+                "nonce": best_result.nonce,
+                "salt": best_result.salt,
+                "solutions": best_result.solutions,
                 "submit_floor_energy": best_floor,
-                "energy": best.energy,
-                "num_valid": best.num_valid,
-                "diversity": best.diversity,
+                "energy": best_result.energy,
+                "num_valid": best_result.num_valid,
+                "diversity": best_result.diversity,
             }
             preview_cb(payload)
         except Exception as exc:  # noqa: BLE001 — preview is best-effort
