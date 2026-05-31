@@ -60,7 +60,7 @@ from substrate.client import SubstrateClient
 from substrate.pool import ValidatorPool
 from substrate.pool_client import PoolClient
 from substrate.decay_timing import TimingTracker
-from substrate.difficulty_decay import EnergyCurve, block_when_energy_clears, build_decay_schedule
+from substrate.difficulty_decay import EnergyCurve, build_decay_schedule
 from substrate.submitter import (
     SubmitRetryAction,
     encode_quantum_proof,
@@ -240,6 +240,12 @@ _DISPATCH_CONTEXT_RETENTION = 4
 # "won't clear in any useful window". Sized generously — at the default
 # 6 s blocktime this is ~10 min of look-ahead.
 _ANTICIPATORY_SEARCH_LIMIT = 100
+
+# Cadence of the free-running fire timer (seconds). Each tick re-evaluates
+# the active preview's worker-computed ``valid_at_block`` against the
+# cadence clock and fires at ``T* - lag``; small enough to be punctual at a
+# 6 s blocktime, large enough to be negligible overhead.
+_FIRE_TICK_S = 1.0
 
 
 # A "work key" uniquely identifies the puzzle a context is mining
@@ -581,9 +587,12 @@ class SubstrateMinerController:
         self._decay_schedule_by_key: dict = {}  # WorkKey -> (list[int], int, int)
         self._anticipatory_fired: set[WorkKey] = set()
         self._timing = TimingTracker()
-        # At most one pending timed anticipatory fire + the work key it targets.
-        self._pending_fire_task: Optional[asyncio.Task] = None
-        self._pending_fire_key: Optional[WorkKey] = None
+        # Free-running cadence fire timer (Task 7). Re-evaluates the active
+        # preview's worker-computed ``valid_at_block`` each tick and fires at
+        # ``T* - lag``; sole fire authority (no per-head recompute).
+        self._fire_timer_task: Optional[asyncio.Task] = None
+        # Dedup key for the throttled "best candidate" status line.
+        self._last_fire_status_key: Optional[tuple] = None
         # Per-handle done-sentinel queue. The worker emits
         # `{"op": "work_item_done"}` when its mining loop exits with no
         # result; the drainer pushes that into the handle's queue and
@@ -788,6 +797,14 @@ class SubstrateMinerController:
                 on_failure=self._shutdown_event.set,
             ),
             name="chain-event-manager",
+        )
+        self._fire_timer_task = asyncio.create_task(
+            supervise(
+                self._fire_timer_loop(),
+                name="fire-timer",
+                on_failure=self._shutdown_event.set,
+            ),
+            name="fire-timer",
         )
         logger.info("ChainEventManager started; polling get_mining_snapshot")
 
@@ -1013,19 +1030,15 @@ class SubstrateMinerController:
         if new_work_key in self._closed_work_keys:
             return
 
-        # Anticipatory submission (Task 6b): if a worker previewed a
-        # best-by-floor candidate for this work key, predict the decay
-        # block at which it clears and fire at B*-1. Runs on every head for
-        # the active key — BEFORE the same-key short-circuit below — so it
-        # drives even when ``_pre_mine_setup`` paced the worker (the
-        # preview was captured before pacing) and the worker is idle. The
-        # fire path marks the work key closed on SUCCESS, so the
-        # closed-work-key guard above absorbs subsequent heads.
+        # Timing anchor (Task 7): fold this head's chain timestamp into the
+        # TimingTracker so the free-running fire timer can convert a worker-
+        # computed ``valid_at_block`` into a monotonic fire deadline. The
+        # timer — not this callback — is the sole fire authority.
         # SubstrateClient.query_block_timestamp_ms swallows its own errors
         # (returns None), but in pool mode ValidatorPool.send can raise (e.g.
         # ValidatorSwapped) BEFORE reaching the client's try/except. Guard the
         # read so a transient swap can't abort the rest of on_new_head and skip
-        # this head's anticipatory fire + dispatch.
+        # this head's dispatch.
         try:
             ts_ms = await self.pool_client.query_block_timestamp_ms(
                 ctx.block_hash,
@@ -1040,10 +1053,6 @@ class SubstrateMinerController:
                 monotonic_now=asyncio.get_running_loop().time(),
                 wallclock_now=time.time(),
             )
-        await self._maybe_anticipatory_fire(ctx, new_work_key)
-        if new_work_key in self._closed_work_keys:
-            # A SUCCESS fire just closed the round; don't also dispatch.
-            return
 
         # 6. Same-key short-circuit: mining already in progress.
         if new_work_key == self._current_work_key:
@@ -1817,10 +1826,9 @@ class SubstrateMinerController:
         self._base_difficulty_by_key.pop(key, None)
         self._decay_schedule_by_key.pop(key, None)
         self._anticipatory_fired.discard(key)
-        # A solution hit the wire (round advanced) or the round was force-
-        # closed: stop trying for this candidate's timed fire.
-        if self._pending_fire_key == key:
-            self._cancel_pending_fire()
+        # New round: re-arm the throttled status line so the next candidate
+        # logs even if its (valid_at_block, decay_num) collides with the old.
+        self._last_fire_status_key = None
 
     async def _anticipatory_inputs(
         self, ctx: SubstrateMiningContext, key: WorkKey
@@ -1868,106 +1876,71 @@ class SubstrateMinerController:
         )
         return base, int(last_proof_block), constants, curve
 
-    async def _maybe_anticipatory_fire(
-        self, ctx: SubstrateMiningContext, key: WorkKey
-    ) -> None:
-        """Predict the decay block for the active preview and fire at B*-1.
+    async def _fire_timer_loop(self) -> None:
+        """Cadence-driven fire authority: tick, predict, fire — no head needed.
 
-        Drives the controller-side anticipatory submission:
-
-        1. Look up the best-by-floor preview stored for ``key``. No preview
-           → nothing to do.
-        2. Predict ``B*`` — the first block at which the candidate's floor
-           clears the (decayed) chain threshold — via the local decay
-           predictor. ``None`` (won't clear within the horizon) → wait.
-        3. Once the head reached ``B* - 1``, fire ``submit_with_retry`` and
-           branch on the typed action.
-
-        Best-effort: any unexpected error is logged and swallowed so a
-        preview hiccup never tears down the head loop.
+        Runs until shutdown. Each tick re-evaluates the active preview's
+        worker-computed ``valid_at_block`` against the cadence clock and fires
+        at ``T* - lag``; resilient to a head feed that pauses between blocks.
         """
+        while not self._shutdown_event.is_set():
+            try:
+                await self._maybe_fire_on_cadence()
+            except Exception:  # noqa: BLE001 — one bad tick must not kill the loop
+                logger.exception("fire timer tick failed; continuing")
+            await asyncio.sleep(_FIRE_TICK_S)
+
+    async def _maybe_fire_on_cadence(self) -> None:
+        """Re-evaluate the active preview and fire it if its win-time arrived.
+
+        Reads the worker-computed ``valid_at_block`` from the active preview,
+        converts it to a monotonic deadline via the TimingTracker anchor, and
+        fires at ``T* - lag``. With no timing anchor yet, falls back to an
+        estimated-block floor so a paused head feed still fires eventually.
+        """
+        key = self._current_work_key
+        if (
+            key is None
+            or key in self._anticipatory_fired
+            or key in self._closed_work_keys
+        ):
+            return
         preview = self._latest_preview.get(key)
-        if preview is None:
+        ctx = self._current_context
+        if preview is None or ctx is None:
             return
-        # Already SUCCESS-fired / mid-fire on this key — don't re-enter.
-        if key in self._anticipatory_fired or key in self._closed_work_keys:
+        valid_at = preview.get("valid_at_block")
+        if valid_at is None:
             return
-
-        inputs = await self._anticipatory_inputs(ctx, key)
-        if inputs is None:
-            return
-        base, last_proof_block, constants, curve = inputs
-
-        # The candidate's chain-equivalent floor (worst submitted solution),
-        # in milli. The chain gates strictly: clears when the live
-        # max_energy_milli > floor_energy_milli.
-        floor = preview.get("submit_floor_energy")
-        if floor is None:
-            return
-        floor_energy_milli = int(float(floor) * 1000)
-
-        b_star = block_when_energy_clears(
-            floor_energy_milli,
-            int(ctx.block_number),
-            base_difficulty=base,
-            last_proof_block=last_proof_block,
-            epoch_length=int(constants.epoch_length),
-            curve=curve,
-            search_limit=_ANTICIPATORY_SEARCH_LIMIT,
-        )
-        if b_star is None:
-            # Won't clear within the look-ahead window; wait for more decay.
-            return
-        # Event floor: once we locally observe B*-1, fire now (never later
-        # than the original block-driven behavior).
-        if int(ctx.block_number) >= b_star - 1:
-            self._cancel_pending_fire()
-            await self._fire_preview(ctx, key, preview, b_star)
-            return
-
-        # Otherwise predict the wall-clock production time of B* and schedule a
-        # one-shot fire at T* - lag, so the tx lands as the decay step goes
-        # live. Re-evaluated on every head; an earlier real head reschedules.
-        now_mono = asyncio.get_running_loop().time()
+        valid_at = int(valid_at)
+        now = asyncio.get_running_loop().time()
+        cur_block = self._timing.estimate_block(now_monotonic=now)
+        self._log_fire_status(preview, valid_at, cur_block)
         deadline = self._timing.fire_deadline_monotonic(
-            b_star=b_star, now_monotonic=now_mono,
+            b_star=valid_at, now_monotonic=now,
         )
         if deadline is None:
-            return  # no timestamp anchor yet — wait for the event floor
-        if deadline <= now_mono:
-            self._cancel_pending_fire()
-            await self._fire_preview(ctx, key, preview, b_star)
+            # No timing anchor yet: fall back to an estimated-block event floor.
+            if cur_block is not None and cur_block >= valid_at:
+                await self._fire_preview(ctx, key, preview, valid_at)
             return
-        self._schedule_fire(ctx, key, preview, b_star, deadline - now_mono)
+        if deadline <= now:
+            await self._fire_preview(ctx, key, preview, valid_at)
 
-    def _cancel_pending_fire(self) -> None:
-        """Cancel any pending timed anticipatory fire."""
-        task = self._pending_fire_task
-        if task is not None and not task.done():
-            task.cancel()
-        self._pending_fire_task = None
-        self._pending_fire_key = None
-
-    def _schedule_fire(self, ctx, key, preview, b_star, delay_s) -> None:
-        """Schedule a single timed fire at +delay_s; supersede any prior timer."""
-        self._cancel_pending_fire()
-
-        async def _runner():
-            try:
-                await asyncio.sleep(delay_s)
-                # Re-validate: key still live + not already fired/closed.
-                if (
-                    key in self._closed_work_keys
-                    or key in self._anticipatory_fired
-                    or self._latest_preview.get(key) is None
-                ):
-                    return
-                await self._fire_preview(ctx, key, preview, b_star)
-            except asyncio.CancelledError:
-                pass
-
-        self._pending_fire_key = key
-        self._pending_fire_task = asyncio.create_task(_runner())
+    def _log_fire_status(self, preview, valid_at, cur_block) -> None:
+        """Throttled 'best candidate … submittable block X / current ~Y' line."""
+        status_key = (valid_at, preview.get("decay_num"))
+        if status_key == self._last_fire_status_key:
+            return
+        self._last_fire_status_key = status_key
+        logger.info(
+            "best candidate: floor=%.0f submittable at block %d (decay #%s); "
+            "current ~block %s",
+            float(preview.get("submit_floor_energy", 0.0)) * 1000,
+            valid_at,
+            preview.get("decay_num"),
+            cur_block if cur_block is not None else "?",
+        )
 
     async def _fire_preview(
         self,
@@ -2451,9 +2424,6 @@ class SubstrateMinerController:
 
     async def _teardown(self) -> None:
         logger.info("controller shutting down: cancelling handles, draining tasks")
-        # Cancel any pending timed anticipatory fire so it can't leak a
-        # "Task was destroyed but it is pending" warning or fire mid-shutdown.
-        self._cancel_pending_fire()
         for handle in self.miner_handles:
             try:
                 handle.cancel()
@@ -2473,6 +2443,9 @@ class SubstrateMinerController:
             self.events.request_shutdown()
         if self._event_manager_task is not None:
             self._event_manager_task.cancel()
+        # Stop the free-running fire timer (Task 7).
+        if self._fire_timer_task is not None:
+            self._fire_timer_task.cancel()
         # Cancel the stats snapshot writer before awaiting tasks.
         if self._stats_writer_task is not None:
             self._stats_writer_task.cancel()
@@ -2481,6 +2454,8 @@ class SubstrateMinerController:
         extras: list[asyncio.Task] = []
         if self._event_manager_task is not None:
             extras.append(self._event_manager_task)
+        if self._fire_timer_task is not None:
+            extras.append(self._fire_timer_task)
         if self._stats_writer_task is not None:
             extras.append(self._stats_writer_task)
         for task in self._drainer_tasks + extras:
@@ -2495,6 +2470,7 @@ class SubstrateMinerController:
                 )
         self._drainer_tasks.clear()
         self._event_manager_task = None
+        self._fire_timer_task = None
         # Telemetry sibling shutdown.
         if self._telemetry_shutdown_event is not None:
             self._telemetry_shutdown_event.set()

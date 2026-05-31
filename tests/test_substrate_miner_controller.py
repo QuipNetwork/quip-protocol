@@ -170,12 +170,12 @@ def _bare_controller() -> SubstrateMinerController:
     c._base_difficulty_by_key = {}
     c._decay_schedule_by_key = {}  # WorkKey -> (schedule, last_proof_block, epoch_length)
     c._anticipatory_fired = set()
-    # Timed anticipatory fire (Task B3). Real TimingTracker with no observed
-    # head: fire_deadline_monotonic returns None until a test sets it.
+    # Cadence fire timer (Task 7). Real TimingTracker with no observed head:
+    # fire_deadline_monotonic returns None until a test seeds an anchor.
     from substrate.decay_timing import TimingTracker
     c._timing = TimingTracker()
-    c._pending_fire_task = None
-    c._pending_fire_key = None
+    c._fire_timer_task = None
+    c._last_fire_status_key = None
     # Per-round solution-number cache (on-disk archive key). Empty by
     # default; _set_current seeds it for the active round so submissions
     # land under the matching {solution_number}/ dir.
@@ -1339,6 +1339,8 @@ def _store_preview_entry(controller, ctx, *, floor: float = -3.0) -> None:
         "energy": floor,
         "num_valid": 3,
         "diversity": 0.5,
+        "decay_num": 2,
+        "valid_at_block": 20,
     }
 
 
@@ -1359,39 +1361,12 @@ def _ctx_at_block(last_proof_block_hash: bytes, block_number: int):
     )
 
 
-async def test_anticipatory_no_fire_before_b_star_minus_one(monkeypatch):
-    """With B*=20, a head at block 18 (< B*-1=19) must NOT fire."""
-    controller = _bare_controller()
-    _stub_predictor_inputs(controller)
-    ctx = _ctx_at_block(b"\xaa" * 32, 18)
-    _store_preview_entry(controller, ctx)
-    from substrate.miner_controller import _work_key
-    key = _work_key(ctx)
+async def test_fire_preview_success_records_and_closes(monkeypatch):
+    """A SUCCESS fire verifies, records, and marks the work key closed.
 
-    fired = False
-
-    async def fake_submit_with_retry(*args, **kwargs):
-        nonlocal fired
-        fired = True
-        from substrate.submitter import SubmitResult, SubmitRetryAction
-        return SubmitResult(action=SubmitRetryAction.SUCCESS)
-
-    monkeypatch.setattr(
-        "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
-    )
-    monkeypatch.setattr(
-        "substrate.miner_controller.block_when_energy_clears",
-        lambda *a, **k: 20,
-    )
-
-    await controller._maybe_anticipatory_fire(ctx, key)
-    assert fired is False
-    assert controller.stats.proofs_submitted == 0
-
-
-async def test_anticipatory_fires_at_b_star_minus_one_success(monkeypatch):
-    """At block 19 (= B*-1 for B*=20), the controller fires and on SUCCESS
-    verifies, records, and marks the work key closed."""
+    Exercises ``_fire_preview`` directly — the cadence timer is what decides
+    *when* to call it, but the SUCCESS branch behavior is the same.
+    """
     controller = _bare_controller()
     _stub_predictor_inputs(controller)
     controller._verify_proof_recorded = AsyncMock(return_value=42)
@@ -1399,6 +1374,7 @@ async def test_anticipatory_fires_at_b_star_minus_one_success(monkeypatch):
     _store_preview_entry(controller, ctx)
     from substrate.miner_controller import _work_key
     key = _work_key(ctx)
+    preview = controller._latest_preview[key]
 
     captured = {}
 
@@ -1414,12 +1390,8 @@ async def test_anticipatory_fires_at_b_star_minus_one_success(monkeypatch):
     monkeypatch.setattr(
         "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
     )
-    monkeypatch.setattr(
-        "substrate.miner_controller.block_when_energy_clears",
-        lambda *a, **k: 20,
-    )
 
-    await controller._maybe_anticipatory_fire(ctx, key)
+    await controller._fire_preview(ctx, key, preview, 20)
 
     assert controller.stats.proofs_submitted == 1
     assert key in controller._closed_work_keys
@@ -1453,6 +1425,7 @@ async def test_anticipatory_verify_fail_records_chain_error_and_refires(monkeypa
     _store_preview_entry(controller, ctx)
     from substrate.miner_controller import _work_key
     key = _work_key(ctx)
+    preview = controller._latest_preview[key]
 
     async def fake_submit_with_retry(*args, **kwargs):
         from substrate.submitter import SubmitResult, SubmitRetryAction
@@ -1464,12 +1437,8 @@ async def test_anticipatory_verify_fail_records_chain_error_and_refires(monkeypa
     monkeypatch.setattr(
         "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
     )
-    monkeypatch.setattr(
-        "substrate.miner_controller.block_when_energy_clears",
-        lambda *a, **k: 20,
-    )
 
-    await controller._maybe_anticipatory_fire(ctx, key)
+    await controller._fire_preview(ctx, key, preview, 20)
 
     # Not won: key stays open, mid-fire mark cleared so a later head re-fires,
     # preview retained.
@@ -1496,6 +1465,7 @@ async def test_anticipatory_retry_keeps_preview_for_next_head(monkeypatch):
     _store_preview_entry(controller, ctx)
     from substrate.miner_controller import _work_key
     key = _work_key(ctx)
+    preview = controller._latest_preview[key]
 
     async def fake_submit_with_retry(*args, **kwargs):
         from substrate.submitter import SubmitResult, SubmitRetryAction
@@ -1504,12 +1474,8 @@ async def test_anticipatory_retry_keeps_preview_for_next_head(monkeypatch):
     monkeypatch.setattr(
         "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
     )
-    monkeypatch.setattr(
-        "substrate.miner_controller.block_when_energy_clears",
-        lambda *a, **k: 20,
-    )
 
-    await controller._maybe_anticipatory_fire(ctx, key)
+    await controller._fire_preview(ctx, key, preview, 20)
 
     assert controller.stats.proofs_submitted == 0
     assert key not in controller._closed_work_keys
@@ -1529,6 +1495,7 @@ async def test_anticipatory_round_stale_discards_preview(monkeypatch):
     _store_preview_entry(controller, ctx)
     from substrate.miner_controller import _work_key
     key = _work_key(ctx)
+    preview = controller._latest_preview[key]
 
     async def fake_submit_with_retry(*args, **kwargs):
         from substrate.submitter import SubmitResult, SubmitRetryAction
@@ -1540,12 +1507,8 @@ async def test_anticipatory_round_stale_discards_preview(monkeypatch):
     monkeypatch.setattr(
         "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
     )
-    monkeypatch.setattr(
-        "substrate.miner_controller.block_when_energy_clears",
-        lambda *a, **k: 20,
-    )
 
-    await controller._maybe_anticipatory_fire(ctx, key)
+    await controller._fire_preview(ctx, key, preview, 20)
 
     assert controller.stats.proofs_submitted == 0
     assert key not in controller._latest_preview  # discarded
@@ -1561,34 +1524,171 @@ async def test_anticipatory_round_stale_discards_preview(monkeypatch):
     assert "InvalidNonce" in record["error"]
 
 
-async def test_anticipatory_no_fire_when_b_star_none(monkeypatch):
-    """If the candidate never clears within the horizon (B*=None), do
-    nothing this head."""
-    controller = _bare_controller()
-    _stub_predictor_inputs(controller)
-    ctx = _ctx_at_block(b"\xaa" * 32, 19)
-    _store_preview_entry(controller, ctx)
+# ----------------------------------------------------------------------
+# Task 7: free-running cadence fire timer reads worker-computed valid_at_block
+# ----------------------------------------------------------------------
+
+
+def _seed_cadence_state(controller, *, valid_at_block, decay_num=2):
+    """Bind a controller to an active preview carrying a worker win-time."""
+    ctx = _ctx_at_block(b"\xaa" * 32, 5)
     from substrate.miner_controller import _work_key
     key = _work_key(ctx)
+    _store_preview_entry(controller, ctx)
+    controller._latest_preview[key]["valid_at_block"] = valid_at_block
+    controller._latest_preview[key]["decay_num"] = decay_num
+    controller._current_context = ctx
+    controller._current_work_key = key
+    return ctx, key
 
-    fired = False
 
-    async def fake_submit_with_retry(*args, **kwargs):
-        nonlocal fired
-        fired = True
-        from substrate.submitter import SubmitResult, SubmitRetryAction
-        return SubmitResult(action=SubmitRetryAction.SUCCESS)
+async def test_cadence_timer_fires_at_deadline(monkeypatch):
+    """With a timing anchor putting the deadline in the past, the cadence
+    tick fires the active preview once at ``b_star == valid_at_block``."""
+    controller = _bare_controller()
+    ctx, key = _seed_cadence_state(controller, valid_at_block=20)
 
-    monkeypatch.setattr(
-        "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
+    # Seed the tracker anchor so fire_deadline_monotonic returns a past time:
+    # anchor far in the past with a tiny interval => deadline << now.
+    now = asyncio.get_running_loop().time()
+    controller._timing.observe_head(
+        block_number=20,
+        chain_ts_s=1000.0,
+        monotonic_now=now - 100.0,
+        wallclock_now=1000.0,
     )
-    monkeypatch.setattr(
-        "substrate.miner_controller.block_when_energy_clears",
-        lambda *a, **k: None,
+
+    fired = []
+
+    async def fake_fire(c, k, p, b):
+        fired.append((k, b))
+
+    monkeypatch.setattr(controller, "_fire_preview", fake_fire)
+
+    await controller._maybe_fire_on_cadence()
+
+    assert len(fired) == 1
+    assert fired[0][0] == key
+    assert fired[0][1] == 20
+
+
+async def test_cadence_no_fire_before_deadline(monkeypatch):
+    """A deadline in the future (anchor block far below valid_at) does not
+    fire on this tick."""
+    controller = _bare_controller()
+    _seed_cadence_state(controller, valid_at_block=200)
+
+    now = asyncio.get_running_loop().time()
+    # Anchor at block 10 with a 6 s interval: deadline for block 200 is far out.
+    controller._timing.observe_head(
+        block_number=9, chain_ts_s=900.0, monotonic_now=now, wallclock_now=900.0,
+    )
+    controller._timing.observe_head(
+        block_number=10, chain_ts_s=906.0, monotonic_now=now, wallclock_now=906.0,
     )
 
-    await controller._maybe_anticipatory_fire(ctx, key)
-    assert fired is False
+    fired = []
+    monkeypatch.setattr(
+        controller, "_fire_preview",
+        lambda *a, **k: fired.append(a),
+    )
+
+    await controller._maybe_fire_on_cadence()
+    assert fired == []
+
+
+async def test_cadence_fires_via_estimate_when_no_deadline_anchor(monkeypatch):
+    """With no timing anchor (deadline None) the cadence path still fires once
+    an estimated block reaches valid_at_block — via the estimate floor."""
+    from substrate.decay_timing import TimingTracker
+
+    controller = _bare_controller()
+    ctx, key = _seed_cadence_state(controller, valid_at_block=20)
+
+    class _NoAnchorTiming(TimingTracker):
+        def fire_deadline_monotonic(self, *, b_star, now_monotonic):
+            return None
+
+        def estimate_block(self, *, now_monotonic):
+            return 25
+
+    controller._timing = _NoAnchorTiming()
+
+    fired = []
+
+    async def fake_fire(c, k, p, b):
+        fired.append((k, b))
+
+    monkeypatch.setattr(controller, "_fire_preview", fake_fire)
+
+    await controller._maybe_fire_on_cadence()
+
+    assert fired == [(key, 20)]
+
+
+async def test_cadence_timer_dedups_when_already_fired(monkeypatch):
+    """A key already in ``_anticipatory_fired`` does not re-fire."""
+    controller = _bare_controller()
+    _ctx, key = _seed_cadence_state(controller, valid_at_block=20)
+    controller._anticipatory_fired.add(key)
+
+    now = asyncio.get_running_loop().time()
+    controller._timing.observe_head(
+        block_number=20, chain_ts_s=1000.0,
+        monotonic_now=now - 100.0, wallclock_now=1000.0,
+    )
+
+    fired = []
+    monkeypatch.setattr(
+        controller, "_fire_preview", lambda *a, **k: fired.append(a),
+    )
+
+    await controller._maybe_fire_on_cadence()
+    assert fired == []
+
+
+async def test_cadence_no_fire_without_preview(monkeypatch):
+    """An active key with no stored preview does not fire."""
+    controller = _bare_controller()
+    ctx = _ctx_at_block(b"\xaa" * 32, 5)
+    from substrate.miner_controller import _work_key
+    controller._current_context = ctx
+    controller._current_work_key = _work_key(ctx)  # no _latest_preview entry
+
+    now = asyncio.get_running_loop().time()
+    controller._timing.observe_head(
+        block_number=20, chain_ts_s=1000.0,
+        monotonic_now=now - 100.0, wallclock_now=1000.0,
+    )
+
+    fired = []
+    monkeypatch.setattr(
+        controller, "_fire_preview", lambda *a, **k: fired.append(a),
+    )
+
+    await controller._maybe_fire_on_cadence()
+    assert fired == []
+
+
+async def test_fire_timer_cancelled_on_teardown():
+    """``_teardown`` cancels the fire-timer task and clears the handle."""
+    controller = _bare_controller()
+    controller.miner_handles = []
+    controller._drainer_tasks = []
+    controller.events = None
+    controller._stats_writer_task = None
+    controller._telemetry_shutdown_event = None
+    controller._telemetry_proc = None
+    controller._event_manager_task = None
+
+    task = asyncio.create_task(controller._fire_timer_loop())
+    controller._fire_timer_task = task
+    await asyncio.sleep(0)  # let the loop start
+
+    await controller._teardown()
+
+    assert task.cancelled() or task.done()
+    assert controller._fire_timer_task is None
 
 
 def test_evict_anticipatory_state_prunes_all():
@@ -1704,12 +1804,6 @@ async def test_rollover_evicts_stale_preview_and_skips_fire(monkeypatch):
     monkeypatch.setattr(
         "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
     )
-    # Predictor would say "fire now" if it ran — proves the eviction, not
-    # an early-return, is what prevents the stale fire.
-    monkeypatch.setattr(
-        "substrate.miner_controller.block_when_energy_clears",
-        lambda *a, **k: 0,
-    )
     _stub_predictor_inputs(controller)
 
     # New round rolls in.
@@ -1719,167 +1813,6 @@ async def test_rollover_evicts_stale_preview_and_skips_fire(monkeypatch):
     assert old_key not in controller._latest_preview  # evicted on rollover
     assert old_key not in controller._base_difficulty_by_key
     assert fired is False  # the stale candidate never fired
-
-
-async def test_anticipatory_fire_paced_worker_idle(monkeypatch):
-    """Even when the worker is paced (idle, no dispatch result), a captured
-    preview drives a fire at B*-1 through `on_new_head`."""
-    from substrate.miner_controller import _work_key
-
-    controller = _bare_controller()
-    controller.events = None
-    handle = _FakeHandle("p0")  # idle: _active_dispatch_id == 0
-    controller.miner_handles = [handle]
-    controller.core = None
-    controller._done_queues = {}
-    controller._verify_proof_recorded = AsyncMock(return_value=42)
-    _stub_predictor_inputs(controller)
-
-    ctx = _ctx_at_block(b"\xaa" * 32, 19)
-    key = _work_key(ctx)
-    _store_preview_entry(controller, ctx)
-    # Controller already mining this key (so it's the active key), worker idle.
-    controller._current_context = ctx
-    controller._current_work_key = key
-
-    async def fake_submit_with_retry(*args, **kwargs):
-        from substrate.submitter import SubmitResult, SubmitRetryAction
-        return SubmitResult(
-            action=SubmitRetryAction.SUCCESS,
-            receipt=ExtrinsicReceipt(extrinsic_hash="0xabc"),
-        )
-
-    monkeypatch.setattr(
-        "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
-    )
-    monkeypatch.setattr(
-        "substrate.miner_controller.block_when_energy_clears",
-        lambda *a, **k: 20,
-    )
-
-    await controller.on_new_head(ctx)
-
-    assert controller.stats.proofs_submitted == 1
-    assert key in controller._closed_work_keys
-    # Worker was never dispatched (the SUCCESS fire closed the round first).
-    assert handle.mine_calls == []
-
-
-class _StubTiming:
-    """Minimal TimingTracker stand-in: pins ``fire_deadline_monotonic``."""
-
-    def __init__(self, deadline):
-        self._deadline = deadline
-        self.observe_calls = 0
-
-    def observe_head(self, **kwargs):  # pragma: no cover - not asserted here
-        self.observe_calls += 1
-
-    def fire_deadline_monotonic(self, *, b_star, now_monotonic):
-        if self._deadline is None:
-            return None
-        return self._deadline
-
-
-async def test_anticipatory_fires_at_predicted_deadline_before_block_floor(
-    monkeypatch,
-):
-    """B* is well above block+1 (block-floor branch does NOT fire), but the
-    predicted deadline is already reached -> fire on the prediction, not on
-    waiting for B*-1."""
-    from substrate.miner_controller import _work_key
-
-    controller = _bare_controller()
-    _stub_predictor_inputs(controller)
-    ctx = _ctx_at_block(b"\xaa" * 32, 5)  # 5 << b_star-1 == 49
-    _store_preview_entry(controller, ctx)
-    key = _work_key(ctx)
-
-    # Deadline already reached (<= now): force the timed fire-now branch.
-    controller._timing = _StubTiming(deadline=0.0)
-
-    fired = {}
-
-    async def fake_fire(c, k, p, b):
-        fired["b_star"] = b
-        fired["key"] = k
-
-    monkeypatch.setattr(controller, "_fire_preview", fake_fire)
-    monkeypatch.setattr(
-        "substrate.miner_controller.block_when_energy_clears",
-        lambda *a, **k: 50,
-    )
-
-    await controller._maybe_anticipatory_fire(ctx, key)
-
-    assert fired.get("b_star") == 50
-    assert fired.get("key") == key
-
-
-async def test_anticipatory_schedules_timer_when_deadline_future(monkeypatch):
-    """A future deadline schedules a live timer task and does NOT fire
-    synchronously."""
-    from substrate.miner_controller import _work_key
-
-    controller = _bare_controller()
-    _stub_predictor_inputs(controller)
-    ctx = _ctx_at_block(b"\xaa" * 32, 5)
-    _store_preview_entry(controller, ctx)
-    key = _work_key(ctx)
-
-    now = asyncio.get_running_loop().time()
-    controller._timing = _StubTiming(deadline=now + 3600.0)
-
-    fired = False
-
-    async def fake_fire(c, k, p, b):
-        nonlocal fired
-        fired = True
-
-    monkeypatch.setattr(controller, "_fire_preview", fake_fire)
-    monkeypatch.setattr(
-        "substrate.miner_controller.block_when_energy_clears",
-        lambda *a, **k: 50,
-    )
-
-    await controller._maybe_anticipatory_fire(ctx, key)
-
-    assert fired is False
-    assert isinstance(controller._pending_fire_task, asyncio.Task)
-    assert not controller._pending_fire_task.done()
-    assert controller._pending_fire_key == key
-
-    # Teardown: cancel the pending timer.
-    controller._cancel_pending_fire()
-
-
-async def test_anticipatory_block_floor_still_fires_without_timing(monkeypatch):
-    """No timestamp anchor (deadline None) but block >= B*-1: the event floor
-    still fires."""
-    from substrate.miner_controller import _work_key
-
-    controller = _bare_controller()
-    _stub_predictor_inputs(controller)
-    ctx = _ctx_at_block(b"\xaa" * 32, 19)  # 19 == b_star-1 for b_star=20
-    _store_preview_entry(controller, ctx)
-    key = _work_key(ctx)
-
-    controller._timing = _StubTiming(deadline=None)
-
-    fired = {}
-
-    async def fake_fire(c, k, p, b):
-        fired["b_star"] = b
-
-    monkeypatch.setattr(controller, "_fire_preview", fake_fire)
-    monkeypatch.setattr(
-        "substrate.miner_controller.block_when_energy_clears",
-        lambda *a, **k: 20,
-    )
-
-    await controller._maybe_anticipatory_fire(ctx, key)
-
-    assert fired.get("b_star") == 20
 
 
 # ----------------------------------------------------------------------
@@ -1945,49 +1878,19 @@ def test_snapshot_qpu_budget_is_none_when_unreported():
 
 
 # ----------------------------------------------------------------------
-# B4: _evict_anticipatory_state cancels pending timed fire on round advance
+# Task 7: _evict_anticipatory_state re-arms the throttled status line
 # ----------------------------------------------------------------------
 
 
-async def test_round_advance_cancels_pending_fire():
-    """When the work key advances (round closes), evicting that key must also
-    cancel any pending timed fire targeting it."""
+def test_evict_resets_fire_status_key():
+    """Evicting a key clears ``_last_fire_status_key`` so the next round's
+    candidate logs even if its (valid_at_block, decay_num) collides."""
     from substrate.miner_controller import _work_key
 
     controller = _bare_controller()
     key = _work_key(_context(b"\xaa" * 32))
-
-    async def _never():
-        await asyncio.sleep(3600)
-
-    controller._pending_fire_task = asyncio.create_task(_never())
-    controller._pending_fire_key = key
+    controller._last_fire_status_key = (20, 2)
 
     controller._evict_anticipatory_state(key)
-    await asyncio.sleep(0)  # let the cancellation propagate
 
-    assert controller._pending_fire_task is None
-    assert controller._pending_fire_key is None
-
-
-async def test_evict_other_key_leaves_pending_fire():
-    """Evicting a DIFFERENT key must not cancel a pending fire for key_a."""
-    from substrate.miner_controller import _work_key
-
-    controller = _bare_controller()
-    key_a = _work_key(_context(b"\xaa" * 32))
-    key_b = _work_key(_context(b"\xbb" * 32))
-
-    async def _never():
-        await asyncio.sleep(3600)
-
-    task = asyncio.create_task(_never())
-    controller._pending_fire_task = task
-    controller._pending_fire_key = key_a
-
-    try:
-        controller._evict_anticipatory_state(key_b)
-        assert controller._pending_fire_task is task  # untouched
-        assert controller._pending_fire_key is key_a
-    finally:
-        task.cancel()
+    assert controller._last_fire_status_key is None

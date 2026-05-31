@@ -56,16 +56,15 @@ def controller():
     ctrl._dispatch_contexts = {}
     ctrl.topology_hash = None
     ctrl.core = None
-    # Anticipatory-submission state (Task 6b). on_new_head reads
-    # `_latest_preview` on every head; these tests never store a preview,
-    # so `_maybe_anticipatory_fire` short-circuits at the empty-store check
-    # and the fire path is a clean no-op. The pool_client stub returns None
-    # from every predictor query so that even if a preview were present,
-    # `_anticipatory_inputs` would return None (no fire) rather than hit
-    # the network.
+    # Anticipatory-submission state. on_new_head no longer fires (the
+    # free-running cadence timer owns that); it only stores previews and a
+    # timing anchor. These tests never store a preview, so the active-key
+    # state stays empty. The pool_client stub returns None from every
+    # predictor query so dispatch's schedule build degrades cleanly.
     ctrl._latest_preview = {}
     ctrl._anticipatory_fired = set()
     ctrl._base_difficulty_by_key = {}
+    ctrl._decay_schedule_by_key = {}
     ctrl._pow_constants = None
     # Per-round solution-number cache (the on-disk archive key). The stub
     # returns a fixed WinningSolutions count so dispatch resolves a stable
@@ -118,55 +117,6 @@ async def test_on_new_head_pushes_threshold_change(controller):
     ctx = _make_context(threshold_milli=-5000)
     await ctrl.on_new_head(ctx)
     assert handle.threshold_pushes == [-5000]
-
-
-@pytest.mark.asyncio
-async def test_maybe_anticipatory_fire_noop_without_preview(controller):
-    """No preview stored → clean no-op (no exception, no chain reads)."""
-    ctrl, _ = controller
-    await ctrl._maybe_anticipatory_fire(
-        _make_context(threshold_milli=-5000), (b"\x01" * 32, b"\xab" * 32)
-    )
-    # Never reached the predictor-input queries.
-    ctrl.pool_client.query_difficulty.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_maybe_anticipatory_fire_noop_when_constants_none(controller):
-    """A preview present but ``query_pow_constants`` → None must short-circuit
-    cleanly (no AttributeError on ``constants.curve_c_*``), keeping the
-    preview, and must NOT even reach ``query_difficulty``."""
-    ctrl, _ = controller
-    ctx = _make_context(threshold_milli=-5000)
-    ctx.block_number = 5
-    key = (b"\x01" * 32, b"\xab" * 32)
-    ctrl._latest_preview[key] = {"submit_floor_energy": -3.0}
-    await ctrl._maybe_anticipatory_fire(ctx, key)
-    # constants None → return before querying difficulty.
-    ctrl.pool_client.query_pow_constants.assert_awaited()
-    ctrl.pool_client.query_difficulty.assert_not_called()
-    assert key in ctrl._latest_preview
-
-
-@pytest.mark.asyncio
-async def test_maybe_anticipatory_fire_noop_when_difficulty_none(controller):
-    """Constants present but ``query_difficulty`` → None must be a clean
-    no-op rather than raise; preview is kept for a later head."""
-    ctrl, _ = controller
-    ctrl._pow_constants = SimpleNamespace(
-        epoch_length=5,
-        curve_c_easy_milli=800,
-        curve_c_knee_milli=750,
-        curve_c_hard_milli=700,
-    )
-    ctx = _make_context(threshold_milli=-5000)
-    ctx.block_number = 5
-    key = (b"\x01" * 32, b"\xab" * 32)
-    ctrl._latest_preview[key] = {"submit_floor_energy": -3.0}
-    await ctrl._maybe_anticipatory_fire(ctx, key)
-    # difficulty None → no fire, preview kept.
-    ctrl.pool_client.query_difficulty.assert_awaited()
-    assert key in ctrl._latest_preview
 
 
 @pytest.mark.asyncio
