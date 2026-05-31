@@ -302,15 +302,21 @@ class QPUTimeManager:
         """
         self._burst_active = False
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self, now: Optional[float] = None) -> Dict[str, Any]:
         """Return current reservoir statistics.
+
+        Args:
+            now: Optional wall-clock timestamp for the accrual step; uses
+                current time if not provided. All callers on a single manager
+                instance must share one clock domain (wall-clock) — the gates
+                and ``record_block_time`` advance the same ``_last_accrual_s``.
 
         Returns:
             Dictionary with pool balance, cap, buffer, burst state, and
             estimation metrics. ``budget_remaining_seconds`` mirrors
             ``pool_seconds`` (the in-loop drain-to-0 gate reads it).
         """
-        now = time.time()
+        now = now if now is not None else time.time()
         self._accrue(now)
         pool_s = self._pool_us / 1_000_000
         buffer_s = self.config.min_block_budget_seconds

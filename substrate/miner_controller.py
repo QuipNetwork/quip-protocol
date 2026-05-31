@@ -53,7 +53,11 @@ from shared.miner_config import SubmissionConfig
 from shared.miner_survey import build_miner_survey
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
-from shared.mining_attempt_log import DEFAULT_LOG_DIR, SubmissionLogger
+from shared.mining_attempt_log import (
+    DEFAULT_LOG_DIR,
+    SubmissionLogger,
+    query_by_solution_number,
+)
 from shared.signer import Signer
 from shared.stats_snapshot import StatsSnapshotWriter, snapshot_filename_for
 from shared.telemetry_process import telemetry_main
@@ -578,12 +582,6 @@ class SubstrateMinerController:
         # marked via a System.remark. Solution numbers are monotonic, so the
         # arbitrary-pop bound below can never re-admit a still-active key.
         self._participated: set[tuple[str, int]] = set()
-        # Per-solution QPU-spend baseline: (miner_id, solution#) -> the miner's
-        # tracked cumulative_used_seconds when it began mining that solution #
-        # (captured when participation fires). At win, the delta against the
-        # latest budget snapshot is the precise QPU spent on that solution —
-        # reusing the figure QPUTimeManager already tracks (no disk re-sum).
-        self._solution_used_start: dict[tuple[str, int], float] = {}
         # Anticipatory-submission state (Task 6b).
         # ``_pow_constants`` caches the four decay constants
         # (epoch_length + curve c-triple) for the session — they only
@@ -1418,11 +1416,9 @@ class SubstrateMinerController:
             won_block_number: Optional[int] = (
                 verified if (verified is not None and verified >= 0) else None
             )
-            # Precise QPU spent on this solution # (delta of the tracked
-            # cumulative_used budget). Telemetry/log only — not on-chain.
-            qpu_access_us_total = self._solution_qpu_spent_us(
-                envelope.handle_id, solution_number
-            )
+            # Precise QPU spent on this solution # (summed from the per-attempt
+            # QPU times in the attempt log). Telemetry/log only — not on-chain.
+            qpu_access_us_total = self._sum_qpu_access_us(solution_number)
             self._submission_log.record(
                 solution_number=solution_number,
                 miner_id=envelope.handle_id,
@@ -1783,26 +1779,30 @@ class SubstrateMinerController:
             return
         self._latest_budget[handle.miner_id] = data
 
-    def _solution_qpu_spent_us(
-        self, miner_id: str, solution_number: Optional[int],
-    ) -> Optional[int]:
-        """Precise QPU spent on a solution # by a miner, in microseconds.
+    def _sum_qpu_access_us(self, solution_number: Optional[int]) -> Optional[int]:
+        """Precise QPU access time the node spent on a solution #, in µs.
 
-        Difference of the miner's tracked ``cumulative_used_seconds`` between
-        the solution-start baseline (captured at participation) and the latest
-        budget snapshot. Reuses the figure ``QPUTimeManager`` already tracks —
-        no attempt-log re-sum. Returns ``None`` when no baseline/snapshot is
-        available (e.g. CPU/GPU miners, or the first solution after startup).
+        Sums the per-attempt ``qpu_access_time_us`` the miners already record in
+        the attempt log under ``{solution#}/`` — the per-solution view of the
+        same QPU times ``QPUTimeManager`` aggregates to a lifetime total. Summed
+        across every launched miner (CPU/GPU attempts carry no QPU time, so the
+        result is the node's true QPU effort on the winning solution). Returns
+        ``None`` on read failure so a log hiccup never blocks the win record.
         """
         if solution_number is None:
             return None
-        start = self._solution_used_start.get((miner_id, solution_number))
-        used_now = self._latest_budget.get(miner_id, {}).get(
-            "cumulative_used_seconds"
-        )
-        if start is None or used_now is None:
+        try:
+            return sum(
+                int(a.get("qpu_access_time_us") or 0)
+                for h in self.miner_handles
+                for a in query_by_solution_number(
+                    h.miner_id, solution_number,
+                    log_dir=self._submission_log.log_dir,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — observability path
+            logger.debug("qpu spend sum failed (ignored): %s", exc)
             return None
-        return max(0, int((float(used_now) - start) * 1_000_000))
 
     def _mark_participating(self, miner_id: str, msg: dict) -> None:
         """Submit a write-once participation remark for ``(miner_id, sol#)``.
@@ -1822,18 +1822,6 @@ class SubstrateMinerController:
         self._participated.add(key)
         while len(self._participated) > _PARTICIPATION_RETENTION:
             self._participated.pop()
-
-        # Baseline for the per-solution QPU-spend delta reported at win: the
-        # miner's tracked cumulative_used just before it began this solution #.
-        # Present only for QPU miners (CPU/GPU stream no budget); absent => the
-        # win record reports None.
-        used_now = self._latest_budget.get(miner_id, {}).get(
-            "cumulative_used_seconds"
-        )
-        if used_now is not None:
-            self._solution_used_start[key] = float(used_now)
-            while len(self._solution_used_start) > _PARTICIPATION_RETENTION:
-                self._solution_used_start.pop(next(iter(self._solution_used_start)))
 
         payload: dict[str, Any] = {
             "schema": "quip-participation",
