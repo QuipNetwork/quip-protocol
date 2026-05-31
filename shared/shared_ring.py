@@ -28,8 +28,10 @@ class SharedRing:
                  *, names: Optional[list] = None, free_q=None):
         self.slots = slots
         self.slot_bytes = slot_bytes
-        self._owner = names is None
-        if self._owner:
+        # Branch on ``names`` directly (not a derived flag) so the owner /
+        # non-owner attribute types narrow cleanly.
+        if names is None:
+            self._owner = True
             self._shm = [shared_memory.SharedMemory(create=True, size=slot_bytes)
                          for _ in range(slots)]
             self.names = [s.name for s in self._shm]
@@ -37,6 +39,15 @@ class SharedRing:
             for i in range(slots):
                 self.free_q.put(i)
         else:
+            # A non-owner is reconstructed from ``attach_args()``, which always
+            # carries the owner's free-queue. A missing ``free_q`` here means a
+            # caller built a non-owner by hand — fail fast rather than crash
+            # later on the first ``claim_free`` / ``release``.
+            if free_q is None:
+                raise ValueError(
+                    "non-owner SharedRing requires free_q (from attach_args())"
+                )
+            self._owner = False
             self._shm = [shared_memory.SharedMemory(name=n) for n in names]
             self.names = list(names)
             self.free_q = free_q

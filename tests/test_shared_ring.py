@@ -7,6 +7,7 @@ from __future__ import annotations
 import multiprocessing as mp
 
 import numpy as np
+import pytest
 
 from shared.shared_ring import SharedRing
 
@@ -71,3 +72,13 @@ def test_owner_exits_cleanly_after_teardown():
         "ring owner hung at exit — free_q feeder-thread join was not cancelled"
     )
     assert proc.exitcode == 0
+
+
+def test_nonowner_without_free_q_raises():
+    """A non-owner (names given) built without a free_q must fail fast."""
+    owner = SharedRing(slots=1, slot_bytes=16)
+    try:
+        with pytest.raises(ValueError, match="requires free_q"):
+            SharedRing(slots=1, slot_bytes=16, names=owner.names, free_q=None)
+    finally:
+        owner.close_unlink()
