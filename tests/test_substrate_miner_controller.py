@@ -168,6 +168,7 @@ def _bare_controller() -> SubstrateMinerController:
     c._latest_budget = {}
     c._pow_constants = None
     c._base_difficulty_by_key = {}
+    c._decay_schedule_by_key = {}  # WorkKey -> (schedule, last_proof_block, epoch_length)
     c._anticipatory_fired = set()
     # Timed anticipatory fire (Task B3). Real TimingTracker with no observed
     # head: fire_deadline_monotonic returns None until a test sets it.
@@ -1591,21 +1592,56 @@ async def test_anticipatory_no_fire_when_b_star_none(monkeypatch):
 
 
 def test_evict_anticipatory_state_prunes_all():
-    """Eviction drops the preview, the cached base difficulty, and the
-    fired mark for a work key."""
+    """Eviction drops the preview, the cached base difficulty, the decay
+    schedule, and the fired mark for a work key."""
     controller = _bare_controller()
     ctx = _ctx_at_block(b"\xaa" * 32, 19)
     from substrate.miner_controller import _work_key
     key = _work_key(ctx)
     _store_preview_entry(controller, ctx)
     controller._base_difficulty_by_key[key] = SubstrateDifficulty(1, -1000, 0)
+    controller._decay_schedule_by_key[key] = ([-1000, -990], 10, 5)
     controller._anticipatory_fired.add(key)
 
     controller._evict_anticipatory_state(key)
 
     assert key not in controller._latest_preview
     assert key not in controller._base_difficulty_by_key
+    assert key not in controller._decay_schedule_by_key
     assert key not in controller._anticipatory_fired
+
+
+async def test_on_new_head_attaches_decay_schedule(monkeypatch):
+    """After on_new_head dispatches, the context handed to mine_work_item
+    must carry a monotonic decay_schedule, a positive epoch_length, and
+    a non-negative last_proof_block."""
+    controller = _bare_controller()
+    controller.events = None
+    handle = _FakeHandle("p0")
+    controller.miner_handles = [handle]
+    controller.core = None
+    controller._done_queues = {}
+    _stub_predictor_inputs(controller, last_proof_block=10)
+
+    ctx = _ctx_at_block(b"\xaa" * 32, 15)
+
+    await controller.on_new_head(ctx)
+
+    # The handle must have been dispatched.
+    assert handle.mine_calls, "expected at least one mine_work_item dispatch"
+    _dispatch_id, dispatched_ctx = handle.mine_calls[-1]
+
+    assert dispatched_ctx.decay_schedule is not None, "decay_schedule must be attached"
+    assert len(dispatched_ctx.decay_schedule) > 1, (
+        "schedule must have more than one step (base + at least one decay step)"
+    )
+    # Monotonic non-decreasing (decay only eases max_energy_milli upward).
+    sched = dispatched_ctx.decay_schedule
+    assert all(
+        sched[i] <= sched[i + 1] for i in range(len(sched) - 1)
+    ), "decay_schedule must be monotonic non-decreasing"
+    assert dispatched_ctx.epoch_length > 0, "epoch_length must be positive"
+    assert dispatched_ctx.last_proof_block >= 0, "last_proof_block must be non-negative"
 
 
 async def test_dedup_worker_result_after_anticipatory_fire(monkeypatch):

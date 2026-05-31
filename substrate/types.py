@@ -107,6 +107,13 @@ class SubstrateMiningContext:
     # them — its work key only changes when ``last_proof_block_hash`` does.
     block_hash: bytes
     block_number: int
+    # Round-constant decay schedule, built once per work key by the
+    # controller and attached before dispatch so workers can rank their
+    # candidate stash by win-time locally (no per-iteration RPC).
+    # None means the schedule was not yet computed (default/legacy callers).
+    decay_schedule: Optional[List[int]] = None  # max_energy_milli per step 0..HORIZON
+    last_proof_block: int = 0                   # round anchor (block number)
+    epoch_length: int = 0                       # blocks per decay step (0 = disabled)
 
     def __post_init__(self) -> None:
         if len(self.last_proof_block_hash) != 32:

@@ -39,7 +39,7 @@ import os
 import queue as _queue
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclasses_replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional, Protocol, Tuple
@@ -60,7 +60,7 @@ from substrate.client import SubstrateClient
 from substrate.pool import ValidatorPool
 from substrate.pool_client import PoolClient
 from substrate.decay_timing import TimingTracker
-from substrate.difficulty_decay import EnergyCurve, block_when_energy_clears
+from substrate.difficulty_decay import EnergyCurve, block_when_energy_clears, build_decay_schedule
 from substrate.submitter import (
     SubmitRetryAction,
     encode_quantum_proof,
@@ -575,6 +575,10 @@ class SubstrateMinerController:
         # returned result for the same key is treated as a no-op.
         self._pow_constants: Optional[PowConstants] = None
         self._base_difficulty_by_key: dict[WorkKey, SubstrateDifficulty] = {}
+        # Cached decay schedule per work key (tuple of schedule, last_proof_block,
+        # epoch_length). Built once per round from _anticipatory_inputs; evicted
+        # alongside the other per-key state in _evict_anticipatory_state.
+        self._decay_schedule_by_key: dict = {}  # WorkKey -> (list[int], int, int)
         self._anticipatory_fired: set[WorkKey] = set()
         self._timing = TimingTracker()
         # At most one pending timed anticipatory fire + the work key it targets.
@@ -1072,6 +1076,32 @@ class SubstrateMinerController:
             )
 
         # 8. Dispatch.
+        # Attach round-constant decay schedule so workers can rank their
+        # candidate stash by win-time locally without per-iteration RPCs.
+        # Built once per work key; SubstrateMiningContext is frozen so we
+        # create an enriched copy via dataclasses.replace before dispatch.
+        sched = self._decay_schedule_by_key.get(new_work_key)
+        if sched is None:
+            inputs = await self._anticipatory_inputs(ctx, new_work_key)
+            if inputs is not None:
+                base, last_proof_block, constants, curve = inputs
+                sched = (
+                    build_decay_schedule(
+                        int(base.max_energy_milli),
+                        curve,
+                        _ANTICIPATORY_SEARCH_LIMIT,
+                    ),
+                    int(last_proof_block),
+                    int(constants.epoch_length),
+                )
+                self._decay_schedule_by_key[new_work_key] = sched
+        if sched is not None:
+            ctx = dataclasses_replace(
+                ctx,
+                decay_schedule=sched[0],
+                last_proof_block=sched[1],
+                epoch_length=sched[2],
+            )
         self._current_context = ctx
         self._current_work_key = new_work_key
         # Chain-global solution number for this round — the on-disk archive
@@ -1785,6 +1815,7 @@ class SubstrateMinerController:
         """
         self._latest_preview.pop(key, None)
         self._base_difficulty_by_key.pop(key, None)
+        self._decay_schedule_by_key.pop(key, None)
         self._anticipatory_fired.discard(key)
         # A solution hit the wire (round advanced) or the round was force-
         # closed: stop trying for this candidate's timed fire.
