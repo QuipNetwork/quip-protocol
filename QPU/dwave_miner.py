@@ -976,7 +976,9 @@ class DWaveMiner(BaseMiner):
             Full-topology sampleset with all variables present and energies
             corrected.
         """
-        return self.sampler.reconstruct_full_sampleset(sampleset, defect_info)
+        return self.sampler.reconstruct_full_sampleset(  # ty:ignore[unresolved-attribute]
+            sampleset, defect_info,
+        )
 
     def _post_mine_cleanup(self) -> None:
         """Stop the streaming pipeline and feeder."""
