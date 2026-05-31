@@ -157,6 +157,21 @@ class _DispatchSetup:
 
 
 @dataclass
+class StashEntry:
+    """A stashed candidate plus its decay-derived win-time.
+
+    ``decay_num`` is the first decay step whose threshold clears the
+    candidate's submit floor; ``valid_at_block`` is the absolute chain block
+    that step lands on (``last_proof_block + decay_num * epoch_length``).
+    Ordering key for the win-time-ranked stash (Task 5).
+    """
+
+    decay_num: int
+    valid_at_block: int
+    result: MiningResult
+
+
+@dataclass
 class _MiningLoopState:
     """Per-dispatch state bundle for ``mine_work_item``'s loop helpers.
 
@@ -188,6 +203,17 @@ class _MiningLoopState:
     # Round generation (mirrors _DispatchSetup.generation) so the ratchet can
     # forward same-generation live-threshold decay updates to the driver.
     generation: int = 0
+    # Round-constant decay inputs (substrate PoW path). When decay_schedule
+    # is None (CPU/GPU backends, or a controller that didn't attach one) the
+    # stash falls back to legacy energy ranking — see is_decay_ranked.
+    decay_schedule: Optional[List[int]] = None
+    last_proof_block: int = 0
+    epoch_length: int = 0
+
+    @property
+    def is_decay_ranked(self) -> bool:
+        """True when the stash should rank by decay win-time (Task 5)."""
+        return self.decay_schedule is not None
 
 
 class _SetupAbortThrottle:
@@ -1015,6 +1041,9 @@ class BaseMiner(ABC):
             top_k_cap=top_k_cap,
             top_k=top_k,
             previewed_floor_milli=previewed_floor_milli,
+            decay_schedule=getattr(context, "decay_schedule", None),
+            last_proof_block=int(getattr(context, "last_proof_block", 0) or 0),
+            epoch_length=int(getattr(context, "epoch_length", 0) or 0),
         )
 
         # Build the feeder for this attempt. Each context flavor picks
