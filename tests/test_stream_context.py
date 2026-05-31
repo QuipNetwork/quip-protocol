@@ -129,3 +129,32 @@ def test_kind_change_rebuilds_and_stops_old_feeder():
     assert built[0].stopped is True  # old feeder stopped on rebuild
     assert ctx._feeder is built[1]
     ctx.cleanup()
+
+
+def test_switch_with_mempool_spec_builds_fixed_feeder_via_real_build_feeder():
+    """End-to-end: a ("mempool", attach_args, slot) switch + the real
+    build_feeder reconstructs the order's fixed model into a FixedIsingFeeder."""
+    import numpy as np
+
+    from shared.ising_feeder import FixedIsingFeeder
+    from shared.ring_views import ProblemView
+
+    nodes, edges = [0, 1, 2], [(0, 1), (1, 2)]
+    pv = ProblemView(slots=1, n_nodes=3, n_edges=2)
+    slot = pv.claim_free(timeout=1.0)
+    pv.write(slot, np.array([0.1, -0.2, 0.3]), np.array([0.5, -0.5]))
+    # No feeder_builder override -> uses the real shared.ising_feeder.build_feeder.
+    ctx = StreamContext(
+        sampler=_FakeSampler(), nodes=nodes, edges=edges,
+        feeder_buffer_size=8, num_reads=8, num_sweeps=64)
+    try:
+        ctx.apply_command((
+            "switch", 1, b"\x00" * 32, b"\x01" * 32, 0, 8, 0.0, 64,
+            ("mempool", pv.attach_args(), slot)))
+        assert isinstance(ctx._feeder, FixedIsingFeeder)
+        m = ctx._feeder.pop_blocking()
+        assert m.h == {0: 0.1, 1: -0.2, 2: 0.3}
+        assert m.J == {(0, 1): 0.5, (1, 2): -0.5}
+        ctx.cleanup()
+    finally:
+        pv.close_unlink()
