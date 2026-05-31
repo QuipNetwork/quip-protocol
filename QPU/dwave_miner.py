@@ -191,7 +191,7 @@ class PersistentStreamContext:
         kind = cmd[0]
         if kind == "switch":
             (_, gen, lpbh, miner_bytes, thr_milli, num_reads,
-             annealing_time) = cmd
+             annealing_time) = cmd[:7]
             self.generation = int(gen)
             self._num_reads = int(num_reads)
             self._annealing_time = float(annealing_time)

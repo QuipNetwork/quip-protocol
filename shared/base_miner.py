@@ -1148,13 +1148,21 @@ class BaseMiner(ABC):
             # Fresh round: clear the budget-pause tracker so the in-loop gate
             # can send a new ("pause", gen) for this generation if needed.
             self._budget_paused_generation = None
-            threshold_milli = _energy_to_milli(sample_ctx["energy_threshold"])
+            # Streaming backends that do no reconstruction gating (Metal/SA)
+            # have no energy_threshold/annealing_time in their adapted params;
+            # default both rather than crash on _energy_to_milli(None). The
+            # switch also carries num_sweeps so the persistent driver re-adapts
+            # the sweep count per round (Metal); QPU ignores num_sweeps.
+            thr = sample_ctx["energy_threshold"]
+            threshold_milli = _energy_to_milli(thr) if thr is not None else 0
+            anneal = sample_ctx["annealing_time"]
             try:
                 self._ctl_q.put(
                     ("switch", generation, sample_ctx["last_proof_block_hash"],
                      sample_ctx["miner_bytes"], threshold_milli,
                      int(sample_ctx["num_reads"]),
-                     float(sample_ctx["annealing_time"])),
+                     float(anneal) if anneal is not None else 0.0,
+                     int(sample_ctx["num_sweeps"])),
                 )
             except Exception as exc:  # noqa: BLE001 — surface, don't hang
                 self.logger.error("switch_round send failed: %s", exc)

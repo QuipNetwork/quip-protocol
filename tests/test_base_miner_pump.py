@@ -815,3 +815,110 @@ def test_ensure_driver_forwards_topology_in_factory_kwargs():
     finally:
         bm.spawn_worker = _orig
         miner._close_driver()
+
+
+# ----------------------------------------------------------------------
+# Regression: switch tuple with Metal-style adapted params (no threshold/anneal)
+# ----------------------------------------------------------------------
+
+
+class _MetalStyleMiner(_DriverMiner):
+    """Streaming miner whose adapted params are Metal-style: no energy_threshold
+    or annealing_time (exactly what GPU.metal_miner._adapt_mining_params
+    returns — only num_sweeps + num_reads)."""
+
+    def _adapt_mining_params(self, requirements, nodes, edges) -> dict:
+        return {
+            "num_sweeps": 128,
+            "num_reads": 8,
+        }
+
+
+def test_switch_tuple_with_metal_style_params_no_crash():
+    """Bug #1 regression: _setup_dispatch must NOT crash when adapted params
+    omit energy_threshold/annealing_time (Metal/SA backends).
+
+    Before the fix, ``_energy_to_milli(None)`` raised ``TypeError`` via
+    ``math.isfinite(None)`` before the try-block, crashing the worker on the
+    first Metal streaming dispatch.
+
+    Also asserts Bug #2: the switch tuple carries num_sweeps as element [7].
+    """
+    import queue
+
+    # Replace _ensure_driver so we control the ctl_q without spawning a real
+    # driver process, and capture exactly what _setup_dispatch puts on it.
+    ctx = _streaming_context()
+    miner = _MetalStyleMiner()
+    captured: list = []
+    fake_q: queue.SimpleQueue = queue.SimpleQueue()
+
+    def _fake_put(item, *a, **k):
+        captured.append(item)
+        fake_q.put(item)
+
+    real_put_holder: dict = {}
+
+    orig_ensure = miner._ensure_driver
+
+    def _ensure_and_hijack(sample_ctx):
+        ready = orig_ensure(sample_ctx)
+        if ready and miner._ctl_q is not None and not real_put_holder:
+            # Grab the real put but replace it so the item lands in our list.
+            real_put_holder["real"] = miner._ctl_q.put
+            miner._ctl_q.put = _fake_put
+        return ready
+
+    miner._ensure_driver = _ensure_and_hijack
+
+    import multiprocessing as mp
+
+    stop = mp.Event()
+    try:
+        # mine_work_item calls _setup_dispatch which builds + sends the switch.
+        # We stop immediately after it starts — we only care that no TypeError
+        # was raised and that the tuple has the right shape.
+        import threading
+        import time as _t
+
+        raised: list = []
+
+        def _run():
+            try:
+                miner.mine_work_item(ctx, stop)
+            except TypeError as exc:
+                raised.append(exc)
+
+        t = threading.Thread(target=_run, name="metal-switch-test")
+        t.start()
+        # Give the dispatch time to send the switch tuple.
+        deadline = _t.monotonic() + 5.0
+        while not captured and _t.monotonic() < deadline:
+            _t.sleep(0.02)
+        stop.set()
+        t.join(timeout=10.0)
+        assert not t.is_alive(), "mine_work_item did not stop"
+
+        # Bug #1: no TypeError from _energy_to_milli(None)
+        assert raised == [], f"TypeError raised (Bug #1 still present): {raised}"
+        assert captured, "no switch tuple was sent at all"
+
+        switch_cmd = captured[0]
+        assert switch_cmd[0] == "switch", f"first command was not switch: {switch_cmd}"
+
+        # 8 elements: kind, gen, lpbh, miner_bytes, threshold_milli,
+        #              num_reads, annealing_time, num_sweeps
+        assert len(switch_cmd) == 8, (
+            f"switch tuple has {len(switch_cmd)} elements, expected 8"
+        )
+        # Bug #1: threshold_milli defaults to 0 when energy_threshold is None
+        assert switch_cmd[4] == 0, (
+            f"threshold_milli expected 0 (no threshold), got {switch_cmd[4]}"
+        )
+        # Bug #2: num_sweeps (element 7) carries the adapted value
+        assert switch_cmd[7] == 128, (
+            f"num_sweeps expected 128, got {switch_cmd[7]}"
+        )
+    finally:
+        stop.set()
+        miner._close_driver()

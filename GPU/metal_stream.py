@@ -74,9 +74,14 @@ class MetalStreamContext:
         """
         kind = cmd[0]
         if kind == "switch":
-            (_, gen, lpbh, miner_bytes, _thr, num_reads, _anneal) = cmd
+            (_, gen, lpbh, miner_bytes, _thr, num_reads, _anneal) = cmd[:7]
             self.generation = int(gen)
             self._num_reads = int(num_reads)
+            # The switch carries the per-round adapted sweep count as an 8th
+            # element (absent in older/test 7-tuples); closing the stream below
+            # makes the new value take effect on the next iter_results.
+            if len(cmd) > 7:
+                self._num_sweeps = int(cmd[7])
             self._paused = False
             self._close_stream()
             if self._feeder is None:
