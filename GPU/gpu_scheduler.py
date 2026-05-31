@@ -24,7 +24,10 @@ import multiprocessing as mp
 import os
 from typing import List, Optional
 
-import cupy as cp
+try:
+    import cupy as cp
+except ImportError:
+    cp = None  # type: ignore[assignment]
 
 
 logger = logging.getLogger(__name__)
