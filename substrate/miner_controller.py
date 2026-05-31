@@ -59,6 +59,7 @@ from shared.telemetry_process import telemetry_main
 from substrate.client import SubstrateClient
 from substrate.pool import ValidatorPool
 from substrate.pool_client import PoolClient
+from substrate.decay_timing import TimingTracker
 from substrate.difficulty_decay import EnergyCurve, block_when_energy_clears
 from substrate.submitter import (
     SubmitRetryAction,
@@ -575,6 +576,10 @@ class SubstrateMinerController:
         self._pow_constants: Optional[PowConstants] = None
         self._base_difficulty_by_key: dict[WorkKey, SubstrateDifficulty] = {}
         self._anticipatory_fired: set[WorkKey] = set()
+        self._timing = TimingTracker()
+        # At most one pending timed anticipatory fire + the work key it targets.
+        self._pending_fire_task: Optional[asyncio.Task] = None
+        self._pending_fire_key: Optional[WorkKey] = None
         # Per-handle done-sentinel queue. The worker emits
         # `{"op": "work_item_done"}` when its mining loop exits with no
         # result; the drainer pushes that into the handle's queue and
@@ -1012,6 +1017,25 @@ class SubstrateMinerController:
         # preview was captured before pacing) and the worker is idle. The
         # fire path marks the work key closed on SUCCESS, so the
         # closed-work-key guard above absorbs subsequent heads.
+        # SubstrateClient.query_block_timestamp_ms swallows its own errors
+        # (returns None), but in pool mode ValidatorPool.send can raise (e.g.
+        # ValidatorSwapped) BEFORE reaching the client's try/except. Guard the
+        # read so a transient swap can't abort the rest of on_new_head and skip
+        # this head's anticipatory fire + dispatch.
+        try:
+            ts_ms = await self.pool_client.query_block_timestamp_ms(
+                ctx.block_hash,
+            )
+        except Exception as exc:  # noqa: BLE001 — transient swap must not skip head
+            logger.debug("query_block_timestamp_ms failed (ignored): %s", exc)
+            ts_ms = None
+        if ts_ms is not None:
+            self._timing.observe_head(
+                block_number=int(ctx.block_number),
+                chain_ts_s=ts_ms / 1000.0,
+                monotonic_now=asyncio.get_running_loop().time(),
+                wallclock_now=time.time(),
+            )
         await self._maybe_anticipatory_fire(ctx, new_work_key)
         if new_work_key in self._closed_work_keys:
             # A SUCCESS fire just closed the round; don't also dispatch.
@@ -1762,6 +1786,10 @@ class SubstrateMinerController:
         self._latest_preview.pop(key, None)
         self._base_difficulty_by_key.pop(key, None)
         self._anticipatory_fired.discard(key)
+        # A solution hit the wire (round advanced) or the round was force-
+        # closed: stop trying for this candidate's timed fire.
+        if self._pending_fire_key == key:
+            self._cancel_pending_fire()
 
     async def _anticipatory_inputs(
         self, ctx: SubstrateMiningContext, key: WorkKey
@@ -1859,11 +1887,56 @@ class SubstrateMinerController:
         if b_star is None:
             # Won't clear within the look-ahead window; wait for more decay.
             return
-        if int(ctx.block_number) < b_star - 1:
-            # Too early — the floor hasn't (nearly) cleared yet.
+        # Event floor: once we locally observe B*-1, fire now (never later
+        # than the original block-driven behavior).
+        if int(ctx.block_number) >= b_star - 1:
+            self._cancel_pending_fire()
+            await self._fire_preview(ctx, key, preview, b_star)
             return
 
-        await self._fire_preview(ctx, key, preview, b_star)
+        # Otherwise predict the wall-clock production time of B* and schedule a
+        # one-shot fire at T* - lag, so the tx lands as the decay step goes
+        # live. Re-evaluated on every head; an earlier real head reschedules.
+        now_mono = asyncio.get_running_loop().time()
+        deadline = self._timing.fire_deadline_monotonic(
+            b_star=b_star, now_monotonic=now_mono,
+        )
+        if deadline is None:
+            return  # no timestamp anchor yet — wait for the event floor
+        if deadline <= now_mono:
+            self._cancel_pending_fire()
+            await self._fire_preview(ctx, key, preview, b_star)
+            return
+        self._schedule_fire(ctx, key, preview, b_star, deadline - now_mono)
+
+    def _cancel_pending_fire(self) -> None:
+        """Cancel any pending timed anticipatory fire."""
+        task = self._pending_fire_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._pending_fire_task = None
+        self._pending_fire_key = None
+
+    def _schedule_fire(self, ctx, key, preview, b_star, delay_s) -> None:
+        """Schedule a single timed fire at +delay_s; supersede any prior timer."""
+        self._cancel_pending_fire()
+
+        async def _runner():
+            try:
+                await asyncio.sleep(delay_s)
+                # Re-validate: key still live + not already fired/closed.
+                if (
+                    key in self._closed_work_keys
+                    or key in self._anticipatory_fired
+                    or self._latest_preview.get(key) is None
+                ):
+                    return
+                await self._fire_preview(ctx, key, preview, b_star)
+            except asyncio.CancelledError:
+                pass
+
+        self._pending_fire_key = key
+        self._pending_fire_task = asyncio.create_task(_runner())
 
     async def _fire_preview(
         self,
@@ -2347,6 +2420,9 @@ class SubstrateMinerController:
 
     async def _teardown(self) -> None:
         logger.info("controller shutting down: cancelling handles, draining tasks")
+        # Cancel any pending timed anticipatory fire so it can't leak a
+        # "Task was destroyed but it is pending" warning or fire mid-shutdown.
+        self._cancel_pending_fire()
         for handle in self.miner_handles:
             try:
                 handle.cancel()

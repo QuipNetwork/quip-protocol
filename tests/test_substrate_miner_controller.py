@@ -133,6 +133,8 @@ def _bare_controller() -> SubstrateMinerController:
     # Default get_block_number returns 0; tests override as needed.
     c.pool_client.get_head = AsyncMock(return_value=b"\xff" * 32)
     c.pool_client.get_block_number = AsyncMock(return_value=0)
+    # Default: no on-chain timestamp anchor (best-effort; tests override).
+    c.pool_client.query_block_timestamp_ms = AsyncMock(return_value=None)
     c._shutdown_event = asyncio.Event()
     c.signer = MagicMock()
     c.signer.account_id_bytes.return_value = b"\x42" * 32
@@ -167,6 +169,12 @@ def _bare_controller() -> SubstrateMinerController:
     c._pow_constants = None
     c._base_difficulty_by_key = {}
     c._anticipatory_fired = set()
+    # Timed anticipatory fire (Task B3). Real TimingTracker with no observed
+    # head: fire_deadline_monotonic returns None until a test sets it.
+    from substrate.decay_timing import TimingTracker
+    c._timing = TimingTracker()
+    c._pending_fire_task = None
+    c._pending_fire_key = None
     # Per-round solution-number cache (on-disk archive key). Empty by
     # default; _set_current seeds it for the active round so submissions
     # land under the matching {solution_number}/ dir.
@@ -1721,6 +1729,123 @@ async def test_anticipatory_fire_paced_worker_idle(monkeypatch):
     assert handle.mine_calls == []
 
 
+class _StubTiming:
+    """Minimal TimingTracker stand-in: pins ``fire_deadline_monotonic``."""
+
+    def __init__(self, deadline):
+        self._deadline = deadline
+        self.observe_calls = 0
+
+    def observe_head(self, **kwargs):  # pragma: no cover - not asserted here
+        self.observe_calls += 1
+
+    def fire_deadline_monotonic(self, *, b_star, now_monotonic):
+        if self._deadline is None:
+            return None
+        return self._deadline
+
+
+async def test_anticipatory_fires_at_predicted_deadline_before_block_floor(
+    monkeypatch,
+):
+    """B* is well above block+1 (block-floor branch does NOT fire), but the
+    predicted deadline is already reached -> fire on the prediction, not on
+    waiting for B*-1."""
+    from substrate.miner_controller import _work_key
+
+    controller = _bare_controller()
+    _stub_predictor_inputs(controller)
+    ctx = _ctx_at_block(b"\xaa" * 32, 5)  # 5 << b_star-1 == 49
+    _store_preview_entry(controller, ctx)
+    key = _work_key(ctx)
+
+    # Deadline already reached (<= now): force the timed fire-now branch.
+    controller._timing = _StubTiming(deadline=0.0)
+
+    fired = {}
+
+    async def fake_fire(c, k, p, b):
+        fired["b_star"] = b
+        fired["key"] = k
+
+    monkeypatch.setattr(controller, "_fire_preview", fake_fire)
+    monkeypatch.setattr(
+        "substrate.miner_controller.block_when_energy_clears",
+        lambda *a, **k: 50,
+    )
+
+    await controller._maybe_anticipatory_fire(ctx, key)
+
+    assert fired.get("b_star") == 50
+    assert fired.get("key") == key
+
+
+async def test_anticipatory_schedules_timer_when_deadline_future(monkeypatch):
+    """A future deadline schedules a live timer task and does NOT fire
+    synchronously."""
+    from substrate.miner_controller import _work_key
+
+    controller = _bare_controller()
+    _stub_predictor_inputs(controller)
+    ctx = _ctx_at_block(b"\xaa" * 32, 5)
+    _store_preview_entry(controller, ctx)
+    key = _work_key(ctx)
+
+    now = asyncio.get_running_loop().time()
+    controller._timing = _StubTiming(deadline=now + 3600.0)
+
+    fired = False
+
+    async def fake_fire(c, k, p, b):
+        nonlocal fired
+        fired = True
+
+    monkeypatch.setattr(controller, "_fire_preview", fake_fire)
+    monkeypatch.setattr(
+        "substrate.miner_controller.block_when_energy_clears",
+        lambda *a, **k: 50,
+    )
+
+    await controller._maybe_anticipatory_fire(ctx, key)
+
+    assert fired is False
+    assert isinstance(controller._pending_fire_task, asyncio.Task)
+    assert not controller._pending_fire_task.done()
+    assert controller._pending_fire_key == key
+
+    # Teardown: cancel the pending timer.
+    controller._cancel_pending_fire()
+
+
+async def test_anticipatory_block_floor_still_fires_without_timing(monkeypatch):
+    """No timestamp anchor (deadline None) but block >= B*-1: the event floor
+    still fires."""
+    from substrate.miner_controller import _work_key
+
+    controller = _bare_controller()
+    _stub_predictor_inputs(controller)
+    ctx = _ctx_at_block(b"\xaa" * 32, 19)  # 19 == b_star-1 for b_star=20
+    _store_preview_entry(controller, ctx)
+    key = _work_key(ctx)
+
+    controller._timing = _StubTiming(deadline=None)
+
+    fired = {}
+
+    async def fake_fire(c, k, p, b):
+        fired["b_star"] = b
+
+    monkeypatch.setattr(controller, "_fire_preview", fake_fire)
+    monkeypatch.setattr(
+        "substrate.miner_controller.block_when_energy_clears",
+        lambda *a, **k: 20,
+    )
+
+    await controller._maybe_anticipatory_fire(ctx, key)
+
+    assert fired.get("b_star") == 20
+
+
 # ----------------------------------------------------------------------
 # Live QPU budget: store + telemetry snapshot surfacing
 # ----------------------------------------------------------------------
@@ -1781,3 +1906,52 @@ def test_snapshot_qpu_budget_is_none_when_unreported():
     )
     snap = build_stats_snapshot_for_telemetry(controller)
     assert snap["miners"][0]["qpu_budget"] is None
+
+
+# ----------------------------------------------------------------------
+# B4: _evict_anticipatory_state cancels pending timed fire on round advance
+# ----------------------------------------------------------------------
+
+
+async def test_round_advance_cancels_pending_fire():
+    """When the work key advances (round closes), evicting that key must also
+    cancel any pending timed fire targeting it."""
+    from substrate.miner_controller import _work_key
+
+    controller = _bare_controller()
+    key = _work_key(_context(b"\xaa" * 32))
+
+    async def _never():
+        await asyncio.sleep(3600)
+
+    controller._pending_fire_task = asyncio.create_task(_never())
+    controller._pending_fire_key = key
+
+    controller._evict_anticipatory_state(key)
+    await asyncio.sleep(0)  # let the cancellation propagate
+
+    assert controller._pending_fire_task is None
+    assert controller._pending_fire_key is None
+
+
+async def test_evict_other_key_leaves_pending_fire():
+    """Evicting a DIFFERENT key must not cancel a pending fire for key_a."""
+    from substrate.miner_controller import _work_key
+
+    controller = _bare_controller()
+    key_a = _work_key(_context(b"\xaa" * 32))
+    key_b = _work_key(_context(b"\xbb" * 32))
+
+    async def _never():
+        await asyncio.sleep(3600)
+
+    task = asyncio.create_task(_never())
+    controller._pending_fire_task = task
+    controller._pending_fire_key = key_a
+
+    try:
+        controller._evict_anticipatory_state(key_b)
+        assert controller._pending_fire_task is task  # untouched
+        assert controller._pending_fire_key is key_a
+    finally:
+        task.cancel()

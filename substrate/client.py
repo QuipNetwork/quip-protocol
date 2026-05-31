@@ -653,6 +653,36 @@ class SubstrateClient:
             return None
         return int(result.value)
 
+    async def query_block_timestamp_ms(self, block_hash: bytes) -> Optional[int]:
+        """Return the ``Timestamp.Now`` storage value at ``block_hash``.
+
+        Reads the on-chain millisecond timestamp for the given block.
+        pallet-timestamp stores the block production time as a ``u64``
+        (milliseconds since UNIX epoch), which the chain updates every block.
+
+        Args:
+            block_hash: The 32-byte block hash to query at.
+
+        Returns:
+            The timestamp in milliseconds, or ``None`` if the read fails
+            (best-effort — a missing timestamp must never crash the caller).
+        """
+        try:
+            result = await self._run(
+                lambda: self._iface.query(
+                    "Timestamp", "Now", block_hash=_hex(block_hash)
+                )
+            )
+            return int(result.value)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "query_block_timestamp_ms failed for %s: %s: %s",
+                block_hash.hex(),
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
     async def query_winning_solution_count(self) -> int:
         """Return the number of recorded ``QuantumPow.WinningSolutions``.
 

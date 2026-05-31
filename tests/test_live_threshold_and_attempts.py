@@ -620,3 +620,232 @@ def test_decay_within_generation_preserves_stash(monkeypatch):
     miner._run_substrate_ratchet(state, ss2, b"\x03" * 32, b"\x04" * 32, 0.0,
                                  preview_cb=None, attempt_log_kwargs=logkw2)
     assert len(state.top_k) == 1, "decay within a generation cleared the stash"
+
+
+def test_ratchet_stashes_top5_energy_regardless_of_threshold(monkeypatch):
+    """top-5 gate: evaluate_sampleset must be called even when the live
+    threshold is MUCH stricter than the attempt's best energy.
+
+    Regression guard for the old ``near_live`` gate that silently skipped
+    stashing whenever the QPU's output was far from the current threshold.
+    Under the new top-5-by-energy policy the stash is filled by energy rank
+    alone; the chain's live threshold is irrelevant to what we KEEP.
+    """
+    import multiprocessing as mp
+
+    import numpy as np
+
+    from shared.base_miner import _MiningLoopState
+    from shared.miner_types import BlockRequirements, MiningResult
+    from tests.test_base_miner_pump import _DriverMiner
+
+    miner = _DriverMiner()
+    # Live threshold is -15053 (milli = -15_053_000) — much stricter than the
+    # attempt energy of -14889.0 (-14_889_000 milli).  Under the old near_live
+    # gate the delta is +164_000 milli > RATCHET_PRECHECK_MARGIN_MILLI (2000),
+    # so the iter would have been skipped.  Under the new gate it must stash.
+    miner._live_max_energy_milli = mp.Value("q", -15_053_000)
+    miner._ctl_q = None
+
+    req = BlockRequirements(
+        difficulty_energy=-15053.0, min_diversity=0.0, min_solutions=1,
+        timeout_to_difficulty_adjustment_decay=10 ** 9,
+    )
+    state = _MiningLoopState(
+        requirements=req, nodes=[0, 1, 2], edges=[(0, 1), (1, 2)],
+        prev_timestamp=0, start_time=0.0, solution_number_for_log=0,
+        dispatch_id_for_log=0,
+        attempt_log=_make_attempt_logger(miner),
+        solution_store=_make_solution_store(miner),
+        live_threshold_var=miner._live_max_energy_milli,
+        top_k_cap=5, top_k=[], previewed_floor_milli=1 << 62, generation=1,
+    )
+
+    cand = MiningResult(
+        miner_id=miner.miner_id, miner_type="QPU", nonce=b"\x01" * 32,
+        salt=b"\x02" * 32, timestamp=0, prev_timestamp=0,
+        solutions=[[1, -1, 1]], energy=-14889.0, diversity=1.0, num_valid=1,
+        mining_time=0, node_list=[0, 1, 2], edge_list=[(0, 1), (1, 2)],
+        submit_floor_energy=-14889.0,
+    )
+    evaluate_called = []
+
+    def _fake_evaluate(*a, **k):
+        evaluate_called.append(True)
+        return cand
+
+    monkeypatch.setattr(miner, "evaluate_sampleset", _fake_evaluate)
+
+    # Attempt energy -14889.0 — improves empty stash (ratchet_threshold = +inf)
+    ss = _energy_sampleset(np.full(4, -14889.0))
+    miner._run_substrate_ratchet(
+        state, ss, b"\x01" * 32, b"\x02" * 32, 0.0,
+        preview_cb=None, attempt_log_kwargs={},
+    )
+
+    assert evaluate_called, (
+        "evaluate_sampleset was NOT called even though the stash was empty — "
+        "the old near_live gate must have been removed"
+    )
+    assert len(state.top_k) == 1, (
+        "candidate was not stashed despite being the best so far"
+    )
+    assert state.top_k[0].energy == -14889.0
+
+
+def test_ratchet_skips_attempt_outside_top5(monkeypatch):
+    """top-5 gate: an attempt whose energy is worse than the worst stashed
+    entry must NOT call evaluate_sampleset.
+
+    Once the stash is full with 5 better candidates, an attempt that cannot
+    displace the worst entry is cheap-rejected without paying the expensive
+    diversity / selection work.
+    """
+    import multiprocessing as mp
+
+    import numpy as np
+
+    from shared.base_miner import _MiningLoopState
+    from shared.miner_types import BlockRequirements, MiningResult
+    from tests.test_base_miner_pump import _DriverMiner
+
+    miner = _DriverMiner()
+    miner._live_max_energy_milli = mp.Value("q", -15_000_000)
+    miner._ctl_q = None
+
+    req = BlockRequirements(
+        difficulty_energy=-15000.0, min_diversity=0.0, min_solutions=1,
+        timeout_to_difficulty_adjustment_decay=10 ** 9,
+    )
+
+    # Pre-populate top_k with 5 candidates all better than -14000.0.
+    better_cand = MiningResult(
+        miner_id=miner.miner_id, miner_type="QPU", nonce=b"\xaa" * 32,
+        salt=b"\xbb" * 32, timestamp=0, prev_timestamp=0,
+        solutions=[[1, -1, 1]], energy=-15000.0, diversity=1.0, num_valid=1,
+        mining_time=0, node_list=[0, 1, 2], edge_list=[(0, 1), (1, 2)],
+        submit_floor_energy=-15000.0,
+    )
+    # Build 5 distinct candidates with energies -15000, -14999, ..., -14996
+    from shared.miner_types import MiningResult as MR
+    top_k = []
+    for i in range(5):
+        top_k.append(MR(
+            miner_id=miner.miner_id, miner_type="QPU",
+            nonce=bytes([i]) * 32, salt=bytes([i + 10]) * 32,
+            timestamp=0, prev_timestamp=0,
+            solutions=[[1, -1, 1]], energy=-15000.0 + i,
+            diversity=1.0, num_valid=1, mining_time=0,
+            node_list=[0, 1, 2], edge_list=[(0, 1), (1, 2)],
+            submit_floor_energy=-15000.0 + i,
+        ))
+    # Sort descending by energy so top_k[-1] is the worst (highest energy).
+    top_k.sort(key=lambda r: r.energy, reverse=True)
+
+    state = _MiningLoopState(
+        requirements=req, nodes=[0, 1, 2], edges=[(0, 1), (1, 2)],
+        prev_timestamp=0, start_time=0.0, solution_number_for_log=0,
+        dispatch_id_for_log=0,
+        attempt_log=_make_attempt_logger(miner),
+        solution_store=_make_solution_store(miner),
+        live_threshold_var=miner._live_max_energy_milli,
+        top_k_cap=5, top_k=top_k, previewed_floor_milli=1 << 62, generation=1,
+    )
+
+    evaluate_called = []
+
+    def _fake_evaluate(*a, **k):
+        evaluate_called.append(True)
+        return better_cand
+
+    monkeypatch.setattr(miner, "evaluate_sampleset", _fake_evaluate)
+
+    # Attempt energy -14000.0 — worse than all 5 stashed (worst stashed = -14996)
+    ss = _energy_sampleset(np.full(4, -14000.0))
+    miner._run_substrate_ratchet(
+        state, ss, b"\x01" * 32, b"\x02" * 32, 0.0,
+        preview_cb=None, attempt_log_kwargs={},
+    )
+
+    assert not evaluate_called, (
+        "evaluate_sampleset was called for an attempt that cannot improve the "
+        "full top-5 stash — the improves_stash gate must block it"
+    )
+    # top_k must be unchanged.
+    assert len(state.top_k) == 5
+
+
+def test_ratchet_skips_under_reconstructed_sample(monkeypatch):
+    """Width guard: a sample narrower than the topology (an under-reconstructed
+    QPU driver result returned via _shift_energies) must NOT be evaluated or
+    stashed, even when its energy WOULD enter the top-5.
+
+    A reduced-width sample drops the clamped fixed-spin columns; passing it to
+    evaluate_sampleset indexes full-topology edge positions into the narrow
+    matrix → IndexError or a silently wrong recomputed energy. This guards
+    against any driver/worker rank divergence. Fails if the guard is removed
+    (evaluate_sampleset would be called on the narrow sample).
+    """
+    import multiprocessing as mp
+
+    import numpy as np
+
+    from shared.base_miner import _MiningLoopState, _SharedSampleSet
+    from shared.miner_types import BlockRequirements, MiningResult
+    from tests.test_base_miner_pump import _DriverMiner
+
+    miner = _DriverMiner()
+    miner._live_max_energy_milli = mp.Value("q", -15_053_000)
+    miner._ctl_q = None
+
+    # Topology has 5 nodes; the sample below has only 3 columns (narrow).
+    nodes = [0, 1, 2, 3, 4]
+    edges = [(0, 1), (1, 2), (2, 3), (3, 4)]
+    req = BlockRequirements(
+        difficulty_energy=-15053.0, min_diversity=0.0, min_solutions=1,
+        timeout_to_difficulty_adjustment_decay=10 ** 9,
+    )
+    state = _MiningLoopState(
+        requirements=req, nodes=nodes, edges=edges,
+        prev_timestamp=0, start_time=0.0, solution_number_for_log=0,
+        dispatch_id_for_log=0,
+        attempt_log=_make_attempt_logger(miner),
+        solution_store=_make_solution_store(miner),
+        live_threshold_var=miner._live_max_energy_milli,
+        top_k_cap=5, top_k=[], previewed_floor_milli=1 << 62, generation=1,
+    )
+
+    cand = MiningResult(
+        miner_id=miner.miner_id, miner_type="QPU", nonce=b"\x01" * 32,
+        salt=b"\x02" * 32, timestamp=0, prev_timestamp=0,
+        solutions=[[1, -1, 1]], energy=-14889.0, diversity=1.0, num_valid=1,
+        mining_time=0, node_list=nodes, edge_list=edges,
+        submit_floor_energy=-14889.0,
+    )
+    evaluate_called = []
+
+    def _fake_evaluate(*a, **k):
+        evaluate_called.append(True)
+        return cand
+
+    monkeypatch.setattr(miner, "evaluate_sampleset", _fake_evaluate)
+
+    # Narrow sample: 3 columns < len(nodes) == 5. Energy -14889 would enter the
+    # empty stash (ratchet_threshold = +inf), so only the width guard can stop
+    # the evaluation.
+    narrow = _SharedSampleSet(
+        np.ones((4, 3), np.int8), np.full(4, -14889.0, np.float64),
+    )
+    miner._run_substrate_ratchet(
+        state, narrow, b"\x01" * 32, b"\x02" * 32, 0.0,
+        preview_cb=None, attempt_log_kwargs={},
+    )
+
+    assert not evaluate_called, (
+        "evaluate_sampleset was called on an under-reconstructed (narrow) "
+        "sample — the width guard must block it"
+    )
+    assert state.top_k == [], (
+        "an under-reconstructed sample was stashed — the width guard must "
+        "skip both evaluation and stashing"
+    )

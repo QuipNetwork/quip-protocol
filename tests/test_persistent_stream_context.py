@@ -81,7 +81,6 @@ def _make_ctx(stop_event):
         num_reads=4,
         annealing_time=80.0,
         energy_threshold_milli=0,
-        precheck_margin_milli=2000,
         queue_depth=2,
         stop_event=stop_event,
     )
@@ -212,10 +211,15 @@ class _GatingSampler(_FakeSampler):
 
 
 def test_driver_gate_reconstructs_after_loosening_threshold():
-    """A sampleset raw at a strict threshold reconstructs once it loosens."""
+    """First defect-bearing sample enters the empty floor and is reconstructed;
+    subsequent samples with the same energy are NOT (floor already full of
+    better-or-equal entries). This replaces the old threshold-driven assertion
+    now that reconstruction is energy-relative (running best-5 floor), not
+    threshold-relative.
+    """
     stop = mp.get_context("spawn").Event()
     miner = _FakeMiner()
-    miner.sampler = _GatingSampler(best_energy=-14850.0)  # approx -14850
+    miner.sampler = _GatingSampler(best_energy=-14850.0)
     ctx = PersistentStreamContext(
         miner=miner,
         nodes=[0, 1, 2],
@@ -223,8 +227,7 @@ def test_driver_gate_reconstructs_after_loosening_threshold():
         feeder_buffer_size=4,
         num_reads=4,
         annealing_time=80.0,
-        energy_threshold_milli=-14900_000,  # strict: -14850 not below -14900
-        precheck_margin_milli=0,
+        energy_threshold_milli=-14900_000,
         queue_depth=1,
         stop_event=stop,
     )
@@ -233,11 +236,83 @@ def test_driver_gate_reconstructs_after_loosening_threshold():
             ("switch", 1, b"\x01" * 32, b"\x02" * 32, -14900_000, 4, 80.0)
         )
         results = ctx.iter_results()
+        # First sample: floor empty → enters best-5 → reconstructed.
         _m, ss, _g = next(results)
-        assert getattr(ss, "reconstructed", False) is False  # raw under strict
-        ctx.apply_command(("threshold", 1, -14800_000))  # loosen past -14850
+        assert ss.reconstructed is True
+        # Seed the floor with 5 entries equal to the sample's energy so the
+        # floor is now full and the next same-energy sample won't enter it.
+        ctx._recon_floor.clear()
+        for e in [-14850.0, -14851.0, -14852.0, -14853.0, -14854.0]:
+            ctx._recon_floor.append(e)
+        ctx._recon_floor.sort()
+        # Next sample (-14850.0) is not better than the floor's worst (-14850.0)
+        # → NOT reconstructed (only energy-shifted).
         _m, ss2, _g = next(results)
-        assert ss2.reconstructed is True  # now reconstructed full-width
+        assert getattr(ss2, "reconstructed", False) is False
+    finally:
+        stop.set()
+        ctx.cleanup()
+
+
+def test_driver_reconstructs_by_running_best5_floor():
+    """The first defect-bearing sample is always reconstructed (floor not full).
+    After seeding the floor with 5 better energies, a worse sample is NOT
+    reconstructed — only energy-shifted.
+    """
+    stop = mp.get_context("spawn").Event()
+    miner = _FakeMiner()
+    # Sampler always returns energy=-14850.0
+    miner.sampler = _GatingSampler(best_energy=-14850.0)
+    ctx = PersistentStreamContext(
+        miner=miner,
+        nodes=[0, 1, 2],
+        edges=[(0, 1), (1, 2)],
+        feeder_buffer_size=4,
+        num_reads=4,
+        annealing_time=80.0,
+        energy_threshold_milli=0,
+        queue_depth=1,
+        stop_event=stop,
+    )
+    try:
+        ctx.apply_command(
+            ("switch", 1, b"\x01" * 32, b"\x02" * 32, 0, 4, 80.0)
+        )
+        # Floor starts empty — first sample enters best-5 and is reconstructed.
+        results = ctx.iter_results()
+        _m, ss, _g = next(results)
+        assert ss.reconstructed is True
+        assert miner.sampler.reconstructed_calls == 1
+
+        # Seed the floor with 5 energies all better than -14850 so the floor
+        # is full and the next -14850 sample won't enter it.
+        ctx._recon_floor.clear()
+        for e in [-14900.0, -14895.0, -14890.0, -14885.0, -14880.0]:
+            ctx._recon_floor.append(e)
+        ctx._recon_floor.sort()
+
+        before = miner.sampler.reconstructed_calls
+        _m, ss2, _g = next(results)
+        assert getattr(ss2, "reconstructed", False) is False
+        assert miner.sampler.reconstructed_calls == before  # no new reconstruction
+    finally:
+        stop.set()
+        ctx.cleanup()
+
+
+def test_switch_clears_recon_floor():
+    """apply_command(("switch", ...)) must reset the running best-5 floor."""
+    stop = mp.get_context("spawn").Event()
+    ctx = _make_ctx(stop)
+    try:
+        ctx.apply_command(("switch", 1, b"\x01" * 32, b"\x02" * 32, 0, 4, 80.0))
+        # Seed the floor with some values.
+        ctx._recon_floor.extend([-100.0, -200.0, -300.0])
+        assert len(ctx._recon_floor) == 3
+
+        # A new switch (new head) must clear the floor.
+        ctx.apply_command(("switch", 2, b"\x09" * 32, b"\x02" * 32, 0, 4, 80.0))
+        assert ctx._recon_floor == []
     finally:
         stop.set()
         ctx.cleanup()
@@ -329,7 +404,7 @@ def test_build_persistent_context_forwards_topology():
         dm.build_persistent_context(
             miner_id="m", queue_depth=2, nodes=[0, 1, 2], edges=[(0, 1)],
             feeder_buffer_size=4, num_reads=4, annealing_time=80.0,
-            energy_threshold_milli=0, precheck_margin_milli=2000,
+            energy_threshold_milli=0,
             topology=DEFAULT_TOPOLOGY,
         )
     _a, kwargs = mk.call_args
@@ -344,6 +419,6 @@ def test_build_persistent_context_requires_topology():
         dm.build_persistent_context(
             miner_id="m", queue_depth=2, nodes=[0, 1, 2], edges=[(0, 1)],
             feeder_buffer_size=4, num_reads=4, annealing_time=80.0,
-            energy_threshold_milli=0, precheck_margin_milli=2000,
+            energy_threshold_milli=0,
             topology=None,
         )

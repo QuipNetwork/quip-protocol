@@ -507,6 +507,53 @@ async def test_invalid_topology_is_round_stale():
     assert result.action is SubmitRetryAction.STOP_ROUND_STALE
 
 
+# ----------------------------------------------------------------------
+# query_block_timestamp_ms — reads Timestamp.Now storage at block_hash
+# ----------------------------------------------------------------------
+
+
+def _make_timestamp_client(iface_query_return):
+    """Build a SubstrateClient with a faked _iface.query for Timestamp.Now.
+
+    Mirrors the ``client._iface = MagicMock(); client._loop = None`` pattern
+    used elsewhere in this file to unit-test SubstrateClient without a socket.
+    """
+    from substrate.client import SubstrateClient
+
+    client = SubstrateClient(url="ws://unused:9944")
+    fake_iface = MagicMock()
+    if isinstance(iface_query_return, Exception):
+        fake_iface.query.side_effect = iface_query_return
+    else:
+        fake_iface.query.return_value = iface_query_return
+    client._iface = fake_iface
+    client._loop = None
+    return client
+
+
+async def test_query_block_timestamp_ms_returns_value():
+    """query_block_timestamp_ms unwraps .value from Timestamp.Now storage."""
+    scale_result = MagicMock()
+    scale_result.value = 1_700_000_123_456
+    client = _make_timestamp_client(scale_result)
+
+    block_hash = b"\xab" * 32
+    result = await client.query_block_timestamp_ms(block_hash)
+
+    assert result == 1_700_000_123_456
+    client._iface.query.assert_called_once_with(
+        "Timestamp", "Now", block_hash="0x" + "ab" * 32
+    )
+
+
+async def test_query_block_timestamp_ms_exception_returns_none():
+    """query_block_timestamp_ms returns None when the storage read raises."""
+    client = _make_timestamp_client(RuntimeError("rpc gone"))
+
+    result = await client.query_block_timestamp_ms(b"\xab" * 32)
+    assert result is None
+
+
 async def test_unknown_error_is_fatal_not_retried():
     # Guards against a future infinite-retry regression: an unrecognized
     # pallet error must STOP_FATAL, never loop. Asserting attempts==1 pins

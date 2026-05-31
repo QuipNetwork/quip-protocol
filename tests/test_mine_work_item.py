@@ -784,11 +784,10 @@ def test_mine_work_item_emits_preview_on_floor_improvement(
     # any of our fake floors (-1.0/-2.0/-1.5 → milli -1000/-2000/-1500):
     # submit needs floor_milli < live, and -2000 < -3000 is False. This
     # keeps the loop running through all three iters so we can observe the
-    # throttle. The precheck ``near_live`` gate must NOT short-circuit the
-    # lenient evaluate, so we widen the precheck margin to admit every iter
-    # regardless of the real sampler's energy.
+    # throttle. Under the new top-5 gate every iter evaluates while the
+    # stash has fewer than 5 entries — so all 3 iters reach fake_evaluate
+    # automatically without any margin hack.
     live_var = mp.Value("q", -3000)
-    monkeypatch.setattr(cpu_miner, "RATCHET_PRECHECK_MARGIN_MILLI", 10**18)
     stop = mp.Event()
     cpu_miner._live_max_energy_milli = live_var
     monkeypatch.setattr(cpu_miner, "evaluate_sampleset", fake_evaluate)
@@ -1000,55 +999,93 @@ def test_attempt_log_records_num_valid_and_diversity_on_stored_iteration(
     )
 
 
-def test_precheck_skips_evaluate_for_no_hope_iter(
+def test_precheck_skips_evaluate_outside_top5(
     cpu_miner, relaxed_context, monkeypatch,
 ):
-    """Pre-check must skip the expensive lenient ``evaluate_sampleset`` when
-    the iter's best energy is FAR above (worse than) the live threshold plus
-    ``RATCHET_PRECHECK_MARGIN_MILLI``.
+    """Pre-check must skip ``evaluate_sampleset`` when the stash is full
+    (top_k_cap=5 entries) and the iter's best energy does NOT beat the
+    worst stashed entry.
 
-    Arranges a fake sampler that returns a sampleset whose best energy is
-    +100.0 (100_000 milli) — far above the live threshold of 0 milli plus the
-    2000-milli margin. The spy on ``evaluate_sampleset`` must NOT be called,
-    and the attempt log must record ``result_kind="rejected"`` with
+    Fills the stash with 5 good-energy winners (energies -1 through -5) via
+    a counter-based fake_sample + fake_evaluate, then presents an iter whose
+    sampleset best energy is +100.0 — worse than all 5 stashed entries.
+    The spy on ``evaluate_sampleset`` must NOT be called for that iter, and
+    its attempt-log record must carry ``result_kind="rejected"`` and
     ``post_processed=False``.
     """
     import dimod
     from unittest.mock import MagicMock
 
-    # Sampleset with a single sample at energy +100 — no-hope (far above live).
-    BAD_ENERGY = 100.0
-    bad_ss = dimod.SampleSet.from_samples(
-        [{n: 1 for n in relaxed_context.nodes}],
-        vartype=dimod.SPIN,
-        energy=[BAD_ENERGY],
-    )
+    nodes = list(relaxed_context.nodes)
+    n_nodes = len(nodes)
 
-    # Spy on evaluate_sampleset — must NOT be called for a no-hope iter.
+    # The first TOP_K_STORE=5 samplesets have improving energies; the 6th is
+    # a worse-energy "bad" iter whose energy won't beat the worst stashed.
+    TOP_K = 5
+    GOOD_ENERGIES = [-float(i + 1) for i in range(TOP_K)]  # -1, -2, -3, -4, -5
+    BAD_ENERGY = 100.0
+
+    call_count = [0]
+
+    def fake_sample(*args, **kwargs):
+        i = call_count[0]
+        energy = GOOD_ENERGIES[i] if i < TOP_K else BAD_ENERGY
+        return dimod.SampleSet.from_samples(
+            [{nd: -1 for nd in nodes}],
+            vartype=dimod.SPIN,
+            energy=[energy],
+        )
+
+    # Spy: returns a valid MiningResult for the first 5 calls so _insert_into_stash
+    # fires and fills top_k; returns None for any subsequent call (shouldn't happen).
     spy_calls = []
 
-    def spy_evaluate(sampleset, *args, **kwargs):
-        spy_calls.append(sampleset)
-        return None
+    def spy_evaluate(sampleset, requirements, nodes_arg, edges_arg,
+                     nonce, salt, prev_timestamp, start_time,
+                     strict_energy=True, live_threshold_energy=None):
+        i = call_count[0]
+        call_count[0] += 1
+        spy_calls.append(i)
+        if i >= TOP_K:
+            # Should never reach here — that's what the test asserts.
+            return None
+        energy = GOOD_ENERGIES[i]
+        return MiningResult(
+            miner_id="test",
+            miner_type="CPU",
+            nonce=(i + 1).to_bytes(32, "big"),
+            salt=bytes([i + 1]) * 32,
+            timestamp=0,
+            prev_timestamp=0,
+            solutions=[[-1] * n_nodes],
+            energy=energy,
+            diversity=1.0,
+            num_valid=1,
+            mining_time=0,
+            node_list=list(nodes_arg),
+            edge_list=list(edges_arg),
+            submit_floor_energy=energy,
+        )
 
-    # Capture the first attempt-log record, then stop.
+    # Capture attempt-log records; stop on the first rejected record (the
+    # bad iter). The bad iter does not call spy_evaluate, so call_count stays
+    # at TOP_K — using call_count to trigger stop would fire too early.
     captured = []
     recording_logger = MagicMock()
 
     def _capture(**kw):
         captured.append(kw)
-        stop.set()
+        # Stop as soon as the bad iter's rejected record lands.
+        if kw.get("result_kind") == "rejected":
+            stop.set()
 
     recording_logger.record.side_effect = _capture
 
-    def fake_sample(*args, **kwargs):
-        # Return the bad-energy sampleset regardless of (h, J).
-        return bad_ss
-
     stop = mp.Event()
-    # Live threshold = 0 milli. With RATCHET_PRECHECK_MARGIN_MILLI=2000,
-    # iter_best_milli = 100_000 >> 0 + 2000 so near_live is False.
-    live_var = mp.Value('q', 0)
+    # Use a live threshold stricter than all good-energy floors so the submit
+    # gate never fires during stash-fill: floor_milli < live requires e.g.
+    # -1000 < -6000 which is False for all our [-1..-5] energies.
+    live_var = mp.Value('q', -6000)
 
     monkeypatch.setattr(cpu_miner, "_sample", fake_sample)
     monkeypatch.setattr(cpu_miner, "evaluate_sampleset", spy_evaluate)
@@ -1060,66 +1097,109 @@ def test_precheck_skips_evaluate_for_no_hope_iter(
         del cpu_miner._attempt_logger
         del cpu_miner._live_max_energy_milli
 
+    assert len(spy_calls) == TOP_K, (
+        f"expected evaluate_sampleset called exactly {TOP_K} times to fill "
+        f"the stash, got {spy_calls}"
+    )
     assert captured, "expected at least one AttemptLogger.record call"
-    rec = captured[0]
-    assert not spy_calls, (
-        "evaluate_sampleset must NOT be called for a no-hope iter "
-        f"(best_energy={BAD_ENERGY}, live_threshold_milli=0, margin=2000)"
+    # The last captured record is the bad iter (result_kind=rejected).
+    bad_rec = captured[-1]
+    assert bad_rec["result_kind"] == "rejected", (
+        f"out-of-top-5 iter must be logged as 'rejected', got "
+        f"{bad_rec['result_kind']!r}"
     )
-    assert rec["result_kind"] == "rejected", (
-        f"no-hope iter must be logged as 'rejected', got {rec['result_kind']!r}"
-    )
-    assert rec["post_processed"] is False, (
-        f"no-hope iter must have post_processed=False, got {rec['post_processed']!r}"
+    assert bad_rec["post_processed"] is False, (
+        f"out-of-top-5 iter must have post_processed=False, got "
+        f"{bad_rec['post_processed']!r}"
     )
 
 
 def test_precheck_skip_still_logs_per_attempt_heartbeat(
     cpu_miner, relaxed_context, monkeypatch,
 ):
-    """A pre-check-skipped (no-hope) iter must still emit a per-attempt
+    """A pre-check-skipped (out-of-top-5) iter must still emit a per-attempt
     console heartbeat.
 
     The per-attempt ``[miner] Mining attempt - Energy: ...`` line
     historically came from ``evaluate_sampleset``'s finally block, which the
     old ratchet called on every iteration. The throughput pre-check gate
-    skips ``evaluate_sampleset`` for no-hope iters, which silently dropped
-    that line (regression: long runs of attempts logged nothing). The
-    ratchet must emit a lightweight heartbeat for skipped iters so operators
-    keep per-attempt energy visibility without paying for the diversity
-    computation.
+    skips ``evaluate_sampleset`` for out-of-top-5 iters, which silently
+    dropped that line (regression: long runs of attempts logged nothing). The
+    ratchet must emit a lightweight heartbeat (containing "Mining attempt" and
+    "not in top-5") for skipped iters so operators keep per-attempt energy
+    visibility without paying for the diversity computation.
+
+    Setup: fill the top-5 stash with 5 good-energy winners (so the gate is
+    armed), then present an iter with energy +100.0 — worse than all stashed
+    entries — and assert the heartbeat fires but evaluate_sampleset does not.
     """
     import dimod
     from unittest.mock import MagicMock
 
-    # Best energy +100 — far above live threshold 0 + 2000-milli margin.
+    nodes = list(relaxed_context.nodes)
+    n_nodes = len(nodes)
+
+    TOP_K = 5
+    GOOD_ENERGIES = [-float(i + 1) for i in range(TOP_K)]  # -1, -2, -3, -4, -5
     BAD_ENERGY = 100.0
-    bad_ss = dimod.SampleSet.from_samples(
-        [{n: 1 for n in relaxed_context.nodes}],
-        vartype=dimod.SPIN,
-        energy=[BAD_ENERGY],
-    )
+
+    call_count = [0]
+
+    def fake_sample(*args, **kwargs):
+        i = call_count[0]
+        energy = GOOD_ENERGIES[i] if i < TOP_K else BAD_ENERGY
+        return dimod.SampleSet.from_samples(
+            [{nd: -1 for nd in nodes}],
+            vartype=dimod.SPIN,
+            energy=[energy],
+        )
 
     spy_calls = []
 
-    def spy_evaluate(sampleset, *args, **kwargs):
-        spy_calls.append(sampleset)
-        return None
+    def spy_evaluate(sampleset, requirements, nodes_arg, edges_arg,
+                     nonce, salt, prev_timestamp, start_time,
+                     strict_energy=True, live_threshold_energy=None):
+        i = call_count[0]
+        call_count[0] += 1
+        spy_calls.append(i)
+        if i >= TOP_K:
+            return None
+        energy = GOOD_ENERGIES[i]
+        return MiningResult(
+            miner_id="test",
+            miner_type="CPU",
+            nonce=(i + 1).to_bytes(32, "big"),
+            salt=bytes([i + 1]) * 32,
+            timestamp=0,
+            prev_timestamp=0,
+            solutions=[[-1] * n_nodes],
+            energy=energy,
+            diversity=1.0,
+            num_valid=1,
+            mining_time=0,
+            node_list=list(nodes_arg),
+            edge_list=list(edges_arg),
+            submit_floor_energy=energy,
+        )
 
     captured = []
     recording_logger = MagicMock()
 
     def _capture(**kw):
         captured.append(kw)
-        stop.set()
+        # Stop on the rejected record so the bad iter fully completes before
+        # we halt (call_count stays at TOP_K after the bad iter since
+        # spy_evaluate is not called for it — stopping on call_count would
+        # fire one iter too early).
+        if kw.get("result_kind") == "rejected":
+            stop.set()
 
     recording_logger.record.side_effect = _capture
 
-    def fake_sample(*args, **kwargs):
-        return bad_ss
-
     stop = mp.Event()
-    live_var = mp.Value('q', 0)
+    # Live threshold stricter than all good-energy floors so the submit gate
+    # never fires during stash-fill (floor_milli=-1000 is NOT < -6000).
+    live_var = mp.Value('q', -6000)
 
     log_spy = MagicMock()
     monkeypatch.setattr(cpu_miner, "_sample", fake_sample)
@@ -1133,36 +1213,37 @@ def test_precheck_skip_still_logs_per_attempt_heartbeat(
         del cpu_miner._attempt_logger
         del cpu_miner._live_max_energy_milli
 
-    assert not spy_calls, (
-        "evaluate_sampleset must NOT run for the no-hope iter (heartbeat "
-        "must not re-introduce the expensive evaluate)"
+    assert len(spy_calls) == TOP_K, (
+        f"evaluate_sampleset must be called exactly {TOP_K} times to fill "
+        f"the stash, not for the out-of-top-5 iter; got calls: {spy_calls}"
     )
     info_formats = [
         str(call.args[0])
         for call in log_spy.info.call_args_list
         if call.args
     ]
-    assert any("Mining attempt" in m for m in info_formats), (
-        "pre-check-skipped iter must emit a per-attempt 'Mining attempt' "
-        f"heartbeat; got info logs: {info_formats}"
+    assert any("Mining attempt" in m and "not in top-5" in m
+               for m in info_formats), (
+        "pre-check-skipped iter must emit a per-attempt 'Mining attempt' + "
+        f"'not in top-5' heartbeat; got info logs: {info_formats}"
     )
 
 
-def test_precheck_evaluates_iter_near_live_threshold(
+def test_precheck_evaluates_iter_when_stash_has_room(
     cpu_miner, relaxed_context, monkeypatch,
 ):
-    """Pre-check must call ``evaluate_sampleset`` when the iter's best energy
-    is at or below the live threshold — i.e. clearly within the
-    ``RATCHET_PRECHECK_MARGIN_MILLI`` window.
+    """Pre-check must call ``evaluate_sampleset`` when the stash has room
+    (fewer than top_k_cap entries), regardless of the live threshold.
 
     Arranges a fake sampler that returns a sampleset whose best energy is
-    -1.0 (-1000 milli) — below the live threshold of 0 milli. The spy on
-    ``evaluate_sampleset`` MUST be called for that iter.
+    -1.0 (-1000 milli). With an empty stash the ratchet threshold is
+    float("inf"), so improves_stash is True and ``evaluate_sampleset``
+    MUST be called.
     """
     import dimod
     from unittest.mock import MagicMock
 
-    # Sampleset with best energy -1.0 — clearly within margin of threshold 0.
+    # Sampleset with best energy -1.0 — stash is empty so threshold=inf.
     GOOD_ENERGY = -1.0
     good_ss = dimod.SampleSet.from_samples(
         [{n: -1 for n in relaxed_context.nodes}],
@@ -1189,7 +1270,7 @@ def test_precheck_evaluates_iter_near_live_threshold(
         return good_ss
 
     stop = mp.Event()
-    # Live threshold = 0 milli; GOOD_ENERGY milli = -1000 << 0 + 2000.
+    # Live threshold = 0 milli; with empty stash the gate always passes.
     live_var = mp.Value('q', 0)
 
     monkeypatch.setattr(cpu_miner, "_sample", fake_sample)
@@ -1203,13 +1284,13 @@ def test_precheck_evaluates_iter_near_live_threshold(
         del cpu_miner._live_max_energy_milli
 
     assert spy_calls, (
-        "evaluate_sampleset MUST be called when iter best energy "
-        f"({GOOD_ENERGY}) is within margin of live threshold (0 milli)"
+        "evaluate_sampleset MUST be called when stash has room "
+        f"(empty stash → threshold=inf, iter energy={GOOD_ENERGY})"
     )
     assert captured, "expected at least one AttemptLogger.record call"
     rec = captured[0]
     assert rec.get("post_processed") is True, (
-        f"near-live iter must have post_processed=True, got {rec.get('post_processed')!r}"
+        f"stash-has-room iter must have post_processed=True, got {rec.get('post_processed')!r}"
     )
 
 

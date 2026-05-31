@@ -52,10 +52,10 @@ def _should_reconstruct(
     """Return True if a sampleset is promising enough to fully reconstruct.
 
     The gate is ``(best_qpu_energy + defect_offset) < threshold_energy``.
-    Callers pass the *effective* threshold: ``sample_ising_streaming`` passes
-    the fixed difficulty energy; the persistent driver passes the live
-    (decayed) threshold widened by ``RATCHET_PRECHECK_MARGIN_MILLI`` so it
-    reconstructs anything the worker's ratchet would want to stash.
+    Used only by the ``sample_ising_streaming`` tooling path, which passes the
+    fixed difficulty energy. The persistent driver does NOT use this — it
+    decides reconstruction via its own running best-5 energy floor
+    (``PersistentStreamContext._note_energy``).
     """
     return (best_qpu_energy + defect_offset) < threshold_energy
 
@@ -98,8 +98,7 @@ class PersistentStreamContext:
     generation it was submitted under; on a switch it cancels in-flight
     futures and reseeds, so a completion from a superseded round is never
     yielded. Each completion is gated by :func:`_should_reconstruct` against
-    the LIVE (decayed) threshold widened by ``precheck_margin_milli`` so the
-    worker always receives full-width samplesets it can stash.
+    the running best-5 energy floor.
     """
 
     def __init__(
@@ -112,7 +111,6 @@ class PersistentStreamContext:
         num_reads: int,
         annealing_time: float,
         energy_threshold_milli: int,
-        precheck_margin_milli: int,
         queue_depth: int,
         stop_event: Optional[multiprocessing.synchronize.Event] = None,
     ) -> None:
@@ -123,7 +121,6 @@ class PersistentStreamContext:
         self._num_reads = num_reads
         self._annealing_time = annealing_time
         self._energy_threshold_milli = int(energy_threshold_milli)
-        self._precheck_margin_milli = int(precheck_margin_milli)
         self._queue_depth = queue_depth
         self._stop_event = stop_event
         # Feeder is built lazily on the first 'switch' (it needs the round
@@ -138,12 +135,42 @@ class PersistentStreamContext:
         # next switch. Lets the QPU budget gate halt forward spend while the
         # consumer still drains every already-paid-for attempt.
         self._paused = False
+        # Energy-relative reconstruction gate: the lowest 5 best_qpu_energy
+        # values seen this round (ascending). We reconstruct the full
+        # sampleset only for samples that would enter the consumer's top-5 by
+        # energy — mirroring the worker's stash gate — instead of the (now-
+        # removed) threshold + precheck margin. Reset on switch.
+        self._recon_floor: List[float] = []
+        self._recon_cap = 5
 
     # -- control ----------------------------------------------------------
 
     def set_threshold(self, energy_threshold_milli: int) -> None:
         """Update the live reconstruction threshold (no reseed, no gen bump)."""
         self._energy_threshold_milli = int(energy_threshold_milli)
+
+    def _note_energy(self, corrected_energy: float) -> bool:
+        """Record an offset-corrected energy; return True if it enters the
+        running best-5 (i.e. the sample is worth full reconstruction).
+
+        The ranked quantity is the OFFSET-CORRECTED energy
+        (``best_qpu_energy + defect_info.energy_offset``) — the same value the
+        worker's stash gate ranks on — so the driver reconstructs exactly the
+        samples the worker would consider for its top-5. Ranking on raw QPU
+        energy here would diverge from the worker (each nonce has a distinct
+        ``energy_offset``) and let an under-reconstructed sample reach the
+        worker.
+        """
+        floor = self._recon_floor
+        if len(floor) < self._recon_cap:
+            floor.append(corrected_energy)
+            floor.sort()
+            return True
+        if corrected_energy < floor[-1]:
+            floor[-1] = corrected_energy
+            floor.sort()
+            return True
+        return False
 
     def cancel_inflight(self) -> None:
         """Best-effort-cancel and drop all in-flight QPU futures."""
@@ -170,6 +197,7 @@ class PersistentStreamContext:
             self._annealing_time = float(annealing_time)
             self._energy_threshold_milli = int(thr_milli)
             self._paused = False  # a new head resumes a paused driver
+            self._recon_floor.clear()
             self.cancel_inflight()
             if self._feeder is None:
                 self._feeder = RandomIsingFeeder(
@@ -213,12 +241,14 @@ class PersistentStreamContext:
         if defect_info is None:
             return raw_ss
         best_qpu_energy = float(min(raw_ss.record.energy))
-        threshold_energy = (
-            self._energy_threshold_milli + self._precheck_margin_milli
-        ) / 1000.0
-        if _should_reconstruct(
-            best_qpu_energy, defect_info.energy_offset, threshold_energy,
-        ):
+        # Rank on the OFFSET-CORRECTED energy — the same quantity the worker's
+        # stash gate ranks on (both reconstruct/shift add energy_offset). Using
+        # raw best_qpu_energy here would diverge from the worker and could let
+        # an under-reconstructed (shifted, reduced-width) sample reach the stash.
+        corrected_energy = best_qpu_energy + defect_info.energy_offset
+        # Energy-relative: reconstruct iff this sample enters our running
+        # best-5 (what the consumer would stash). No threshold dependence.
+        if self._note_energy(corrected_energy):
             return self._miner.sampler.reconstruct_full_sampleset(
                 raw_ss, defect_info,
             )
@@ -301,7 +331,6 @@ def build_persistent_context(
     num_reads: int,
     annealing_time: float,
     energy_threshold_milli: int,
-    precheck_margin_milli: int,
     solver_name: Optional[str] = None,
     region: Optional[str] = None,
     token: Optional[str] = None,
@@ -346,7 +375,6 @@ def build_persistent_context(
         num_reads=num_reads,
         annealing_time=annealing_time,
         energy_threshold_milli=energy_threshold_milli,
-        precheck_margin_milli=precheck_margin_milli,
         queue_depth=queue_depth,
         stop_event=stop_event,
     )

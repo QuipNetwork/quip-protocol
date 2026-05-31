@@ -111,6 +111,11 @@ class PoolClient:
     async def query_last_proof_block_number(self):
         return await self._pool.send("query_last_proof_block_number", {})
 
+    async def query_block_timestamp_ms(self, block_hash: bytes) -> "Optional[int]":
+        return await self._pool.send(
+            "query_block_timestamp_ms", {"block_hash": block_hash}
+        )
+
     async def query_pow_constants(self):
         return await self._pool.send("query_pow_constants", {})
 

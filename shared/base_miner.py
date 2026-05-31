@@ -468,12 +468,6 @@ class BaseMiner(ABC):
     # the consumer has headroom equal to what the cloud holds; on full the
     # pump drops the newest result (rare safety valve) and counts it.
     RESULT_QUEUE_MAXSIZE: int = 32
-    # Ratchet pre-check: skip the expensive lenient evaluate unless the
-    # iter's cheap best-energy is within this many milli of the live
-    # (decayed) threshold — i.e. it could plausibly submit now or after a
-    # little decay. Larger = more evaluates (safer, slower); 0 = only
-    # iters already at/below the live target. Tunable per backend.
-    RATCHET_PRECHECK_MARGIN_MILLI: int = 2000
 
     # --- Adaptive parameter bounds (override in subclasses) ---
     # SA/GPU miners use sweeps + reads; QPU miners use annealing_time + reads.
@@ -1162,7 +1156,6 @@ class BaseMiner(ABC):
             "energy_threshold_milli": _energy_to_milli(
                 sample_ctx["energy_threshold"],
             ),
-            "precheck_margin_milli": self.RATCHET_PRECHECK_MARGIN_MILLI,
             "solver_name": getattr(self, "solver_name", None),
             "region": getattr(self, "region", None),
             "token": getattr(self, "token", None),
@@ -1567,20 +1560,48 @@ class BaseMiner(ABC):
             if len(state.top_k) >= state.top_k_cap
             else float("inf")
         )
-        # Pre-check: only pay the lenient evaluate when the iter both (a)
-        # would improve the running top_k baseline and (b) is within
-        # RATCHET_PRECHECK_MARGIN_MILLI of the live (decayed) threshold —
-        # i.e. could submit now or after a little decay. No-hope iters skip
-        # the expensive diversity/selection work and log a lightweight
-        # rejected row. NOTE: if the miner never lands within margin of the
-        # live target (e.g. hardware underperforming), the stash stays empty
-        # and nothing submits — expected; every skipped iter still logs as
-        # "rejected".
-        iter_best_milli = int(iter_best_energy * 1000)
-        near_live = iter_best_milli <= (
-            live_threshold_milli + self.RATCHET_PRECHECK_MARGIN_MILLI
-        )
+        # Top-5-by-energy gate: we keep our best candidates independent of the
+        # current live threshold. The chain's difficulty decays to meet our
+        # stash — the controller's predictor fires whichever candidate clears
+        # the falling threshold. Gating stash entry on proximity to the live
+        # target would starve the stash whenever the QPU is producing energies
+        # that are better than SA-at-launch but not yet inside threshold window,
+        # which is exactly the window decay is designed to cover. Once top_k is
+        # seeded, improvements and evaluations become rare (only iters that beat
+        # the heap's worst entry reach evaluate_sampleset).
+        #
+        # Accepted I-1 cost: while the stash holds fewer than 5 valid
+        # candidates, ``ratchet_threshold`` is ``inf`` so every improving-energy
+        # iter runs ``evaluate_sampleset`` (a CPU cost). This is inherent to
+        # "always keep the top-5" and self-resolves once 5 valid candidates
+        # land. It is CPU-bound and ring-backpressured — never a QPU-spend or
+        # unbounded-memory issue — so we do NOT reintroduce a threshold/margin
+        # gate; top-5-by-energy is the intended design.
         improves_stash = iter_best_energy < ratchet_threshold
+
+        # Width guard: the QPU stream driver only fully reconstructs (full
+        # topology) the samples it ranks into its own best-5; non-promising
+        # samples are returned cheaply via ``_shift_energies`` with the REDUCED
+        # variable set (clamped fixed-spins dropped). ``evaluate_sampleset``
+        # indexes full-topology edge positions into the sample matrix, so a
+        # reduced-width sample yields an IndexError or a silently wrong
+        # recomputed energy that would then be stashed/previewed/submitted. The
+        # driver's best-5 (now ranked on offset-corrected energy) should match
+        # the worker's, but this is the correctness backstop: never evaluate a
+        # sample that wasn't fully reconstructed, regardless of any rank
+        # divergence. A reconstructed sample is full width; a shifted one is
+        # narrower. CPU/GPU inline backends always produce full-width samples,
+        # so this never triggers for them.
+        if improves_stash and (
+            sampleset.record.sample.shape[1] != len(state.nodes)
+        ):
+            self.logger.info(
+                "[%s] Mining attempt - Energy: %.0f (under-reconstructed: "
+                "sample width %d != topology %d; skipping evaluation)",
+                self.miner_id, iter_best_energy,
+                sampleset.record.sample.shape[1], len(state.nodes),
+            )
+            improves_stash = False
 
         result = None
         stored_replaced = False
@@ -1589,7 +1610,7 @@ class BaseMiner(ABC):
         # ``post_processed=true`` iteration, not just submitted ones.
         post_num_valid: Optional[int] = None
         post_diversity_milli: Optional[int] = None
-        if improves_stash and near_live:
+        if improves_stash:
             # Lenient eval — diversity + min_solutions still required, but no
             # energy gate. The ratchet itself enforces "only improvements
             # land" via the comparison below.
@@ -1617,9 +1638,10 @@ class BaseMiner(ABC):
             # the gate skips.
             self.logger.info(
                 "[%s] Mining attempt - Energy: %.0f (pre-check skip: "
-                "improves_stash=%s near_live=%s, live threshold<=%.0f)",
-                self.miner_id, iter_best_energy, improves_stash, near_live,
-                live_threshold_milli / 1000.0,
+                "not in top-5, worst stashed=%.0f)",
+                self.miner_id, iter_best_energy,
+                (state.top_k[-1].energy if len(state.top_k) >= state.top_k_cap
+                 else float("inf")),
             )
 
         # Anticipatory-submission preview. When the stash gains a candidate
