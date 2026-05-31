@@ -46,6 +46,15 @@ class StreamContext:
         self._num_reads = num_reads
         self._num_sweeps = num_sweeps
         self._sampler_kwargs = sampler_kwargs or {}
+        # ``num_reads``/``num_sweeps`` are passed explicitly to the sampler;
+        # a backend that also put them in sampler_kwargs would otherwise hit a
+        # cryptic "multiple values for keyword argument" at stream-open time.
+        clash = {"num_reads", "num_sweeps"} & self._sampler_kwargs.keys()
+        if clash:
+            raise ValueError(
+                f"sampler_kwargs must not contain {sorted(clash)} "
+                "(passed explicitly per round)"
+            )
         self._feeder_builder = feeder_builder or build_feeder
         self._stop_event = stop_event
         self._feeder: Optional[Any] = None

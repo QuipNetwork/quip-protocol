@@ -98,3 +98,34 @@ def test_threshold_noop_and_pause_stops():
     assert ctx._paused is True
     assert list(ctx.iter_results()) == []
     ctx.cleanup()
+
+
+def test_sampler_kwargs_must_not_shadow_round_params():
+    import pytest
+    with pytest.raises(ValueError, match="num_reads"):
+        StreamContext(
+            sampler=_FakeSampler(), nodes=[0, 1], edges=[(0, 1)],
+            feeder_buffer_size=4, num_reads=8, num_sweeps=64,
+            feeder_builder=_fake_builder, sampler_kwargs={"num_reads": 1})
+
+
+def test_kind_change_rebuilds_and_stops_old_feeder():
+    built = []
+
+    def _builder(spec, nodes, edges, buffer_size):
+        f = _FakeFeeder()
+        built.append(f)
+        return f
+
+    ctx = StreamContext(
+        sampler=_FakeSampler(), nodes=[0, 1], edges=[(0, 1)],
+        feeder_buffer_size=4, num_reads=8, num_sweeps=64, feeder_builder=_builder)
+    ctx.apply_command(_switch(1))  # pow -> build
+    # second switch with a different feeder kind -> rebuild + stop old
+    different = ("switch", 2, b"\x00" * 32, b"\x01" * 32, 0, 8, 0.0, 64,
+                 ("oneshot", []))
+    ctx.apply_command(different)
+    assert len(built) == 2
+    assert built[0].stopped is True  # old feeder stopped on rebuild
+    assert ctx._feeder is built[1]
+    ctx.cleanup()
