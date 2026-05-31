@@ -1156,13 +1156,21 @@ class BaseMiner(ABC):
             thr = sample_ctx["energy_threshold"]
             threshold_milli = _energy_to_milli(thr) if thr is not None else 0
             anneal = sample_ctx["annealing_time"]
+            # The 9th element is the feeder spec the generic StreamContext builds
+            # its feeder from (PoW: random-model derivation seed). The legacy QPU
+            # PersistentStreamContext unpacks cmd[:7] and ignores it; it moves to
+            # the spec when QPU joins the generic context (unification step 3).
+            feeder_spec = (
+                "pow", sample_ctx["last_proof_block_hash"],
+                sample_ctx["miner_bytes"],
+            )
             try:
                 self._ctl_q.put(
                     ("switch", generation, sample_ctx["last_proof_block_hash"],
                      sample_ctx["miner_bytes"], threshold_milli,
                      int(sample_ctx["num_reads"]),
                      float(anneal) if anneal is not None else 0.0,
-                     int(sample_ctx["num_sweeps"])),
+                     int(sample_ctx["num_sweeps"]), feeder_spec),
                 )
             except Exception as exc:  # noqa: BLE001 — surface, don't hang
                 self.logger.error("switch_round send failed: %s", exc)

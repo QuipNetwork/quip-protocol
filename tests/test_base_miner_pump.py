@@ -906,10 +906,10 @@ def test_switch_tuple_with_metal_style_params_no_crash():
         switch_cmd = captured[0]
         assert switch_cmd[0] == "switch", f"first command was not switch: {switch_cmd}"
 
-        # 8 elements: kind, gen, lpbh, miner_bytes, threshold_milli,
-        #              num_reads, annealing_time, num_sweeps
-        assert len(switch_cmd) == 8, (
-            f"switch tuple has {len(switch_cmd)} elements, expected 8"
+        # 9 elements: kind, gen, lpbh, miner_bytes, threshold_milli,
+        #              num_reads, annealing_time, num_sweeps, feeder_spec
+        assert len(switch_cmd) == 9, (
+            f"switch tuple has {len(switch_cmd)} elements, expected 9"
         )
         # Bug #1: threshold_milli defaults to 0 when energy_threshold is None
         assert switch_cmd[4] == 0, (
@@ -918,6 +918,10 @@ def test_switch_tuple_with_metal_style_params_no_crash():
         # Bug #2: num_sweeps (element 7) carries the adapted value
         assert switch_cmd[7] == 128, (
             f"num_sweeps expected 128, got {switch_cmd[7]}"
+        )
+        # Element 8: the feeder spec the generic StreamContext builds from.
+        assert switch_cmd[8][0] == "pow", (
+            f"feeder_spec expected ('pow', ...), got {switch_cmd[8]!r}"
         )
     finally:
         stop.set()
