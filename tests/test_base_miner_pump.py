@@ -2,7 +2,7 @@
 """Tests for the process-model stream driver path in BaseMiner.
 
 The in-worker pump thread was replaced by a stream-driver PROCESS that
-writes samplesets into a SharedSampleRing and enqueues small descriptors
+writes samplesets into a SampleView and enqueues small descriptors
 (see QPU/stream_driver.py). These tests exercise the consumer side
 (``_acquire_result`` reading the ring, slot release, budget feed, clean
 teardown) without contacting a QPU — ``build_fake_persistent_context``
@@ -25,7 +25,7 @@ from shared.base_miner import (
 )
 from shared.miner_types import MiningResult
 from shared.proc_util import terminate_join
-from shared.shared_sample_ring import SharedSampleRing
+from shared.ring_views import SampleView
 from substrate.types import SubstrateDifficulty, SubstrateMiningContext
 
 _FAKE_CTX = "tests.fakes.fake_stream:build_fake_persistent_context"
@@ -210,7 +210,7 @@ def test_ensure_driver_spawns_non_daemon_driver():
 
 def test_acquire_result_reads_descriptor_from_ring():
     consumer = _RingConsumer()
-    ring = SharedSampleRing(slots=2, max_rows=4, max_cols=3)
+    ring = SampleView(slots=2, max_rows=4, max_cols=3)
     consumer._ring = ring
     desc_q: "mp.Queue" = mp.get_context("spawn").Queue()
     stop = mp.Event()
@@ -273,7 +273,7 @@ def test_acquire_result_feeds_budget_time_manager():
 
     consumer = _RingConsumer()
     consumer.time_manager = _Mgr()
-    ring = SharedSampleRing(slots=2, max_rows=4, max_cols=3)
+    ring = SampleView(slots=2, max_rows=4, max_cols=3)
     consumer._ring = ring
     desc_q: "mp.Queue" = mp.get_context("spawn").Queue()
     stop = mp.Event()
@@ -297,7 +297,7 @@ def test_acquire_result_feeds_budget_time_manager():
 def test_acquire_result_drops_stale_generation_descriptor():
     """A descriptor from a superseded round is released + skipped, not OK."""
     consumer = _RingConsumer()
-    ring = SharedSampleRing(slots=2, max_rows=4, max_cols=3)
+    ring = SampleView(slots=2, max_rows=4, max_cols=3)
     consumer._ring = ring
     desc_q = mp.get_context("spawn").Queue()
     stop = mp.Event()

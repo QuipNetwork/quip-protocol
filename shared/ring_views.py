@@ -9,8 +9,7 @@ the free-list, ``attach_args`` reconstruction, and close/unlink to a
 generation/qpu_us) rides the separate descriptor queue.
 
 - ``SampleView``  — producer→evaluator transport: int8 sample matrix + f64
-  energy vector. Replaces the former ``SharedSampleRing`` with an identical
-  public surface.
+  energy vector.
 - ``ProblemView`` — feeder→producer transport: f64 ``h`` vector + f64 ``J``
   vector (dense, in the caller's canonical node/edge order). Consumed by §4.
 """

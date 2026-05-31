@@ -10,7 +10,7 @@ production path the live miner uses: ``BaseMiner._ensure_driver`` spawns the
 ONE persistent ``QPU.stream_driver`` subprocess running
 ``build_persistent_context`` against the live QPU, and a ``switch_round``
 control message starts the round; the consumer reads generation-tagged
-samplesets through the ``SharedSampleRing`` via ``_acquire_result``;
+samplesets through the ``SampleView`` via ``_acquire_result``;
 ``_close_driver`` reaps the persistent driver + ring.
 This exercises the parts the in-process probe cannot:
 
@@ -99,7 +99,7 @@ def _summary(name: str, xs: List[float]) -> str:
 def _count_shm() -> Optional[int]:
     """POSIX shared-memory segment count (Linux ``/dev/shm``), else None.
 
-    Used to detect leaked ``SharedSampleRing`` segments after teardown.
+    Used to detect leaked ``SampleView`` segments after teardown.
     macOS has no ``/dev/shm`` so the check is skipped there.
     """
     shm_dir = "/dev/shm"

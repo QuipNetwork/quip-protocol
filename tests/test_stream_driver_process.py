@@ -10,7 +10,7 @@ import queue as _queue
 import time
 
 from shared.proc_util import terminate_join
-from shared.shared_sample_ring import SharedSampleRing
+from shared.ring_views import SampleView
 
 _FAKE_CTX = "tests.fakes.fake_stream:build_fake_persistent_context"
 _FAKE_RAISING = "tests.fakes.fake_stream:build_fake_raising_context"
@@ -84,7 +84,7 @@ def _spawn_driver(ring, desc_q, ctl_q, stop, factory, factory_kwargs):
 
 def test_driver_produces_generation_tagged_descriptors():
     ctx = mp.get_context("spawn")
-    ring = SharedSampleRing(slots=4, max_rows=8, max_cols=3)
+    ring = SampleView(slots=4, max_rows=8, max_cols=3)
     desc_q, ctl_q, stop = ctx.Queue(), ctx.Queue(), ctx.Event()
     proc = _spawn_driver(
         ring,
@@ -116,7 +116,7 @@ def test_driver_produces_generation_tagged_descriptors():
 
 def test_driver_shuts_down_on_ctl_q_none():
     ctx = mp.get_context("spawn")
-    ring = SharedSampleRing(slots=2, max_rows=8, max_cols=3)
+    ring = SampleView(slots=2, max_rows=8, max_cols=3)
     desc_q, ctl_q, stop = ctx.Queue(), ctx.Queue(), ctx.Event()
     proc = _spawn_driver(
         ring,
@@ -144,7 +144,7 @@ def test_driver_shuts_down_on_ctl_q_none():
 
 def test_driver_factory_error_yields_none_not_hang():
     ctx = mp.get_context("spawn")
-    ring = SharedSampleRing(slots=2, max_rows=8, max_cols=3)
+    ring = SampleView(slots=2, max_rows=8, max_cols=3)
     desc_q, ctl_q, stop = ctx.Queue(), ctx.Queue(), ctx.Event()
     proc = _spawn_driver(
         ring,
@@ -169,7 +169,7 @@ def test_driver_pauses_then_resumes_on_switch():
     """A ('pause', gen) idles the driver (production stops); a later switch
     resumes it under the new generation."""
     ctx = mp.get_context("spawn")
-    ring = SharedSampleRing(slots=4, max_rows=8, max_cols=3)
+    ring = SampleView(slots=4, max_rows=8, max_cols=3)
     desc_q, ctl_q, stop = ctx.Queue(), ctx.Queue(), ctx.Event()
     proc = _spawn_driver(
         ring,
@@ -220,7 +220,7 @@ def test_driver_switch_mid_stream_advances_generation():
     """A switch mid-stream advances the descriptor generation; the driver
     drops the straddler from the old generation (its stale-discard filter)."""
     ctx = mp.get_context("spawn")
-    ring = SharedSampleRing(slots=4, max_rows=8, max_cols=3)
+    ring = SampleView(slots=4, max_rows=8, max_cols=3)
     desc_q, ctl_q, stop = ctx.Queue(), ctx.Queue(), ctx.Event()
     proc = _spawn_driver(
         ring,

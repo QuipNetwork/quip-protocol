@@ -39,7 +39,7 @@ from shared.work_context import (
     WorkContext,
     requirements_from_context,
 )
-from shared.shared_sample_ring import SharedSampleRing
+from shared.ring_views import SampleView
 from shared.proc_util import spawn_worker, terminate_join
 
 # Global logger for this module
@@ -1200,7 +1200,7 @@ class BaseMiner(ABC):
         import multiprocessing as _mp
         from QPU.stream_driver import stream_driver_main
         ctx = _mp.get_context("spawn")
-        ring = SharedSampleRing(
+        ring = SampleView(
             slots=self.RESULT_QUEUE_MAXSIZE, max_rows=dims[0], max_cols=dims[1],
         )
         desc_q = ctx.Queue(maxsize=self.RESULT_QUEUE_MAXSIZE)

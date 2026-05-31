@@ -2,7 +2,7 @@
 # Copyright (C) 2025 QUIP Protocol Contributors
 
 """Stream-driver process: owns the sampler/feeder/generator and produces
-samplesets into a SharedSampleRing for the consumer (miner worker).
+samplesets into a SampleView for the consumer (miner worker).
 
 Replaces the in-worker QPU pump thread (AGENTS.md). The generator is driven
 by exactly one caller (this process's loop). Only a small descriptor crosses
@@ -18,7 +18,7 @@ from typing import Any, Dict
 
 import numpy as np
 
-from shared.shared_sample_ring import SharedSampleRing
+from shared.ring_views import SampleView
 
 log = logging.getLogger(__name__)
 
@@ -129,7 +129,7 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, ctl_q, stop_event,
     ``(slot, n_rows, n_cols, nonce, salt, qpu_us, generation)``. A trailing
     ``None`` on ``desc_q`` signals end-of-stream (driver exit).
     """
-    ring = SharedSampleRing(**ring_args)
+    ring = SampleView(**ring_args)
     ctx = None
     dropped = 0
     shutdown = False
