@@ -180,7 +180,7 @@ class _MiningLoopState:
     (``_run_substrate_ratchet``, ``_run_mempool_eval``,
     ``_finalize_iteration_logging``) need so each stays under the
     positional-param limit. Constructed once per ``mine_work_item`` call
-    and mutated in place (``top_k``, ``previewed_floor_milli``) by the
+    and mutated in place (``top_k``, ``previewed_wintime``) by the
     ratchet helper, mirroring the original inline locals exactly.
     """
 
@@ -200,7 +200,14 @@ class _MiningLoopState:
     live_threshold_var: Optional[Any]
     top_k_cap: int
     top_k: List[StashEntry]
-    previewed_floor_milli: int
+    # Preview throttle state: (valid_at_block, floor_milli) — emit on strict
+    # lexicographic improvement so an earlier-winning candidate always fires a
+    # preview even when its floor isn't lower.  Initialised to (_MILLI_INF,
+    # _MILLI_INF) = "nothing previewed yet".
+    previewed_wintime: Tuple[int, int]
+    # Last-logged best win-time (decay_num, valid_at_block) for the "Best
+    # Solution …" throttle. None = never logged.
+    last_best_wintime: Optional[Tuple[int, int]] = None
     # Round generation (mirrors _DispatchSetup.generation) so the ratchet can
     # forward same-generation live-threshold decay updates to the driver.
     generation: int = 0
@@ -996,11 +1003,13 @@ class BaseMiner(ABC):
         # the best candidate; the worst entry is the eviction target.
         top_k: List[StashEntry] = []
         top_k_cap: int = self.TOP_K_STORE
-        # Anticipatory-submission preview throttle. Tracks the best
-        # (lowest) ``submit_floor_energy`` we've previewed to the
-        # controller so far; we only emit a fresh preview on a strict
-        # improvement. ``inf`` = nothing previewed yet.
-        previewed_floor_milli: int = _MILLI_INF
+        # Anticipatory-submission preview throttle. Tracks
+        # (valid_at_block, floor_milli) of the last-emitted preview;
+        # we emit on a strict lexicographic improvement so an
+        # earlier-winning candidate always fires a preview even if its
+        # floor isn't lower.  ``(_MILLI_INF, _MILLI_INF)`` = nothing
+        # previewed yet.
+        previewed_wintime: Tuple[int, int] = (_MILLI_INF, _MILLI_INF)
         # Lazily build the per-worker attempt log. Mempool jobs share
         # the same writer for cross-mode forensics; the ``result_kind``
         # field on each row distinguishes the two paths.
@@ -1041,7 +1050,7 @@ class BaseMiner(ABC):
             live_threshold_var=live_threshold_var,
             top_k_cap=top_k_cap,
             top_k=top_k,
-            previewed_floor_milli=previewed_floor_milli,
+            previewed_wintime=previewed_wintime,
             decay_schedule=getattr(context, "decay_schedule", None),
             last_proof_block=int(getattr(context, "last_proof_block", 0) or 0),
             epoch_length=int(getattr(context, "epoch_length", 0) or 0),
@@ -1681,21 +1690,42 @@ class BaseMiner(ABC):
             # lightweight heartbeat sharing the "[id] Mining attempt - Energy:"
             # prefix so one grep catches both; num_valid / diversity omitted.
             self.logger.info(
-                "[%s] Mining attempt - Energy: %.0f (pre-check skip: "
-                "not in top-5, worst stashed=%.0f)",
+                "[%s] Mining attempt - Energy: %.0f (pre-check skip: not in "
+                "top-5, worst stashed=%.0f, live threshold<=%d)",
                 self.miner_id, iter_best_energy,
                 (state.top_k[-1].result.energy
                  if len(state.top_k) >= state.top_k_cap
                  else float("inf")),
+                live_threshold_milli,
             )
 
-        # Anticipatory-submission preview on a better-by-floor stash gain; the
-        # submit gate below still owns the returned result.
-        if preview_cb is not None and stored_replaced:
-            state.previewed_floor_milli = self._maybe_emit_preview(
-                preview_cb, state.top_k, state.previewed_floor_milli,
-                state.dispatch_id_for_log,
-            )
+        # Anticipatory-submission preview on a stash improvement; the submit
+        # gate below still owns the returned result.
+        if stored_replaced:
+            # Throttled "Best Solution" log line when the earliest-winning
+            # entry changes (decay path only).
+            if state.is_decay_ranked and state.top_k:
+                best = min(
+                    state.top_k, key=lambda e: (e.decay_num, e.result.energy),
+                )
+                new_wintime = (best.decay_num, best.valid_at_block)
+                if new_wintime != state.last_best_wintime:
+                    self.logger.info(
+                        "[%s] Best Solution: floor=%.0f energy=%.0f "
+                        "div=%.3f -> submittable at block %d (decay #%d)",
+                        self.miner_id,
+                        best.result.effective_floor,
+                        best.result.energy,
+                        best.result.diversity,
+                        best.valid_at_block,
+                        best.decay_num,
+                    )
+                    state.last_best_wintime = new_wintime
+            if preview_cb is not None:
+                state.previewed_wintime = self._maybe_emit_preview(
+                    preview_cb, state.top_k, state.previewed_wintime,
+                    state.dispatch_id_for_log,
+                )
 
         self.timing_stats['postprocessing'].append(
             (time.time() - postprocess_start) * 1e6,
@@ -1874,34 +1904,38 @@ class BaseMiner(ABC):
         self,
         preview_cb: Any,
         top_k: List[StashEntry],
-        previewed_floor_milli: int,
+        previewed_wintime: Tuple[int, int],
         dispatch_id: int,
-    ) -> int:
-        """Emit a best-candidate preview if the best-by-floor improved.
+    ) -> Tuple[int, int]:
+        """Emit a best-candidate preview on win-time or floor improvement.
 
-        Walks ``top_k`` for the candidate with the lowest
-        ``submit_floor_energy`` (the chain-equivalent floor the controller
-        must gate on). If that floor is a strict improvement over
-        ``previewed_floor_milli``, builds a lightweight picklable payload
-        and hands it to ``preview_cb``.
+        On the decay path selects the **earliest-winning** entry by
+        ``(decay_num, energy)`` and emits when ``(valid_at_block,
+        floor_milli)`` is lexicographically smaller than the last-previewed
+        pair — a candidate that will win EARLIER always fires a fresh preview
+        even if its energy/floor is not lower.
 
-        Returns the (possibly updated) ``previewed_floor_milli`` so the
-        caller can persist the throttle state. A failing callback or
-        payload build never propagates — mining must not break on a
-        preview hiccup.
+        On the legacy (non-decay) path all entries have ``valid_at_block=0``
+        and ``decay_num=0``, so the tiebreak collapses to ``floor_milli``
+        alone, preserving the prior floor-improvement-only behaviour.
+
+        Returns the (possibly updated) ``(valid_at_block, floor_milli)``
+        throttle state so the caller can persist it. A failing callback or
+        payload build never propagates — mining must not break on a preview
+        hiccup.
         """
         if not top_k:
-            return previewed_floor_milli
-        # Best-by-floor across the stash (not best-by-energy): the chain
-        # gates strictly on the floor, so that's what determines whether a
-        # candidate could be submitted as decay eases.
-        best = min(top_k, key=lambda e: e.result.effective_floor)
+            return previewed_wintime
+        # Earliest-winning entry: (decay_num, energy) ascending — nearest
+        # win-time first, then lower energy as a tiebreak.
+        best = min(top_k, key=lambda e: (e.decay_num, e.result.energy))
         best_result = best.result
         best_floor = best_result.effective_floor
         best_floor_milli = int(best_floor * 1000)
-        if best_floor_milli >= previewed_floor_milli:
-            # No strict improvement over what we already previewed.
-            return previewed_floor_milli
+        new_wintime = (best.valid_at_block, best_floor_milli)
+        if new_wintime >= previewed_wintime:
+            # No lexicographic improvement over what we already previewed.
+            return previewed_wintime
         try:
             payload = {
                 "dispatch_id": dispatch_id,
@@ -1913,14 +1947,16 @@ class BaseMiner(ABC):
                 "energy": best_result.energy,
                 "num_valid": best_result.num_valid,
                 "diversity": best_result.diversity,
+                "valid_at_block": best.valid_at_block,
+                "decay_num": best.decay_num,
             }
             preview_cb(payload)
         except Exception as exc:  # noqa: BLE001 — preview is best-effort
             self.logger.debug("preview_cb failed (ignored): %s", exc)
             # Don't advance the throttle on failure so a later identical
             # improvement still gets a chance to emit.
-            return previewed_floor_milli
-        return best_floor_milli
+            return previewed_wintime
+        return new_wintime
 
     # ------------------------------------------------------------------
     # Hook methods (override in subclasses as needed)

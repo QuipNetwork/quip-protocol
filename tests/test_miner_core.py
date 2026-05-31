@@ -445,7 +445,7 @@ def test_stash_entry_and_loop_state_decay_fields(tmp_path):
         live_threshold_var=None,
         top_k_cap=5,
         top_k=[],
-        previewed_floor_milli=10 ** 18,
+        previewed_wintime=(10 ** 18, 10 ** 18),
         decay_schedule=[-15_000_000, -14_900_000],
         last_proof_block=42,
         epoch_length=100,
@@ -469,7 +469,7 @@ def test_stash_entry_and_loop_state_decay_fields(tmp_path):
         live_threshold_var=None,
         top_k_cap=5,
         top_k=[],
-        previewed_floor_milli=10 ** 18,
+        previewed_wintime=(10 ** 18, 10 ** 18),
     )
     assert st2.is_decay_ranked is False
     assert st2.decay_schedule is None

@@ -589,7 +589,7 @@ def test_decay_within_generation_preserves_stash(monkeypatch):
         if hasattr(miner, "_attempt_logger") else _make_attempt_logger(miner),
         solution_store=_make_solution_store(miner),
         live_threshold_var=miner._live_max_energy_milli,
-        top_k_cap=5, top_k=[], previewed_floor_milli=1 << 62, generation=1,
+        top_k_cap=5, top_k=[], previewed_wintime=(1 << 62, 1 << 62), generation=1,
     )
 
     # Force evaluate_sampleset to stash one candidate (floor -14500).
@@ -658,7 +658,7 @@ def test_ratchet_stashes_top5_energy_regardless_of_threshold(monkeypatch):
         attempt_log=_make_attempt_logger(miner),
         solution_store=_make_solution_store(miner),
         live_threshold_var=miner._live_max_energy_milli,
-        top_k_cap=5, top_k=[], previewed_floor_milli=1 << 62, generation=1,
+        top_k_cap=5, top_k=[], previewed_wintime=(1 << 62, 1 << 62), generation=1,
     )
 
     cand = MiningResult(
@@ -753,7 +753,7 @@ def test_ratchet_skips_attempt_outside_top5(monkeypatch):
         attempt_log=_make_attempt_logger(miner),
         solution_store=_make_solution_store(miner),
         live_threshold_var=miner._live_max_energy_milli,
-        top_k_cap=5, top_k=top_k, previewed_floor_milli=1 << 62, generation=1,
+        top_k_cap=5, top_k=top_k, previewed_wintime=(1 << 62, 1 << 62), generation=1,
     )
 
     evaluate_called = []
@@ -816,7 +816,7 @@ def test_ratchet_skips_under_reconstructed_sample(monkeypatch):
         attempt_log=_make_attempt_logger(miner),
         solution_store=_make_solution_store(miner),
         live_threshold_var=miner._live_max_energy_milli,
-        top_k_cap=5, top_k=[], previewed_floor_milli=1 << 62, generation=1,
+        top_k_cap=5, top_k=[], previewed_wintime=(1 << 62, 1 << 62), generation=1,
     )
 
     cand = MiningResult(
@@ -891,7 +891,7 @@ def _decay_state(miner, top_k, *, last_proof_block=100, epoch_length=10):
         attempt_log=_make_attempt_logger(miner),
         solution_store=_make_solution_store(miner),
         live_threshold_var=miner._live_max_energy_milli,
-        top_k_cap=5, top_k=top_k, previewed_floor_milli=1 << 62, generation=1,
+        top_k_cap=5, top_k=top_k, previewed_wintime=(1 << 62, 1 << 62), generation=1,
         decay_schedule=list(_DECAY_SCHED),
         last_proof_block=last_proof_block, epoch_length=epoch_length,
     )
@@ -1105,3 +1105,157 @@ def test_legacy_path_still_energy_ranked():
         False,
     )
     assert rejected is False
+
+
+# ── Task 6: preview valid_at_block + heartbeat win-time/threshold ─────────
+
+
+def test_preview_payload_includes_valid_at_block(monkeypatch):
+    """After a valid decay-path stash, preview_cb payload carries
+    valid_at_block and decay_num from the earliest-winning entry, plus all
+    the existing keys (submit_floor_energy, energy, num_valid, diversity,
+    nonce, salt, solutions, dispatch_id, miner_type)."""
+    import multiprocessing as mp
+    import numpy as np
+    from shared.base_miner import StashEntry
+    from tests.test_base_miner_pump import _DriverMiner
+
+    miner = _DriverMiner()
+    miner._live_max_energy_milli = mp.Value("q", -11_000_000)
+    miner._ctl_q = None
+
+    # Two candidates at different decay steps.
+    # decay_num=1 -> valid_at_block=110; decay_num=2 -> valid_at_block=120.
+    cand_early = _decay_result(miner, -14.5, -14.5, 1)
+    cand_late  = _decay_result(miner, -15.0, -13.5, 2)
+
+    top_k = [
+        StashEntry(1, 110, cand_early),  # earliest-winning
+        StashEntry(2, 120, cand_late),
+    ]
+    # Use _decay_state which sets decay_schedule=_DECAY_SCHED.
+    state = _decay_state(miner, top_k)
+
+    payloads = []
+    miner._run_substrate_ratchet(
+        state, _energy_sampleset(np.full(4, -11.5)),
+        b"\x01" * 32, b"\x02" * 32, 0.0,
+        preview_cb=None, attempt_log_kwargs={},
+    )
+    # Directly call _maybe_emit_preview with a fresh (INF, INF) throttle.
+    from shared.base_miner import _MILLI_INF
+    new_throttle = miner._maybe_emit_preview(
+        payloads.append, top_k, (_MILLI_INF, _MILLI_INF), dispatch_id=42,
+    )
+
+    assert len(payloads) == 1, "exactly one preview must be emitted"
+    p = payloads[0]
+    # win-time fields must be present and match the earliest-winning entry.
+    assert p["valid_at_block"] == 110
+    assert p["decay_num"] == 1
+    # Existing required keys must all be present.
+    for key in ("submit_floor_energy", "energy", "num_valid", "diversity",
+                "nonce", "salt", "solutions", "dispatch_id", "miner_type"):
+        assert key in p, f"missing expected payload key: {key!r}"
+    # Throttle advanced to (valid_at_block=110, floor_milli).
+    assert new_throttle == (110, int(cand_early.submit_floor_energy * 1000))
+
+
+def test_preview_no_duplicate_on_unchanged_best(monkeypatch):
+    """Emitting a preview for the same (valid_at_block, floor) a second time
+    must NOT fire again — the throttle must suppress it.
+
+    Also verify: a strictly-earlier valid_at_block DOES trigger a fresh preview.
+    """
+    import multiprocessing as mp
+    from shared.base_miner import StashEntry, _MILLI_INF
+    from tests.test_base_miner_pump import _DriverMiner
+
+    miner = _DriverMiner()
+    miner._live_max_energy_milli = mp.Value("q", -11_000_000)
+    miner._ctl_q = None
+
+    cand = _decay_result(miner, -14.5, -14.5, 1)
+    top_k = [StashEntry(2, 120, cand)]
+
+    payloads = []
+
+    # First emission.
+    throttle = miner._maybe_emit_preview(
+        payloads.append, top_k, (_MILLI_INF, _MILLI_INF), dispatch_id=7,
+    )
+    assert len(payloads) == 1
+
+    # Second call with the same stash and the returned throttle — must NOT emit.
+    throttle2 = miner._maybe_emit_preview(
+        payloads.append, top_k, throttle, dispatch_id=7,
+    )
+    assert len(payloads) == 1, "throttle must suppress duplicate preview"
+    assert throttle2 == throttle
+
+    # Now add a strictly earlier-winning entry and call again — must emit.
+    cand_earlier = _decay_result(miner, -14.0, -14.0, 9)
+    top_k.insert(0, StashEntry(1, 110, cand_earlier))  # earlier valid_at_block
+
+    miner._maybe_emit_preview(
+        payloads.append, top_k, throttle, dispatch_id=7,
+    )
+    assert len(payloads) == 2, (
+        "a strictly-earlier valid_at_block must trigger a fresh preview"
+    )
+    assert payloads[1]["valid_at_block"] == 110
+    assert payloads[1]["decay_num"] == 1
+
+
+def test_heartbeat_restores_live_threshold(monkeypatch, caplog):
+    """The per-attempt skip heartbeat must include the live threshold value.
+
+    Regression: the live threshold was dropped from the heartbeat in a
+    prior commit.  This test pins the format so it can be grepped.
+    """
+    import logging
+    import multiprocessing as mp
+    import numpy as np
+    from shared.base_miner import StashEntry
+    from tests.test_base_miner_pump import _DriverMiner
+
+    miner = _DriverMiner()
+    live_milli = -11_500_000
+    miner._live_max_energy_milli = mp.Value("q", live_milli)
+    miner._ctl_q = None
+
+    # Fill the stash with 5 entries all at decay_num=1 so the pre-check
+    # gate definitely rejects the incoming attempt (-11.0 -> step 4 > s_max 1).
+    top_k = [
+        StashEntry(1, 110, _decay_result(miner, -14.5, -14.5, i))
+        for i in range(5)
+    ]
+    state = _decay_state(miner, top_k)
+    state.previewed_wintime = (0, 0)  # treat as already-previewed
+
+    evaluate_called = []
+    monkeypatch.setattr(
+        miner, "evaluate_sampleset",
+        lambda *a, **k: evaluate_called.append(True),
+    )
+
+    # iter energy -11.0 maps to step 4 which is > s_max=1 -> pre-check skip.
+    ss = _energy_sampleset(np.full(4, -11.0))
+    with caplog.at_level(logging.INFO, logger=miner.logger.name):
+        miner._run_substrate_ratchet(
+            state, ss, b"\x01" * 32, b"\x02" * 32, 0.0,
+            preview_cb=None, attempt_log_kwargs={},
+        )
+
+    assert not evaluate_called, "evaluate must not be called on pre-check skip"
+
+    # The heartbeat line must contain the live threshold value.
+    import re
+    threshold_pat = re.compile(r"live threshold<=(-?\d+)")
+    matching = [r.message for r in caplog.records if threshold_pat.search(r.message)]
+    assert matching, "no heartbeat line with 'live threshold<=' found in logs"
+    m = threshold_pat.search(matching[0])
+    assert m and int(m.group(1)) == live_milli, (
+        f"expected threshold {live_milli} in heartbeat, "
+        f"got: {matching[0]!r}"
+    )
