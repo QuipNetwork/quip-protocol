@@ -116,3 +116,99 @@ class SampleView:
         s = np.ndarray((n_rows, n_cols), np.int8, buf, 0)
         e = np.ndarray((n_rows,), np.float64, buf, self._sample_bytes)
         return s, e
+
+
+class ProblemView:
+    """f64 ``h`` vector (``n_nodes``) + f64 ``J`` vector (``n_edges``).
+
+    Both arrays are dense, in the caller's canonical node / edge order. The
+    sizes are fixed by the topology, so unlike ``SampleView`` (where D-Wave may
+    return a variable row count) ``read`` needs no dimensions. nonce / salt /
+    generation ride the descriptor queue, not the slot.
+    """
+
+    def __init__(self, slots: int, n_nodes: int, n_edges: int,
+                 *, names: Optional[list] = None, free_q=None):
+        self.n_nodes = n_nodes
+        self.n_edges = n_edges
+        self._h_bytes = n_nodes * 8
+        slot_bytes = self._h_bytes + n_edges * 8
+        self._ring = SharedRing(slots, slot_bytes, names=names, free_q=free_q)
+
+    # ── ring delegation ──────────────────────────────────────────────────
+    @property
+    def slots(self) -> int:
+        """Total number of slots in the ring."""
+        return self._ring.slots
+
+    @property
+    def names(self) -> list:
+        """Shared-memory segment names (one per slot)."""
+        return self._ring.names
+
+    @property
+    def free_q(self):
+        """Cross-process free-list queue."""
+        return self._ring.free_q
+
+    def attach_args(self) -> dict:
+        """Picklable kwargs to reconstruct this view in another process."""
+        return {"slots": self._ring.slots, "n_nodes": self.n_nodes,
+                "n_edges": self.n_edges, "names": self._ring.names,
+                "free_q": self._ring.free_q}
+
+    def claim_free(self, timeout: float) -> Optional[int]:
+        """Return a free slot index, or None if none free within timeout."""
+        return self._ring.claim_free(timeout)
+
+    def release(self, slot: int) -> None:
+        """Return a slot to the free-list for reuse."""
+        self._ring.release(slot)
+
+    def close(self) -> None:
+        """Close all slot handles without unlinking (best-effort)."""
+        self._ring.close()
+
+    def close_unlink(self) -> None:
+        """Close all slots; unlink them if this instance owns them."""
+        self._ring.close_unlink()
+
+    # ── problem layout ───────────────────────────────────────────────────
+    def write(self, slot: int, h: np.ndarray, j: np.ndarray) -> None:
+        """Copy the ``h`` (f64) + ``J`` (f64) vectors into the slot.
+
+        Args:
+            slot: Free slot index obtained from ``claim_free``.
+            h: float64 array of shape ``(n_nodes,)``; linear Ising biases.
+            j: float64 array of shape ``(n_edges,)``; quadratic couplings in
+                the caller's canonical edge order.
+
+        Raises:
+            ValueError: if ``h``/``j`` do not match the view's fixed
+                ``n_nodes``/``n_edges``. A mismatch would read back a wrong /
+                corrupt model, so reject loudly.
+        """
+        if h.shape != (self.n_nodes,) or j.shape != (self.n_edges,):
+            raise ValueError(
+                f"problem ({h.shape}, {j.shape}) != view "
+                f"({self.n_nodes!r} nodes, {self.n_edges!r} edges)"
+            )
+        buf = self._ring.buf(slot)
+        np.ndarray((self.n_nodes,), np.float64, buf, 0)[:] = h
+        np.ndarray((self.n_edges,), np.float64, buf, self._h_bytes)[:] = j
+
+    def read(self, slot: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Return zero-copy (h, J) views over the slot's buffer.
+
+        Args:
+            slot: Slot index to read from.
+
+        Returns:
+            Tuple of ``(h_view, j_view)`` — zero-copy float64 numpy arrays
+            backed by the shared-memory buffer. Release the slot only after
+            all views are deleted or otherwise unreferenced.
+        """
+        buf = self._ring.buf(slot)
+        h = np.ndarray((self.n_nodes,), np.float64, buf, 0)
+        j = np.ndarray((self.n_edges,), np.float64, buf, self._h_bytes)
+        return h, j

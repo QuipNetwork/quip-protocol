@@ -7,7 +7,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from shared.ring_views import SampleView
+from shared.ring_views import ProblemView, SampleView
 
 
 def test_sample_roundtrip_zero_copy():
@@ -63,6 +63,50 @@ def test_sample_attach_args_keys_unchanged():
         attached.write(slot, np.ones((8, 3), np.int8), np.zeros(8, np.float64))
         s, _e = ring.read(slot, 8, 3)
         assert int(s[0, 0]) == 1  # same shared segment
+        attached.close()
+    finally:
+        ring.close_unlink()
+
+
+def test_problem_roundtrip_zero_copy():
+    ring = ProblemView(slots=3, n_nodes=16, n_edges=40)
+    try:
+        h = np.arange(16, dtype=np.float64)
+        j = np.linspace(-1.0, 1.0, 40, dtype=np.float64)
+        slot = ring.claim_free(timeout=1.0)
+        ring.write(slot, h, j)
+        h_view, j_view = ring.read(slot)
+        assert np.array_equal(h_view, h)
+        assert np.array_equal(j_view, j)
+        del h_view, j_view
+        ring.release(slot)
+        assert ring.claim_free(timeout=1.0) is not None
+    finally:
+        ring.close_unlink()
+
+
+def test_problem_write_rejects_wrong_size():
+    ring = ProblemView(slots=1, n_nodes=4, n_edges=6)
+    try:
+        slot = ring.claim_free(timeout=1.0)
+        with pytest.raises(ValueError):
+            ring.write(slot, np.zeros(5, np.float64), np.zeros(6, np.float64))
+        with pytest.raises(ValueError):
+            ring.write(slot, np.zeros(4, np.float64), np.zeros(7, np.float64))
+    finally:
+        ring.close_unlink()
+
+
+def test_problem_attach_args_reconstructs():
+    ring = ProblemView(slots=2, n_nodes=4, n_edges=6)
+    try:
+        args = ring.attach_args()
+        assert set(args) == {"slots", "n_nodes", "n_edges", "names", "free_q"}
+        attached = ProblemView(**args)
+        slot = attached.claim_free(timeout=1.0)
+        attached.write(slot, np.full(4, 2.0), np.full(6, 3.0))
+        h, j = ring.read(slot)
+        assert h[0] == 2.0 and j[0] == 3.0  # same shared segment
         attached.close()
     finally:
         ring.close_unlink()
