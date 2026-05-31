@@ -275,3 +275,91 @@ def test_reduced_width_without_defect_info_skips_evaluation() -> None:
         "evaluate_sampleset must NOT be called for an under-reconstructed sample"
         " without defect_info"
     )
+
+
+# ===========================================================================
+# _run_mempool_eval — width/finalize handling (Task 3 / Step 4)
+# ===========================================================================
+
+
+def test_mempool_reduced_width_with_defect_info_calls_finalize_then_evaluate() -> None:
+    """Reduced-width QPU mempool sample + defect_info → finalize then evaluate."""
+    nodes = [0, 1, 2]
+    miner = _FinalizeSpy(nodes)
+    state = _make_loop_state(nodes=nodes)
+
+    # Reduced: only 2 columns instead of len(nodes)=3
+    reduced_cols = len(nodes) - 1
+    ss = _make_sampleset(n_rows=4, n_cols=reduced_cols, energy_val=-16000.0)
+
+    fake_defect = SimpleNamespace(energy_offset=0.0)
+
+    miner._run_mempool_eval(
+        state, ss, b"\x00" * 32, b"\x01" * 32, 0.0,
+        attempt_log_kwargs={},
+        defect_info=fake_defect,
+    )
+
+    assert len(miner.finalize_calls) == 1, (
+        "_finalize_sample must be called once for a reduced-width QPU mempool sample"
+    )
+    called_ss, called_defect = miner.finalize_calls[0]
+    assert called_ss is ss
+    assert called_defect is fake_defect
+    assert len(miner.eval_calls) == 1, (
+        "evaluate_sampleset must be called after _finalize_sample"
+    )
+
+
+def test_mempool_reduced_width_without_defect_info_returns_none() -> None:
+    """Reduced-width mempool sample with defect_info=None → returns None; eval not called."""
+    nodes = [0, 1, 2]
+    miner = _FinalizeSpy(nodes)
+    state = _make_loop_state(nodes=nodes)
+
+    # Reduced: only 2 columns instead of len(nodes)=3
+    reduced_cols = len(nodes) - 1
+    ss = _make_sampleset(n_rows=4, n_cols=reduced_cols, energy_val=-16000.0)
+
+    result = miner._run_mempool_eval(
+        state, ss, b"\x00" * 32, b"\x01" * 32, 0.0,
+        attempt_log_kwargs={},
+        defect_info=None,
+    )
+
+    assert result is None, (
+        "_run_mempool_eval must return None for under-reconstructed sample without defect_info"
+    )
+    assert miner.finalize_calls == [], (
+        "_finalize_sample must NOT be called when defect_info is None"
+    )
+    assert miner.eval_calls == [], (
+        "evaluate_sampleset must NOT be called for an under-reconstructed sample"
+        " without defect_info"
+    )
+
+
+def test_mempool_full_width_no_defect_info_evaluates_normally() -> None:
+    """Full-width mempool sample + defect_info=None → evaluate called, no finalize.
+
+    Regression guard: Metal/CUDA mempool samples must be unaffected.
+    """
+    nodes = [0, 1, 2]
+    miner = _FinalizeSpy(nodes)
+    state = _make_loop_state(nodes=nodes)
+
+    # Full-width: cols == len(nodes)
+    ss = _make_sampleset(n_rows=4, n_cols=len(nodes), energy_val=-16000.0)
+
+    miner._run_mempool_eval(
+        state, ss, b"\x00" * 32, b"\x01" * 32, 0.0,
+        attempt_log_kwargs={},
+        defect_info=None,
+    )
+
+    assert miner.finalize_calls == [], (
+        "_finalize_sample must NOT be called for full-width samples"
+    )
+    assert len(miner.eval_calls) == 1, (
+        "evaluate_sampleset must be called exactly once for full-width mempool samples"
+    )

@@ -809,6 +809,7 @@ class BaseMiner(ABC):
                     result = self._run_mempool_eval(
                         loop_state, sampleset, nonce, salt, postprocess_start,
                         attempt_log_kwargs=attempt_log_kwargs,
+                        defect_info=defect_info,
                     )
 
                 self._finalize_iteration_logging(
@@ -1911,6 +1912,7 @@ class BaseMiner(ABC):
         postprocess_start: float,
         *,
         attempt_log_kwargs: Dict[str, Any],
+        defect_info: Any = None,
     ) -> Optional[MiningResult]:
         """Mempool-path strict evaluation (the ``else`` of ``is_substrate``).
 
@@ -1918,7 +1920,25 @@ class BaseMiner(ABC):
         post-processing timing, and updates ``attempt_log_kwargs`` in place.
         Returns the evaluated ``MiningResult`` (or ``None``). Behaviour is
         identical to the original inline mempool branch.
+
+        QPU mempool samples arrive reduced (offline qubits stripped) carrying
+        ``defect_info``.  ``evaluate_sampleset`` requires the full-topology
+        sample, so a reduced sample is reconstructed via ``_finalize_sample``
+        before evaluation.  Metal/CUDA mempool samples are full-width with
+        ``defect_info=None`` and are unaffected.
         """
+        if sampleset.record.sample.shape[1] != len(state.nodes):
+            if defect_info is not None:
+                sampleset = self._finalize_sample(sampleset, defect_info)
+            else:
+                self.logger.info(
+                    "[%s] mempool attempt skipped (under-reconstructed: "
+                    "width %d != topology %d)",
+                    self.miner_id, sampleset.record.sample.shape[1],
+                    len(state.nodes),
+                )
+                return None
+
         result = self.evaluate_sampleset(
             sampleset, state.requirements, state.nodes, state.edges,
             nonce, salt, state.prev_timestamp, state.start_time,
