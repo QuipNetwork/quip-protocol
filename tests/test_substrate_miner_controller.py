@@ -168,6 +168,7 @@ def _bare_controller() -> SubstrateMinerController:
     c._latest_preview = {}
     c._latest_budget = {}
     c._participated = set()
+    c._solution_used_start = {}
     c._pow_constants = None
     c._base_difficulty_by_key = {}
     c._decay_schedule_by_key = {}  # WorkKey -> (schedule, last_proof_block, epoch_length)
@@ -1985,3 +1986,49 @@ async def test_mark_participating_cpu_omits_budget():
     payload = controller._submit_participation_remark.call_args.args[0]
     assert "budget_seconds" not in payload
     assert payload["kind"] == "cpu"
+
+
+
+# ----------------------------------------------------------------------
+# Precise per-solution QPU spend at win (reuses tracked cumulative_used)
+# ----------------------------------------------------------------------
+
+
+def test_solution_qpu_spent_us_deltas_tracked_budget():
+    controller = _bare_controller()
+    # Baseline captured at participation: 35s used when solution 7 started.
+    controller._solution_used_start[("qpu-0", 7)] = 35.0
+    # Latest budget snapshot for the miner shows 40.5s used now.
+    controller._latest_budget["qpu-0"] = {"cumulative_used_seconds": 40.5}
+    # delta = 5.5s = 5_500_000 us
+    assert controller._solution_qpu_spent_us("qpu-0", 7) == 5_500_000
+
+
+def test_solution_qpu_spent_us_none_without_baseline():
+    controller = _bare_controller()
+    controller._latest_budget["qpu-0"] = {"cumulative_used_seconds": 40.5}
+    # No baseline recorded for this (miner, solution) -> None.
+    assert controller._solution_qpu_spent_us("qpu-0", 7) is None
+    # No solution number -> None.
+    assert controller._solution_qpu_spent_us("qpu-0", None) is None
+    # CPU miner streams no budget -> no snapshot -> None.
+    controller._solution_used_start[("cpu-0", 7)] = 0.0
+    assert controller._solution_qpu_spent_us("cpu-0", 7) is None
+
+
+async def test_mark_participating_snapshots_qpu_baseline():
+    controller = _bare_controller()
+    controller._submit_participation_remark = AsyncMock(return_value=None)
+    controller._latest_budget["qpu-0"] = {"cumulative_used_seconds": 35.0}
+    controller._mark_participating(
+        "qpu-0", {"solution_number": 7, "kind": "qpu", "budget_seconds": 90.0}
+    )
+    assert controller._solution_used_start[("qpu-0", 7)] == 35.0
+
+
+async def test_mark_participating_no_baseline_for_cpu():
+    controller = _bare_controller()
+    controller._submit_participation_remark = AsyncMock(return_value=None)
+    # CPU streams no budget => _latest_budget has no entry => no baseline.
+    controller._mark_participating("cpu-0", {"solution_number": 7, "kind": "cpu"})
+    assert ("cpu-0", 7) not in controller._solution_used_start

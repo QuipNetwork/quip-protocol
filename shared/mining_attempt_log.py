@@ -543,6 +543,7 @@ class SubmissionLogger:
         chain_block_number: Optional[int] = None,
         pow_sequence: Optional[int] = None,
         error: Optional[str] = None,
+        qpu_access_us_total: Optional[int] = None,
     ) -> None:
         """Write the per-solution submission record.
 
@@ -576,6 +577,7 @@ class SubmissionLogger:
             "pow_sequence": pow_sequence,
             "outcome": outcome,
             "error": error,
+            "qpu_access_us_total": qpu_access_us_total,
         }
         # Per-solution submission.json.
         sub_path = (

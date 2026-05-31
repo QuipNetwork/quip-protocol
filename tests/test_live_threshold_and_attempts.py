@@ -366,6 +366,39 @@ def test_submission_logger_record_writes_pow_sequence(tmp_path: Path) -> None:
     assert rec2["pow_sequence"] is None, "pow_sequence must default to None"
 
 
+def test_submission_logger_record_writes_qpu_access_us_total(
+    tmp_path: Path,
+) -> None:
+    """``qpu_access_us_total`` (precise QPU spend on a won solution) is written
+    when provided and defaults to None for schema compatibility."""
+    log = SubmissionLogger(log_dir=tmp_path)
+    log.record(
+        solution_number=300,
+        miner_id="qpu-0",
+        energy_milli=-14_800,
+        diversity_milli=210,
+        threshold_milli=-14_000,
+        last_proof_block_hash_hex="0x" + "cc" * 32,
+        outcome="submitted_inblock",
+        qpu_access_us_total=101_000,
+    )
+    rec = json.loads((tmp_path / "300" / "submission.json").read_text())
+    assert rec["qpu_access_us_total"] == 101_000
+
+    log.record(
+        solution_number=301,
+        miner_id="qpu-0",
+        energy_milli=-14_800,
+        diversity_milli=210,
+        threshold_milli=-14_000,
+        last_proof_block_hash_hex="0x" + "dd" * 32,
+        outcome="rejected_stale",
+    )
+    rec2 = json.loads((tmp_path / "301" / "submission.json").read_text())
+    assert "qpu_access_us_total" in rec2
+    assert rec2["qpu_access_us_total"] is None
+
+
 def test_query_stored_solutions_returns_sorted_by_iter(tmp_path: Path) -> None:
     """query_stored_solutions returns all matching files sorted by iter
     (the leading 06d in the filename guarantees fs-sort order)."""
