@@ -4,48 +4,9 @@
 """MetalStreamContext: switch reseeds + bumps gen; iter_results yields tagged sets."""
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from GPU.metal_stream import MetalStreamContext
-
-
-class _FakeModel:
-    def __init__(self, n):
-        self.h = {0: 0.0}
-        self.J = {}
-        self.nonce = bytes([n % 256]) * 32
-        self.salt = bytes([n % 256]) * 32
-
-
-class _FakeFeeder:
-    """Stands in for RandomIsingFeeder; records reseed/stop."""
-
-    def __init__(self, **_kw):
-        self.reseeds = 0
-        self.stopped = False
-
-    def reseed(self, lpbh, miner_bytes):
-        self.reseeds += 1
-
-    def stop(self):
-        self.stopped = True
-
-
-class _FakeSampler:
-    """Yields (model, sampleset) pairs; sampleset has .record.sample/.energy."""
-
-    def __init__(self):
-        self.closed = False
-
-    def sample_ising_streaming(self, feeder, **_kw):
-        i = 0
-        while True:
-            ss = SimpleNamespace(record=SimpleNamespace(sample=[[1, -1]], energy=[0.0]))
-            yield _FakeModel(i), ss
-            i += 1
-
-    def close(self):
-        self.closed = True
+from tests._metal_stream_fakes import FakeFeeder as _FakeFeeder
+from tests._metal_stream_fakes import FakeSampler as _FakeSampler
 
 
 def _ctx():
