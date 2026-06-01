@@ -38,8 +38,11 @@ def get_version() -> str:
             # Try to get version from package metadata (when installed)
             __version__ = importlib.metadata.version("quip-protocol")
         except importlib.metadata.PackageNotFoundError:
-            # Fallback to development version
-            __version__ = "0.1.20"
+            # Fallback when running from a source checkout (not pip-installed).
+            # Keep in lockstep with pyproject.toml's version so a source-run
+            # miner advertises the same major.minor and isn't rejected by the
+            # version-compat gate.
+            __version__ = "0.2.0rc1"
 
     return __version__
 

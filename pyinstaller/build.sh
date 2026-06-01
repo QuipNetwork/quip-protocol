@@ -12,8 +12,8 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_ROOT"
 
-# Isolate PyInstaller cache per architecture to prevent corruption when
-# arm64 and x86_64 jobs run concurrently on the same machine.
+# Key the PyInstaller cache by architecture so a future multi-arch build
+# can't corrupt a shared cache. macOS ships arm64 only today.
 ARCH="$(uname -m)"
 export PYINSTALLER_CONFIG_DIR="$PROJECT_ROOT/build/.pyinstaller-cache-${ARCH}"
 rm -rf "$PYINSTALLER_CONFIG_DIR"
