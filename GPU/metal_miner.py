@@ -75,12 +75,12 @@ class MetalMiner(BaseMiner):
         gpu_util = cfg.pop('utilization', cfg.pop('gpu_utilization', 100))
         yielding = cfg.pop('yielding', True)
         # Metal-only adaptive-cap keys (see metal_scheduler.CapConfig). Popped
-        # here and threaded into the stream-driver context. active_threads is
-        # the occupancy budget (max concurrent GPU threads per command buffer)
-        # while the user is present — the jank lever. ~2048 is smooth on a
-        # 40-core M4 Max; lower it (e.g. 1024) if the UI still stutters, raise
-        # it for more throughput while present. Idle/headless runs uncapped.
-        self.active_threads = cfg.pop('active_threads', 2048)
+        # here and threaded into the stream-driver context. active_util is the
+        # occupancy budget while the user is present, as a percentage of the
+        # GPU's max thread capacity (maxTotalThreadsPerThreadgroup x cores).
+        # Default 85 leaves ~15% headroom; lower it if a (weaker) Mac stutters.
+        # Idle/headless runs uncapped; battery/critical pauses.
+        self.active_util = cfg.pop('active_util', 85)
         self.idle_after_s = cfg.pop('idle_after_s', 60.0)
         self.yielding = yielding
         # Remove CUDA-only keys that flow through common_cfg
@@ -173,7 +173,7 @@ class MetalMiner(BaseMiner):
             "topology": getattr(self, "topology", None),
             "utilization": getattr(self, "gpu_utilization", 100),
             "yielding": getattr(self, "yielding", True),
-            "active_threads": getattr(self, "active_threads", 2048),
+            "active_util": getattr(self, "active_util", 85),
             "idle_after_s": getattr(self, "idle_after_s", 60.0),
         }
 

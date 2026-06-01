@@ -44,13 +44,14 @@ yielding      = false  # true = yield to other GPU users between batches
 # Interactive profile — keep an interactive Mac responsive while mining.
 # `yielding` is on by default (the adaptive cap monitor: HID-idle / thermal /
 # battery / display sensing). While you're present it caps GPU *occupancy*
-# (concurrent threads per command buffer) to `active_threads`; idle/headless
+# (concurrent threads per command buffer) to `active_util` percent of the GPU's
+# max thread capacity (maxTotalThreadsPerThreadgroup x cores); idle/headless
 # runs flat-out; battery / critical thermal pause automatically. Total reads
 # and sweeps are always preserved.
-# yielding       = true      # master enable for the adaptive cap (default on)
-# active_threads = 2048      # occupancy budget while present (lower to ~1024
-#                            # if the UI still stutters; raise for throughput)
-# idle_after_s   = 60        # seconds of no input before going flat-out
+# yielding     = true        # master enable for the adaptive cap (default on)
+# active_util  = 85          # % of max GPU threads while present (default 85;
+#                            # lower if a weaker Mac stutters)
+# idle_after_s = 60          # seconds of no input before going flat-out
 
 # ── Modal cloud GPU ───────────────────────────────────────────────────
 # Uncomment for Modal-hosted cloud GPUs. `gpu_type` picks the class

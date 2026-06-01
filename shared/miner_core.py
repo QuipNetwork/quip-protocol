@@ -49,7 +49,7 @@ _GPU_CFG_KEYS = (
 # `[metal]` device section carries them. Applied solely in the metal branch
 # of `_build_gpu_specs`.
 _METAL_CFG_KEYS = (
-    "active_threads", "idle_after_s",
+    "active_util", "idle_after_s",
 )
 
 _GPU_DEVICE_SECTIONS = {

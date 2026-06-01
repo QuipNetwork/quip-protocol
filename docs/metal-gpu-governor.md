@@ -75,11 +75,15 @@ stream driver.
 | key | default | meaning |
 |---|---|---|
 | `yielding` | `true` | master enable for the adaptive cap |
-| `active_threads` | `2048` | occupancy budget (max concurrent GPU threads per command buffer) while present; the jank lever. Lower (e.g. 1024) if the UI still stutters; raise for more throughput while present |
+| `active_util` | `85` | occupancy budget while present, as **% of the GPU's max thread capacity** (`maxTotalThreadsPerThreadgroup × cores`, e.g. 1024×40=40960 → ~34816 threads at 85%). Lower it if a weaker Mac stutters |
 | `idle_after_s` | `60` | seconds of no HID input before going IDLE (away) |
 | `utilization` | `100` | problem-batch size (core budget = cores × util%) — unchanged role |
 
-`active_threads`/`idle_after_s` are Metal-only and live in the `[metal]` device
+Note: on a 40-core M4 Max, steady-state mining is smooth even at **full**
+saturation (the GPU time-slices the compositor in), so the default is generous
+(85%); the cap is mainly insurance for weaker GPUs and sustained/thermal load.
+The only observed stutter is a one-time init (first dispatch). `active_util`/
+`idle_after_s` are Metal-only and live in the `[metal]` device
 section; they do not inherit from the shared `[gpu]` defaults (kept out of
 `_GPU_CFG_KEYS`, so CUDA is unaffected). Idle/headless runs uncapped; battery
 and critical thermal pause; thermal-serious halves the budget.
