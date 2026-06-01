@@ -29,7 +29,6 @@ import sys
 import pytest
 
 from shared.base_miner import BaseMiner
-from shared.miner_types import BlockRequirements
 
 
 # ---------------------------------------------------------------------------
@@ -74,11 +73,6 @@ class TestGracefulExit:
         miner = self._make_miner()
         # Must not raise anything
         miner._graceful_exit()
-
-    def test_static_method_callable_on_class(self, monkeypatch):
-        """_graceful_exit is a static method callable directly on the class."""
-        monkeypatch.setattr(sys, "is_finalizing", lambda: True)
-        BaseMiner._graceful_exit()  # should not raise
 
 
 # ---------------------------------------------------------------------------

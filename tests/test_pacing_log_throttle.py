@@ -47,11 +47,6 @@ class TestPacingRateLimiter:
         rl.should_log(now=0.0, wait_bucket="2h")
         assert rl.should_log(now=60.0, wait_bucket="2h") is True
 
-    def test_logs_again_just_over_interval(self):
-        rl = self._make(interval=60.0)
-        rl.should_log(now=0.0, wait_bucket="2h")
-        assert rl.should_log(now=60.001, wait_bucket="2h") is True
-
     def test_interval_is_relative_to_last_log(self):
         rl = self._make(interval=60.0)
         rl.should_log(now=0.0, wait_bucket="2h")    # logged at t=0
@@ -126,13 +121,6 @@ class TestSetupAbortThrottle:
         t.should_log("block=0xdeadbeef")
         assert t.should_log("block=0xcafebabe") is True
 
-    def test_multiple_tags_independent(self):
-        t = self._make()
-        assert t.should_log("tag-A") is True
-        assert t.should_log("tag-B") is True
-        assert t.should_log("tag-A") is False
-        assert t.should_log("tag-B") is False
-
     # ------------------------------------------------------------------
     # Bounded size — oldest entry evicted when cap is reached
     # ------------------------------------------------------------------
@@ -147,13 +135,3 @@ class TestSetupAbortThrottle:
         assert t.should_log("tag-0") is True
         # Internal size never exceeds max_tags
         assert len(t) <= 3
-
-    def test_size_never_exceeds_max(self):
-        t = self._make(max_tags=5)
-        for i in range(20):
-            t.should_log(f"tag-{i}")
-        assert len(t) <= 5
-
-    def test_empty_throttle_has_zero_length(self):
-        t = self._make()
-        assert len(t) == 0

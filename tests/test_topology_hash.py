@@ -36,6 +36,12 @@ def test_edge_order_and_endpoint_swap_invariant():
     assert h1 == h2
 
 
+def test_graph_structure_change_perturbs_hash():
+    h1 = topology_hash([0, 1, 2], [(0, 1), (1, 2)], _TER, _BIN, _BIN)
+    h2 = topology_hash([0, 1, 2, 3], [(0, 1), (1, 2), (2, 3)], _TER, _BIN, _BIN)
+    assert h1 != h2
+
+
 def test_allowed_h_change_perturbs_hash():
     h1 = topology_hash([0, 1, 2], [(0, 1), (1, 2)], _TER, _BIN, _BIN)
     h2 = topology_hash([0, 1, 2], [(0, 1), (1, 2)], _BIN, _BIN, _BIN)

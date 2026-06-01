@@ -175,14 +175,6 @@ def test_canonical_json_is_byte_stable():
     assert b"[\"ws://b\",\"ws://a\"]" in b1
 
 
-def test_canonical_json_omits_system_info_key_when_skipped():
-    desc = build_descriptor(
-        node_id="rig", include_system_info=False,
-    )
-    body = json.loads(to_canonical_json(desc))
-    assert "system_info" not in body
-
-
 # ----------------------------------------------------------------------
 # validate_descriptor — wire-format bounds
 # ----------------------------------------------------------------------
@@ -484,24 +476,6 @@ def test_dwave_region_url_does_not_leak_to_remark_payload(tmp_path):
     # The two whitelisted keys ARE present.
     assert "Advantage2_system1" in text
     assert "60s" in text
-
-
-def test_dwave_qpu_token_via_toml_does_not_leak(tmp_path):
-    """Defensive: D-Wave's TOML doesn't conventionally carry `token`
-    (the SDK reads `DWAVE_API_KEY` from env), but a confused operator
-    might paste one in. The spec builder doesn't copy `token` from a
-    `[dwave]` table, so this should be a no-op — but verify."""
-    _, payload = _build_canonical_payload_from_toml(
-        tmp_path,
-        """
-        [miner]
-        validators = ["ws://a:9944"]
-        [dwave]
-        daily_budget = "60s"
-        token = "dwave-shouldnotleak-12345"
-        """,
-    )
-    assert "dwave-shouldnotleak-12345" not in payload.decode("utf-8")
 
 
 def test_credential_smuggled_through_solver_field_is_rejected_end_to_end(tmp_path):

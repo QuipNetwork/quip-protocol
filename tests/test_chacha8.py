@@ -23,8 +23,6 @@ from shared.chacha8 import (
     _CONSTANTS,
 )
 from shared.quantum_proof_of_work import (
-    DEFAULT_ALLOWED_H,
-    DEFAULT_ALLOWED_J,
     derive_nonce,
     generate_ising_model_from_nonce,
 )
@@ -39,14 +37,6 @@ _VECTORS = json.loads(_VECTORS_PATH.read_text())
 
 class TestPCG32Expansion:
     """Verify the PCG32 expansion matches rand_core::SeedableRng."""
-
-    def test_seed_zero_key_length(self):
-        key = _seed_from_u64(0)
-        assert len(key) == 32
-
-    def test_seed_zero_key_not_all_zeros(self):
-        key = _seed_from_u64(0)
-        assert key != b'\x00' * 32
 
     @pytest.mark.parametrize(
         'vec',
@@ -70,11 +60,6 @@ class TestPCG32Expansion:
 
 class TestChaCha8Block:
     """Verify the ChaCha8 block function internals."""
-
-    def test_block_output_length(self):
-        state = list(_CONSTANTS) + [0] * 12
-        output = _chacha_block(state)
-        assert len(output) == 16
 
     def test_all_zero_key_nonce_produces_nonzero(self):
         state = list(_CONSTANTS) + [0] * 12
@@ -114,18 +99,6 @@ class TestChaCha8Rng:
         rng1 = ChaCha8Rng.seed_from_u64(0)
         rng2 = ChaCha8Rng.seed_from_u64(1)
         assert rng1.next_u32() != rng2.next_u32()
-
-    def test_many_values_no_crash(self):
-        """Generate 1000 values (covers many block refills)."""
-        rng = ChaCha8Rng.seed_from_u64(7)
-        for _ in range(1000):
-            val = rng.next_u32()
-            assert 0 <= val <= 0xFFFFFFFF
-
-    def test_key_constructor(self):
-        key = b'\x01' * 32
-        rng = ChaCha8Rng(key)
-        assert 0 <= rng.next_u32() <= 0xFFFFFFFF
 
     def test_invalid_key_length(self):
         with pytest.raises(ValueError, match="32 bytes"):

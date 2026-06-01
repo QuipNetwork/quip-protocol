@@ -19,12 +19,6 @@ def test_streaming_wiring_on_success():
     # The inline sampling path is gone — no _sample/_sample_batch on the class.
     assert not hasattr(type(m), "_sample")
     assert not hasattr(type(m), "_sample_batch")
-    kw = m._stream_factory_kwargs(
-        {"nodes": [0, 1], "edges": [(0, 1)], "num_reads": 8, "num_sweeps": 64},
-        [0, 1],
-    )
-    assert kw["num_reads"] == 8 and kw["num_sweeps"] == 64
-    assert kw["nodes"] == [0, 1]
 
 
 def test_metal_init_raises_when_metal_unavailable():

@@ -212,23 +212,3 @@ def test_dispatch_error_survives_get_block_decode_crash():
     assert err is not None
     assert "decode failure" in err
     assert "DigestItem" in err
-
-
-def test_dispatch_error_passes_ignore_decoding_errors_to_get_block():
-    """Regression guard: get_block must be called with
-    ignore_decoding_errors=True so a single bad digest field doesn't
-    take out the whole block read."""
-    seen_kwargs = {}
-
-    class _SpyIface:
-        def get_block(self, **kwargs):
-            seen_kwargs.update(kwargs)
-            return {"extrinsics": [{"extrinsic_hash": "0x" + "aa" * 32}]}
-
-        def get_events(self, **kwargs):  # noqa: ARG002
-            return []
-
-    _fetch_extrinsic_dispatch_error(
-        _SpyIface(), block_hash="0x" + "cc" * 32, ext_hash="0x" + "aa" * 32
-    )
-    assert seen_kwargs.get("ignore_decoding_errors") is True

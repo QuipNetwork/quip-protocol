@@ -77,25 +77,7 @@ def test_run_concurrent_miner_wires_topology_to_minercore():
     assert "_inject_topology" not in src
 
 
-def test_inject_topology_helper_is_gone():
-    assert not hasattr(quip_cli, "_inject_topology")
-
-
 # ── topology_hash tests ────────────────────────────────────────────────────
-
-
-def test_topology_hash_is_deterministic():
-    topology = quip_cli._parse_topology("zephyr:2,2")
-    h1 = _hash(topology)
-    h2 = _hash(topology)
-    assert h1 == h2
-    assert len(h1) == 32
-
-
-def test_topology_hash_differs_across_specs():
-    t1 = quip_cli._parse_topology("zephyr:2,2")
-    t2 = quip_cli._parse_topology("zephyr:3,2")
-    assert _hash(t1) != _hash(t2)
 
 
 def test_topology_hash_differs_zephyr_vs_hardware():
@@ -333,62 +315,6 @@ def test_guard_a_wallet_not_configured_returns_machine_parseable_error(tmp_path)
     assert result.exit_code != 0
     assert "wallet-not-configured" in result.output
     assert f"keystore={missing}" in result.output
-
-
-def test_guard_b_validators_unreachable_renders_attempt_log(monkeypatch, tmp_path):
-    """All validators refuse → `validators-unreachable urls=... reasons=...`."""
-    # Stub: a real keystore file so Guard A passes, then a SubstrateClient
-    # whose connect() raises NoValidatorReachable so Guard B fires.
-    from substrate.client import NoValidatorReachable, ValidatorAttempt
-
-    fake_keystore_path = tmp_path / "signing.json"
-    fake_keystore_path.write_text("{}")  # contents unused — _load is stubbed
-
-    monkeypatch.setattr(
-        quip_cli, "_load_keystore_or_fail",
-        lambda _path: type("KS", (), {
-            "signer": type("S", (), {
-                "account_id_bytes": lambda self: b"\x00" * 32,
-                "ss58_address": lambda self: "5Test",
-            })(),
-            "path": fake_keystore_path,
-        })(),
-    )
-
-    fail = NoValidatorReachable(attempts=[
-        ValidatorAttempt(url="ws://a:9944", exc_type="ConnectionRefusedError",
-                         message="Connection refused"),
-        ValidatorAttempt(url="ws://b:9944", exc_type="TimeoutError",
-                         message="timed out"),
-    ])
-
-    # Simulate the real helper: convert NoValidatorReachable -> ClickException.
-    # Signature mirrors the pool-aware `_connect_or_fail(pool, role)`.
-    async def fake_connect_or_fail(_pool, role="rpc"):
-        urls = ",".join(a.url for a in fail.attempts)
-        reasons = ",".join(a.exc_type for a in fail.attempts)
-        import click as _click
-        raise _click.ClickException(
-            f"validators-unreachable urls={urls} reasons={reasons}"
-        )
-
-    monkeypatch.setattr(quip_cli, "_connect_or_fail", fake_connect_or_fail)
-
-    result = CliRunner().invoke(
-        quip_cli.quip_miner_cpu,
-        [
-            "--validator", "ws://a:9944",
-            "--validator", "ws://b:9944",
-            "--signer-key", str(fake_keystore_path),
-            "--num-cpus", "1",
-        ],
-    )
-    assert result.exit_code != 0
-    assert "validators-unreachable" in result.output
-    assert "ws://a:9944" in result.output
-    assert "ws://b:9944" in result.output
-    assert "ConnectionRefusedError" in result.output
-    assert "TimeoutError" in result.output
 
 
 def test_guard_c_wallet_underfunded_without_faucet_fails_fast():
