@@ -9,7 +9,7 @@ import importlib
 import os
 import platform
 
-from PyInstaller.utils.hooks import collect_submodules, copy_metadata
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 
 block_cipher = None
 proj_root = os.path.abspath(os.path.join(SPECPATH, ".."))
@@ -149,6 +149,16 @@ if platform.system() == "Windows":
                     if os.path.isfile(full) and not _is_unwanted_cuda(dll):
                         extra_binaries.append((full, "."))
                         print(f"  vendored: {dll} (from {entry})")
+
+# scalecodec ships its SCALE type-registry presets (core.json, legacy.json,
+# ...) and substrate-interface ships chainspec JSON as package *data*, not
+# code — PyInstaller's import analysis can't see them. Without these,
+# SubstrateInterface.__init__ -> reload_type_registry() loads preset "core",
+# load_type_registry_preset() hits FileNotFoundError and returns None, and
+# update_type_registry(None) raises "'NoneType' object has no attribute 'get'"
+# on the first connect (masquerading as an unreachable-validator error).
+datas += collect_data_files("scalecodec")
+datas += collect_data_files("substrateinterface")
 
 # Package metadata so importlib.metadata.version("quip-protocol") works
 datas += copy_metadata("quip-protocol")
