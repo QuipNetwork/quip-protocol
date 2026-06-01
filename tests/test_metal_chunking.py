@@ -113,7 +113,10 @@ class TestPerBatchPathSelection:
             seed=1, scheduler=self._FakeScheduler([50]),
             duty_cycle=DutyCycleController(target_pct=100),
         ))
-        assert calls == {"mono": 0, "chunk": 1}
+        # Throttled -> chunked path, one problem per command buffer (one
+        # chunked dispatch per model), never monolithic.
+        assert calls["mono"] == 0
+        assert calls["chunk"] == len(models)
         assert len(out) == len(models)
 
     def test_target_zero_pauses_then_dispatches(self, monkeypatch):
@@ -135,6 +138,27 @@ class TestPerBatchPathSelection:
         assert slept["n"] >= 2          # paused before dispatching
         assert len(out) == 1            # model still dispatched after resume
 
+    def test_throttled_caps_one_problem_per_buffer(self, monkeypatch):
+        """When throttled (target<100), each command buffer dispatches a single
+        problem so a beta can't run long enough to stall the compositor; the
+        full batch is only used flat-out (target==100)."""
+        from GPU.metal_scheduler import DutyCycleController
+        s, models = self._sampler_and_models(3)
+        sizes = []
+
+        def fake_chunk(batch, **kw):
+            sizes.append(len(batch))
+            return [None] * len(batch)
+
+        monkeypatch.setattr(s, "_dispatch_batch_chunked", fake_chunk)
+        out = list(s.sample_ising_streaming(
+            iter(models), num_reads=8, num_sweeps=64, max_threadgroups=8,
+            seed=1, scheduler=self._FakeScheduler([50]),
+            duty_cycle=DutyCycleController(target_pct=100),
+        ))
+        assert sizes == [1, 1, 1]          # one problem per command buffer
+        assert len(out) == 3               # all models still produced
+
     def test_pause_returns_promptly_when_stop_set(self):
         """A permanent PAUSE (target 0) must not hang: a set stop_event ends
         the generator instead of spinning forever (battery / critical-thermal
@@ -152,19 +176,21 @@ class TestPerBatchPathSelection:
         assert out == []
 
     def test_adaptive_chunked_matches_monolithic(self):
-        """Adaptive chunk sizing must stay state-equivalent to monolithic
-        (persistent device buffers + beta_start/beta_count make chunk size
-        irrelevant to the result given the same seed)."""
-        from GPU.metal_scheduler import DutyCycleController
+        """Adaptive chunk sizing must stay state-equivalent to monolithic for
+        the same batch + seed (persistent device buffers + beta_start/
+        beta_count make chunk size irrelevant to the result). Compared at the
+        dispatch level to isolate it from the streaming per-batch seed bump."""
+        from GPU.metal_utils import compute_beta_schedule
         s, models = self._sampler_and_models(3)
-        direct = s.sample_ising(
-            [m.h for m in models], [m.J for m in models],
-            num_reads=32, num_sweeps=128, seed=7,
+        s.prepare_topology()
+        beta_arr, beta_range = compute_beta_schedule(
+            models[0].h, models[0].J, 128, 1, None, "geometric", None,
         )
-        streamed = list(s.sample_ising_streaming(
-            iter(models), num_reads=32, num_sweeps=128, max_threadgroups=3,
-            seed=7, scheduler=self._FakeScheduler([50]),
-            duty_cycle=DutyCycleController(target_pct=100), burst_ms=4.0,
-        ))
+        common = dict(
+            num_reads=32, beta_schedule_arr=beta_arr, beta_range=beta_range,
+            beta_schedule_type="geometric", num_sweeps_per_beta=1, seed=7,
+        )
+        direct = s._dispatch_batch(models, **common)
+        chunked = s._dispatch_batch_chunked(models, burst_ms=4.0, **common)
         for i in range(len(models)):
-            assert min(direct[i].record.energy) == min(streamed[i][1].record.energy)
+            assert min(direct[i].record.energy) == min(chunked[i].record.energy)

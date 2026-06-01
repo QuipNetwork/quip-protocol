@@ -890,10 +890,21 @@ class MetalSASampler:
                 time.sleep(_PAUSE_POLL_S)
                 target = _resolve_target_pct(scheduler, duty_cycle)
 
-            # Fill batch from pending + iterator
+            # When throttled, cap to ONE problem per command buffer: the GPU
+            # only preempts the compositor at command-buffer boundaries, and a
+            # single beta over the full batch can exceed a frame. One problem
+            # (x num_reads x a burst-bounded beta chunk) is the shortest buffer
+            # we can submit without new kernels. Idle/headless (target==100)
+            # keeps the full batch for throughput.
+            effective_max_tg = 1 if target < 100 else max_threadgroups
+
+            # Fill batch from pending + iterator; stash any overflow (from a
+            # larger prior batch) back into pending for the next iteration.
             batch_models: List[IsingModel] = list(pending)
             pending.clear()
-            while len(batch_models) < max_threadgroups:
+            while len(batch_models) > effective_max_tg:
+                pending.append(batch_models.pop())
+            while len(batch_models) < effective_max_tg:
                 try:
                     batch_models.append(next(model_iter))
                 except StopIteration:
