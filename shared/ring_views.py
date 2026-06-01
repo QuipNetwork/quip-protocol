@@ -132,6 +132,17 @@ class ProblemView:
         self.n_edges = n_edges
         self._h_bytes = n_nodes * 8
         slot_bytes = self._h_bytes + n_edges * 8
+        if names is not None and free_q is None:
+            # Read-only non-owner reconstruction (mempool driver reading a slot
+            # the worker wrote). ProblemView is a write-once/read-once
+            # transport: the consumer reads slot 0 by name and never
+            # claims/releases across the process boundary, so it needs no
+            # shared free-list. attach_args() therefore omits free_q (an
+            # mp.Queue can't ride a live ctl_q.put); give SharedRing a throwaway
+            # local queue to satisfy its non-owner invariant. Never used for
+            # this transport.
+            import multiprocessing as _mp
+            free_q = _mp.get_context("spawn").Queue()
         self._ring = SharedRing(slots, slot_bytes, names=names, free_q=free_q)
 
     # ── ring delegation ──────────────────────────────────────────────────
@@ -151,10 +162,17 @@ class ProblemView:
         return self._ring.free_q
 
     def attach_args(self) -> dict:
-        """Picklable kwargs to reconstruct this view in another process."""
+        """Read-only descriptor to reconstruct this view in another process.
+
+        Unlike ``SampleView.attach_args``, this omits ``free_q``: ProblemView is
+        a write-once/read-once fixed-problem transport whose consumer only reads
+        a slot by name, so it never needs the owner's shared free-list. The
+        returned dict is therefore picklable over a live ``multiprocessing.Queue``
+        (it contains no ``mp.Queue``), which the mempool driver path requires —
+        the spec rides ``ctl_q.put`` rather than process inheritance.
+        """
         return {"slots": self._ring.slots, "n_nodes": self.n_nodes,
-                "n_edges": self.n_edges, "names": self._ring.names,
-                "free_q": self._ring.free_q}
+                "n_edges": self.n_edges, "names": self._ring.names}
 
     def claim_free(self, timeout: float) -> Optional[int]:
         """Return a free slot index, or None if none free within timeout."""

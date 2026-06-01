@@ -98,14 +98,19 @@ def test_problem_write_rejects_wrong_size():
 
 
 def test_problem_attach_args_reconstructs():
+    # ProblemView is a write-once/read-once transport: the owner claims a slot
+    # and writes h/J; a non-owner reconstructed from attach_args reads it by
+    # name. attach_args carries no free_q (the consumer never claims/releases),
+    # so the descriptor stays picklable over a live multiprocessing.Queue.
     ring = ProblemView(slots=2, n_nodes=4, n_edges=6)
     try:
+        slot = ring.claim_free(timeout=1.0)
+        ring.write(slot, np.full(4, 2.0), np.full(6, 3.0))
+
         args = ring.attach_args()
-        assert set(args) == {"slots", "n_nodes", "n_edges", "names", "free_q"}
-        attached = ProblemView(**args)
-        slot = attached.claim_free(timeout=1.0)
-        attached.write(slot, np.full(4, 2.0), np.full(6, 3.0))
-        h, j = ring.read(slot)
+        assert set(args) == {"slots", "n_nodes", "n_edges", "names"}
+        attached = ProblemView(**args)  # read-only non-owner (free_q=None)
+        h, j = attached.read(slot)
         assert h[0] == 2.0 and j[0] == 3.0  # same shared segment
         attached.close()
     finally:
