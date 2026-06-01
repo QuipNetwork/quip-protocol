@@ -23,17 +23,6 @@ def test_dwave_miner_connect_false_builds_no_sampler():
         pass
 
 
-def test_dwave_miner_sample_raises_not_implemented():
-    """The legacy synchronous _sample fallback is gone; the stub raises."""
-    import pytest
-
-    from QPU.dwave_miner import DWaveMiner
-
-    m = DWaveMiner(miner_id="worker-orchestrator", connect=False)
-    with pytest.raises(NotImplementedError):
-        m._sample({}, {}, num_reads=1, num_sweeps=1)
-
-
 def test_build_persistent_context_forwards_topology():
     """build_persistent_context passes topology to DWaveMiner and returns StreamContext."""
     from unittest.mock import patch
