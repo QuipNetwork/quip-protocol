@@ -8,6 +8,8 @@ from __future__ import annotations
 import multiprocessing as mp
 from types import SimpleNamespace
 
+import pytest
+
 from substrate.miner_controller import SubstrateMinerController
 
 
@@ -43,23 +45,20 @@ def _make_ctrl(monkeypatch, tmp_path, telemetry_port):
     return ctrl, spawned
 
 
-def test_controller_spawns_telemetry_with_default_port(monkeypatch, tmp_path):
-    """Default constructor port (8086) reaches the sibling kwargs."""
-    ctrl, spawned = _make_ctrl(monkeypatch, tmp_path, telemetry_port=8086)
+@pytest.mark.parametrize("telemetry_port", [8086, 9999])
+def test_controller_spawns_telemetry_port_reaches_sibling(
+    monkeypatch, tmp_path, telemetry_port
+):
+    """The constructor port (default 8086 or a custom override) flows through
+    to the sibling kwargs alongside the port-independent validator URLs and
+    snapshot path."""
+    ctrl, spawned = _make_ctrl(monkeypatch, tmp_path, telemetry_port=telemetry_port)
     ctrl._spawn_telemetry_sibling()
     assert len(spawned) == 1
-    assert spawned[0]._kwargs["listen_port"] == 8086
+    assert spawned[0]._kwargs["listen_port"] == telemetry_port
     assert spawned[0]._kwargs["validator_urls"] == ["http://test:9944"]
     # Default snapshot filename: empty snapshot_kind resolves to
     # `telemetry-stats-default.json` (per `snapshot_filename_for("")`).
     assert spawned[0]._kwargs["stats_snapshot_path"] == str(
         tmp_path / "telemetry-stats-default.json"
     )
-
-
-def test_controller_spawns_telemetry_with_custom_port(monkeypatch, tmp_path):
-    """A custom telemetry_port flows through to the sibling kwargs."""
-    ctrl, spawned = _make_ctrl(monkeypatch, tmp_path, telemetry_port=9999)
-    ctrl._spawn_telemetry_sibling()
-    assert len(spawned) == 1
-    assert spawned[0]._kwargs["listen_port"] == 9999

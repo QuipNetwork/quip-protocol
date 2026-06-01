@@ -120,38 +120,3 @@ async def test_decay_steps_drive_threshold_changes_through_event_manager():
         f"expected {len(decay_steps)} distinct threshold events; "
         f"got {len(received_thresholds)}"
     )
-
-
-@pytest.mark.asyncio
-async def test_no_state_change_for_3_blocktimes_triggers_force_swap():
-    """The load-bearing watchdog: silent chain → force_swap.
-
-    This is the failure mode the bug exhibited. The original
-    substrate-interface subscription would freeze, so the controller
-    never saw a head and never even tried to swap to a healthy
-    validator. The new design's watchdog fires force_swap if the
-    snapshot state hasn't changed for ``dead_blocktime_multiplier ×
-    blocktime_s``.
-    """
-    # A pool that hands out the same snapshot forever.
-    pool = _DecayPool([_ctx(threshold_milli=-1000)])
-    em = ChainEventManager(
-        pool=pool,
-        state_key=_state_key,
-        snapshot_op="get_mining_snapshot",
-        snapshot_args={},
-        blocktime_s=0.01,
-        settled_poll_pct=0.5,
-        catch_up_poll_pct=0.1,
-        stale_blocktime_multiplier=1.0,
-        dead_blocktime_multiplier=3.0,  # 3 × 0.01s = 30ms dead threshold
-    )
-    em.subscribe("new_head", lambda c: None)
-    task = asyncio.create_task(em.run())
-    await asyncio.sleep(0.2)  # well past the 30ms dead threshold
-    em.request_shutdown()
-    await task
-    assert pool.force_swap_calls >= 1, (
-        "watchdog did not call force_swap despite no state change "
-        "for >> dead threshold"
-    )

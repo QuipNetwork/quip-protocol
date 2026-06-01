@@ -6,7 +6,6 @@ Tests the full range of energy requirements from -15700 to -14200
 
 import sys
 import os
-import math
 
 # Add the project root to the path so we can import the function
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -14,78 +13,6 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from CPU.sa_miner import SimulatedAnnealingMiner
 
 adapt_parameters = SimulatedAnnealingMiner.adapt_parameters
-
-
-def test_adapt_parameters_range():
-    """Test adapt_parameters across the full energy range"""
-    
-    print("Testing adapt_parameters function across energy range [-15700, -14200]")
-    print("=" * 80)
-    
-    # Test boundary conditions
-    test_cases = [
-        # Energy, expected behavior
-        (-15700, "hardest - should use max_sweeps (8192)"),
-        (-15701, "beyond hardest - should use max_sweeps (8192)"),
-        (-15650, "between hardest and knee - should interpolate"),
-        (-15600, "between hardest and knee - should interpolate"),
-        (-15550, "between hardest and knee - should interpolate"),
-        (-15520, "near knee - should interpolate"),
-        (-15500, "knee point - should use knee_sweeps (2048)"),
-        (-15000, "mid-range - should interpolate (~400-500)"),
-        (-14500, "easier - should interpolate (~100-200)"),
-        (-14200, "easiest - should use min_sweeps (32)"),
-        (-14100, "beyond easiest - should use min_sweeps (32)"),
-    ]
-    
-    print(f"{'Energy':>8} | {'Sweeps':>6} | {'Reads':>5} | {'Description'}")
-    print("-" * 80)
-    
-    for energy, description in test_cases:
-        params = adapt_parameters(energy, 0.46, 25)
-        sweeps = params['num_sweeps']
-        reads = params['num_reads']
-        print(f"{energy:>8.0f} | {sweeps:>6d} | {reads:>5d} | {description}")
-    
-    print("\n" + "=" * 80)
-    print("Detailed energy sweep test (focus on -15700 to -15500 range):")
-    print(f"{'Energy':>8} | {'Sweeps':>6} | {'Log2(Sweeps)':>11} | {'Fraction':>8}")
-    print("-" * 50)
-    
-    # Test a range of energies to verify smooth interpolation
-    min_observed_energy = -15700
-    knee_energy = -15500
-    max_observed_energy = -14200
-    
-    # More granular testing in the critical range between hardest and knee
-    test_energies = []
-    
-    # Dense sampling between -15700 and -15500 (hardest to knee)
-    test_energies.extend(range(-15700, -15500, 25))
-    
-    # Regular sampling for the rest
-    test_energies.extend(range(-15500, -14150, 100))
-    
-    for energy in sorted(test_energies):
-        params = adapt_parameters(energy, 0.46, 25)
-        sweeps = params['num_sweeps']
-        log2_sweeps = math.log2(sweeps) if sweeps > 0 else 0
-        
-        # Calculate fraction based on which range we're in
-        if energy <= min_observed_energy:
-            fraction_str = "hardest"
-        elif energy >= max_observed_energy:
-            fraction_str = "easiest"
-        elif energy <= knee_energy:
-            # Between hardest and knee - interpolating between max_sweeps and knee_sweeps
-            fraction = (energy - min_observed_energy) / (knee_energy - min_observed_energy)
-            fraction_str = f"{fraction:.3f}*"
-        else:
-            # Between knee and easiest - interpolating between knee_sweeps and min_sweeps
-            fraction = (energy - knee_energy) / (max_observed_energy - knee_energy)
-            fraction_str = f"{fraction:.3f}"
-            
-        print(f"{energy:>8.0f} | {sweeps:>6d} | {log2_sweeps:>11.2f} | {fraction_str:>8}")
 
 
 def test_parameter_constraints():
@@ -119,9 +46,10 @@ def test_parameter_constraints():
         
         print(f"{energy:>8.0f} | {diversity:>9.2f} | {min_sol:>7d} | {sweeps:>6d} | {reads:>5d} | {reads_per_sol:>9.1f}")
         
-        # Validate constraints
-        if sweeps < 32 or sweeps > 8192:
-            print(f"  ERROR: sweeps {sweeps} out of range [32, 8192]")
+        # Validate constraints against the live SA bounds
+        # (ADAPT_MIN_SWEEPS=64, ADAPT_MAX_SWEEPS=4096).
+        if sweeps < 64 or sweeps > 4096:
+            print(f"  ERROR: sweeps {sweeps} out of range [64, 4096]")
             all_valid = False
         
         if reads < min_sol * 4:
@@ -175,30 +103,3 @@ def test_monotonicity():
         print("❌ Monotonicity property violated!")
 
     assert monotonic, "Monotonicity property violated"
-
-
-if __name__ == "__main__":
-    print("Adaptive Parameters Test Suite")
-    print("=" * 80)
-
-    try:
-        # Run all tests (assertions will raise on failure)
-        test_adapt_parameters_range()
-        test_parameter_constraints()
-        test_monotonicity()
-
-        print("\n" + "=" * 80)
-        print("SUMMARY:")
-        print("Parameter constraints: ✅ PASS")
-        print("Monotonicity:         ✅ PASS")
-        print("\n🎉 All tests PASSED!")
-        sys.exit(0)
-
-    except AssertionError as e:
-        print(f"\n💥 Test FAILED: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Test failed with error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)

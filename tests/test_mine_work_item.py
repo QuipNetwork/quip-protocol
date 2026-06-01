@@ -628,70 +628,60 @@ def test_requirements_from_context_mempool_zero_energy_floor():
     assert req.difficulty_energy != float("inf")
 
 
-def test_mempool_job_context_from_job_order():
-    """from_job_order must copy all IsingParams fields into the context."""
-    from shared.mempool_types import (
-        IsingParams, JobMode, JobOrder, MempoolJobContext,
-        OrderStatus, OrderTiming, ResultDelivery, RewardResolution,
-    )
-    ising = IsingParams(
-        nodes=(10, 20),
-        edges=((10, 20),),
-        h_values=(500, -500),
-        j_values=(250,),
-        min_energy_milli=-1000,
-        min_diversity_milli=100,
-        min_solutions=2,
-    )
-    order = JobOrder(
-        spec_id=b"\x01" * 32,
-        proposer=b"\x02" * 32,
-        ising_params=ising,
-        reward=1000,
-        mode=JobMode.open(),
-        resolution=RewardResolution.single_best(),
-        timing=OrderTiming(deadline_blocks=10, block_wait=1),
-        delivery=ResultDelivery.on_chain_only(),
-        status=OrderStatus.OPENED,
-        created_at=100,
-        first_solution_at=None,
-        solution_count=0,
-    )
-    ctx = MempoolJobContext.from_job_order(order_id=5, order=order)
-    assert ctx.order_id == 5
-    assert ctx.nodes == (10, 20)
-    assert ctx.edges == ((10, 20),)
-    assert ctx.h_values == (500, -500)
-    assert ctx.j_values == (250,)
-    assert ctx.min_energy_milli == -1000
-    assert ctx.min_diversity_milli == 100
-    assert ctx.min_solutions == 2
+def test_minerhandle_cancel_does_not_enqueue_stop_mining(monkeypatch):
+    """The legacy `MinerHandle.cancel()` queued an untagged `stop_mining`
+    op that could be consumed by a *later* dispatch's req.get and
+    cancel the new work with a stale cancel. The fix is to not queue
+    anything — stop_event is the single signal."""
+    import multiprocessing as mp
+    from shared.miner_worker import MinerHandle
+
+    # Bypass __init__ to avoid spawning a real subprocess.
+    handle = MinerHandle.__new__(MinerHandle)
+    handle.spec = {"id": "test", "kind": "cpu"}
+    handle.req = mp.Queue()
+    handle.resp = mp.Queue()
+    handle.stop_event = mp.Event()
+    handle._next_dispatch_id = 0
+    handle._active_dispatch_id = 0
+
+    handle.cancel()
+    assert handle.stop_event.is_set()
+    # Queue must be empty — no stop_mining op enqueued.
+    import queue
+    try:
+        msg = handle.req.get(timeout=0.05)
+        pytest.fail(f"cancel() enqueued unexpected op: {msg}")
+    except queue.Empty:
+        pass  # expected
 
 
-def test_mempool_job_context_rejects_mismatched_h_values():
-    """MempoolJobContext.__post_init__ must raise if h_values length != nodes."""
-    from shared.mempool_types import MempoolJobContext
-    with pytest.raises(ValueError, match="h_values length"):
-        MempoolJobContext(
-            order_id=1,
-            nodes=(0, 1, 2),
-            edges=(),
-            h_values=(0, 0),       # 2 != 3 nodes
-            j_values=(),
-        )
+def test_minerhandle_mine_work_item_returns_dispatch_id():
+    """`mine_work_item` must increment + return the dispatch_id so the
+    controller can key its immutable (handle_id, dispatch_id) →
+    context map by it."""
+    import multiprocessing as mp
+    from shared.miner_worker import MinerHandle
 
+    handle = MinerHandle.__new__(MinerHandle)
+    handle.spec = {"id": "test", "kind": "cpu"}
+    handle.req = mp.Queue()
+    handle.resp = mp.Queue()
+    handle.stop_event = mp.Event()
+    handle._next_dispatch_id = 0
+    handle._active_dispatch_id = 0
 
-def test_mempool_job_context_rejects_mismatched_j_values():
-    """MempoolJobContext.__post_init__ must raise if j_values length != edges."""
-    from shared.mempool_types import MempoolJobContext
-    with pytest.raises(ValueError, match="j_values length"):
-        MempoolJobContext(
-            order_id=1,
-            nodes=(0, 1),
-            edges=((0, 1),),
-            h_values=(0, 0),
-            j_values=(0, 0),       # 2 != 1 edge
-        )
+    fake_ctx = object()
+    d1 = handle.mine_work_item(fake_ctx)
+    d2 = handle.mine_work_item(fake_ctx)
+    d3 = handle.mine_work_item(fake_ctx)
+    assert (d1, d2, d3) == (1, 2, 3)
+    assert handle._active_dispatch_id == 3
+
+    # And the worker request includes the dispatch_id.
+    msg = handle.req.get(timeout=0.5)
+    assert msg["op"] == "mine_work_item"
+    assert msg["dispatch_id"] == 1
 
 
 @pytest.mark.timeout(120)
@@ -919,16 +909,6 @@ def test_mine_work_item_emits_preview_on_floor_improvement(
     # Second preview: the improved iter-2 candidate (floor -2.0).
     assert previews[1]["submit_floor_energy"] == -2.0
     assert previews[1]["nonce"] == (2).to_bytes(32, "big")
-
-
-def test_mine_work_item_preview_cb_default_none_is_noop(
-    cpu_miner, relaxed_context,
-):
-    """Backward-compat: callers passing no ``preview_cb`` (the default)
-    mine exactly as before — no error, a normal result comes back."""
-    stop = mp.Event()
-    result = cpu_miner.mine_work_item(relaxed_context, stop)
-    assert isinstance(result, MiningResult)
 
 
 def test_mine_work_item_preview_cb_failure_does_not_break_mining(

@@ -207,6 +207,77 @@ def test_ising_params_decode_with_missing_optionals():
 
 
 # ----------------------------------------------------------------------
+# MempoolJobContext
+# ----------------------------------------------------------------------
+
+
+def test_mempool_job_context_from_job_order():
+    """from_job_order must copy all IsingParams fields into the context."""
+    from shared.mempool_types import (
+        IsingParams, JobMode, JobOrder, MempoolJobContext,
+        OrderStatus, OrderTiming, ResultDelivery, RewardResolution,
+    )
+    ising = IsingParams(
+        nodes=(10, 20),
+        edges=((10, 20),),
+        h_values=(500, -500),
+        j_values=(250,),
+        min_energy_milli=-1000,
+        min_diversity_milli=100,
+        min_solutions=2,
+    )
+    order = JobOrder(
+        spec_id=b"\x01" * 32,
+        proposer=b"\x02" * 32,
+        ising_params=ising,
+        reward=1000,
+        mode=JobMode.open(),
+        resolution=RewardResolution.single_best(),
+        timing=OrderTiming(deadline_blocks=10, block_wait=1),
+        delivery=ResultDelivery.on_chain_only(),
+        status=OrderStatus.OPENED,
+        created_at=100,
+        first_solution_at=None,
+        solution_count=0,
+    )
+    ctx = MempoolJobContext.from_job_order(order_id=5, order=order)
+    assert ctx.order_id == 5
+    assert ctx.nodes == (10, 20)
+    assert ctx.edges == ((10, 20),)
+    assert ctx.h_values == (500, -500)
+    assert ctx.j_values == (250,)
+    assert ctx.min_energy_milli == -1000
+    assert ctx.min_diversity_milli == 100
+    assert ctx.min_solutions == 2
+
+
+def test_mempool_job_context_rejects_mismatched_h_values():
+    """MempoolJobContext.__post_init__ must raise if h_values length != nodes."""
+    from shared.mempool_types import MempoolJobContext
+    with pytest.raises(ValueError, match="h_values length"):
+        MempoolJobContext(
+            order_id=1,
+            nodes=(0, 1, 2),
+            edges=(),
+            h_values=(0, 0),       # 2 != 3 nodes
+            j_values=(),
+        )
+
+
+def test_mempool_job_context_rejects_mismatched_j_values():
+    """MempoolJobContext.__post_init__ must raise if j_values length != edges."""
+    from shared.mempool_types import MempoolJobContext
+    with pytest.raises(ValueError, match="j_values length"):
+        MempoolJobContext(
+            order_id=1,
+            nodes=(0, 1),
+            edges=((0, 1),),
+            h_values=(0, 0),
+            j_values=(0, 0),       # 2 != 1 edge
+        )
+
+
+# ----------------------------------------------------------------------
 # solutions_to_scale
 # ----------------------------------------------------------------------
 

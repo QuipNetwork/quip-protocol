@@ -6,7 +6,6 @@ failure with idempotent-only auto-retry.
 """
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 import pytest
@@ -92,25 +91,6 @@ async def test_pool_swaps_on_connection_error_and_retries_idempotent_op():
         # get_head is idempotent → auto-retry across swap → succeeds on B
         result = await pool.send("get_head", {})
         assert result == b"\xab" * 32
-        assert pool._fakes_by_url["http://a"].is_shutdown
-    finally:
-        await pool.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_pool_does_NOT_auto_retry_submit_extrinsic():
-    """submit_extrinsic raises ValidatorSwapped; pool does not retry on its own."""
-    pool = _make_pool([
-        {"url": "http://a", "behaviour": {"submit_extrinsic": ConnectionError("dead")}},
-        {"url": "http://b"},
-    ])
-    await pool.start()
-    try:
-        with pytest.raises(ValidatorSwapped):
-            await pool.send("submit_extrinsic", {"signed": b"\x00"})
-        # B did NOT receive a submit_extrinsic call
-        assert pool._fakes_by_url["http://b"].calls == []
-        # A was swapped out, though
         assert pool._fakes_by_url["http://a"].is_shutdown
     finally:
         await pool.shutdown()

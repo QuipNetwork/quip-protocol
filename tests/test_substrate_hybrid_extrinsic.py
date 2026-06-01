@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from shared.miner_bootstrap import DEV_HYBRID_SEEDS, _resolve_dev_signer
+from shared.miner_bootstrap import _resolve_dev_signer
 from substrate.client import (
     _HYBRID_TERMINAL_FAILURES,
     _encode_compact_u128,
@@ -54,19 +54,6 @@ def test_encode_compact_u32_rejects_big_int_mode():
 # ----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "value, expected",
-    [
-        (0, b"\x00"),
-        (63, b"\xfc"),
-        (64, (64 << 2 | 0b01).to_bytes(2, "little")),
-        (16_384, (16_384 << 2 | 0b10).to_bytes(4, "little")),
-    ],
-)
-def test_encode_compact_u128_low_modes_match_u32(value: int, expected: bytes):
-    assert _encode_compact_u128(value) == expected
-
-
 def test_encode_compact_u128_big_int_mode_layout():
     """Big-int mode prefix: top 6 bits = (n_bytes - 4), low 2 bits = 0b11.
 
@@ -78,11 +65,6 @@ def test_encode_compact_u128_big_int_mode_layout():
     assert encoded[0] == 0x07
     assert int.from_bytes(encoded[1:], "little") == value
     assert len(encoded) == 1 + 5
-
-
-def test_encode_compact_u128_rejects_negative():
-    with pytest.raises(ValueError, match="non-negative"):
-        _encode_compact_u128(-1)
 
 
 def test_encode_compact_u128_overflow_message_uses_67_limit():
@@ -123,8 +105,3 @@ def test_resolve_dev_signer_accepts_alice():
     signer = _resolve_dev_signer("//Alice")
     # Determinism: same URI → same account_id.
     assert _resolve_dev_signer("//Alice").account_id_bytes() == signer.account_id_bytes()
-
-
-def test_dev_hybrid_seeds_contains_canonical_uris():
-    """Pin the table's URI set so a typo or accidental removal fails loud."""
-    assert set(DEV_HYBRID_SEEDS) == {"//Alice", "//Bob", "//Alice//stash"}

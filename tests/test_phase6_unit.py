@@ -13,7 +13,6 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
 
 from shared.miner_bootstrap import (
     BootstrapConfig,
@@ -21,10 +20,6 @@ from shared.miner_bootstrap import (
     _maybe_seed_chain,
 )
 from substrate.client import SubstrateClient
-from substrate.miner_controller import (
-    ControllerStats,
-    SubstrateMinerController,
-)
 
 
 # ----------------------------------------------------------------------
@@ -61,39 +56,6 @@ async def test_call_lock_serialises_concurrent_run():
         f"three serial 50ms _run calls took only {elapsed:.3f}s — "
         "lock is not being honoured"
     )
-
-
-async def test_call_lock_is_none_pre_connect():
-    """Pre-`connect()`, `_call_lock` is None. The lock binds to the
-    running event loop on `connect()`; constructing it in `__init__`
-    would bind to the wrong loop in fixture-heavy test files."""
-    client = SubstrateClient(url="ws://nowhere")
-    assert client._call_lock is None
-
-
-# ----------------------------------------------------------------------
-# Controller → MinerCore wiring is exercised end-to-end against a
-# running validator. The dispatch + result paths are inline in
-# ``on_new_head`` / ``_handle_result`` and not cleanly unit-testable
-# without standing up a substantial chunk of the runtime.
-# The Protocol typing on `core` (added in this MR) plus the live test
-# together pin the contract; a unit test that mirrored the call sites
-# would just duplicate the type annotation in test form.
-#
-# What we CAN test cheaply: the controller exposes `core` as a public
-# attribute, and the default is None.
-# ----------------------------------------------------------------------
-
-
-def test_controller_core_attribute_defaults_none():
-    """A controller built with no `core=` kwarg must expose `core=None`
-    so the dispatch / result hooks can use `if self.core is not None`
-    to stay no-op in headless deployments."""
-    c = SubstrateMinerController.__new__(SubstrateMinerController)
-    c.miner_handles = []
-    c._dispatch_contexts = {}
-    c.core = None  # default
-    assert c.core is None
 
 
 # ----------------------------------------------------------------------

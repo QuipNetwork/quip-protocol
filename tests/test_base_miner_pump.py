@@ -901,3 +901,89 @@ def test_switch_tuple_with_metal_style_params_no_crash():
     finally:
         stop.set()
         miner._close_driver()
+
+
+# ── StashEntry + _MiningLoopState decay fields ───────────────────────────
+
+
+def test_stash_entry_and_loop_state_decay_fields(tmp_path):
+    """StashEntry carries (decay_num, valid_at_block, result);
+    _MiningLoopState carries decay inputs and exposes is_decay_ranked."""
+    from shared.base_miner import StashEntry, _MiningLoopState
+    from shared.miner_types import BlockRequirements, MiningResult
+    from shared.mining_attempt_log import AttemptLogger, SolutionStore
+
+    # --- StashEntry ---
+    mr = MiningResult(
+        miner_id="test-miner",
+        miner_type="CPU",
+        nonce=b"\x00" * 32,
+        salt=b"s" * 32,
+        timestamp=0,
+        prev_timestamp=0,
+        solutions=[[1, -1, 1]],
+        energy=-100.0,
+        diversity=0.3,
+        num_valid=5,
+        mining_time=1000,
+        node_list=[0, 1, 2],
+        edge_list=[(0, 1), (1, 2)],
+    )
+    entry = StashEntry(decay_num=2, valid_at_block=242, result=mr)
+    assert entry.decay_num == 2
+    assert entry.valid_at_block == 242
+    assert entry.result is mr
+
+    # --- _MiningLoopState: decay-ranked path ---
+    requirements = BlockRequirements(
+        difficulty_energy=-100.0,
+        min_diversity=0.1,
+        min_solutions=3,
+        timeout_to_difficulty_adjustment_decay=3600,
+    )
+    attempt_log = AttemptLogger("test-miner", log_dir=tmp_path)
+    solution_store = SolutionStore("test-miner", log_dir=tmp_path)
+
+    st = _MiningLoopState(
+        requirements=requirements,
+        nodes=[0, 1, 2],
+        edges=[(0, 1)],
+        prev_timestamp=0,
+        start_time=0.0,
+        solution_number_for_log=0,
+        dispatch_id_for_log=0,
+        attempt_log=attempt_log,
+        solution_store=solution_store,
+        live_threshold_var=None,
+        top_k_cap=5,
+        top_k=[],
+        previewed_wintime=(10 ** 18, 10 ** 18),
+        decay_schedule=[-15_000_000, -14_900_000],
+        last_proof_block=42,
+        epoch_length=100,
+    )
+    assert st.is_decay_ranked is True
+    assert st.decay_schedule[0] == -15_000_000
+    assert st.last_proof_block == 42
+    assert st.epoch_length == 100
+
+    # --- _MiningLoopState: legacy path (no decay_schedule) ---
+    st2 = _MiningLoopState(
+        requirements=requirements,
+        nodes=[0, 1, 2],
+        edges=[(0, 1)],
+        prev_timestamp=0,
+        start_time=0.0,
+        solution_number_for_log=0,
+        dispatch_id_for_log=0,
+        attempt_log=attempt_log,
+        solution_store=solution_store,
+        live_threshold_var=None,
+        top_k_cap=5,
+        top_k=[],
+        previewed_wintime=(10 ** 18, 10 ** 18),
+    )
+    assert st2.is_decay_ranked is False
+    assert st2.decay_schedule is None
+    assert st2.last_proof_block == 0
+    assert st2.epoch_length == 0

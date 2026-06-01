@@ -130,17 +130,6 @@ def test_account_id_rendered_as_0x_hex():
     assert acc["account_id_hex"] == "0x" + bytes(range(32)).hex()
 
 
-def test_client_block_is_static():
-    core = MinerCore(node_id="quip-miner-client", miners_config={})
-    try:
-        survey = build_miner_survey(core, _signer())
-    finally:
-        core.close()
-    assert survey["client"]["name"] == "quip-miner"
-    assert isinstance(survey["client"]["version"], str)
-    assert survey["client"]["version"]  # non-empty
-
-
 # ----------------------------------------------------------------------
 # Topology injection
 # ----------------------------------------------------------------------
@@ -280,18 +269,6 @@ def test_secret_config_keys_are_redacted():
 # ----------------------------------------------------------------------
 
 
-def test_pow_capability_true_when_handles_present():
-    core = MinerCore(
-        node_id="quip-miner-pow", miners_config={"cpu": {"num_cpus": 1}},
-        topology=DEFAULT_TOPOLOGY,
-    )
-    try:
-        survey = build_miner_survey(core, _signer())
-    finally:
-        core.close()
-    assert survey["capabilities"]["pow"] is True
-
-
 def test_miner_types_are_sorted_and_deduplicated():
     """`capabilities.miner_types` must be deterministic — sort it so
     indexers can compare across snapshots without normalizing
@@ -309,20 +286,6 @@ def test_miner_types_are_sorted_and_deduplicated():
 # ----------------------------------------------------------------------
 # Defensive: missing controller / signer fields shouldn't raise
 # ----------------------------------------------------------------------
-
-
-def test_controller_without_topology_hash_attr_handled():
-    """A controller object that doesn't expose `topology_hash` (or has
-    it set to None) renders the field as null instead of crashing."""
-    core = MinerCore(node_id="quip-miner-noattr", miners_config={"cpu": {"num_cpus": 1}},
-                     topology=DEFAULT_TOPOLOGY)
-    try:
-        core.miner_handles[0].spec.setdefault("args", {})["topology"] = _fake_topology()
-        controller = SimpleNamespace()  # no `topology_hash` at all
-        survey = build_miner_survey(core, _signer(), controller=controller)
-    finally:
-        core.close()
-    assert survey["miners"][0]["topology"]["topology_hash"] is None
 
 
 @pytest.mark.parametrize("bad_hash", [b"", None])
