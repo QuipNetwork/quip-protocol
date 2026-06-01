@@ -14,12 +14,10 @@ Run:
 """
 from __future__ import annotations
 
-import os
 import sys
 import threading
 import time
 from typing import List
-from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -40,7 +38,7 @@ if not METAL_AVAILABLE:
     pytest.skip("Metal not available", allow_module_level=True)
 
 from GPU.metal_sa import MetalSASampler
-from GPU.metal_scheduler import MetalScheduler, _query_iokit_gpu_utilization
+from GPU.metal_scheduler import _query_iokit_gpu_utilization
 from shared.ising_model import IsingModel
 from shared.quantum_proof_of_work import (
     derive_nonce,
@@ -144,55 +142,19 @@ class TestIOKitGPUDetection:
             "IOKit never detected GPU activity"
         )
 
-    def test_returns_to_idle_after_kernel(self):
-        """GPU utilization drops back after kernel completes."""
-        sampler = MetalSASampler()
-        models = _make_models(sampler, 2)
-
-        sampler.sample_ising(
-            [m.h for m in models],
-            [m.J for m in models],
-            num_reads=32, num_sweeps=64, seed=42,
-        )
-
-        # IOKit updates asynchronously; poll until idle or timeout
-        deadline = time.monotonic() + 5.0
-        util = 100
-        while time.monotonic() < deadline:
-            time.sleep(0.5)
-            util = _query_iokit_gpu_utilization()
-            if util < 20:
-                break
-
-        assert util < 20, (
-            f"Expected GPU idle after kernel within 5s, "
-            f"got {util}%"
-        )
-
 
 # ── Utilization scaling ──────────────────────────────────
 
 class TestUtilizationScaling:
     """Verify throughput scales with gpu_utilization percentage."""
 
-    def test_core_budget_proportional(self):
-        """Core budget should be proportional to utilization%."""
-        from GPU.metal_miner import get_gpu_core_count
-        cores = get_gpu_core_count()
-
-        sched_100 = MetalScheduler(cores, 100, yielding=False)
-        sched_50 = MetalScheduler(cores, 50, yielding=False)
-        sched_25 = MetalScheduler(cores, 25, yielding=False)
-
-        assert sched_100.get_core_budget() == cores
-        assert sched_50.get_core_budget() == cores // 2
-        assert sched_25.get_core_budget() == cores // 4
-
     def test_throughput_scales_with_batch_size(self):
         """More threadgroups per batch = higher throughput.
 
-        Dispatching 8 problems per batch should be faster than
-        dispatching 1 problem per batch (amortized overhead).
+        This intentionally exercises the FLAT-OUT (idle/headless, target=100)
+        path — batching only applies there; when throttled the governor caps
+        to one problem per command buffer. Kept small to avoid saturating the
+        GPU during the test run.
         """
         sampler = MetalSASampler()
         models = _make_models(sampler, 8)
@@ -204,16 +166,16 @@ class TestUtilizationScaling:
         tp_1 = _measure_streaming_throughput(
             sampler, models,
             max_threadgroups=1,
-            num_reads=32,
-            num_sweeps=64,
+            num_reads=16,
+            num_sweeps=24,
         )
 
         # 8 threadgroups per batch = 1 batched dispatch
         tp_8 = _measure_streaming_throughput(
             sampler, models,
             max_threadgroups=8,
-            num_reads=32,
-            num_sweeps=64,
+            num_reads=16,
+            num_sweeps=24,
         )
 
         # Batched should be at least 1.3x faster (less dispatch overhead)
@@ -223,11 +185,10 @@ class TestUtilizationScaling:
         )
 
     def test_utilization_reduces_batch_size(self):
-        """Lower utilization → smaller max_threadgroups → more batches.
+        """Smaller max_threadgroups → more batches → lower flat-out throughput.
 
-        With 8 models at max_tg=2, pipeline does 4 batches.
-        With 8 models at max_tg=8, pipeline does 1 batch.
-        The first should take measurably longer.
+        Also the FLAT-OUT (idle/headless, target=100) path; kept small to avoid
+        saturating the GPU during the test run.
         """
         sampler = MetalSASampler()
         sampler.prepare_topology()
@@ -236,15 +197,15 @@ class TestUtilizationScaling:
         tp_full = _measure_streaming_throughput(
             sampler, models,
             max_threadgroups=8,
-            num_reads=32,
-            num_sweeps=64,
+            num_reads=16,
+            num_sweeps=24,
         )
 
         tp_half = _measure_streaming_throughput(
             sampler, models,
             max_threadgroups=2,
-            num_reads=32,
-            num_sweeps=64,
+            num_reads=16,
+            num_sweeps=24,
         )
 
         # Full batch should be faster than quarter-batch
@@ -258,31 +219,6 @@ class TestUtilizationScaling:
 
 class TestYieldingBehavior:
     """Verify yielding mode and throttle logic."""
-
-    def test_scheduler_no_throttle_at_idle(self):
-        """Yielding scheduler shouldn't throttle when GPU idle."""
-        sched = MetalScheduler(
-            gpu_core_count=40,
-            gpu_utilization_pct=100,
-            yielding=True,
-        )
-        # Let the IOKit poll thread run once
-        time.sleep(0.5)
-        assert sched.should_throttle() is False
-        sched.stop()
-
-    def test_scheduler_throttles_at_high_utilization(self):
-        """Yielding scheduler should throttle when GPU is busy."""
-        sched = MetalScheduler(
-            gpu_core_count=40,
-            gpu_utilization_pct=100,
-            yielding=True,
-        )
-        # Simulate external GPU load via shared Value
-        sched._util_value.value = 95
-
-        assert sched.should_throttle() is True
-        sched.stop()
 
     def test_iokit_thread_updates_utilization(self):
         """util_monitor_main process should publish IOKit readings into shared Value."""
@@ -314,96 +250,36 @@ class TestYieldingBehavior:
             f"Expected 0-100 from IOKit poll, got {val.value}"
         )
 
-    def test_iokit_thread_detects_gpu_load(self):
-        """util_monitor process should detect GPU load during Metal dispatch."""
-        import multiprocessing as mp
 
-        from GPU.util_monitor import util_monitor_main
-        from shared.proc_util import terminate_join
+# ── Streaming pipeline through the governor (yielding) ───
 
-        ctx = mp.get_context("spawn")
-        val = ctx.Value("i", -1)
-        stop = ctx.Event()
-        proc = ctx.Process(
-            target=util_monitor_main,
-            args=(val, stop, 0.2,
-                  "GPU.metal_scheduler:poll_iokit_gpu_util"),
-            daemon=True,
-        )
-        proc.start()
+class _ThrottleScheduler:
+    """Fake governor that caps occupancy to a fixed thread budget.
 
-        sampler = MetalSASampler()
-        models = _make_models(sampler, 4)
+    Drives ``sample_ising_streaming`` down the GOVERNED path: reads are split
+    so ``problems x reads <= budget`` per command buffer, keeping the GPU below
+    the occupancy that janks the UI rather than saturating it. That's the whole
+    point of yielding.
+    """
 
-        # Run kernel while monitor polls
-        sampler.sample_ising(
-            [m.h for m in models],
-            [m.J for m in models],
-            num_reads=128, num_sweeps=256, seed=42,
-        )
+    def __init__(self, budget: int = 256):
+        self._budget = budget
 
-        # Give monitor a moment to publish the last value
-        time.sleep(0.3)
-        observed = val.value
-        stop.set()
-        assert terminate_join(proc, 2.0)
+    def get_thread_budget(self) -> int:
+        return self._budget
 
-        # The monitor process must have written a valid 0-100 value.
-        # Since the kernel just finished the reading may be high or
-        # low — we only verify the mechanism worked.
-        assert isinstance(observed, int)
-        assert 0 <= observed <= 100
+    def get_measured_gpu(self) -> int:
+        return 0
 
-    def test_target_threadgroups_reduced_under_load(self):
-        """compute_target_threadgroups should reduce when loaded."""
-        sched = MetalScheduler(
-            gpu_core_count=40,
-            gpu_utilization_pct=100,
-            yielding=True,
-        )
-
-        # No load → full budget
-        sched._util_value.value = 0
-        target_idle = sched.compute_target_threadgroups(
-            max_tg=10, active_tg=0,
-        )
-        assert target_idle == 10
-
-        # High external load, no active tg → reduced
-        sched._util_value.value = 80
-        target_loaded = sched.compute_target_threadgroups(
-            max_tg=10, active_tg=0,
-        )
-        assert target_loaded < target_idle, (
-            f"Loaded target ({target_loaded}) should be "
-            f"< idle ({target_idle})"
-        )
-        assert target_loaded >= 1
-
-        sched.stop()
-
-    def test_non_yielding_ignores_load(self):
-        """Non-yielding scheduler always returns full budget."""
-        sched = MetalScheduler(
-            gpu_core_count=40,
-            gpu_utilization_pct=100,
-            yielding=False,
-        )
-
-        target = sched.compute_target_threadgroups(
-            max_tg=10, active_tg=5,
-        )
-        assert target == 10
-        assert sched.should_throttle() is False
-
-
-# ── Streaming pipeline with scheduler ────────────────────
 
 class TestStreamingWithScheduler:
-    """End-to-end: streaming pipeline respects core budget."""
+    """End-to-end: streaming pipeline runs through the governor (throttled)."""
+
+    def _governed_kwargs(self):
+        return {"scheduler": _ThrottleScheduler(256)}
 
     def test_streaming_completes_all_models(self):
-        """All models should be yielded regardless of batch size."""
+        """All models are yielded through the throttled (yielding) path."""
         sampler = MetalSASampler()
         models = _make_models(sampler, 7)  # Non-power-of-2
 
@@ -411,8 +287,9 @@ class TestStreamingWithScheduler:
             iter(models),
             num_reads=16,
             num_sweeps=32,
-            max_threadgroups=3,  # 3 batches: 3+3+1
+            max_threadgroups=3,
             seed=42,
+            **self._governed_kwargs(),
         ))
 
         assert len(results) == 7
@@ -421,7 +298,7 @@ class TestStreamingWithScheduler:
         assert returned_nonces == expected_nonces
 
     def test_streaming_energies_are_valid(self):
-        """Sample energies should be negative (Ising solutions)."""
+        """Throttled streaming still yields valid (negative) Ising energies."""
         sampler = MetalSASampler()
         models = _make_models(sampler, 3)
 
@@ -431,7 +308,9 @@ class TestStreamingWithScheduler:
             num_sweeps=64,
             max_threadgroups=3,
             seed=42,
+            **self._governed_kwargs(),
         ):
+            assert len(ss) == 32, "throttled path must preserve total reads"
             min_e = min(ss.record.energy)
             assert min_e < 0, (
                 f"Nonce {model.nonce}: expected negative "

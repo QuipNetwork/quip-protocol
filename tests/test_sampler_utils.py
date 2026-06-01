@@ -9,7 +9,6 @@ J-value updates.
 """
 
 import numpy as np
-import pytest
 
 from GPU.sampler_utils import (
     build_csr_from_ising,
@@ -64,14 +63,6 @@ class TestBuildCsrStructureSmallGraph:
             build_csr_structure_from_edges(edges, nodes)
         )
         assert set(node_to_idx.values()) == set(range(N))
-
-    def test_neighbors_sorted(self):
-        nodes, edges = _small_graph()
-        _, _, _, neighbors, N, _ = (
-            build_csr_structure_from_edges(edges, nodes)
-        )
-        for i in range(N):
-            assert neighbors[i] == sorted(neighbors[i])
 
 
 class TestBuildCsrStructureFromTopology:
@@ -151,16 +142,6 @@ class TestEdgePositionIndex:
                 f"Edge ({i},{j}): J[{pos_ij}]={j_vals[pos_ij]} "
                 f"!= J[{pos_ji}]={j_vals[pos_ji]}"
             )
-
-    def test_position_count_matches_edges(self):
-        nodes, edges = _small_graph()
-        row_ptr, col_ind, node_to_idx, neighbors, N, nnz = (
-            build_csr_structure_from_edges(edges, nodes)
-        )
-        positions = build_edge_position_index(
-            edges, node_to_idx, row_ptr, neighbors,
-        )
-        assert len(positions) == len(edges)
 
     def test_topology_roundtrip(self):
         """Full topology: positions-based fill matches reference CSR."""

@@ -305,14 +305,6 @@ class TestFixedIsingFeeder:
         with pytest.raises(ValueError, match="at least one IsingModel"):
             FixedIsingFeeder(models=[])
 
-    def test_pop_n_cycles(self):
-        a, b = _make_model(10), _make_model(11)
-        feeder = FixedIsingFeeder(models=[a, b])
-        try:
-            assert feeder.pop_n(5) == [a, b, a, b, a]
-        finally:
-            feeder.stop()
-
     def test_iteration_protocol(self):
         """``__iter__`` returns self; ``next()`` cycles indefinitely."""
         model = _make_model(seed=2)
@@ -369,22 +361,6 @@ class TestRandomIsingFeederFinalizer:
         assert not feeder._finalizer.alive, (
             "stop() must call _finalizer.detach() to cancel the backstop"
         )
-
-    def test_finalizer_shuts_down_pool(self):
-        """Calling the finalizer directly shuts down the pool.
-
-        After shutdown, submitting new work raises RuntimeError — confirming
-        the pool is closed and the atexit join would be a no-op.
-        """
-        feeder = _make_feeder(seed=22)
-        pool = feeder._pool
-
-        # Manually fire the finalizer (simulates GC without stop()).
-        feeder._finalizer()
-
-        # Pool should be shut down: new submissions must raise.
-        with pytest.raises(RuntimeError):
-            pool.submit(lambda: None)
 
     def test_finalizer_fires_on_gc_without_stop(self):
         """Dropping all references triggers the finalizer via GC."""

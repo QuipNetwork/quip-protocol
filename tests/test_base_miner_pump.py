@@ -2,7 +2,7 @@
 """Tests for the process-model stream driver path in BaseMiner.
 
 The in-worker pump thread was replaced by a stream-driver PROCESS that
-writes samplesets into a SharedSampleRing and enqueues small descriptors
+writes samplesets into a SampleView and enqueues small descriptors
 (see QPU/stream_driver.py). These tests exercise the consumer side
 (``_acquire_result`` reading the ring, slot release, budget feed, clean
 teardown) without contacting a QPU — ``build_fake_persistent_context``
@@ -25,7 +25,7 @@ from shared.base_miner import (
 )
 from shared.miner_types import MiningResult
 from shared.proc_util import terminate_join
-from shared.shared_sample_ring import SharedSampleRing
+from shared.ring_views import SampleView
 from substrate.types import SubstrateDifficulty, SubstrateMiningContext
 
 _FAKE_CTX = "tests.fakes.fake_stream:build_fake_persistent_context"
@@ -91,10 +91,8 @@ def _streaming_context(nodes=(0, 1, 2)) -> SubstrateMiningContext:
 
 
 class _DriverMiner(BaseMiner):
-    """STREAMING_PUMP + DRIVER_OWNS_FEEDER miner driven by the fake context."""
+    """Driver-path miner driven by the fake stream context."""
 
-    STREAMING_PUMP = True
-    DRIVER_OWNS_FEEDER = True
     STREAM_FACTORY_DOTTED = _FAKE_CTX
     RESULT_QUEUE_MAXSIZE = 4
 
@@ -111,11 +109,12 @@ class _DriverMiner(BaseMiner):
             "energy_threshold": requirements.difficulty_energy,
         }
 
-    def _sample(self, *a, **k):
-        raise AssertionError("single-shot _sample must not run on driver path")
-
-    def _sample_batch(self, *a, **k):
-        raise AssertionError("_sample_batch must not run on driver path")
+    def _stream_factory_kwargs(self, sample_ctx, nodes):
+        return {
+            "num_reads": sample_ctx["num_reads"],
+            "nodes": nodes,
+            "topology": getattr(self, "topology", None),
+        }
 
     def evaluate_sampleset(self, *args, **kwargs):
         return None  # never a winner
@@ -129,29 +128,12 @@ class _DriverMiner(BaseMiner):
 class _RingConsumer(BaseMiner):
     """Bare consumer used to drive ``_acquire_result`` directly."""
 
-    STREAMING_PUMP = True
-    DRIVER_OWNS_FEEDER = True
-
     def __init__(self) -> None:
         super().__init__("ring-consumer", sampler=object(), miner_type="QPU")
         self.time_manager = None
 
     def _adapt_mining_params(self, requirements, nodes, edges) -> dict:
         return {"num_reads": 4}
-
-    def _sample(self, *a, **k):
-        raise AssertionError("no sample on driver path")
-
-    def _sample_batch(self, *a, **k):
-        raise AssertionError("no batch on driver path")
-
-
-def _sample_ctx() -> dict:
-    return {
-        "prev_hash": b"\x00" * 32, "miner_id": "m", "cur_index": 0,
-        "nodes": [0, 1, 2], "edges": [], "num_reads": 4, "num_sweeps": 1,
-        "extra": {},
-    }
 
 
 def _noop() -> None:
@@ -178,7 +160,7 @@ def test_acquire_result_dead_driver_without_sentinel_is_done():
     assert not dead.is_alive()
     try:
         acquired = consumer._acquire_result(
-            stop, desc_q, preprocess_start=0.0, sample_ctx=_sample_ctx(),
+            stop, desc_q, preprocess_start=0.0,
             driver_proc=dead,
         )
         assert acquired.action == _ACQUIRE_DONE
@@ -210,7 +192,7 @@ def test_ensure_driver_spawns_non_daemon_driver():
 
 def test_acquire_result_reads_descriptor_from_ring():
     consumer = _RingConsumer()
-    ring = SharedSampleRing(slots=2, max_rows=4, max_cols=3)
+    ring = SampleView(slots=2, max_rows=4, max_cols=3)
     consumer._ring = ring
     desc_q: "mp.Queue" = mp.get_context("spawn").Queue()
     stop = mp.Event()
@@ -222,7 +204,7 @@ def test_acquire_result_reads_descriptor_from_ring():
         desc_q.put((slot, 4, 3, b"\x01" * 32, b"\x02" * 32, 51010, 1))
 
         acquired = consumer._acquire_result(
-            stop, desc_q, preprocess_start=0.0, sample_ctx=_sample_ctx(),
+            stop, desc_q, preprocess_start=0.0,
             generation=1,
         )
         assert acquired.action == _ACQUIRE_OK
@@ -247,7 +229,7 @@ def test_acquire_result_none_descriptor_is_done():
     desc_q.put(None)
     stop = mp.Event()
     acquired = consumer._acquire_result(
-        stop, desc_q, preprocess_start=0.0, sample_ctx=_sample_ctx(),
+        stop, desc_q, preprocess_start=0.0,
     )
     assert acquired.action == _ACQUIRE_DONE
 
@@ -258,7 +240,7 @@ def test_acquire_result_stop_event_returns_stop():
     stop = mp.Event()
     stop.set()
     acquired = consumer._acquire_result(
-        stop, desc_q, preprocess_start=0.0, sample_ctx=_sample_ctx(),
+        stop, desc_q, preprocess_start=0.0,
     )
     assert acquired.action == _ACQUIRE_STOP
 
@@ -273,7 +255,7 @@ def test_acquire_result_feeds_budget_time_manager():
 
     consumer = _RingConsumer()
     consumer.time_manager = _Mgr()
-    ring = SharedSampleRing(slots=2, max_rows=4, max_cols=3)
+    ring = SampleView(slots=2, max_rows=4, max_cols=3)
     consumer._ring = ring
     desc_q: "mp.Queue" = mp.get_context("spawn").Queue()
     stop = mp.Event()
@@ -283,7 +265,7 @@ def test_acquire_result_feeds_budget_time_manager():
                    np.zeros(4, np.float64))
         desc_q.put((slot, 4, 3, b"\x01" * 32, b"\x02" * 32, 4242, 1))
         acquired = consumer._acquire_result(
-            stop, desc_q, preprocess_start=0.0, sample_ctx=_sample_ctx(),
+            stop, desc_q, preprocess_start=0.0,
             generation=1,
         )
         assert acquired.action == _ACQUIRE_OK
@@ -297,7 +279,7 @@ def test_acquire_result_feeds_budget_time_manager():
 def test_acquire_result_drops_stale_generation_descriptor():
     """A descriptor from a superseded round is released + skipped, not OK."""
     consumer = _RingConsumer()
-    ring = SharedSampleRing(slots=2, max_rows=4, max_cols=3)
+    ring = SampleView(slots=2, max_rows=4, max_cols=3)
     consumer._ring = ring
     desc_q = mp.get_context("spawn").Queue()
     stop = mp.Event()
@@ -308,7 +290,7 @@ def test_acquire_result_drops_stale_generation_descriptor():
         desc_q.put((slot, 4, 3, b"\x01" * 32, b"\x02" * 32, 0, 1))
         desc_q.put(None)
         acquired = consumer._acquire_result(
-            stop, desc_q, preprocess_start=0.0, sample_ctx=_sample_ctx(),
+            stop, desc_q, preprocess_start=0.0,
             generation=2,
         )
         # Stale one skipped; stream then ended -> DONE.
@@ -808,3 +790,200 @@ def test_ensure_driver_forwards_topology_in_factory_kwargs():
     finally:
         bm.spawn_worker = _orig
         miner._close_driver()
+
+
+# ----------------------------------------------------------------------
+# Regression: switch tuple with Metal-style adapted params (no threshold/anneal)
+# ----------------------------------------------------------------------
+
+
+class _MetalStyleMiner(_DriverMiner):
+    """Streaming miner whose adapted params are Metal-style: no energy_threshold
+    or annealing_time (exactly what GPU.metal_miner._adapt_mining_params
+    returns — only num_sweeps + num_reads)."""
+
+    def _adapt_mining_params(self, requirements, nodes, edges) -> dict:
+        return {
+            "num_sweeps": 128,
+            "num_reads": 8,
+        }
+
+
+def test_switch_tuple_with_metal_style_params_no_crash():
+    """Bug #1 regression: _setup_dispatch must NOT crash when adapted params
+    omit energy_threshold/annealing_time (Metal/SA backends).
+
+    Before the fix, ``_energy_to_milli(None)`` raised ``TypeError`` via
+    ``math.isfinite(None)`` before the try-block, crashing the worker on the
+    first Metal streaming dispatch.
+
+    Also asserts Bug #2: the switch tuple carries num_sweeps as element [7].
+    """
+    import queue
+
+    # Replace _ensure_driver so we control the ctl_q without spawning a real
+    # driver process, and capture exactly what _setup_dispatch puts on it.
+    ctx = _streaming_context()
+    miner = _MetalStyleMiner()
+    captured: list = []
+    fake_q: queue.SimpleQueue = queue.SimpleQueue()
+
+    def _fake_put(item, *a, **k):
+        captured.append(item)
+        fake_q.put(item)
+
+    real_put_holder: dict = {}
+
+    orig_ensure = miner._ensure_driver
+
+    def _ensure_and_hijack(sample_ctx):
+        ready = orig_ensure(sample_ctx)
+        if ready and miner._ctl_q is not None and not real_put_holder:
+            # Grab the real put but replace it so the item lands in our list.
+            real_put_holder["real"] = miner._ctl_q.put
+            miner._ctl_q.put = _fake_put
+        return ready
+
+    miner._ensure_driver = _ensure_and_hijack
+
+    import multiprocessing as mp
+
+    stop = mp.Event()
+    try:
+        # mine_work_item calls _setup_dispatch which builds + sends the switch.
+        # We stop immediately after it starts — we only care that no TypeError
+        # was raised and that the tuple has the right shape.
+        import threading
+        import time as _t
+
+        raised: list = []
+
+        def _run():
+            try:
+                miner.mine_work_item(ctx, stop)
+            except TypeError as exc:
+                raised.append(exc)
+
+        t = threading.Thread(target=_run, name="metal-switch-test")
+        t.start()
+        # Give the dispatch time to send the switch tuple.
+        deadline = _t.monotonic() + 5.0
+        while not captured and _t.monotonic() < deadline:
+            _t.sleep(0.02)
+        stop.set()
+        t.join(timeout=10.0)
+        assert not t.is_alive(), "mine_work_item did not stop"
+
+        # Bug #1: no TypeError from _energy_to_milli(None)
+        assert raised == [], f"TypeError raised (Bug #1 still present): {raised}"
+        assert captured, "no switch tuple was sent at all"
+
+        switch_cmd = captured[0]
+        assert switch_cmd[0] == "switch", f"first command was not switch: {switch_cmd}"
+
+        # 9 elements: kind, gen, lpbh, miner_bytes, threshold_milli,
+        #              num_reads, annealing_time, num_sweeps, feeder_spec
+        assert len(switch_cmd) == 9, (
+            f"switch tuple has {len(switch_cmd)} elements, expected 9"
+        )
+        # Bug #1: threshold_milli defaults to 0 when energy_threshold is None
+        assert switch_cmd[4] == 0, (
+            f"threshold_milli expected 0 (no threshold), got {switch_cmd[4]}"
+        )
+        # Bug #2: num_sweeps (element 7) carries the adapted value
+        assert switch_cmd[7] == 128, (
+            f"num_sweeps expected 128, got {switch_cmd[7]}"
+        )
+        # Element 8: the feeder spec the generic StreamContext builds from.
+        assert switch_cmd[8][0] == "pow", (
+            f"feeder_spec expected ('pow', ...), got {switch_cmd[8]!r}"
+        )
+    finally:
+        stop.set()
+        miner._close_driver()
+
+
+# ── StashEntry + _MiningLoopState decay fields ───────────────────────────
+
+
+def test_stash_entry_and_loop_state_decay_fields(tmp_path):
+    """StashEntry carries (decay_num, valid_at_block, result);
+    _MiningLoopState carries decay inputs and exposes is_decay_ranked."""
+    from shared.base_miner import StashEntry, _MiningLoopState
+    from shared.miner_types import BlockRequirements, MiningResult
+    from shared.mining_attempt_log import AttemptLogger, SolutionStore
+
+    # --- StashEntry ---
+    mr = MiningResult(
+        miner_id="test-miner",
+        miner_type="CPU",
+        nonce=b"\x00" * 32,
+        salt=b"s" * 32,
+        timestamp=0,
+        prev_timestamp=0,
+        solutions=[[1, -1, 1]],
+        energy=-100.0,
+        diversity=0.3,
+        num_valid=5,
+        mining_time=1000,
+        node_list=[0, 1, 2],
+        edge_list=[(0, 1), (1, 2)],
+    )
+    entry = StashEntry(decay_num=2, valid_at_block=242, result=mr)
+    assert entry.decay_num == 2
+    assert entry.valid_at_block == 242
+    assert entry.result is mr
+
+    # --- _MiningLoopState: decay-ranked path ---
+    requirements = BlockRequirements(
+        difficulty_energy=-100.0,
+        min_diversity=0.1,
+        min_solutions=3,
+        timeout_to_difficulty_adjustment_decay=3600,
+    )
+    attempt_log = AttemptLogger("test-miner", log_dir=tmp_path)
+    solution_store = SolutionStore("test-miner", log_dir=tmp_path)
+
+    st = _MiningLoopState(
+        requirements=requirements,
+        nodes=[0, 1, 2],
+        edges=[(0, 1)],
+        prev_timestamp=0,
+        start_time=0.0,
+        solution_number_for_log=0,
+        dispatch_id_for_log=0,
+        attempt_log=attempt_log,
+        solution_store=solution_store,
+        live_threshold_var=None,
+        top_k_cap=5,
+        top_k=[],
+        previewed_wintime=(10 ** 18, 10 ** 18),
+        decay_schedule=[-15_000_000, -14_900_000],
+        last_proof_block=42,
+        epoch_length=100,
+    )
+    assert st.is_decay_ranked is True
+    assert st.decay_schedule[0] == -15_000_000
+    assert st.last_proof_block == 42
+    assert st.epoch_length == 100
+
+    # --- _MiningLoopState: legacy path (no decay_schedule) ---
+    st2 = _MiningLoopState(
+        requirements=requirements,
+        nodes=[0, 1, 2],
+        edges=[(0, 1)],
+        prev_timestamp=0,
+        start_time=0.0,
+        solution_number_for_log=0,
+        dispatch_id_for_log=0,
+        attempt_log=attempt_log,
+        solution_store=solution_store,
+        live_threshold_var=None,
+        top_k_cap=5,
+        top_k=[],
+        previewed_wintime=(10 ** 18, 10 ** 18),
+    )
+    assert st2.is_decay_ranked is False
+    assert st2.decay_schedule is None
+    assert st2.last_proof_block == 0
+    assert st2.epoch_length == 0

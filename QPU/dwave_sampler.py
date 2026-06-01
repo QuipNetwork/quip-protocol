@@ -2,7 +2,11 @@
 
 import logging
 import os
-from typing import Dict, List, Tuple, Any, Union, Mapping, Sequence, cast, Optional, TYPE_CHECKING
+import time
+from typing import (
+    Dict, Iterator, List, Optional, Sequence, Tuple, TYPE_CHECKING,
+    Any, Union, Mapping, cast,
+)
 import collections.abc
 import numpy as np
 from dwave.system import DWaveSampler, FixedEmbeddingComposite
@@ -691,3 +695,150 @@ class DWaveSamplerWrapper:
             # No embedding - submit to underlying solver directly (returns raw Future)
             bqm = dimod.BinaryQuadraticModel.from_ising(h, J)
             return self.qpu_solver.solver.sample_bqm(bqm, **kwargs)
+
+    def sample_ising_streaming(
+        self,
+        models: Any,
+        *,
+        num_reads: int,
+        num_sweeps: int = 0,
+        queue_depth: int = 30,
+        annealing_time: Optional[float] = None,
+        energy_threshold_milli: int = 0,
+        stop_event: Optional[Any] = None,
+        **_kw: Any,
+    ) -> Iterator[Tuple[Any, Any]]:
+        """Async streaming pump: keep queue_depth submissions in flight; yield
+        (model, raw_reduced_sampleset) with sampleset.info['defect_info'] set.
+
+        No reconstruction gating — the consumer reconstructs survivors.
+        Cancels in-flight futures on GeneratorExit (the generic StreamContext
+        closes this generator on a chain-head switch).
+
+        Args:
+            models: Feeder providing IsingModel objects via ``pop_blocking()``
+                or ``__next__``.
+            num_reads: QPU reads per submission.
+            num_sweeps: Unused (accepted for interface compatibility with the
+                generic ``StreamContext``).
+            queue_depth: Number of concurrent in-flight QPU jobs.
+            annealing_time: Anneal duration in microseconds; ``None`` uses the
+                QPU default.
+            energy_threshold_milli: Accepted for interface compatibility; not
+                used (no gating in this path — the consumer gates).
+            stop_event: When set, stop submitting and cancel in-flight work.
+            **_kw: Extra kwargs accepted silently for interface compatibility.
+
+        Yields:
+            ``(model, raw_reduced_sampleset)`` in completion order, with
+            ``sampleset.info['defect_info']`` set to the
+            :class:`DefectInfo` (or ``None`` when no defects).
+        """
+        # pending: {id(future): (model, future, defect_info, job_index)}
+        pending: Dict[int, Tuple[Any, Any, Optional[DefectInfo], int]] = {}
+        job_index: int = 0
+        feeder_exhausted: bool = False
+
+        def _stopped() -> bool:
+            return stop_event is not None and stop_event.is_set()
+
+        def _best_effort_cancel_future(fut: Any, fidx: int) -> None:
+            cancel_fn = getattr(fut, "cancel", None)
+            if not callable(cancel_fn):
+                return
+            try:
+                cancel_fn()
+            except Exception as exc:  # noqa: BLE001 — advisory; log and continue
+                logger.debug(
+                    "D-Wave future.cancel() failed for job %d (best-effort): "
+                    "%s: %s",
+                    fidx, type(exc).__name__, exc,
+                )
+
+        def _cancel_all() -> None:
+            """Best-effort cancel every in-flight future and clear pending."""
+            for _mdl, fut, _d, fidx in list(pending.values()):
+                _best_effort_cancel_future(fut, fidx)
+            pending.clear()
+
+        def _try_submit_one() -> None:
+            """Submit one model; sets feeder_exhausted on StopIteration."""
+            nonlocal job_index, feeder_exhausted
+            pop = getattr(models, "pop_blocking", None)
+            try:
+                model = pop() if callable(pop) else next(models)  # type: ignore[call-overload]
+            except StopIteration:
+                feeder_exhausted = True
+                return
+            submit_kwargs: Dict[str, Any] = {
+                "num_reads": num_reads,
+                "answer_mode": "raw",
+                "label": f"{self.job_label}_s{job_index}",
+                "nonce_seed": model.nonce,
+            }
+            if annealing_time is not None:
+                submit_kwargs["annealing_time"] = annealing_time
+            future, defect_info = self.sample_ising_async(
+                model.h, model.J, **submit_kwargs
+            )
+            pending[id(future)] = (model, future, defect_info, job_index)
+            job_index += 1
+
+        try:
+            # Fill to queue_depth before entering the poll loop.
+            while len(pending) < queue_depth and not _stopped() and not feeder_exhausted:
+                _try_submit_one()
+
+            while pending:
+                if _stopped():
+                    _cancel_all()
+                    return
+
+                # Fill any open slots (after a completion was popped below).
+                while (
+                    len(pending) < queue_depth
+                    and not _stopped()
+                    and not feeder_exhausted
+                ):
+                    _try_submit_one()
+
+                # Poll for the next completed future.
+                completed_id: Optional[int] = None
+                while completed_id is None and not _stopped():
+                    for fid, (_, fut, _, _) in pending.items():
+                        if fut.done():
+                            completed_id = fid
+                            break
+                    if completed_id is None:
+                        time.sleep(0.005)
+
+                if completed_id is None:
+                    # stop_event fired while polling.
+                    _cancel_all()
+                    return
+
+                model, future, defect_info, _ = pending.pop(completed_id)
+                raw_ss = future.sampleset
+
+                # Attach defect_info so the consumer can reconstruct survivors.
+                raw_ss.info["defect_info"] = defect_info
+
+                # Periodic throughput diagnostic (operator observability).
+                if job_index % 50 == 0:
+                    pop_stats = getattr(models, "stats", None)
+                    if callable(pop_stats):
+                        fstats = pop_stats()
+                        logger.info(
+                            "[QPU] stream depth: in_flight=%d/%d "
+                            "feeder_ready=%d/%d drained=%d wait_total=%.2fs",
+                            len(pending), queue_depth,
+                            fstats.get("ready", 0),
+                            fstats.get("buffer_size", 0),
+                            fstats.get("drained_count", 0),
+                            fstats.get("pop_wait_total_s", 0.0),
+                        )
+
+                yield model, raw_ss
+
+        finally:
+            _cancel_all()

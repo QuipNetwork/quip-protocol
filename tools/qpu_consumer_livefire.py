@@ -10,7 +10,7 @@ production path the live miner uses: ``BaseMiner._ensure_driver`` spawns the
 ONE persistent ``QPU.stream_driver`` subprocess running
 ``build_persistent_context`` against the live QPU, and a ``switch_round``
 control message starts the round; the consumer reads generation-tagged
-samplesets through the ``SharedSampleRing`` via ``_acquire_result``;
+samplesets through the ``SampleView`` via ``_acquire_result``;
 ``_close_driver`` reaps the persistent driver + ring.
 This exercises the parts the in-process probe cannot:
 
@@ -25,7 +25,7 @@ This exercises the parts the in-process probe cannot:
     processes, and ``/dev/shm`` segments returned to baseline (no leak).
 
 ``inprocess`` — the consumer-cost probe: drives
-``DWaveMiner.sample_ising_streaming`` in-process and measures, per attempt,
+``DWaveSamplerWrapper.sample_ising_streaming`` in-process and measures, per attempt,
 ``t_next`` (QPU pipeline wait), ``t_meta`` (``compute_solution_meta``), and
 ``t_eval`` (``evaluate_sampleset``). Use this to confirm the per-attempt
 consumer work stays under the 50ms target; it does NOT spawn the driver
@@ -99,7 +99,7 @@ def _summary(name: str, xs: List[float]) -> str:
 def _count_shm() -> Optional[int]:
     """POSIX shared-memory segment count (Linux ``/dev/shm``), else None.
 
-    Used to detect leaked ``SharedSampleRing`` segments after teardown.
+    Used to detect leaked ``SampleView`` segments after teardown.
     macOS has no ``/dev/shm`` so the check is skipped there.
     """
     shm_dir = "/dev/shm"
@@ -494,7 +494,8 @@ def run_inprocess(args: argparse.Namespace) -> int:
         edges=edges,
         buffer_size=args.feeder_buffer_size,
     )
-    miner._stop_event = multiprocessing.Event()
+    stop_event = multiprocessing.Event()
+    miner._stop_event = stop_event  # kept for legacy callers that check this attr
     requirements = _make_requirements(args)
 
     t_next: List[float] = []
@@ -505,12 +506,13 @@ def run_inprocess(args: argparse.Namespace) -> int:
 
     overall_start = time.perf_counter()
     try:
-        stream = miner.sample_ising_streaming(
+        stream = miner.sampler.sample_ising_streaming(
             feeder,
             num_reads=args.num_reads,
             annealing_time=args.anneal,
             queue_depth=args.queue_depth,
-            energy_threshold=args.energy_threshold,
+            energy_threshold_milli=int(args.energy_threshold * 1000),
+            stop_event=stop_event,
         )
         it = iter(stream)
         for i in range(args.n):
@@ -522,6 +524,15 @@ def run_inprocess(args: argparse.Namespace) -> int:
             t_next.append((time.perf_counter() - t0) * 1000.0)
 
             try:
+                # Reconstruct the full topology sampleset so consumer cost
+                # measurements include the reconstruction step that the
+                # production consumer performs on every survivor.
+                defect_info = sampleset.info.get("defect_info")
+                if defect_info is not None:
+                    sampleset = miner.sampler.reconstruct_full_sampleset(
+                        sampleset, defect_info,
+                    )
+
                 t1 = time.perf_counter()
                 compute_solution_meta(sampleset, args.energy_threshold)
                 t_meta.append((time.perf_counter() - t1) * 1000.0)
@@ -549,7 +560,7 @@ def run_inprocess(args: argparse.Namespace) -> int:
             if (i + 1) % args.log_every == 0:
                 print(f"[livefire] {i + 1}/{args.n} attempts...", file=sys.stderr)
     finally:
-        miner._stop_event.set()
+        stop_event.set()
         feeder.stop()
 
     wall = time.perf_counter() - overall_start

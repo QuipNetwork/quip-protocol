@@ -160,13 +160,14 @@ def _run_batch(
     log_every: int = 50,
     stored_solutions_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    """Run n submissions through ``DWaveMiner.sample_ising_streaming``.
+    """Run n submissions through ``DWaveSamplerWrapper.sample_ising_streaming``.
 
-    Uses the exact production pipeline: background ``RandomIsingFeeder``
-    (ProcessPool) for problem derivation, async D-Wave submissions
-    pipelined ``queue_depth`` deep, fast-path reconstruction skip for
-    non-promising candidates. Throughput numbers match what the miner
-    sees on the same hardware.
+    Uses the same sampler as the production pipeline: background
+    ``RandomIsingFeeder`` (ProcessPool) for problem derivation, async D-Wave
+    submissions pipelined ``queue_depth`` deep. The new pump yields raw
+    reduced samplesets with ``sampleset.info['defect_info']`` set; this
+    function reconstructs the full topology for each result so energies and
+    the chain validator see the full spin vector.
 
     Per-submission metrics: ``qpu_access_us`` (from sampleset.info),
     ``best_energy``, ``valid`` (chain or energy-only). Per-submission
@@ -189,13 +190,11 @@ def _run_batch(
         edges=edges,
         buffer_size=feeder_buffer_size,
     )
-    # Wire a stop_event into the miner so we can cancel any pending
-    # D-Wave futures cleanly when we break out of the stream early
-    # (after hitting n_submissions). Without this the stream's
-    # in-flight futures keep the SDK client alive and the process
-    # hangs at the end.
+    # stop_event is passed into the pump so it can cancel in-flight D-Wave
+    # futures when we reach n_submissions or on KeyboardInterrupt.
     import multiprocessing
-    miner._stop_event = multiprocessing.Event()
+    stop_event = multiprocessing.Event()
+    miner._stop_event = stop_event  # kept for legacy callers that check this attr
 
     per_submission: List[Dict[str, Any]] = []
     overall_start = time.monotonic()
@@ -212,14 +211,22 @@ def _run_batch(
     )
 
     try:
-        stream = miner.sample_ising_streaming(
+        stream = miner.sampler.sample_ising_streaming(
             feeder,
             num_reads=num_reads,
             annealing_time=annealing_time_us,
             queue_depth=queue_depth,
-            energy_threshold=energy_threshold,
+            energy_threshold_milli=int(energy_threshold * 1000),
+            stop_event=stop_event,
         )
         for model, sampleset in stream:
+            # Reconstruct the full topology sampleset from the raw reduced
+            # result so energies and the chain validator see all variables.
+            defect_info = sampleset.info.get("defect_info")
+            if defect_info is not None:
+                sampleset = miner.sampler.reconstruct_full_sampleset(
+                    sampleset, defect_info,
+                )
             # Wrap the sampleset-info access too: the future is lazy,
             # so accessing .info or .record can raise a transient
             # D-Wave SolverError (502, 503, network) that would
@@ -339,25 +346,15 @@ def _run_batch(
                 last_log = now
 
             if completed >= n_submissions:
-                # Signal the generator to wind down, but DON'T break —
-                # we drain it below so it reaches its own
-                # _cancel_pending() path. stream.close() would raise
-                # GeneratorExit at the yield, skipping that cancel and
-                # leaving D-Wave futures (and their SDK poll threads)
-                # alive, which hangs the process at exit.
-                miner._stop_event.set()
+                # Signal the generator to wind down. The pump sees
+                # stop_event set, cancels in-flight D-Wave futures, and
+                # returns cleanly (no hanging SDK threads).
+                stop_event.set()
                 break
     finally:
-        # Drain the generator so it resumes past the last yield, sees
-        # stop_event set at the top of its loop, calls
-        # _cancel_pending() on the in-flight D-Wave futures, and
-        # returns (StopIteration). This releases the SDK resources that
-        # otherwise keep the process alive.
-        try:
-            if miner._stop_event is not None:
-                miner._stop_event.set()
-        except AttributeError:
-            pass
+        # Ensure the pump sees stop_event so in-flight D-Wave futures
+        # are cancelled and the SDK releases its poll threads.
+        stop_event.set()
         try:
             for _ in stream:
                 pass

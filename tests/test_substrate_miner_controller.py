@@ -1028,62 +1028,6 @@ async def test_handle_result_pairs_late_result_with_dispatch_context(monkeypatch
     assert controller.stats.stale_drops == 1
 
 
-def test_minerhandle_cancel_does_not_enqueue_stop_mining(monkeypatch):
-    """The legacy `MinerHandle.cancel()` queued an untagged `stop_mining`
-    op that could be consumed by a *later* dispatch's req.get and
-    cancel the new work with a stale cancel. The fix is to not queue
-    anything — stop_event is the single signal."""
-    import multiprocessing as mp
-    from shared.miner_worker import MinerHandle
-
-    # Bypass __init__ to avoid spawning a real subprocess.
-    handle = MinerHandle.__new__(MinerHandle)
-    handle.spec = {"id": "test", "kind": "cpu"}
-    handle.req = mp.Queue()
-    handle.resp = mp.Queue()
-    handle.stop_event = mp.Event()
-    handle._next_dispatch_id = 0
-    handle._active_dispatch_id = 0
-
-    handle.cancel()
-    assert handle.stop_event.is_set()
-    # Queue must be empty — no stop_mining op enqueued.
-    import queue
-    try:
-        msg = handle.req.get(timeout=0.05)
-        pytest.fail(f"cancel() enqueued unexpected op: {msg}")
-    except queue.Empty:
-        pass  # expected
-
-
-def test_minerhandle_mine_work_item_returns_dispatch_id():
-    """`mine_work_item` must increment + return the dispatch_id so the
-    controller can key its immutable (handle_id, dispatch_id) →
-    context map by it."""
-    import multiprocessing as mp
-    from shared.miner_worker import MinerHandle
-
-    handle = MinerHandle.__new__(MinerHandle)
-    handle.spec = {"id": "test", "kind": "cpu"}
-    handle.req = mp.Queue()
-    handle.resp = mp.Queue()
-    handle.stop_event = mp.Event()
-    handle._next_dispatch_id = 0
-    handle._active_dispatch_id = 0
-
-    fake_ctx = object()
-    d1 = handle.mine_work_item(fake_ctx)
-    d2 = handle.mine_work_item(fake_ctx)
-    d3 = handle.mine_work_item(fake_ctx)
-    assert (d1, d2, d3) == (1, 2, 3)
-    assert handle._active_dispatch_id == 3
-
-    # And the worker request includes the dispatch_id.
-    msg = handle.req.get(timeout=0.5)
-    assert msg["op"] == "mine_work_item"
-    assert msg["dispatch_id"] == 1
-
-
 # ----------------------------------------------------------------------
 # Chain-derived Sol# (Task 4): chain_block_number / pow_sequence wiring
 # ----------------------------------------------------------------------

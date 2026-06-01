@@ -26,13 +26,17 @@ test:
     - pip install -U pip setuptools wheel
     - pip install -e ".[dev]"
   script:
+    # Fast guard: the unified streaming stack has no inline path. Fail early
+    # if the deleted _sample/_sample_batch/STREAMING_PUMP/DRIVER_OWNS_FEEDER
+    # symbols reappear (also covered by pytest, but cheaper as a standalone).
+    - python tools/lint_no_inline_sampling.py
     # Wrap pytest so a hang (e.g. a lingering non-daemon thread blocking
     # interpreter shutdown) produces a full all-thread stack dump rather
     # than a silent timeout. The suite runs in ~80s, so 180s catches a
     # post-summary shutdown hang with margin. SIGABRT triggers
     # faulthandler's all-thread dump; the 30s --kill-after guarantees the
     # job still exits if the dump itself stalls.
-    - timeout --signal=ABRT --kill-after=30 180 python -X faulthandler -m pytest tests/ -v --ignore=tests/test_certificate_manager.py
+    - timeout --signal=ABRT --kill-after=30 180 python -X faulthandler -m pytest tests/ -v
   rules:
     - if: $CI_COMMIT_TAG
       when: never

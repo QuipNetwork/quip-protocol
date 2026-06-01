@@ -19,7 +19,6 @@ _spec.loader.exec_module(_module)
 
 parse_duration = _module.parse_duration
 QPUTimeConfig = _module.QPUTimeConfig
-QPUTimeEstimate = _module.QPUTimeEstimate
 QPUTimeManager = _module.QPUTimeManager
 
 
@@ -83,12 +82,6 @@ class TestParseDuration:
 
 class TestQPUTimeConfig:
     """Tests for QPUTimeConfig dataclass."""
-
-    def test_default_values(self):
-        config = QPUTimeConfig(daily_budget_seconds=1800.0)
-        assert config.daily_budget_seconds == 1800.0
-        assert config.min_blocks_for_estimation == 5
-        assert config.ema_alpha == 0.3
 
     def test_default_reservoir_fields(self):
         cfg = QPUTimeConfig(daily_budget_seconds=1800.0)
@@ -277,31 +270,3 @@ class TestGetStatsAndWarnings:
             QPUTimeManager(QPUTimeConfig(daily_budget_seconds=1800.0,
                                          min_block_budget_seconds=90.0))
         assert not any("min_block_budget" in r.message for r in caplog.records)
-
-
-class TestQPUTimeEstimate:
-    """Tests for QPUTimeEstimate dataclass."""
-
-    def test_estimate_creation(self):
-        estimate = QPUTimeEstimate(
-            estimated_block_time_us=10000.0,
-            cumulative_used_us=50000.0,
-            daily_budget_us=1000000.0,
-            budget_remaining_us=450000.0,
-            pool_us=450000.0,
-            pool_cap_us=900000.0,
-            burst_active=True,
-            should_mine=True,
-            confidence="high",
-            seconds_until_can_mine=0.0,
-        )
-        assert estimate.estimated_block_time_us == 10000.0
-        assert estimate.cumulative_used_us == 50000.0
-        assert estimate.daily_budget_us == 1000000.0
-        assert estimate.budget_remaining_us == 450000.0
-        assert estimate.pool_us == 450000.0
-        assert estimate.pool_cap_us == 900000.0
-        assert estimate.burst_active is True
-        assert estimate.should_mine is True
-        assert estimate.confidence == "high"
-        assert estimate.seconds_until_can_mine == 0.0

@@ -23,12 +23,34 @@ def test_dwave_miner_connect_false_builds_no_sampler():
         pass
 
 
-def test_dwave_miner_sample_raises_not_implemented():
-    """The legacy synchronous _sample fallback is gone; the stub raises."""
+def test_build_persistent_context_forwards_topology():
+    """build_persistent_context passes topology to DWaveMiner and returns StreamContext."""
+    from unittest.mock import patch
+    from dwave_topologies import DEFAULT_TOPOLOGY
+    from shared.stream_context import StreamContext
+    import QPU.dwave_miner as dm
+
+    with patch.object(dm, "DWaveMiner") as mk:
+        result = dm.build_persistent_context(
+            miner_id="m", queue_depth=2, nodes=[0, 1, 2], edges=[(0, 1)],
+            feeder_buffer_size=4, num_reads=4, annealing_time=80.0,
+            energy_threshold_milli=0,
+            topology=DEFAULT_TOPOLOGY,
+        )
+    _a, kwargs = mk.call_args
+    assert kwargs["topology"] is DEFAULT_TOPOLOGY
+    assert isinstance(result, StreamContext)
+
+
+def test_build_persistent_context_requires_topology():
+    """build_persistent_context raises ValueError when topology is None."""
     import pytest
+    import QPU.dwave_miner as dm
 
-    from QPU.dwave_miner import DWaveMiner
-
-    m = DWaveMiner(miner_id="worker-orchestrator", connect=False)
-    with pytest.raises(NotImplementedError):
-        m._sample({}, {}, num_reads=1, num_sweeps=1)
+    with pytest.raises(ValueError, match="requires a topology"):
+        dm.build_persistent_context(
+            miner_id="m", queue_depth=2, nodes=[0, 1, 2], edges=[(0, 1)],
+            feeder_buffer_size=4, num_reads=4, annealing_time=80.0,
+            energy_threshold_milli=0,
+            topology=None,
+        )

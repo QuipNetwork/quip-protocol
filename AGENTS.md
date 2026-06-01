@@ -60,6 +60,21 @@ Live integration uses the docker-compose validator under `docker/`
 (`docker compose up quip-validator`); the validator listens on
 `ws://127.0.0.1:9944` by default.
 
+**Metal interactive cap (Apple Silicon):** the `[metal]` section runs an
+adaptive governor when `yielding` is on (default). It senses HID-idle /
+thermal / battery / displays and caps **GPU occupancy** — the jank lever is
+concurrent threads per command buffer (`problems × reads`), not core count or
+duty cycle. While you're present it splits reads so each command buffer stays
+under `active_util` % of the GPU's max thread capacity
+(`maxTotalThreadsPerThreadgroup × cores`; default 85); idle/headless runs
+uncapped (full speed); thermal-serious halves it; battery / critical thermal
+pause. Total reads and sweeps are always preserved. (On an M4 Max steady-state
+mining is smooth even at full saturation, so the cap is mainly insurance for
+weaker GPUs / sustained thermal load.) This path
+is **independent of the CUDA util monitor** — it lives in
+`GPU/metal_scheduler.py` + `GPU/macos_sensors.py` and shares no utilization
+machinery with `GPU/util_monitor.py`. See `docs/metal-gpu-governor.md`.
+
 ## Testing
 
 ```bash

@@ -196,3 +196,27 @@ class ModalSampler(MockDWaveSampler):
         
         # Create proper dimod.SampleSet
         return dimod.SampleSet.from_samples(sample_dicts, 'SPIN', energies)
+
+    def sample_ising_streaming(
+        self, feeder, *, num_reads, num_sweeps, **_ignored,
+    ):
+        """Stream samplesets from a feeder, one model at a time.
+
+        Thin generator for the unified driver path: pop a model, sample it,
+        yield ``(model, sampleset)``. The feeder is owned by the caller
+        (``StreamContext``); this generator never stops it. ``**_ignored``
+        absorbs any sampler_kwargs a generic driver may pass.
+        """
+        while True:
+            try:
+                model = feeder.pop_blocking()
+            except StopIteration:
+                # PEP 479: a bare StopIteration escaping a generator body
+                # becomes RuntimeError. Returning lets StreamContext reseed
+                # cleanly instead of crashing the stream driver.
+                return
+            ss = self.sample_ising(
+                h=model.h, J=model.J,
+                num_reads=num_reads, num_sweeps=num_sweeps,
+            )
+            yield model, ss

@@ -87,50 +87,56 @@ def test_load_rejects_non_string_validator(tmp_path):
 
 
 def test_merge_cli_overrides_toml():
-    toml = {"validators": ["ws://toml:9944"], "topology": "zephyr:9,2"}
-    cli = {"validators": ("ws://cli:9944",), "topology": "zephyr:10,2"}
+    """CLI values win over TOML — covers list, scalar, and rest_host/rest_port."""
+    toml = {
+        "validators": ["ws://toml:9944"],
+        "topology": "zephyr:9,2",
+        "rest_host": "127.0.0.1",
+        "rest_port": 8086,
+    }
+    cli = {
+        "validators": ("ws://cli:9944",),
+        "topology": "zephyr:10,2",
+        "rest_host": "0.0.0.0",
+        "rest_port": 9000,
+    }
     merged = merge_config(toml, cli)
     # CLI list materialized to a list — order preserved.
     assert merged["validators"] == ["ws://cli:9944"]
     assert merged["topology"] == "zephyr:10,2"
+    assert merged["rest_host"] == "0.0.0.0"
+    assert merged["rest_port"] == 9000
 
 
 def test_merge_falls_back_to_toml_when_cli_empty():
-    """Empty tuples / None / unset CLI values must NOT clobber TOML."""
+    """Empty tuples / None / unset CLI values must NOT clobber TOML —
+    covers validators, signer_key, topology, and rest_host/rest_port."""
     toml = {
         "validators": ["ws://toml:9944"],
         "signer_key": "~/.quip-miner/signing.json",
         "topology": "zephyr:9,2",
+        "rest_host": "0.0.0.0",
+        "rest_port": 8086,
     }
-    cli = {"validators": (), "signer_key": None, "topology": None}
+    cli = {
+        "validators": (),
+        "signer_key": None,
+        "topology": None,
+        "rest_host": None,
+        "rest_port": None,
+    }
     merged = merge_config(toml, cli)
     assert merged["validators"] == ["ws://toml:9944"]
     assert merged["signer_key"] == "~/.quip-miner/signing.json"
     assert merged["topology"] == "zephyr:9,2"
+    assert merged["rest_host"] == "0.0.0.0"
+    assert merged["rest_port"] == 8086
 
 
 def test_merge_unknown_cli_key_passes_through():
     """Extra CLI keys (e.g. num_cpus on the cpu command) get merged in."""
     merged = merge_config({}, {"validators": ("ws://a:9944",), "num_cpus": 4})
     assert merged["num_cpus"] == 4
-
-
-def test_merge_rest_host_and_port_cli_overrides_toml():
-    """`rest_host` / `rest_port` follow the same CLI > TOML precedence."""
-    toml = {"rest_host": "127.0.0.1", "rest_port": 8086}
-    cli = {"rest_host": "0.0.0.0", "rest_port": 9000}
-    merged = merge_config(toml, cli)
-    assert merged["rest_host"] == "0.0.0.0"
-    assert merged["rest_port"] == 9000
-
-
-def test_merge_rest_host_and_port_toml_when_cli_unset():
-    """A TOML `rest_host = "0.0.0.0"` survives an unset CLI flag (None)."""
-    toml = {"rest_host": "0.0.0.0", "rest_port": 8086}
-    cli = {"rest_host": None, "rest_port": None}
-    merged = merge_config(toml, cli)
-    assert merged["rest_host"] == "0.0.0.0"
-    assert merged["rest_port"] == 8086
 
 
 # ----------------------------------------------------------------------
@@ -448,16 +454,17 @@ def test_resolve_modes_dwave_section_resolves_to_qpu():
     assert resolve_modes({"dwave": {"daily_budget": "60s"}}) == ["qpu"]
 
 
-def test_resolve_modes_cuda_section_resolves_to_gpu():
-    assert resolve_modes({"cuda": {"0": {}}}) == ["gpu"]
-
-
-def test_resolve_modes_metal_section_resolves_to_gpu():
-    assert resolve_modes({"metal": {}}) == ["gpu"]
-
-
-def test_resolve_modes_modal_section_resolves_to_gpu():
-    assert resolve_modes({"modal": {"gpu_type": "a10g"}}) == ["gpu"]
+@pytest.mark.parametrize(
+    "backends",
+    [
+        {"cuda": {"0": {}}},
+        {"metal": {}},
+        {"modal": {"gpu_type": "a10g"}},
+    ],
+)
+def test_resolve_modes_gpu_section_resolves_to_gpu(backends):
+    """Each GPU-group section (cuda/metal/modal) resolves to the gpu mode."""
+    assert resolve_modes(backends) == ["gpu"]
 
 
 def test_resolve_modes_multi_group_returns_canonical_order():

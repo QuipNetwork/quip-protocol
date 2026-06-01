@@ -1,29 +1,24 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
 
-"""GPU miner using Metal/MPS with RandomIsingFeeder streaming pipeline.
+"""GPU miner using Metal/MPS, driven by the stream-driver pipeline.
 
-Mirrors GPUMiner (gpu_miner.py) architecture: RandomIsingFeeder for
-background model generation, MetalScheduler for core budget and
-IOKit-based yielding, and batched streaming dispatch via
-MetalSASampler.sample_ising_streaming().
+The sampler (MetalSASampler), feeder, and MetalScheduler (core budget +
+IOKit-based yielding) live in the stream-driver process
+(GPU/metal_stream.py). This worker only adapts params and supplies the
+driver-context factory kwargs.
 """
 from __future__ import annotations
 
 import os
 import signal
 import subprocess
-import sys
-import time
-from typing import Dict, Iterator, List, Optional, Tuple
-
-import dimod
+from typing import List, Tuple
 
 from shared.base_miner import BaseMiner
 from shared.miner_types import BlockRequirements
-from shared.ising_feeder import RandomIsingFeeder
 from GPU.metal_sa import MetalSASampler
-from GPU.metal_scheduler import DutyCycleController, MetalScheduler
+from GPU.metal_scheduler import MetalScheduler
 
 
 def get_gpu_core_count() -> int:
@@ -52,24 +47,23 @@ def get_gpu_core_count() -> int:
     )
 
 
-# Pipeline stall timeout constants (match gpu_miner.py)
-_PIPELINE_STALL_FLOOR = 60.0
-_SEC_PER_SWEEP = 0.03
-_STALL_SAFETY_FACTOR = 5.0
-
-
 class MetalMiner(BaseMiner):
-    """Metal GPU miner with RandomIsingFeeder streaming pipeline.
+    """Metal GPU miner driven by the stream-driver pipeline.
 
-    Architecture mirrors GPUMiner: background model generation
-    via RandomIsingFeeder, core budget via MetalScheduler, and batched
-    multi-problem dispatch via sample_ising_streaming().
+    The sampler, feeder, and MetalScheduler live in the stream-driver
+    process (GPU/metal_stream.py); this worker only adapts params and
+    supplies the driver-context factory kwargs.
     """
 
     # Keep the feeder large enough to keep Metal threadgroup dispatch fed
     # without starving on Python-side derivation. Matches the old default
     # of ``budget * 2`` for typical Apple Silicon core counts (~10).
     FEEDER_BUFFER_SIZE = 16
+
+    # Dotted path to the stream-driver producer factory (GPU/metal_stream.py).
+    # The driver process builds its own scheduler + feeder; the worker keeps
+    # neither.
+    STREAM_FACTORY_DOTTED = "GPU.metal_stream:build_persistent_context"
 
     # Metal MPS strategy: fewer sweeps, more reads
     ADAPT_MIN_SWEEPS = 64
@@ -80,30 +74,27 @@ class MetalMiner(BaseMiner):
     def __init__(self, miner_id: str, topology=None, **cfg):
         gpu_util = cfg.pop('utilization', cfg.pop('gpu_utilization', 100))
         yielding = cfg.pop('yielding', True)
+        # Metal-only adaptive-cap keys (see metal_scheduler.CapConfig). Popped
+        # here and threaded into the stream-driver context. active_util is the
+        # occupancy budget while the user is present, as a percentage of the
+        # GPU's max thread capacity (maxTotalThreadsPerThreadgroup x cores).
+        # Default 85 leaves ~15% headroom; lower it if a (weaker) Mac stutters.
+        # Idle/headless runs uncapped; battery/critical pauses.
+        self.active_util = cfg.pop('active_util', 85)
+        self.idle_after_s = cfg.pop('idle_after_s', 60.0)
+        self.yielding = yielding
         # Remove CUDA-only keys that flow through common_cfg
         cfg.pop('sms_per_nonce', None)
 
-        try:
-            sampler = MetalSASampler(topology=topology)
-            super().__init__(
-                miner_id, sampler, miner_type="GPU-Metal",
-            )
-            sampler.logger = self.logger
-        except Exception as e:
-            from CPU.sa_sampler import (
-                SimulatedAnnealingStructuredSampler,
-            )
-            sampler = SimulatedAnnealingStructuredSampler(
-                topology=topology,
-            )
-            super().__init__(
-                miner_id, sampler, miner_type="CPU-FALLBACK",
-            )
-            self.logger.warning(
-                "Metal GPU init failed, falling back to "
-                "CPU: %s", e,
-            )
-            return
+        self.topology = topology
+
+        # Metal is required: a failed sampler init crashes rather than
+        # silently falling back to CPU (the driver process owns the sampler).
+        sampler = MetalSASampler(topology=topology)
+        super().__init__(
+            miner_id, sampler, miner_type="GPU-Metal",
+        )
+        sampler.logger = self.logger
 
         if not 0 < gpu_util <= 100:
             raise ValueError(
@@ -113,40 +104,30 @@ class MetalMiner(BaseMiner):
         self.gpu_utilization = gpu_util
 
         self.gpu_core_count = get_gpu_core_count()
-        self._scheduler = MetalScheduler(
+        # yielding=False here: this worker-side scheduler only computes the
+        # core budget for the log line below. The live cap monitor runs in the
+        # stream-driver process (build_persistent_context), not the worker.
+        scheduler = MetalScheduler(
             gpu_core_count=self.gpu_core_count,
             gpu_utilization_pct=gpu_util,
-            yielding=yielding,
+            yielding=False,
         )
-
         self.logger.info(
             "Metal miner %s: utilization=%d%%, "
             "core_budget=%d, cores=%d, yielding=%s",
             miner_id,
             gpu_util,
-            self._scheduler.get_core_budget(),
+            scheduler.get_core_budget(),
             self.gpu_core_count,
             yielding,
         )
-
-        # Duty-cycle controller: sleep proportionally to compute
-        # time so actual GPU utilization matches the target.
-        self._duty_cycle = DutyCycleController(
-            target_pct=gpu_util,
-        )
-
-        # Pipeline state (reset per mine_block call)
-        self._feeder: Optional[RandomIsingFeeder] = None
-        self._stream: Optional[Iterator] = None
-        self._active_tg = self._scheduler.get_core_budget()
-        self._max_tg = self._active_tg
 
         signal.signal(signal.SIGTERM, self._cleanup_handler)
 
     # ── BaseMiner hooks ──────────────────────────────────
 
     def _pre_mine_setup(self, *args, **kwargs) -> bool:
-        """Per-attempt setup. Feeder is built by ``BaseMiner.mine_work_item``.
+        """Per-attempt setup validating the work context.
 
         Kept as an override (instead of using BaseMiner's default no-op)
         so the validation of ``prev_block`` / ``node_info`` runs early
@@ -161,7 +142,6 @@ class MetalMiner(BaseMiner):
             )
             return False
 
-        self._stream = None
         return True
 
     def _adapt_mining_params(
@@ -178,103 +158,32 @@ class MetalMiner(BaseMiner):
             num_edges=len(edges),
         )
 
-    def _sample_batch(
-        self,
-        prev_hash: bytes,
-        miner_id: str,
-        cur_index: int,
-        nodes: List[int],
-        edges: List[Tuple[int, int]],
-        *,
-        num_reads: int,
-        num_sweeps: int,
-        **kwargs,
-    ) -> Optional[
-        List[Tuple[int, bytes, dimod.SampleSet]]
-    ]:
-        """Stream one batch from the Metal pipeline.
+    def _stream_factory_kwargs(self, sample_ctx, nodes):
+        """Return kwargs forwarded to GPU.metal_stream:build_persistent_context.
 
-        Lazily creates the streaming iterator on first call.
-        Returns one (nonce, salt, sampleset) per call, or
-        None to fall through to single-nonce path.
+        Called by BaseMiner._ensure_driver when spawning the stream driver.
         """
-        # No feeder means fallback mode (CPU sampler)
-        if self._feeder is None:
-            return None
-
-        if self._scheduler.should_throttle():
-            time.sleep(0.5)
-
-        # Dynamic batch sizing: check if IOKit suggests resizing
-        if self._stream is not None and self._scheduler.yielding:
-            new_tg = self._scheduler.check_stable_target_threadgroups(
-                self._max_tg, self._active_tg,
-            )
-            if new_tg is not None and new_tg != self._active_tg:
-                self.logger.info(
-                    "Resizing Metal batch: %d → %d threadgroups",
-                    self._active_tg, new_tg,
-                )
-                if hasattr(self._stream, 'close'):
-                    self._stream.close()
-                self._stream = None
-                self._active_tg = new_tg
-                self._duty_cycle.reset()
-
-        if self._stream is None:
-            budget = self._active_tg
-            self._stream = self.sampler.sample_ising_streaming(
-                self._feeder,
-                num_reads=num_reads,
-                num_sweeps=num_sweeps,
-                max_threadgroups=budget,
-                duty_cycle=self._duty_cycle,
-                scheduler=self._scheduler,
-            )
-
-        try:
-            model, ss = next(self._stream)
-        except StopIteration:
-            return None
-
-        return [(model.nonce, model.salt, ss)]
-
-    def _sample(
-        self,
-        h: Dict[int, float],
-        J: Dict[Tuple[int, int], float],
-        *,
-        num_reads: int,
-        num_sweeps: int,
-        **kwargs,
-    ) -> dimod.SampleSet:
-        """Single-nonce fallback (synchronous)."""
-        results = self.sampler.sample_ising(
-            [h], [J],
-            num_reads=num_reads,
-            num_sweeps=num_sweeps,
-        )
-        return results[0]
-
-    def _post_mine_cleanup(self) -> None:
-        """Stop stream and feeder."""
-        if self._stream is not None:
-            if hasattr(self._stream, 'close'):
-                self._stream.close()
-            self._stream = None
-        if self._feeder is not None:
-            self._feeder.stop()
-            self._feeder = None
+        return {
+            "miner_id": self.miner_id,
+            "nodes": nodes,
+            "edges": sample_ctx["edges"],
+            "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
+            "num_reads": sample_ctx["num_reads"],
+            "num_sweeps": sample_ctx["num_sweeps"],
+            "topology": getattr(self, "topology", None),
+            "utilization": getattr(self, "gpu_utilization", 100),
+            "yielding": getattr(self, "yielding", True),
+            "active_util": getattr(self, "active_util", 85),
+            "idle_after_s": getattr(self, "idle_after_s", 60.0),
+        }
 
     def _cleanup_handler(self, signum, frame):
-        """Handle SIGTERM: stop feeder, scheduler, exit."""
-        if self._feeder is not None:
-            self._feeder.stop()
-            self._feeder = None
+        """Handle SIGTERM: clear cached state, exit.
 
-        if hasattr(self, '_scheduler'):
-            self._scheduler.stop()
-
+        The sampler, scheduler and feeder live in the stream-driver process
+        (reaped by ``BaseMiner._close_driver``), so this worker-side handler
+        only drops cached candidates before a hard exit.
+        """
         if hasattr(self, 'top_attempts'):
             self.top_attempts.clear()
 

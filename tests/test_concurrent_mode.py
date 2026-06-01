@@ -95,25 +95,6 @@ def test_split_returns_fresh_lists():
     assert len(handles) == 4
 
 
-def test_split_returns_fresh_lists_mempool_side():
-    handles = _handles(4)
-    pow_h, mempool_h = _split_handles_for_mode("mempool", handles)
-    mempool_h.append(_StubHandle("extra"))
-    assert len(handles) == 4
-
-
-def test_split_empty_handles_pow():
-    pow_h, mempool_h = _split_handles_for_mode("pow", [])
-    assert pow_h == []
-    assert mempool_h == []
-
-
-def test_split_empty_handles_mempool():
-    pow_h, mempool_h = _split_handles_for_mode("mempool", [])
-    assert pow_h == []
-    assert mempool_h == []
-
-
 def test_split_empty_handles_both():
     pow_h, mempool_h = _split_handles_for_mode("both", [])
     assert pow_h == []

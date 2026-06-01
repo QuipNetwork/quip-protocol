@@ -109,7 +109,17 @@ signer_key = "~/.quip-miner/signing.json"
 
 # Apple Silicon (Metal Performance Shaders). Single GPU per node.
 # [metal]
-# utilization = 100
+# utilization = 100          # IDLE/headless cap — flat-out when nobody's here
+#
+# Interactive profile — responsive Mac while mining. `yielding` (default on)
+# enables the adaptive cap monitor (HID-idle / thermal / battery / display
+# sensing). While present it caps GPU occupancy (concurrent threads per command
+# buffer) to `active_util` % of the GPU's max thread capacity; idle/headless
+# runs flat-out; auto-pauses on battery / critical thermal. Total reads and
+# sweeps are preserved.
+# yielding     = true
+# active_util  = 85          # % of max GPU threads while present (default 85)
+# idle_after_s = 60          # seconds of no input before going flat-out
 
 # Modal cloud GPUs. Set `gpu_type` to the Modal class (t4, a10g, …).
 # [modal]

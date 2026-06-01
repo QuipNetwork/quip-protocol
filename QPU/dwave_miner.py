@@ -5,320 +5,19 @@ import logging
 import multiprocessing
 import multiprocessing.synchronize
 import signal
-import sys
 import time
 from typing import Dict, Iterator, List, Optional, Tuple, Any
 
-import dimod
-
 init_logger = logging.getLogger(__name__)
 
-from QPU.dwave_sampler import DWaveSamplerWrapper, DefectInfo
+from QPU.dwave_sampler import DWaveSamplerWrapper
 from QPU.qpu_time_manager import QPUTimeManager, QPUTimeConfig
-from shared.base_miner import BaseMiner, MidstreamBudget
+from shared.base_miner import BaseMiner, MidstreamBudget, _energy_to_milli
 from shared.miner_types import BlockRequirements
 from shared.ising_feeder import RandomIsingFeeder
-from shared.ising_model import IsingModel
+from shared.stream_context import StreamContext
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies.dwave_topology import DWaveTopology
-
-
-def _best_effort_cancel(future: Any, label: str = "") -> None:
-    """Best-effort cancel of a D-Wave future.
-
-    D-Wave's remote cancel is advisory (the solver may have already
-    run) but invoking it lets the client release network resources.
-    Failures are logged at debug level so flaky networks during
-    teardown don't spam production logs.
-    """
-    cancel_fn = getattr(future, "cancel", None)
-    if not callable(cancel_fn):
-        return
-    try:
-        cancel_fn()
-    except Exception as exc:
-        init_logger.debug(
-            "D-Wave future.cancel() failed%s (best-effort): %s: %s",
-            f" for {label}" if label else "",
-            type(exc).__name__, exc,
-        )
-
-
-def _should_reconstruct(
-    best_qpu_energy: float,
-    defect_offset: float,
-    threshold_energy: float,
-) -> bool:
-    """Return True if a sampleset is promising enough to fully reconstruct.
-
-    The gate is ``(best_qpu_energy + defect_offset) < threshold_energy``.
-    Used only by the ``sample_ising_streaming`` tooling path, which passes the
-    fixed difficulty energy. The persistent driver does NOT use this — it
-    decides reconstruction via its own running best-5 energy floor
-    (``PersistentStreamContext._note_energy``).
-    """
-    return (best_qpu_energy + defect_offset) < threshold_energy
-
-
-def _shift_energies(sampleset: dimod.SampleSet, offset: float) -> dimod.SampleSet:
-    """Shift all energies in a sampleset by a constant offset.
-
-    Cheap O(n) operation — no sample dict copying. Used when we don't
-    need full reconstruction but want approximate full-topology energies.
-    """
-    new_energies = sampleset.record.energy + offset
-    # Build new record with shifted energies
-    import numpy as np
-    new_record = np.recarray(
-        sampleset.record.shape,
-        dtype=sampleset.record.dtype,
-    )
-    for name in sampleset.record.dtype.names:
-        if name == 'energy':
-            new_record.energy = new_energies
-        else:
-            new_record[name] = sampleset.record[name]
-    return dimod.SampleSet(
-        new_record, sampleset.variables, sampleset.info, sampleset.vartype,
-    )
-
-
-class PersistentStreamContext:
-    """Long-lived D-Wave connection + feeder driving generation-tagged streams.
-
-    Built ONCE per driver process by :func:`build_persistent_context` (the
-    expensive ``DWaveSampler`` solver download happens there). A chain-head
-    change calls :meth:`apply_command` with a ``switch`` tuple to swap the
-    round seed (via ``feeder.reseed`` — no re-fork, no reconnect); a live
-    threshold decay calls it with a ``threshold`` tuple to widen/narrow the
-    reconstruction gate WITHOUT bumping the generation.
-
-    :meth:`iter_results` is one long-lived generator. It maintains
-    ``queue_depth`` in-flight QPU submissions, tagging each with the
-    generation it was submitted under; on a switch it cancels in-flight
-    futures and reseeds, so a completion from a superseded round is never
-    yielded. Each completion is gated by :func:`_should_reconstruct` against
-    the running best-5 energy floor.
-    """
-
-    def __init__(
-        self,
-        *,
-        miner: "DWaveMiner",
-        nodes: List[int],
-        edges: List[Tuple[int, int]],
-        feeder_buffer_size: int,
-        num_reads: int,
-        annealing_time: float,
-        energy_threshold_milli: int,
-        queue_depth: int,
-        stop_event: Optional[multiprocessing.synchronize.Event] = None,
-    ) -> None:
-        self._miner = miner
-        self._nodes = nodes
-        self._edges = edges
-        self._feeder_buffer_size = feeder_buffer_size
-        self._num_reads = num_reads
-        self._annealing_time = annealing_time
-        self._energy_threshold_milli = int(energy_threshold_milli)
-        self._queue_depth = queue_depth
-        self._stop_event = stop_event
-        # Feeder is built lazily on the first 'switch' (it needs the round
-        # seed); thereafter reseed() keeps the same pool.
-        self._feeder: Optional[RandomIsingFeeder] = None
-        self.generation: int = 0
-        # pending[id(future)] = (model, future, defect_info, job_index, gen)
-        self._pending: Dict[int, Tuple[Any, Any, Any, int, int]] = {}
-        self._job_index = 0
-        # Drain-and-idle pause: a ("pause", gen) command stops NEW submissions
-        # (no _submit_one) but leaves in-flight work to complete; cleared by the
-        # next switch. Lets the QPU budget gate halt forward spend while the
-        # consumer still drains every already-paid-for attempt.
-        self._paused = False
-        # Energy-relative reconstruction gate: the lowest 5 best_qpu_energy
-        # values seen this round (ascending). We reconstruct the full
-        # sampleset only for samples that would enter the consumer's top-5 by
-        # energy — mirroring the worker's stash gate — instead of the (now-
-        # removed) threshold + precheck margin. Reset on switch.
-        self._recon_floor: List[float] = []
-        self._recon_cap = 5
-
-    # -- control ----------------------------------------------------------
-
-    def set_threshold(self, energy_threshold_milli: int) -> None:
-        """Update the live reconstruction threshold (no reseed, no gen bump)."""
-        self._energy_threshold_milli = int(energy_threshold_milli)
-
-    def _note_energy(self, corrected_energy: float) -> bool:
-        """Record an offset-corrected energy; return True if it enters the
-        running best-5 (i.e. the sample is worth full reconstruction).
-
-        The ranked quantity is the OFFSET-CORRECTED energy
-        (``best_qpu_energy + defect_info.energy_offset``) — the same value the
-        worker's stash gate ranks on — so the driver reconstructs exactly the
-        samples the worker would consider for its top-5. Ranking on raw QPU
-        energy here would diverge from the worker (each nonce has a distinct
-        ``energy_offset``) and let an under-reconstructed sample reach the
-        worker.
-        """
-        floor = self._recon_floor
-        if len(floor) < self._recon_cap:
-            floor.append(corrected_energy)
-            floor.sort()
-            return True
-        if corrected_energy < floor[-1]:
-            floor[-1] = corrected_energy
-            floor.sort()
-            return True
-        return False
-
-    def cancel_inflight(self) -> None:
-        """Best-effort-cancel and drop all in-flight QPU futures."""
-        for _mdl, fut, _d, fidx, _g in self._pending.values():
-            _best_effort_cancel(fut, label=f"job {fidx}")
-        self._pending.clear()
-
-    def apply_command(self, cmd: Tuple[Any, ...]) -> None:
-        """Apply one ctl_q command tuple.
-
-        ``("switch", gen, last_proof_block_hash, miner_bytes, thr_milli,
-        num_reads, annealing_time)`` bumps the generation, cancels in-flight
-        work, (re)seeds the feeder, and resumes (clears pause).
-        ``("threshold", gen, thr_milli)`` updates the gate only.
-        ``("pause", gen)`` stops new submissions without cancelling in-flight
-        (drain-and-idle); the next switch resumes.
-        """
-        kind = cmd[0]
-        if kind == "switch":
-            (_, gen, lpbh, miner_bytes, thr_milli, num_reads,
-             annealing_time) = cmd
-            self.generation = int(gen)
-            self._num_reads = int(num_reads)
-            self._annealing_time = float(annealing_time)
-            self._energy_threshold_milli = int(thr_milli)
-            self._paused = False  # a new head resumes a paused driver
-            self._recon_floor.clear()
-            self.cancel_inflight()
-            if self._feeder is None:
-                self._feeder = RandomIsingFeeder(
-                    last_proof_block_hash=lpbh,
-                    miner_bytes=miner_bytes,
-                    nodes=self._nodes,
-                    edges=self._edges,
-                    buffer_size=self._feeder_buffer_size,
-                )
-            else:
-                self._feeder.reseed(lpbh, miner_bytes)
-        elif kind == "threshold":
-            self.set_threshold(cmd[2])
-        elif kind == "pause":
-            # Drain-and-idle: stop submitting new work; in-flight is left to
-            # complete (NOT cancelled) so the consumer still drains every
-            # already-submitted attempt.
-            self._paused = True
-
-    # -- streaming --------------------------------------------------------
-
-    def _submit_one(self) -> None:
-        model = self._feeder.pop_blocking()
-        future, defect_info = self._miner.sampler.sample_ising_async(
-            model.h, model.J,
-            num_reads=self._num_reads,
-            answer_mode="raw",
-            annealing_time=self._annealing_time,
-            label=f"{self._miner.sampler.job_label}_s{self._job_index}",
-            nonce_seed=model.nonce,
-        )
-        self._pending[id(future)] = (
-            model, future, defect_info, self._job_index, self.generation,
-        )
-        self._job_index += 1
-
-    def _stop(self) -> bool:
-        return self._stop_event is not None and self._stop_event.is_set()
-
-    def _gate_sampleset(self, raw_ss: Any, defect_info: Any) -> Any:
-        if defect_info is None:
-            return raw_ss
-        best_qpu_energy = float(min(raw_ss.record.energy))
-        # Rank on the OFFSET-CORRECTED energy — the same quantity the worker's
-        # stash gate ranks on (both reconstruct/shift add energy_offset). Using
-        # raw best_qpu_energy here would diverge from the worker and could let
-        # an under-reconstructed (shifted, reduced-width) sample reach the stash.
-        corrected_energy = best_qpu_energy + defect_info.energy_offset
-        # Energy-relative: reconstruct iff this sample enters our running
-        # best-5 (what the consumer would stash). No threshold dependence.
-        if self._note_energy(corrected_energy):
-            return self._miner.sampler.reconstruct_full_sampleset(
-                raw_ss, defect_info,
-            )
-        return _shift_energies(raw_ss, defect_info.energy_offset)
-
-    def iter_results(self) -> Iterator[Tuple[IsingModel, dimod.SampleSet, int]]:
-        """Yield ``(model, sampleset, submit_generation)`` in completion order.
-
-        Runs until ``stop_event`` fires. Requires at least one ``switch``
-        command applied first (so a feeder exists). Submissions are tagged
-        with the generation they were made under; the driver discards any
-        completion whose tag no longer matches the live generation.
-        """
-        while not self._stop():
-            if self._feeder is None:
-                return  # no round yet; driver waits on ctl_q before iterating
-            if self._paused and not self._pending:
-                # Drained while paused: end the generator so the driver loop
-                # idles on ctl_q until the next switch resumes us.
-                return
-            while (len(self._pending) < self._queue_depth and not self._stop()
-                   and not self._paused):
-                self._submit_one()
-            completed_id = None
-            while completed_id is None and not self._stop():
-                for fid, (_, fut, _, _, _) in self._pending.items():
-                    if fut.done():
-                        completed_id = fid
-                        break
-                if completed_id is None:
-                    time.sleep(0.005)
-            if completed_id is None:
-                return  # stopped while polling
-            model, future, defect_info, _, submit_gen = self._pending.pop(
-                completed_id,
-            )
-            # Throughput diagnostic (restored from the legacy
-            # sample_ising_streaming path): periodically log the in-flight
-            # depth + feeder state so operators can tell a D-Wave-bound stream
-            # (in_flight stays near queue_depth) from a driver/feeder stall
-            # (in_flight collapses). Logger falls back to the module logger so
-            # the no-QPU context tests (fake miner without .logger) don't break.
-            if self._job_index % 50 == 0 and self._feeder is not None:
-                fstats = self._feeder.stats()
-                logger = getattr(self._miner, "logger", init_logger)
-                logger.info(
-                    "[QPU] stream depth: in_flight=%d/%d feeder_ready=%d/%d "
-                    "drained=%d wait_total=%.2fs",
-                    len(self._pending), self._queue_depth,
-                    fstats["ready"], fstats["buffer_size"],
-                    fstats["drained_count"], fstats["pop_wait_total_s"],
-                )
-            sampleset = self._gate_sampleset(future.sampleset, defect_info)
-            yield model, sampleset, submit_gen
-
-    def cleanup(self) -> None:
-        """Cancel in-flight work, stop the feeder, close the sampler."""
-        self.cancel_inflight()
-        if self._feeder is not None:
-            try:
-                self._feeder.stop()
-            except Exception as exc:  # noqa: BLE001 — log; a leak must show
-                init_logger.warning("ctx cleanup: feeder.stop failed: %s", exc)
-            self._feeder = None
-        sampler = getattr(self._miner, "sampler", None)
-        if sampler is not None and hasattr(sampler, "close"):
-            try:
-                sampler.close()
-            except Exception as exc:  # noqa: BLE001 — connection may leak
-                init_logger.warning("ctx cleanup: sampler.close failed: %s", exc)
 
 
 def build_persistent_context(
@@ -336,20 +35,22 @@ def build_persistent_context(
     token: Optional[str] = None,
     topology: Optional[DWaveTopology] = None,
     stop_event: Optional[multiprocessing.synchronize.Event] = None,
-) -> PersistentStreamContext:
+) -> StreamContext:
     """Build the persistent QPU context (the expensive D-Wave connect).
 
-    Constructs a connected :class:`DWaveMiner` ONCE; the feeder is created
-    lazily on the first ``switch`` command (it needs the round seed) and
-    reseeded thereafter. Runs ONLY in the stream-driver process — never in
-    tests (it connects to D-Wave). Requires a topology to wire the chain
-    topology to the QPU sampler.
+    Constructs a connected :class:`DWaveMiner` ONCE (for its
+    :class:`~QPU.dwave_sampler.DWaveSamplerWrapper`) then hands the sampler
+    to the generic :class:`~shared.stream_context.StreamContext`. The feeder
+    is built lazily on the first ``switch`` command (via the spec). Runs ONLY
+    in the stream-driver process — never in tests (it connects to D-Wave).
+    Requires a topology to wire the chain topology to the QPU sampler.
 
     Args:
         topology: The chain topology for the QPU (required).
 
     Returns:
-        A :class:`PersistentStreamContext` ready to receive ctl_q commands.
+        A :class:`~shared.stream_context.StreamContext` ready to receive
+        ctl_q commands.
 
     Raises:
         ValueError: If topology is None.
@@ -367,15 +68,18 @@ def build_persistent_context(
         token=token,
         topology=topology,
     )
-    return PersistentStreamContext(
-        miner=miner,
+    return StreamContext(
+        sampler=miner.sampler,
         nodes=nodes,
         edges=edges,
         feeder_buffer_size=feeder_buffer_size,
         num_reads=num_reads,
-        annealing_time=annealing_time,
-        energy_threshold_milli=energy_threshold_milli,
-        queue_depth=queue_depth,
+        num_sweeps=0,
+        sampler_kwargs={
+            "queue_depth": queue_depth,
+            "annealing_time": annealing_time,
+            "energy_threshold_milli": energy_threshold_milli,
+        },
         stop_event=stop_event,
     )
 
@@ -441,13 +145,9 @@ class DWaveMiner(BaseMiner):
     # Keep that headroom so the streaming sampler can saturate the
     # D-Wave cloud queue without blocking on Python-side derivation.
     FEEDER_BUFFER_SIZE = 60
-    # QPU is the async-streaming backend: drive the stream in a separate
-    # process so per-result processing never blocks the cloud pipeline.
-    STREAMING_PUMP = True
     # The sampler + feeder live in the persistent stream-driver process (see
-    # QPU/stream_driver.py + build_persistent_context); BaseMiner skips the
-    # worker-side feeder and _ensure_driver spawns/reuses that process.
-    DRIVER_OWNS_FEEDER = True
+    # QPU/stream_driver.py + build_persistent_context); _ensure_driver
+    # spawns/reuses that process and the worker keeps no feeder.
 
     def __init__(
         self,
@@ -573,9 +273,8 @@ class DWaveMiner(BaseMiner):
             )
         self._feeder: Optional[RandomIsingFeeder] = None
         self._stream: Optional[Iterator] = None
-        # Stashed by _pre_mine_setup so the streaming iterator can observe
-        # cancellation during its inner poll loop. Needed because
-        # base_miner's outer stop_event check only fires between batches.
+        # Stashed by _pre_mine_setup; exposed for tooling that builds an
+        # in-process miner and passes the event to the sampler's pump.
         self._stop_event: Optional[multiprocessing.synchronize.Event] = None
 
         # Rate-limiter for the budget-pacing log line. Suppresses the
@@ -634,8 +333,8 @@ class DWaveMiner(BaseMiner):
         must run before any QPU calls so we don't burn budget on an
         already-exhausted day.
         """
-        # Stash the stop_event so sample_ising_streaming can poll it
-        # between QPU completions without plumbing it through every call.
+        # Stash the stop_event so tooling (e.g. qpu_consumer_livefire) that
+        # builds a miner and checks _stop_event can still find it here.
         self._stop_event = stop_event
         if self.time_manager is not None:
             estimate = self.time_manager.should_mine_block()
@@ -768,177 +467,43 @@ class DWaveMiner(BaseMiner):
             'energy_threshold': current_requirements.difficulty_energy,
         }
 
-    def sample_ising_streaming(
-        self,
-        feeder: RandomIsingFeeder,
-        *,
-        num_reads: int,
-        annealing_time: float,
-        queue_depth: int,
-        energy_threshold: float = 0.0,
-    ) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
-        """Stream Ising model solutions via async QPU submission.
+    def _stream_factory_kwargs(self, sample_ctx, nodes):
+        return {
+            "miner_id": self.miner_id,
+            "queue_depth": self.queue_depth,
+            "nodes": nodes,
+            "edges": sample_ctx["edges"],
+            "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
+            "num_reads": sample_ctx["num_reads"],
+            "annealing_time": sample_ctx["annealing_time"],
+            "energy_threshold_milli": _energy_to_milli(
+                sample_ctx["energy_threshold"],
+            ),
+            "solver_name": getattr(self, "solver_name", None),
+            "region": getattr(self, "region", None),
+            "token": getattr(self, "token", None),
+            "topology": getattr(self, "topology", None),
+        }
 
-        Diagnostic/tooling path only — the production miner streams via
-        ``PersistentStreamContext`` (see ``build_persistent_context``); this
-        method is retained for the QPU canary/sweep tools and their tests.
+    def _finalize_sample(self, sampleset: Any, defect_info: Any) -> Any:
+        """Reconstruct a reduced D-Wave sampleset to full topology (survivor-only).
 
-        Maintains queue_depth jobs in-flight on the D-Wave cloud.
-        As each completes, checks whether the best QPU energy (plus
-        the defect offset) could meet the threshold. Only reconstructs
-        the full-topology sampleset for promising candidates.
-
-        Non-candidates get a minimal sampleset with just the best
-        energy — enough for the mining loop's progress tracking but
-        without the ~1s cost of copying 4,500+ spin dicts.
+        Called by ``BaseMiner._run_substrate_ratchet`` when a promising sample
+        has fewer variables than the topology — i.e. the QPU driver stripped
+        offline qubits before writing to the ring.  ``defect_info`` carries the
+        fixed-spin assignments and energy offset needed for reconstruction.
 
         Args:
-            feeder: RandomIsingFeeder providing pre-generated IsingModels.
-            num_reads: QPU reads per problem.
-            annealing_time: Annealing time in microseconds.
-            queue_depth: Number of concurrent in-flight QPU jobs.
-            energy_threshold: Current difficulty energy. Only samplesets
-                whose best QPU energy + defect offset < threshold are
-                fully reconstructed.
+            sampleset: The reduced sampleset from the QPU driver.
+            defect_info: :class:`~QPU.dwave_sampler.DefectInfo` with
+                ``fixed_spins``, ``energy_offset``, and ``removed_edges``.
 
-        Yields:
-            (IsingModel, SampleSet) in completion order.
+        Returns:
+            Full-topology sampleset with all variables present and energies
+            corrected.
         """
-        topology_label = self.sampler.job_label
-
-        # pending: {future_id: (model, future, defect_info, job_index)}
-        pending: Dict[int, Tuple[IsingModel, Any, Optional[DefectInfo], int]] = {}
-        job_index = 0
-
-        def submit_one():
-            nonlocal job_index
-            model = feeder.pop_blocking()
-            future, defect_info = self.sampler.sample_ising_async(
-                model.h, model.J,
-                num_reads=num_reads,
-                answer_mode='raw',
-                annealing_time=annealing_time,
-                label=f"{topology_label}_s{job_index}",
-                nonce_seed=model.nonce,
-            )
-            pending[id(future)] = (model, future, defect_info, job_index)
-            job_index += 1
-
-        # Fill initial queue
-        for _ in range(queue_depth):
-            submit_one()
-
-        stop_event = self._stop_event
-
-        def _stop_requested() -> bool:
-            # stop_event captured once at stream start; stable for this
-            # stream's lifetime (a new dispatch builds a fresh stream).
-            return stop_event is not None and stop_event.is_set()
-
-        def _cancel_pending():
-            """Abandon in-flight D-Wave futures on stop.
-
-            Remote cancel is best-effort (see _best_effort_cancel).
-            Clearing the local map is what frees the mining child to
-            move on to the next block.
-            """
-            for _mdl, fut, _defect, fidx in pending.values():
-                _best_effort_cancel(fut, label=f"job {fidx}")
-            pending.clear()
-
-        drain_engaged = False
-
-        # Stream: poll for completions, yield, refill
-        while pending:
-            # Observe cancellation between polls. Default is discard-on-
-            # stop: abandon pending futures and stop yielding so
-            # base_miner's outer loop can exit promptly. With
-            # drain_on_stop=True (test-only), stop submitting new work
-            # but let in-flight jobs complete so callers can still read
-            # their results.
-            if _stop_requested():
-                if not self.drain_on_stop:
-                    _cancel_pending()
-                    return
-                if not drain_engaged:
-                    # Suppress submit_one() for the remainder of this
-                    # stream so the pipeline winds down naturally as
-                    # pending empties. One-shot — repeated reassignment
-                    # would just churn lambdas every poll.
-                    self.logger.info(
-                        f"[QPU] drain_on_stop engaged with "
-                        f"{len(pending)} jobs in flight; no new "
-                        f"submissions until stream completes"
-                    )
-                    submit_one = lambda: None  # noqa: E731
-                    drain_engaged = True
-
-            completed_id = None
-            while completed_id is None:
-                for fid, (_, fut, _, _) in pending.items():
-                    if fut.done():
-                        completed_id = fid
-                        break
-                if completed_id is None:
-                    if _stop_requested() and not self.drain_on_stop:
-                        _cancel_pending()
-                        return
-                    # 5ms poll: at production throughput one job per ~60ms
-                    # the difference vs 20ms is small per-cycle but worth a
-                    # few percent over a long mining session, and matters
-                    # more when shorter (num_reads, annealing_time) push
-                    # the per-job time down.
-                    time.sleep(0.005)
-
-            model, future, defect_info, _ = pending.pop(completed_id)
-            raw_ss = future.sampleset
-
-            # Refill the slot immediately (before any reconstruction).
-            # In drain mode, submit_one is a no-op so the pipeline winds
-            # down naturally as pending empties.
-            submit_one()
-
-            if job_index % 100 == 0:
-                feeder_stats = feeder.stats()
-                self.logger.info(
-                    "[QPU] stream depth: in_flight=%d/%d "
-                    "feeder_ready=%d/%d drained=%d wait_total=%.2fs",
-                    len(pending), queue_depth,
-                    feeder_stats['ready'], feeder_stats['buffer_size'],
-                    feeder_stats['drained_count'],
-                    feeder_stats['pop_wait_total_s'],
-                )
-
-            if defect_info is not None:
-                # Check if best QPU energy + offset could meet threshold
-                best_qpu_energy = min(raw_ss.record.energy)
-
-                if _should_reconstruct(
-                    best_qpu_energy, defect_info.energy_offset, energy_threshold,
-                ):
-                    # Promising — full reconstruction
-                    sampleset = self.sampler.reconstruct_full_sampleset(
-                        raw_ss, defect_info,
-                    )
-                else:
-                    # Not promising — yield raw QPU energies shifted by
-                    # offset so the mining loop sees approximate values
-                    # without paying reconstruction cost.
-                    sampleset = _shift_energies(raw_ss, defect_info.energy_offset)
-            else:
-                sampleset = raw_ss
-
-            yield model, sampleset
-
-    def _sample(self, h, J, *, num_reads, num_sweeps, **kwargs):
-        """Unused on the QPU path — sampling runs in the stream-driver process.
-
-        QPU mining is STREAMING_PUMP=True and is sourced exclusively from the
-        stream-driver descriptor queue; the legacy synchronous fallback was
-        removed. Kept only to satisfy the BaseMiner ABC.
-        """
-        raise NotImplementedError(
-            "DWaveMiner does not sample synchronously; use the stream driver"
+        return self.sampler.reconstruct_full_sampleset(  # ty:ignore[unresolved-attribute]
+            sampleset, defect_info,
         )
 
     def _post_mine_cleanup(self) -> None:

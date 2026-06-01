@@ -544,7 +544,57 @@ class FixedIsingFeeder:
         """No-op for API parity with :class:`RandomIsingFeeder`."""
 
 
+def build_feeder(spec, nodes, edges, buffer_size):
+    """Build an IsingFeeder from a switch ``feeder_spec`` tuple.
+
+    ``("pow", last_proof_block_hash, miner_bytes)`` -> ``RandomIsingFeeder``.
+    ``("mempool", problem_slot)`` and ``("oneshot", models)`` are wired in
+    later unification steps; for now they raise so a missing case fails loudly.
+
+    Args:
+        spec: A feeder-spec tuple whose first element is the kind string.
+        nodes: Topology node list passed through to the feeder.
+        edges: Topology edge list passed through to the feeder.
+        buffer_size: Target number of ready + in-flight models.
+
+    Returns:
+        A configured feeder implementing the pop/stop interface.
+
+    Raises:
+        NotImplementedError: If ``spec[0]`` is not ``"pow"``.
+    """
+    kind = spec[0]
+    if kind == "pow":
+        _, last_proof_block_hash, miner_bytes = spec
+        return RandomIsingFeeder(
+            last_proof_block_hash=last_proof_block_hash,
+            miner_bytes=miner_bytes,
+            nodes=nodes,
+            edges=edges,
+            buffer_size=buffer_size,
+        )
+    elif kind == "mempool":
+        from shared.ring_views import ProblemView
+        from shared.ising_model import IsingModel
+        _, attach_args, slot = spec
+        pv = ProblemView(**attach_args)  # non-owner attach
+        try:
+            h_vec, j_vec = pv.read(slot)
+            model = IsingModel(
+                h={int(n): float(h_vec[i]) for i, n in enumerate(nodes)},
+                J={(int(e[0]), int(e[1])): float(j_vec[k])
+                   for k, e in enumerate(edges)},
+                nonce=b"\x00" * 32,
+                salt=b"\x00" * 32,
+            )
+        finally:
+            pv.close()  # non-owner: close (never unlink — the worker owns it)
+        return FixedIsingFeeder(models=[model])
+    raise NotImplementedError(f"feeder spec kind not yet supported: {kind!r}")
+
+
 __all__ = [
     "FixedIsingFeeder",
     "RandomIsingFeeder",
+    "build_feeder",
 ]
