@@ -53,10 +53,6 @@ check-version:
   image: python:3.12-slim
   tags: [linux, amd64]
   rules:
-    # Preview tags intentionally don't match pyproject's version (e.g.
-    # 0.2.0rc1) — they're frozen snapshots of the v0.2 line, not releases.
-    - if: $CI_COMMIT_TAG == "v0.2-preview"
-      when: never
     - if: $CI_COMMIT_TAG
   script:
     - |
@@ -76,10 +72,11 @@ check-version:
 # image-build job so the Docker pipelines move in lockstep. MUTABLE_TAGS is
 # a space-separated list; each entry becomes an additional registry tag:
 #   main             -> :latest            (stable)
-#   v0.2             -> :v0.2 :v0.2.0rc1   (rolling + pinned rc)
-#   git tag v0.2-preview -> :v0.2-preview  (frozen preview snapshot;
-#                                        must NOT move :latest, which the
-#                                        production node manager tracks)
+#   v0.2             -> :v0.2               (rolling branch pointer)
+#   git tag v0.2.0rc1 -> :v0.2 :v0.2.0rc1  (pinned rc; also bumps the
+#                                        rolling :v0.2 pointer. Must NOT move
+#                                        :latest, which the production node
+#                                        manager tracks)
 #   git tag vX.Y     -> :latest            (also produces the SHA tag below;
 #                                        true version tagging is a follow-up)
 # The immutable :CI_COMMIT_SHA tag is pushed unconditionally so downstream
@@ -91,10 +88,10 @@ check-version:
         MUTABLE_TAGS: latest
     - if: $CI_COMMIT_BRANCH == "v0.2"
       variables:
-        MUTABLE_TAGS: "v0.2 v0.2.0rc1"
-    - if: $CI_COMMIT_TAG == "v0.2-preview"
+        MUTABLE_TAGS: v0.2
+    - if: $CI_COMMIT_TAG == "v0.2.0rc1"
       variables:
-        MUTABLE_TAGS: v0.2-preview
+        MUTABLE_TAGS: "v0.2 v0.2.0rc1"
     - if: $CI_COMMIT_TAG
       variables:
         MUTABLE_TAGS: latest
