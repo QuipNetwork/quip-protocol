@@ -74,6 +74,15 @@ class MetalMiner(BaseMiner):
     def __init__(self, miner_id: str, topology=None, **cfg):
         gpu_util = cfg.pop('utilization', cfg.pop('gpu_utilization', 100))
         yielding = cfg.pop('yielding', True)
+        # Metal-only adaptive-cap keys (see metal_scheduler.CapConfig). Popped
+        # here and threaded into the stream-driver context. active_util
+        # defaults to 70 (polite while the user is present); drop it to ~30 if
+        # the machine still feels janky under load.
+        self.active_util = cfg.pop('active_util', 70)
+        self.idle_after_s = cfg.pop('idle_after_s', 60.0)
+        self.burst_ms = cfg.pop('burst_ms', 8.0)
+        self.serious_util = cfg.pop('serious_util', 30)
+        self.yielding = yielding
         # Remove CUDA-only keys that flow through common_cfg
         cfg.pop('sms_per_nonce', None)
 
@@ -95,10 +104,13 @@ class MetalMiner(BaseMiner):
         self.gpu_utilization = gpu_util
 
         self.gpu_core_count = get_gpu_core_count()
+        # yielding=False here: this worker-side scheduler only computes the
+        # core budget for the log line below. The live cap monitor runs in the
+        # stream-driver process (build_persistent_context), not the worker.
         scheduler = MetalScheduler(
             gpu_core_count=self.gpu_core_count,
             gpu_utilization_pct=gpu_util,
-            yielding=yielding,
+            yielding=False,
         )
         self.logger.info(
             "Metal miner %s: utilization=%d%%, "
@@ -160,6 +172,11 @@ class MetalMiner(BaseMiner):
             "num_sweeps": sample_ctx["num_sweeps"],
             "topology": getattr(self, "topology", None),
             "utilization": getattr(self, "gpu_utilization", 100),
+            "yielding": getattr(self, "yielding", True),
+            "active_util": getattr(self, "active_util", 100),
+            "idle_after_s": getattr(self, "idle_after_s", 60.0),
+            "burst_ms": getattr(self, "burst_ms", 8.0),
+            "serious_util": getattr(self, "serious_util", 30),
         }
 
     def _cleanup_handler(self, signum, frame):

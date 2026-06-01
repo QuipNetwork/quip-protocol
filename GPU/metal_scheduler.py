@@ -1,191 +1,214 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
 
-"""GPU core budget + IOKit utilization monitoring for Metal.
+"""GPU core budget + adaptive utilization governor for Metal.
 
-Metal equivalent of gpu_scheduler.py. Uses IOKit to query
-Apple Silicon GPU utilization via the IOAccelerator service,
-and provides a core budget for threadgroup dispatch.
+Metal equivalent of gpu_scheduler.py, but **entirely independent** of the
+CUDA path: it owns its own sensor-driven monitor process (``cap_monitor_main``)
+and shares no utilization machinery with ``GPU/util_monitor.py`` (CUDA's NVML
+monitor). The only shared code is the generic process lifecycle in
+``shared/proc_util.py``.
 
 Yielding modes:
-    yielding=False (default): Static core budget from
-        gpu_utilization config. No monitoring.
-    yielding=True: IOKit daemon thread polls GPU utilization
-        and triggers throttling when external load is high.
+    yielding=False (default): Static core budget from gpu_utilization config.
+        No monitor; the sampler runs flat-out monolithic.
+    yielding=True: The adaptive cap monitor process polls the macOS sensors
+        (HID idle / thermal / battery / displays), runs the tier state machine
+        with hysteresis, and publishes a ``target_pct`` cap (0=pause … 100=
+        flat-out) plus a measured-GPU trim signal and a heartbeat. The Metal
+        sampler re-reads ``target_pct`` per batch to pick its dispatch path.
+
+The IOKit "Device Utilization %" query that used to live here moved to
+``GPU/macos_sensors.py`` (its natural home); it is re-exported below so the
+dotted path ``GPU.metal_scheduler:poll_iokit_gpu_util`` and existing imports
+keep resolving.
 """
 
-import ctypes
-import ctypes.util
 import logging
 import multiprocessing as mp
+import time
+from dataclasses import dataclass
 from typing import Optional
+
+from GPU import macos_sensors
+from GPU.macos_sensors import _query_iokit_gpu_utilization, poll_iokit_gpu_util
 
 
 logger = logging.getLogger(__name__)
 
+# Re-export so static analysis sees the names as used (back-compat surface).
+__all__ = [
+    "_query_iokit_gpu_utilization", "poll_iokit_gpu_util",
+    "MetalScheduler", "DutyCycleController", "CapConfig", "Signals",
+    "HysteresisState", "decide_tier", "tier_target_pct", "cap_monitor_main",
+    "PAUSE", "LOW", "IDLE", "ACTIVE", "LEAVE_POLLS",
+]
 
-# ── IOKit GPU utilization query ──────────────────────────
 
-def _query_iokit_gpu_utilization() -> int:
-    """Query GPU utilization percentage via IOKit.
+# ── adaptive cap tier policy (Metal-only, pure) ──────────────────────────
 
-    Walks the IOAccelerator service to find
-    PerformanceStatistics -> "Device Utilization %".
+PAUSE = "pause"
+LOW = "low"
+IDLE = "idle"
+ACTIVE = "active"
 
-    Returns:
-        GPU utilization 0-100, or 0 on any error.
+# Consecutive polls required to *leave* a protective tier (PAUSE/LOW). Entry
+# into a protective tier is immediate; only relaxing one is debounced.
+LEAVE_POLLS = 2
+
+
+@dataclass(frozen=True)
+class CapConfig:
+    """Caps + thresholds the cap policy maps tiers onto.
+
+    Args:
+        idle_after_s: Seconds of no HID input before entering IDLE.
+        active_util: Cap (%) while the user is present (ACTIVE tier).
+        idle_util: Cap (%) when HID-idle or headless (IDLE tier) — the
+            existing ``utilization`` key; default 100 keeps headless flat-out.
+        serious_util: Cap (%) at thermal == serious (LOW tier).
     """
-    try:
-        iokit_path = ctypes.util.find_library("IOKit")
-        cf_path = ctypes.util.find_library("CoreFoundation")
-        if iokit_path is None or cf_path is None:
-            return 0
-        iokit = ctypes.cdll.LoadLibrary(iokit_path)
-        cf = ctypes.cdll.LoadLibrary(cf_path)
-    except (OSError, TypeError):
-        return 0
 
-    # Type aliases
-    kern_return_t = ctypes.c_int
-    mach_port_t = ctypes.c_uint
-    io_iterator_t = ctypes.c_uint
-    io_object_t = ctypes.c_uint
-    CFMutableDictionaryRef = ctypes.c_void_p
-    CFStringRef = ctypes.c_void_p
-    CFTypeRef = ctypes.c_void_p
-
-    # IOServiceMatching
-    iokit.IOServiceMatching.restype = CFMutableDictionaryRef
-    iokit.IOServiceMatching.argtypes = [ctypes.c_char_p]
-
-    # IOServiceGetMatchingServices
-    iokit.IOServiceGetMatchingServices.restype = kern_return_t
-    iokit.IOServiceGetMatchingServices.argtypes = [
-        mach_port_t, CFMutableDictionaryRef,
-        ctypes.POINTER(io_iterator_t),
-    ]
-
-    # IOIteratorNext
-    iokit.IOIteratorNext.restype = io_object_t
-    iokit.IOIteratorNext.argtypes = [io_iterator_t]
-
-    # IORegistryEntryCreateCFProperties
-    iokit.IORegistryEntryCreateCFProperties.restype = kern_return_t
-    iokit.IORegistryEntryCreateCFProperties.argtypes = [
-        io_object_t,
-        ctypes.POINTER(CFMutableDictionaryRef),
-        ctypes.c_void_p,  # allocator
-        ctypes.c_uint,     # options
-    ]
-
-    # IOObjectRelease
-    iokit.IOObjectRelease.restype = kern_return_t
-    iokit.IOObjectRelease.argtypes = [io_object_t]
-
-    # CoreFoundation helpers
-    cf.CFDictionaryGetValue.restype = CFTypeRef
-    cf.CFDictionaryGetValue.argtypes = [
-        CFTypeRef, CFStringRef,
-    ]
-    cf.CFNumberGetValue.restype = ctypes.c_bool
-    cf.CFNumberGetValue.argtypes = [
-        CFTypeRef, ctypes.c_int, ctypes.c_void_p,
-    ]
-    cf.CFRelease.restype = None
-    cf.CFRelease.argtypes = [CFTypeRef]
-
-    kCFNumberSInt64Type = 4
-
-    def _cfstr(s: str) -> CFStringRef:
-        cf.CFStringCreateWithCString.restype = CFStringRef
-        cf.CFStringCreateWithCString.argtypes = [
-            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint,
-        ]
-        return cf.CFStringCreateWithCString(
-            None, s.encode("utf-8"), 0x08000100,
-        )
-
-    try:
-        matching = iokit.IOServiceMatching(b"IOAccelerator")
-        if not matching:
-            return 0
-
-        iterator = io_iterator_t()
-        # kIOMasterPortDefault = 0
-        ret = iokit.IOServiceGetMatchingServices(
-            0, matching, ctypes.byref(iterator),
-        )
-        if ret != 0:
-            return 0
-
-        best_util = 0
-        while True:
-            service = iokit.IOIteratorNext(iterator)
-            if not service:
-                break
-
-            props = CFMutableDictionaryRef()
-            ret = iokit.IORegistryEntryCreateCFProperties(
-                service, ctypes.byref(props), None, 0,
-            )
-            iokit.IOObjectRelease(service)
-
-            if ret != 0 or not props:
-                continue
-
-            perf_key = _cfstr("PerformanceStatistics")
-            perf_dict = cf.CFDictionaryGetValue(props, perf_key)
-            cf.CFRelease(perf_key)
-
-            if perf_dict:
-                util_key = _cfstr("Device Utilization %")
-                util_val = cf.CFDictionaryGetValue(
-                    perf_dict, util_key,
-                )
-                cf.CFRelease(util_key)
-
-                if util_val:
-                    val = ctypes.c_int64(0)
-                    if cf.CFNumberGetValue(
-                        util_val, kCFNumberSInt64Type,
-                        ctypes.byref(val),
-                    ):
-                        best_util = max(best_util, val.value)
-
-            cf.CFRelease(props)
-
-        iokit.IOObjectRelease(iterator)
-        return max(0, min(100, best_util))
-
-    except Exception:
-        return 0
+    idle_after_s: float = 60.0
+    active_util: int = 70
+    idle_util: int = 100
+    serious_util: int = 30
 
 
-def poll_iokit_gpu_util() -> int:
-    """Zero-arg IOKit utilization poll for the monitor process.
+@dataclass(frozen=True)
+class Signals:
+    """A single poll of the macOS sensors."""
 
-    ``_query_iokit_gpu_utilization`` recreates its ctypes handles per call, so
-    nothing IOKit-related needs to survive between calls or cross processes.
+    idle_s: float
+    thermal_state: str
+    on_battery: bool
+    active_displays: int
 
-    Returns:
-        GPU utilization percentage 0-100, or 0 on error.
+
+@dataclass(frozen=True)
+class HysteresisState:
+    """Effective tier plus the consecutive-poll counter for leaving it."""
+
+    tier: str
+    leave_count: int
+
+
+def _classify(signals: Signals, config: CapConfig) -> str:
+    """Raw tier from the priority table (no hysteresis)."""
+    if signals.on_battery or signals.thermal_state == macos_sensors.THERMAL_CRITICAL:
+        return PAUSE
+    if signals.thermal_state == macos_sensors.THERMAL_SERIOUS:
+        return LOW
+    if signals.active_displays == 0 or signals.idle_s > config.idle_after_s:
+        return IDLE
+    return ACTIVE
+
+
+def decide_tier(
+    signals: Signals,
+    config: CapConfig,
+    state: HysteresisState,
+) -> HysteresisState:
+    """Pure tier decision with asymmetric hysteresis.
+
+    Entering a protective tier (PAUSE/LOW) is immediate; leaving one requires
+    ``LEAVE_POLLS`` consecutive polls whose raw classification no longer
+    demands it. ACTIVE/IDLE transitions are immediate (IDLE entry is already
+    gated by ``idle_after_s``; IDLE exit fires on the first HID event).
     """
-    return int(_query_iokit_gpu_utilization())
+    raw = _classify(signals, config)
+    prev = state.tier
+
+    if raw == PAUSE:
+        return HysteresisState(PAUSE, 0)
+    if prev == PAUSE:
+        count = state.leave_count + 1
+        if count >= LEAVE_POLLS:
+            return HysteresisState(raw, 0)
+        return HysteresisState(PAUSE, count)
+
+    if raw == LOW:
+        return HysteresisState(LOW, 0)
+    if prev == LOW:
+        count = state.leave_count + 1
+        if count >= LEAVE_POLLS:
+            return HysteresisState(raw, 0)
+        return HysteresisState(LOW, count)
+
+    return HysteresisState(raw, 0)
+
+
+def tier_target_pct(tier: str, config: CapConfig) -> int:
+    """Map a tier to its ``target_pct`` cap (0-100)."""
+    if tier == PAUSE:
+        return 0
+    if tier == LOW:
+        return config.serious_util
+    if tier == IDLE:
+        return config.idle_util
+    return config.active_util
+
+
+def _read_signals() -> Signals:
+    """Read all macOS sensors into a snapshot (each degrades safely)."""
+    return Signals(
+        idle_s=macos_sensors.hid_idle_seconds(),
+        thermal_state=macos_sensors.thermal_state(),
+        on_battery=macos_sensors.on_battery(),
+        active_displays=macos_sensors.active_display_count(),
+    )
+
+
+def cap_monitor_main(
+    target_value,
+    measured_value,
+    heartbeat_value,
+    stop_event,
+    poll_interval: float,
+    idle_after_s: float,
+    active_util: int,
+    idle_util: int,
+    serious_util: int,
+) -> None:
+    """Metal adaptive-cap monitor process entry (picklable, spawn-safe).
+
+    Polls the macOS sensors every ``poll_interval``, runs the tier state
+    machine, and publishes into three shared ints: the ``target_pct`` cap, the
+    measured GPU residency (trim signal), and an incrementing heartbeat for
+    staleness detection. Config is passed as plain scalars; sensors are
+    resolved in the child. Never raises into the loop (sensors degrade safely).
+    """
+    config = CapConfig(
+        idle_after_s=idle_after_s, active_util=active_util,
+        idle_util=idle_util, serious_util=serious_util,
+    )
+    state = HysteresisState(tier=ACTIVE, leave_count=0)
+    if heartbeat_value.value < 0:
+        heartbeat_value.value = 0
+    while not stop_event.is_set():
+        state = decide_tier(_read_signals(), config, state)
+        target_value.value = tier_target_pct(state.tier, config)
+        measured_value.value = int(macos_sensors.gpu_active_residency())
+        heartbeat_value.value += 1
+        stop_event.wait(poll_interval)
 
 
 class MetalScheduler:
-    """GPU core budget + IOKit utilization monitoring for Metal.
+    """GPU core budget + adaptive utilization governor for Metal.
 
-    Analogous to KernelScheduler in gpu_scheduler.py but uses
-    IOKit instead of NVML, and manages threadgroup counts
-    instead of SM counts.
+    Analogous to KernelScheduler in gpu_scheduler.py but uses the macOS
+    sensors instead of NVML, manages threadgroup counts instead of SM counts,
+    and owns its own monitor process (no shared CUDA machinery).
 
     Args:
         gpu_core_count: Apple Silicon GPU core count.
-        gpu_utilization_pct: Config ceiling (1-100).
-        yielding: True = yield to other GPU users via IOKit
-            monitoring. False = static budget.
-        poll_interval: Seconds between IOKit polls (yielding).
+        gpu_utilization_pct: Config ceiling (1-100); also the IDLE/headless cap.
+        yielding: True = run the adaptive cap monitor. False = static budget,
+            no monitor, flat-out.
+        poll_interval: Seconds between sensor polls (yielding).
+        active_util: Cap (%) while the user is present (ACTIVE tier).
+        idle_after_s: Seconds of no HID input before entering IDLE.
+        serious_util: Cap (%) at thermal == serious (LOW tier).
     """
 
     def __init__(
@@ -194,56 +217,91 @@ class MetalScheduler:
         gpu_utilization_pct: int = 100,
         yielding: bool = False,
         poll_interval: float = 0.3,
+        active_util: int = 70,
+        idle_after_s: float = 60.0,
+        serious_util: int = 30,
     ):
         self._gpu_core_count = gpu_core_count
         self._gpu_utilization_pct = gpu_utilization_pct
         self._yielding = yielding
         self._poll_interval = poll_interval
+        self._active_util = max(1, min(100, active_util))
+        self._idle_after_s = idle_after_s
+        self._serious_util = max(1, min(100, serious_util))
 
         self._static_budget = max(
             1,
             int(gpu_core_count * gpu_utilization_pct / 100),
         )
 
-        # IOKit polling state
-        self._util_value = mp.get_context("spawn").Value("i", 0)
+        # Shared monitor state (published by cap_monitor_main).
+        ctx = mp.get_context("spawn")
+        self._util_value = ctx.Value("i", 0)          # measured GPU residency
+        self._target_value = ctx.Value("i", self._active_util)  # cap %
+        self._heartbeat_value = ctx.Value("i", -1)    # ++ each poll
         self._util_proc: Optional[mp.process.BaseProcess] = None
         self._util_stop = None
 
-        # Hysteresis for stable target threadgroups
+        # Staleness detection for get_target_pct (fail-safe to active cap).
+        self._last_heartbeat = -1
+        self._last_hb_time = time.monotonic()
+        self._stale_timeout_s = max(2.0, poll_interval * 6)
+
+        # Hysteresis for stable target threadgroups (legacy spatial path;
+        # dead under the governor — flagged for dead-code triage).
         self._prev_target = 0
         self._stable_ticks = 0
 
         if yielding:
-            self._start_iokit_monitor()
+            self._start_cap_monitor()
 
-    def _start_iokit_monitor(self) -> None:
-        """Start IOKit utilization monitor process for yielding mode."""
-        # Verify IOKit works before starting process
-        test_util = _query_iokit_gpu_utilization()
-        if test_util == 0:
-            logger.warning(
-                "IOKit GPU utilization query returned 0 on "
-                "probe — yielding may use static budget only"
-            )
+    def _start_cap_monitor(self) -> None:
+        """Spawn the Metal adaptive-cap monitor process (yielding mode).
 
-        from GPU.util_monitor import util_monitor_main
+        Reuses only the generic ``spawn_worker`` lifecycle helper — the poll +
+        policy are Metal-specific (``cap_monitor_main``) and share nothing with
+        the CUDA util monitor.
+        """
         from shared.proc_util import spawn_worker
 
         self._util_stop = mp.get_context("spawn").Event()
         self._util_proc = spawn_worker(
-            util_monitor_main,
-            (self._util_value, self._util_stop, self._poll_interval,
-             "GPU.metal_scheduler:poll_iokit_gpu_util"),
-            name="metal-util-monitor",
+            cap_monitor_main,
+            (self._target_value, self._util_value, self._heartbeat_value,
+             self._util_stop, self._poll_interval, self._idle_after_s,
+             self._active_util, self._gpu_utilization_pct, self._serious_util),
+            name="metal-cap-monitor",
         )
         logger.info(
-            "IOKit monitor process started (yielding, ceiling=%d%%, "
+            "Metal cap monitor started (yielding, idle_cap=%d%%, "
+            "active_cap=%d%%, serious_cap=%d%%, idle_after=%.0fs, "
             "cores=%d, poll=%.1fs)",
-            self._gpu_utilization_pct,
-            self._gpu_core_count,
-            self._poll_interval,
+            self._gpu_utilization_pct, self._active_util, self._serious_util,
+            self._idle_after_s, self._gpu_core_count, self._poll_interval,
         )
+
+    def get_target_pct(self) -> int:
+        """Return the current cap % (0=pause … 100=flat-out).
+
+        When yielding is off there is no monitor — returns 100 (flat-out).
+        While yielding, returns the monitor's published cap, but falls back to
+        the ACTIVE cap (never flat-out) if the monitor heartbeat has been
+        stale for longer than ``_stale_timeout_s`` (monitor death = fail safe).
+        """
+        if not self._yielding:
+            return 100
+        hb = self._heartbeat_value.value
+        now = time.monotonic()
+        if hb != self._last_heartbeat:
+            self._last_heartbeat = hb
+            self._last_hb_time = now
+        elif now - self._last_hb_time > self._stale_timeout_s:
+            return self._active_util
+        return self._target_value.value
+
+    def get_measured_gpu(self) -> int:
+        """Return the latest measured GPU residency 0-100 (trim signal)."""
+        return self._util_value.value
 
     def get_core_budget(self) -> int:
         """Static budget: gpu_utilization% x core_count.
@@ -466,3 +524,23 @@ class DutyCycleController:
         self._ema_initialized = False
         self._duty_multiplier = 1.0
         self._integral = 0.0
+
+    def set_target(self, target_pct: int) -> None:
+        """Retarget the duty cycle at runtime, resetting EMA + PI together.
+
+        Updates ``target_pct`` / duty ratio / enabled flag AND resets the EMA
+        and PI integral in lock-step, so a tier change can't carry windup or a
+        stale compute-time EMA into the next ``compute_sleep``. A no-op when
+        the target is unchanged (preserves accumulated convergence state).
+
+        Args:
+            target_pct: New target GPU utilization (1-100). 100 disables
+                duty cycling (flat-out monolithic dispatch).
+        """
+        new_target = max(1, min(100, target_pct))
+        if new_target == self._target_pct:
+            return
+        self._target_pct = new_target
+        self._duty_ratio = new_target / 100.0
+        self._enabled = new_target < 100
+        self.reset()

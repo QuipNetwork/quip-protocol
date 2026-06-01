@@ -26,16 +26,24 @@ def build_persistent_context(
     num_sweeps: int,
     topology: Any = None,
     utilization: int = 100,
+    yielding: bool = True,
+    active_util: int = 70,
+    idle_after_s: float = 60.0,
+    burst_ms: float = 8.0,
+    serious_util: int = 30,
     stop_event: Optional[multiprocessing.synchronize.Event] = None,
     **_ignored: Any,
 ) -> StreamContext:
     """Build the Metal producer context (runs in the stream-driver process).
 
     Constructs the ``MetalSASampler`` + a ``MetalScheduler``/``DutyCycleController``
-    ONCE here (the scheduler gives the GPU core budget = ``max_threadgroups`` and
-    drives IOKit-feedback throttling to honor ``utilization``); the feeder is
-    created lazily on the first ``switch``. ``**_ignored`` absorbs extra kwargs
-    the generic driver passes that Metal does not need.
+    ONCE here. When ``yielding`` the scheduler runs the adaptive cap monitor
+    (sensor-driven ``target_pct``); ``utilization`` is the IDLE/headless cap,
+    ``active_util`` the cap while the user is present, ``serious_util`` the
+    thermal-Serious cap, ``idle_after_s`` the HID-idle threshold, and
+    ``burst_ms`` bounds each command buffer for compositor responsiveness. The
+    sampler re-reads ``target_pct`` per batch. ``**_ignored`` absorbs extra
+    kwargs the generic driver passes that Metal does not need.
     """
     from GPU.metal_miner import get_gpu_core_count
     from GPU.metal_sa import MetalSASampler
@@ -45,9 +53,14 @@ def build_persistent_context(
     scheduler = MetalScheduler(
         gpu_core_count=get_gpu_core_count(),
         gpu_utilization_pct=utilization,
-        yielding=True,
+        yielding=yielding,
+        active_util=active_util,
+        idle_after_s=idle_after_s,
+        serious_util=serious_util,
     )
-    duty_cycle = DutyCycleController(target_pct=utilization)
+    # The cap is retargeted per batch via scheduler.get_target_pct(); seed the
+    # duty cycle at the ACTIVE cap so the first throttled batch paces correctly.
+    duty_cycle = DutyCycleController(target_pct=active_util)
     return StreamContext(
         sampler=sampler,
         nodes=nodes,
@@ -59,6 +72,7 @@ def build_persistent_context(
             "max_threadgroups": scheduler.get_core_budget(),
             "duty_cycle": duty_cycle,
             "scheduler": scheduler,
+            "burst_ms": burst_ms,
         },
         stop_event=stop_event,
     )

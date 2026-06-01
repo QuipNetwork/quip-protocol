@@ -39,7 +39,20 @@ yielding      = false  # true = yield to other GPU users between batches
 # ── Apple Silicon (Metal) ─────────────────────────────────────────────
 # Uncomment for Apple Silicon rigs. Single GPU per node.
 # [metal]
-# utilization = 100
+# utilization = 100          # IDLE/headless cap — flat-out when nobody's here
+#
+# Interactive profile — keep an interactive Mac responsive while mining.
+# `yielding` is on by default (the adaptive cap monitor: HID-idle / thermal /
+# battery / display sensing). The machine runs flat-out once you walk away
+# (IDLE -> utilization) but throttles to `active_util` while you're actually
+# using it. Pauses on battery and at critical thermal pressure automatically.
+# `active_util` defaults to 70; if the UI still feels janky under load, drop
+# it to ~30.
+# yielding     = true        # master enable for the adaptive cap (default on)
+# active_util  = 30          # cap (%) while present (default 70; 30 if janky)
+# idle_after_s = 60          # seconds of no input before going flat-out
+# burst_ms     = 8           # per-frame GPU burst budget (compositor seam)
+# serious_util = 30          # cap (%) at thermal == serious
 
 # ── Modal cloud GPU ───────────────────────────────────────────────────
 # Uncomment for Modal-hosted cloud GPUs. `gpu_type` picks the class

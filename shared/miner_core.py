@@ -44,6 +44,14 @@ _GPU_CFG_KEYS = (
     "utilization", "yielding", "enabled", "sms_per_nonce",
 )
 
+# Metal-only adaptive-cap keys. Kept OUT of `_GPU_CFG_KEYS` so they never
+# inherit down the shared `[gpu]` path (CUDA stays independent) and only the
+# `[metal]` device section carries them. Applied solely in the metal branch
+# of `_build_gpu_specs`.
+_METAL_CFG_KEYS = (
+    "active_util", "idle_after_s", "burst_ms", "serious_util",
+)
+
 _GPU_DEVICE_SECTIONS = {
     "cuda": "cuda",
     "nvidia": "cuda",   # alias
@@ -432,6 +440,13 @@ def _build_gpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
                 }
             )
         elif dev_type == "metal":
+            # Preserve Metal-only adaptive-cap keys from the [metal] section
+            # (they are filtered out by `_build_gpu_miner_cfg`, which only
+            # keeps `_GPU_CFG_KEYS`). Read from the device section only, so a
+            # key set in the shared [gpu] section does not leak through.
+            for key in _METAL_CFG_KEYS:
+                if key in dev:
+                    dev_cfg[key] = dev[key]
             specs.append(
                 {
                     "id": f"{node_id}-GPU-MPS",

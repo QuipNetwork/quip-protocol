@@ -11,10 +11,12 @@ SimulatedAnnealingSampler from cpu_sa.cpp, including:
 5. Beta schedule computation matching _default_ising_beta_range
 """
 
+import ctypes
 import logging
 import os
+import sys
 import time
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Union
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import dimod
 import numpy as np
@@ -25,8 +27,93 @@ except ImportError:  # Apple Metal framework is macOS-only; absent on Linux/CI.
     Metal = None  # type: ignore[assignment]
 
 from shared.ising_model import IsingModel
-from GPU.metal_scheduler import DutyCycleController
-from GPU.metal_utils import _create_buffer, build_csr_from_ising, compute_beta_schedule, unpack_metal_results
+from GPU.metal_scheduler import DutyCycleController, MetalScheduler
+from GPU.metal_utils import _create_buffer, compute_beta_schedule, unpack_metal_results
+
+# Default per-command-buffer wall-clock budget (~one 120Hz/60Hz frame). Sizing
+# each committed chunk to ~burst_ms gives the macOS compositor a GPU preemption
+# seam every frame, which is the real responsiveness lever on Apple Silicon.
+DEFAULT_BURST_MS = 8.0
+
+# Betas dispatched in the first (calibration) chunk to seed the per-beta EMA.
+_CALIB_BETAS = 2
+
+# Seconds to idle between target re-checks while paused (target_pct == 0).
+_PAUSE_POLL_S = 0.5
+
+# EMA smoothing for the per-beta GPU wall-time estimate.
+_BETA_EMA_ALPHA = 0.3
+
+# pthread QoS class for the Metal sampler thread. QOS_CLASS_UTILITY (0x11, per
+# <sys/qos.h>) deprioritizes us against the foreground UI on the P-cores.
+# WARNING: 0x21 is USER_INTERACTIVE — the opposite of intended (a boost).
+QOS_CLASS_UTILITY = 0x11
+
+# Applied once per process (the stream-driver child); never raises.
+_qos_applied = False
+_qos_log = logging.getLogger(__name__)
+
+
+def apply_qos_utility() -> bool:
+    """Lower this thread's QoS to UTILITY (darwin only). Returns True if applied.
+
+    Metal-only CPU-side politeness: reduces P-core contention with the UI. It
+    does NOT bound GPU occupancy (a command buffer runs to completion
+    regardless of submitter QoS) — it composes with the burst/duty cap. Run in
+    the child process (spawn isolation means a parent call wouldn't carry over)
+    and invoked from the Metal sampler only — never from the shared QPU stream
+    driver. Idempotent and non-fatal.
+    """
+    global _qos_applied
+    if _qos_applied or sys.platform != "darwin":
+        return False
+    try:
+        libc = ctypes.CDLL(None)  # libSystem
+        fn = libc.pthread_set_qos_class_self_np
+        fn.restype = ctypes.c_int
+        fn.argtypes = [ctypes.c_int, ctypes.c_int]
+        fn(QOS_CLASS_UTILITY, 0)
+        _qos_applied = True
+        return True
+    except Exception as exc:  # noqa: BLE001 — non-fatal CPU-politeness hint
+        _qos_log.debug("QoS clamp skipped: %s", exc)
+        return False
+
+
+def compute_betas_per_chunk(
+    burst_ms: float,
+    ema_per_beta_ms: float,
+    total_betas: int,
+) -> int:
+    """Betas per command buffer to keep each chunk near ``burst_ms``.
+
+    Args:
+        burst_ms: Per-command-buffer wall-clock budget (ms).
+        ema_per_beta_ms: Smoothed per-beta GPU wall time (ms). ``<= 0`` means
+            "not yet calibrated" — dispatch the whole schedule.
+        total_betas: Total betas in the schedule (the chunk upper bound).
+
+    Returns:
+        Chunk size in [1, total_betas].
+    """
+    if ema_per_beta_ms <= 0:
+        return total_betas
+    n = round(burst_ms / ema_per_beta_ms)
+    return max(1, min(int(n), total_betas))
+
+
+def _resolve_target_pct(scheduler, duty_cycle) -> int:
+    """Resolve the per-batch cap %: scheduler (adaptive) > duty cycle > 100.
+
+    The scheduler's ``get_target_pct`` is the live, sensor-driven cap. With no
+    scheduler, fall back to the duty cycle's static target; with neither, run
+    flat-out (100).
+    """
+    if scheduler is not None and hasattr(scheduler, "get_target_pct"):
+        return int(scheduler.get_target_pct())
+    if duty_cycle is not None:
+        return int(duty_cycle.target_pct)
+    return 100
 
 
 class MetalSASampler:
@@ -471,20 +558,22 @@ class MetalSASampler:
         beta_schedule_type: str,
         num_sweeps_per_beta: int,
         seed: int,
-        betas_per_chunk: int = 10,
+        burst_ms: float = DEFAULT_BURST_MS,
         duty_cycle: Optional[DutyCycleController] = None,
         scheduler: Optional['MetalScheduler'] = None,
     ) -> List[dimod.SampleSet]:
-        """Dispatch a batch in small beta-schedule chunks.
+        """Dispatch a batch in adaptively-sized beta-schedule chunks.
 
-        Splits the full beta schedule into chunks of
-        ``betas_per_chunk`` betas. Between each chunk, the GPU
-        is released and a duty-cycle sleep is inserted so the
-        system UI remains responsive on Apple Silicon.
+        The first (calibration) chunk dispatches ``_CALIB_BETAS`` betas to seed
+        a per-beta GPU-wall-time EMA; every subsequent chunk is sized via
+        ``compute_betas_per_chunk`` so each committed command buffer runs
+        ≈ ``burst_ms`` — bounding burst length (the real jank lever) and giving
+        the compositor a preemption seam every frame. Between chunks the GPU is
+        released and a duty-cycle sleep paces the average occupancy.
 
-        State is persisted between chunks via device buffers,
-        so the result is identical to a monolithic dispatch
-        given the same seed.
+        State is persisted between chunks via device buffers, so the result is
+        identical to a monolithic dispatch given the same seed (chunk-size
+        changes are safe: the kernel takes beta_start/beta_count).
         """
         num_problems = len(models)
         N = self._topo_N
@@ -563,11 +652,21 @@ class MetalSASampler:
         tg = Metal.MTLSize(width=num_problems, height=1, depth=1)
         tpt = Metal.MTLSize(width=num_reads, height=1, depth=1)
 
-        # Dispatch beta chunks
-        for chunk_start in range(0, total_betas, betas_per_chunk):
-            chunk_count = min(
-                betas_per_chunk, total_betas - chunk_start,
-            )
+        # Dispatch adaptively-sized beta chunks. The first chunk calibrates the
+        # per-beta wall-time EMA; later chunks target burst_ms.
+        ema_per_beta_ms = 0.0
+        chunk_start = 0
+        chunk_idx = 0
+        while chunk_start < total_betas:
+            if ema_per_beta_ms <= 0:
+                chunk_count = min(_CALIB_BETAS, total_betas - chunk_start)
+            else:
+                chunk_count = min(
+                    compute_betas_per_chunk(
+                        burst_ms, ema_per_beta_ms, total_betas,
+                    ),
+                    total_betas - chunk_start,
+                )
             bs_bytes = np.int32(chunk_start).tobytes()
             bc_bytes = np.int32(chunk_count).tobytes()
 
@@ -636,34 +735,43 @@ class MetalSASampler:
                     f"(chunk {chunk_start}): {error}",
                 )
 
-            # Duty-cycle sleep between chunks
+            # Update the per-beta wall-time EMA from this chunk (drives the
+            # next chunk's size toward burst_ms).
+            compute_s = time.perf_counter() - t0
+            per_beta_ms = (compute_s * 1000.0) / max(1, chunk_count)
+            if ema_per_beta_ms <= 0:
+                ema_per_beta_ms = per_beta_ms
+            else:
+                ema_per_beta_ms = (
+                    _BETA_EMA_ALPHA * per_beta_ms
+                    + (1.0 - _BETA_EMA_ALPHA) * ema_per_beta_ms
+                )
+
+            # Duty-cycle sleep between chunks (paces average occupancy).
             if duty_cycle and duty_cycle.enabled:
-                compute_s = time.perf_counter() - t0
                 sleep_s = duty_cycle.compute_sleep(compute_s)
-                self.logger.info(
-                    "[duty-cycle] chunk %d/%d "
+                self.logger.debug(
+                    "[duty-cycle] chunk %d betas=%d "
                     "compute=%.1fms sleep=%.1fms "
-                    "ema=%.1fms mult=%.2f",
-                    chunk_start // betas_per_chunk,
-                    (total_betas + betas_per_chunk - 1)
-                    // betas_per_chunk,
-                    compute_s * 1000,
-                    sleep_s * 1000,
+                    "per_beta=%.2fms ema_compute=%.1fms mult=%.2f",
+                    chunk_idx, chunk_count,
+                    compute_s * 1000, sleep_s * 1000,
+                    ema_per_beta_ms,
                     duty_cycle._ema_compute_s * 1000,
                     duty_cycle._duty_multiplier,
                 )
                 time.sleep(sleep_s)
 
-                # IOKit feedback: adjust duty multiplier to
-                # converge on target utilization
+                # Closed-loop trim: nudge the duty multiplier toward target.
                 if scheduler is not None:
-                    iokit_val = (
-                        scheduler.get_cached_utilization()
-                    )
-                    duty_cycle.feedback(iokit_val)
+                    measured = scheduler.get_cached_utilization()
+                    duty_cycle.feedback(measured)
                     self.logger.debug(
-                        "[duty-cycle] iokit=%d%%", iokit_val,
+                        "[duty-cycle] measured=%d%%", measured,
                     )
+
+            chunk_start += chunk_count
+            chunk_idx += 1
 
         # Unpack results from final chunk
         packed_data = np.frombuffer(
@@ -708,13 +816,17 @@ class MetalSASampler:
         seed: Optional[int] = None,
         duty_cycle: Optional[DutyCycleController] = None,
         scheduler: Optional['MetalScheduler'] = None,
+        burst_ms: float = DEFAULT_BURST_MS,
         **kwargs,
     ) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
         """Stream batched results using cached topology structure.
 
-        On first call, prepares the topology CSR structure once.
-        Each batch then only fills J/h values into preallocated
-        positions — no adjacency sorting or degree counting.
+        On first call, prepares the topology CSR structure once. Each batch
+        then only fills J/h values into preallocated positions. The cap
+        ``target_pct`` is re-read **per batch** (from ``scheduler`` when
+        present, else the duty cycle's static target) to pick the dispatch
+        path: 100 → monolithic (max throughput), 0 → pause (idle and re-check),
+        0<target<100 → adaptive chunked dispatch sized to ``burst_ms``.
 
         Args:
             models: Iterable of IsingModel (typically a RandomIsingFeeder).
@@ -726,11 +838,15 @@ class MetalSASampler:
             beta_schedule_type: "linear", "geometric", or "custom".
             seed: Base RNG seed (incremented per batch).
             duty_cycle: Optional controller for GPU duty cycling.
-            scheduler: Optional MetalScheduler for IOKit feedback.
+            scheduler: Optional MetalScheduler — the per-batch cap source.
+            burst_ms: Per-command-buffer wall-clock budget for chunked dispatch.
 
         Yields:
             (IsingModel, dimod.SampleSet) for each completed problem.
         """
+        # CPU-side politeness: lower this (stream-driver child) thread's QoS so
+        # we yield P-cores to the foreground UI. Metal-only; once per process.
+        apply_qos_utility()
         self.prepare_topology()
 
         model_iter = iter(models)
@@ -756,6 +872,14 @@ class MetalSASampler:
         pending = [first_model]
 
         while True:
+            # Re-read the cap before consuming the feeder so a PAUSE does not
+            # burn queued models.
+            target = _resolve_target_pct(scheduler, duty_cycle)
+            if target <= 0:
+                # PAUSE: idle and re-check; do not dispatch or pull models.
+                time.sleep(_PAUSE_POLL_S)
+                continue
+
             # Fill batch from pending + iterator
             batch_models: List[IsingModel] = list(pending)
             pending.clear()
@@ -767,27 +891,7 @@ class MetalSASampler:
             if not batch_models:
                 return
 
-            if duty_cycle and duty_cycle.enabled:
-                # Chunked dispatch: break beta schedule into
-                # small chunks with duty-cycle sleeps between
-                # them for smooth GPU sharing.
-                self.logger.info(
-                    "[streaming] Using CHUNKED dispatch "
-                    "(target=%d%%, betas=%d)",
-                    duty_cycle.target_pct, len(beta_arr),
-                )
-                samplesets = self._dispatch_batch_chunked(
-                    batch_models,
-                    num_reads=num_reads,
-                    beta_schedule_arr=beta_arr,
-                    beta_range=beta_range_out,
-                    beta_schedule_type=beta_schedule_type,
-                    num_sweeps_per_beta=num_sweeps_per_beta,
-                    seed=batch_seed,
-                    duty_cycle=duty_cycle,
-                    scheduler=scheduler,
-                )
-            else:
+            if target >= 100:
                 samplesets = self._dispatch_batch(
                     batch_models,
                     num_reads=num_reads,
@@ -800,6 +904,24 @@ class MetalSASampler:
                 # Minimal yield for WindowServer compositor on
                 # Apple Silicon's shared GPU (~2% overhead).
                 time.sleep(0.002)
+            else:
+                # Throttled: adaptive chunked dispatch. Retarget the duty cycle
+                # in lock-step (resets EMA + PI integral together) so a tier
+                # change doesn't carry windup into the new cap.
+                if duty_cycle is not None:
+                    duty_cycle.set_target(target)
+                samplesets = self._dispatch_batch_chunked(
+                    batch_models,
+                    num_reads=num_reads,
+                    beta_schedule_arr=beta_arr,
+                    beta_range=beta_range_out,
+                    beta_schedule_type=beta_schedule_type,
+                    num_sweeps_per_beta=num_sweeps_per_beta,
+                    seed=batch_seed,
+                    burst_ms=burst_ms,
+                    duty_cycle=duty_cycle,
+                    scheduler=scheduler,
+                )
 
             batch_seed = (batch_seed + 1) & 0x7FFFFFFF
 
