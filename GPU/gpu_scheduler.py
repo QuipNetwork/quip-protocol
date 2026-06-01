@@ -17,6 +17,12 @@ Yielding modes:
 State machine per slot:
     FREE → UPLOADING → READY → ACTIVE → DONE → FREE
 """
+# ``cp.cuda.*`` appears in type annotations below; ``cupy`` is absent on
+# CPU/CI hosts (``cp`` is None). Defer annotation evaluation so importing this
+# module never evaluates ``cp.cuda`` — without this, Python < 3.14 (CI runs
+# 3.12) eagerly evaluates the annotations at class-definition time and raises
+# ``AttributeError: 'NoneType' object has no attribute 'cuda'`` on import.
+from __future__ import annotations
 
 import enum
 import logging
