@@ -233,6 +233,19 @@ class QPUTimeManager:
             # Fallback if EMA wasn't computed (shouldn't happen)
             return (sum(self.block_times_us) / len(self.block_times_us)) * 1.2
 
+    def _seconds_until_buffer(self) -> float:
+        """Seconds for the pool to accrue back up to the min-block buffer.
+
+        Caller-owned zero-guards (already-bursting / pool already at buffer)
+        live at the call sites; this is only the non-trivial accrual branch.
+        Assumes ``_accrue`` has already advanced ``_pool_us``.
+        """
+        deficit_us = max(
+            0.0, self.config.min_block_budget_seconds * 1_000_000 - self._pool_us
+        )
+        rate = self._accrual_rate_us_per_s
+        return deficit_us / rate if rate > 0 else float("inf")
+
     def should_mine_block(self, now: Optional[float] = None) -> QPUTimeEstimate:
         """Decide whether to mine, using start/continue reservoir hysteresis.
 
@@ -266,11 +279,7 @@ class QPUTimeManager:
         if should_mine:
             seconds_until_can_mine = 0.0
         else:
-            deficit_us = max(0.0, buffer_us - pool_us)
-            rate = self._accrual_rate_us_per_s
-            seconds_until_can_mine = (
-                deficit_us / rate if rate > 0 else float("inf")
-            )
+            seconds_until_can_mine = self._seconds_until_buffer()
             self.blocks_skipped += 1
 
         n = len(self.block_times_us)
@@ -320,14 +329,10 @@ class QPUTimeManager:
         self._accrue(now)
         pool_s = self._pool_us / 1_000_000
         buffer_s = self.config.min_block_budget_seconds
-        rate = self._accrual_rate_us_per_s
-        deficit_us = max(0.0, buffer_s * 1_000_000 - self._pool_us)
         if self._burst_active or self._pool_us >= buffer_s * 1_000_000:
             seconds_until_buffer = 0.0
         else:
-            seconds_until_buffer = (
-                deficit_us / rate if rate > 0 else float("inf")
-            )
+            seconds_until_buffer = self._seconds_until_buffer()
 
         return {
             "daily_budget_seconds": self.config.daily_budget_seconds,

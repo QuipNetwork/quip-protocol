@@ -529,10 +529,6 @@ def _runtime() -> Runtime:
 
 # ── Per-handle summarization (v0.2: drives off MinerCore handles) ──
 
-def _handle_kind(handle: "MinerHandle") -> str:
-    return str((handle.spec or {}).get("kind", "")).lower()
-
-
 def _spec_kind(spec: Dict[str, Any]) -> str:
     return str(spec.get("kind", "")).lower()
 

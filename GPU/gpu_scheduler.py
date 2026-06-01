@@ -48,6 +48,23 @@ def throttle_if_busy(
     if scheduler is not None and scheduler.should_throttle():
         sleep_fn(sleep_s)
 
+
+def throttled_stream(gen: Any, scheduler: Any) -> Any:
+    """Yield from ``gen``, calling ``throttle_if_busy`` before each pull.
+
+    Restores the per-result back-off the inline ``_sample_batch`` did; the
+    unified driver path bypasses that, so the throttle lives in the streaming
+    samplers. The throttle runs before every ``next()`` (including the first),
+    matching the original inline ordering exactly.
+    """
+    while True:
+        throttle_if_busy(scheduler)
+        try:
+            yield next(gen)
+        except StopIteration:
+            return
+
+
 try:
     import cupy as cp
 except ImportError:

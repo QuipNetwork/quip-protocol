@@ -53,6 +53,7 @@ from shared.quantum_proof_of_work import (  # noqa: E402
 )
 from substrate.client import SubstrateClient  # noqa: E402
 from substrate.types import (  # noqa: E402
+    SubstrateDifficulty,
     SubstrateMiningContext,
     WinningSolutionWithNonce,
 )
@@ -71,6 +72,15 @@ def _hx(s: str) -> bytes:
 def _spin(milli_value: int) -> int:
     """Map a milli-precision spin value to a canonical Ising spin (-1/+1)."""
     return 1 if milli_value > 0 else -1
+
+
+def _difficulty_dict(d: SubstrateDifficulty) -> Dict[str, int]:
+    """Serialize the three on-chain difficulty fields to a plain dict."""
+    return {
+        "min_solutions": d.min_solutions,
+        "max_energy_milli": d.max_energy_milli,
+        "min_diversity_milli": d.min_diversity_milli,
+    }
 
 
 async def _decode_submit_proof(
@@ -172,11 +182,7 @@ def _validate(
         "num_solutions": len(spins),
         "num_valid": len(valid_spins),
         "diversity": round(diversity, 6),
-        "threshold": {
-            "min_solutions": diff.min_solutions,
-            "max_energy_milli": diff.max_energy_milli,
-            "min_diversity_milli": diff.min_diversity_milli,
-        },
+        "threshold": _difficulty_dict(diff),
         "checks": checks,
         "valid": all(checks.values()),
     }
@@ -210,11 +216,7 @@ async def _validate_one(
         "reward": sol.reward,
         "submitted_at": sol.submitted_at,
         "last_proof_block_hash": "0x" + sol.last_proof_block_hash.hex(),
-        "difficulty": {
-            "min_solutions": sol.difficulty.min_solutions,
-            "max_energy_milli": sol.difficulty.max_energy_milli,
-            "min_diversity_milli": sol.difficulty.min_diversity_milli,
-        },
+        "difficulty": _difficulty_dict(sol.difficulty),
         "topology_hash": "0x" + proof["topology_hash"].hex() if proof else None,
         "solutions_hex": ["0x" + s.hex() for s in proof["solutions"]] if proof else [],
     }

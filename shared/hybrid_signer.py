@@ -33,7 +33,7 @@ from dilithium_py.ml_dsa import ML_DSA_44
 from scalecodec.utils.ss58 import ss58_encode
 from substrateinterface import Keypair, KeypairType
 
-from shared.signer import Signer, SignatureKind
+from shared.signer import Signer, SignatureKind, _normalize_sr25519_sig
 
 
 # ----------------------------------------------------------------------
@@ -219,10 +219,7 @@ class HybridSigner(Signer):
         signature-correctness-only, not byte-equality with the chain's path.
         """
         msg_prime = prepare_message(payload)
-        sr_sig = self._kp.sr25519.sign(data=msg_prime)
-        if isinstance(sr_sig, str):
-            sr_sig = bytes.fromhex(sr_sig[2:] if sr_sig.startswith("0x") else sr_sig)
-        sr_sig = bytes(sr_sig)
+        sr_sig = _normalize_sr25519_sig(self._kp.sr25519.sign(data=msg_prime))
         ml_sig = ML_DSA_44.sign(self._kp.ml_dsa_sk, msg_prime)
         if len(sr_sig) != SR_SIG_LEN:
             raise RuntimeError(

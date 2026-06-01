@@ -96,6 +96,19 @@ def _summary(name: str, xs: List[float]) -> str:
     )
 
 
+def _consumer_ms(t_meta: List[float], t_eval: List[float], n: int) -> List[float]:
+    """Per-attempt consumer cost (compute_solution_meta + evaluate_sampleset), ms.
+
+    t_eval is shorter than t_meta when eval is skipped for sub-width samplesets,
+    so each series is length-padded with 0 before summing over the n attempts.
+    """
+    return [
+        (t_meta[i] if i < len(t_meta) else 0)
+        + (t_eval[i] if i < len(t_eval) else 0)
+        for i in range(n)
+    ]
+
+
 def _count_shm() -> Optional[int]:
     """POSIX shared-memory segment count (Linux ``/dev/shm``), else None.
 
@@ -359,11 +372,7 @@ def _report_consume(res: Dict[str, Any]) -> bool:
     print(_summary("t_meta", res["t_meta"]))
     print(_summary("t_eval", res["t_eval"]))
     print(_summary("qpu_access", res["qpu_ms"]))
-    consumer_ms = [
-        (res["t_meta"][i] if i < len(res["t_meta"]) else 0)
-        + (res["t_eval"][i] if i < len(res["t_eval"]) else 0)
-        for i in range(len(res["t_acq"]))
-    ]
+    consumer_ms = _consumer_ms(res["t_meta"], res["t_eval"], len(res["t_acq"]))
     print(_summary("consumer(m+e)", consumer_ms))
     med = statistics.median(consumer_ms) if consumer_ms else 0.0
     n = len(res["t_acq"])
@@ -570,10 +579,7 @@ def run_inprocess(args: argparse.Namespace) -> int:
     print(_summary("t_meta", t_meta))
     print(_summary("t_eval", t_eval))
     print(_summary("qpu_access", qpu_ms))
-    consumer = [
-        (t_meta[i] if i < len(t_meta) else 0) + (t_eval[i] if i < len(t_eval) else 0)
-        for i in range(n_done)
-    ]
+    consumer = _consumer_ms(t_meta, t_eval, n_done)
     print(_summary("consumer(m+e)", consumer))
     if n_done:
         thru = n_done / wall

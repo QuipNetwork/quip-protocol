@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import signal
-import sys
 from typing import List, Tuple
 
 from shared.base_miner import BaseMiner
@@ -56,8 +55,9 @@ class ModalMiner(BaseMiner):
             if hasattr(self, 'logger'):
                 self.logger.error(f"Error during Modal miner cleanup: {e}")
 
-        # Exit gracefully
-        sys.exit(0)
+        # Exit gracefully — guard against raising SystemExit during
+        # interpreter finalization (would produce "Exception ignored" noise).
+        self._graceful_exit()
 
     def _adapt_mining_params(
         self,

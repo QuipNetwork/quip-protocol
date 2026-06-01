@@ -1248,7 +1248,8 @@ class SubstrateMinerController:
             self._submission_log.record(
                 solution_number=solution_number,
                 miner_id=envelope.handle_id,
-                miner_type=envelope.result.miner_type,                energy_milli=result_energy_milli,
+                miner_type=envelope.result.miner_type,
+                energy_milli=result_energy_milli,
                 diversity_milli=result_diversity_milli,
                 threshold_milli=snapshot_threshold_milli,
                 last_proof_block_hash_hex=last_proof_hex,
@@ -1285,7 +1286,8 @@ class SubstrateMinerController:
                 self._submission_log.record(
                     solution_number=solution_number,
                     miner_id=envelope.handle_id,
-                    miner_type=envelope.result.miner_type,                    energy_milli=result_energy_milli,
+                    miner_type=envelope.result.miner_type,
+                    energy_milli=result_energy_milli,
                     diversity_milli=result_diversity_milli,
                     threshold_milli=snapshot_threshold_milli,
                     last_proof_block_hash_hex=last_proof_hex,
@@ -1363,27 +1365,9 @@ class SubstrateMinerController:
             # round at or just past the most recent head we processed)
             # and the subscription will re-converge within one or two
             # heads even if it's slightly off.
-            accepted_block_hash = b""
-            accepted_block_number = self._highest_handled_block + 1
-            if receipt.block_hash:
-                try:
-                    accepted_block_hash = bytes.fromhex(
-                        receipt.block_hash[2:]
-                        if receipt.block_hash.startswith("0x")
-                        else receipt.block_hash
-                    )
-                    accepted_block_number = await self.pool_client.get_block_number(
-                        at=accepted_block_hash
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "could not resolve accepted block number for "
-                        "receipt block=%s (%s: %s); using fallback=%d",
-                        receipt.block_hash,
-                        type(exc).__name__,
-                        exc,
-                        accepted_block_number,
-                    )
+            accepted_block_hash, accepted_block_number = (
+                await self._resolve_accepted_block(receipt.block_hash)
+            )
             record = ClosedWorkRecord(
                 accepted_block_hash=accepted_block_hash,
                 accepted_block_number=accepted_block_number,
@@ -1422,7 +1406,8 @@ class SubstrateMinerController:
             self._submission_log.record(
                 solution_number=solution_number,
                 miner_id=envelope.handle_id,
-                miner_type=envelope.result.miner_type,                energy_milli=result_energy_milli,
+                miner_type=envelope.result.miner_type,
+                energy_milli=result_energy_milli,
                 diversity_milli=result_diversity_milli,
                 threshold_milli=snapshot_threshold_milli,
                 last_proof_block_hash_hex=last_proof_hex,
@@ -1460,7 +1445,8 @@ class SubstrateMinerController:
             self._submission_log.record(
                 solution_number=solution_number,
                 miner_id=envelope.handle_id,
-                miner_type=envelope.result.miner_type,                energy_milli=result_energy_milli,
+                miner_type=envelope.result.miner_type,
+                energy_milli=result_energy_milli,
                 diversity_milli=result_diversity_milli,
                 threshold_milli=snapshot_threshold_milli,
                 last_proof_block_hash_hex=last_proof_hex,
@@ -1477,7 +1463,8 @@ class SubstrateMinerController:
             self._submission_log.record(
                 solution_number=solution_number,
                 miner_id=envelope.handle_id,
-                miner_type=envelope.result.miner_type,                energy_milli=result_energy_milli,
+                miner_type=envelope.result.miner_type,
+                energy_milli=result_energy_milli,
                 diversity_milli=result_diversity_milli,
                 threshold_milli=snapshot_threshold_milli,
                 last_proof_block_hash_hex=last_proof_hex,
@@ -2235,8 +2222,8 @@ class SubstrateMinerController:
     ) -> Tuple[bytes, int]:
         """Resolve a receipt's block hash → ``(hash_bytes, block_number)``.
 
-        Best-effort, mirroring the OK branch of ``_handle_result``: a
-        failure to decode or look up the number falls back to
+        Shared by the OK branch of ``_handle_result`` and the anticipatory
+        path: a failure to decode or look up the number falls back to
         ``(b"", self._highest_handled_block + 1)`` — correct in the common
         case (we won at/just past the last processed head) and the
         subscription re-converges within a head or two.
@@ -2256,7 +2243,7 @@ class SubstrateMinerController:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "anticipatory: could not resolve accepted block number "
+                "could not resolve accepted block number "
                 "for receipt block=%s (%s: %s); using fallback=%d",
                 receipt_block,
                 type(exc).__name__,

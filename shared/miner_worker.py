@@ -265,44 +265,38 @@ def miner_worker_main(
             miner._current_dispatch_id = dispatch_id
             miner._current_solution_number = msg.get("solution_number")
 
+            # Best-effort forwarder for worker-initiated pushes that share the
+            # results id/dispatch_id envelope (preview + budget). A put failure
+            # must never break mining.
+            def _emit(op: str, data: Dict[str, Any]) -> None:
+                try:
+                    resp_q.put(
+                        {
+                            "op": op,
+                            "id": spec.get("id"),
+                            "dispatch_id": dispatch_id,
+                            "data": data,
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001 — best-effort
+                    logger.debug("%s put failed (ignored): %s", op, exc)
+
             # Anticipatory-submission preview channel. The miner calls
             # this whenever its best-by-floor stashed candidate improves;
             # we forward it to the controller as a lightweight
             # ``{"op": "preview"}`` message (same id/dispatch_id shape as
             # results) WITHOUT ending the dispatch. The controller stashes
             # the latest best preview per work key so Task 6b can predict
-            # the decay-block and pre-submit. Best-effort: a put failure
-            # must not break mining.
+            # the decay-block and pre-submit.
             def _emit_preview(payload: Dict[str, Any]) -> None:
-                try:
-                    resp_q.put(
-                        {
-                            "op": "preview",
-                            "id": spec.get("id"),
-                            "dispatch_id": dispatch_id,
-                            "data": payload,
-                        }
-                    )
-                except Exception as exc:  # noqa: BLE001 — best-effort
-                    logger.debug("preview put failed (ignored): %s", exc)
+                _emit("preview", payload)
 
             # Live QPU budget channel. The miner calls this at the progress-log
             # cadence with its ``QPUTimeManager.get_stats`` snapshot; we forward
             # it to the controller as a worker-initiated ``{"op": "budget"}``
             # push (never blocks the serial op-loop, unlike a get_stats RPC).
-            # Best-effort: a put failure must not break mining.
             def _emit_budget(stats: Dict[str, Any]) -> None:
-                try:
-                    resp_q.put(
-                        {
-                            "op": "budget",
-                            "id": spec.get("id"),
-                            "dispatch_id": dispatch_id,
-                            "data": stats,
-                        }
-                    )
-                except Exception as exc:  # noqa: BLE001 — best-effort
-                    logger.debug("budget put failed (ignored): %s", exc)
+                _emit("budget", stats)
 
             # Write-once participation channel. The miner calls this exactly
             # once per accepted dispatch (after its budget gate passes) with the

@@ -9,7 +9,7 @@ and metal_splash_sa.py for CSR graph construction, beta schedule computation,
 Metal buffer creation, and result unpacking.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import dimod
 import numpy as np
@@ -42,6 +42,38 @@ def _create_buffer(device, data: np.ndarray, label: str = ""):
     )
     if not buf:
         raise RuntimeError(f"Failed to create buffer: {label}")
+    return buf
+
+
+def pooled_buffer(device, pool: Dict[str, Any], role: str, nbytes: int):
+    """Return a reused shared MTLBuffer of at least ``nbytes`` for ``role``.
+
+    Grows on demand and persists in ``pool`` (keyed by ``role``), so a
+    streaming loop allocates each role's buffer once at its max size instead of
+    every batch. ``role`` namespaces buffers so two same-sized roles never
+    alias. Shared by the Metal SA and Gibbs samplers.
+    """
+    nbytes = max(1, int(nbytes))
+    buf = pool.get(role)
+    if buf is None or buf.length() < nbytes:
+        buf = device.newBufferWithLength_options_(
+            nbytes, Metal.MTLResourceStorageModeShared,
+        )
+        pool[role] = buf
+    return buf
+
+
+def pooled_input(device, pool: Dict[str, Any], role: str, data: np.ndarray):
+    """Pooled buffer for ``role`` filled with ``data`` (copied to shared mem).
+
+    Safe across batches because the dispatch is synchronous
+    (``waitUntilCompleted``) before the buffer is refilled.
+    """
+    if not data.flags["C_CONTIGUOUS"]:
+        data = np.ascontiguousarray(data)
+    byte_data = data.tobytes()
+    buf = pooled_buffer(device, pool, role, len(byte_data))
+    buf.contents().as_buffer(len(byte_data))[:] = byte_data
     return buf
 
 

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from shared.system_info import is_secret_key
+from shared.system_info import _is_jsonable, is_secret_key
 from shared.version import get_version
 
 
@@ -232,18 +232,6 @@ def _config_dict(spec: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(k, str) and not is_secret_key(k) and _is_jsonable(v):
             merged[k] = v
     return merged
-
-
-def _is_jsonable(value: Any) -> bool:
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return True
-    if isinstance(value, (list, tuple)):
-        return all(_is_jsonable(v) for v in value)
-    if isinstance(value, dict):
-        return all(
-            isinstance(k, str) and _is_jsonable(v) for k, v in value.items()
-        )
-    return False
 
 
 # ----------------------------------------------------------------------

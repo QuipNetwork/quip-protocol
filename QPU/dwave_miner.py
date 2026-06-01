@@ -6,7 +6,7 @@ import multiprocessing
 import multiprocessing.synchronize
 import signal
 import time
-from typing import Dict, Iterator, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any
 
 init_logger = logging.getLogger(__name__)
 
@@ -14,7 +14,6 @@ from QPU.dwave_sampler import DWaveSamplerWrapper
 from QPU.qpu_time_manager import QPUTimeManager, QPUTimeConfig
 from shared.base_miner import BaseMiner, MidstreamBudget, _energy_to_milli
 from shared.miner_types import BlockRequirements
-from shared.ising_feeder import RandomIsingFeeder
 from shared.stream_context import StreamContext
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies.dwave_topology import DWaveTopology
@@ -271,8 +270,6 @@ class DWaveMiner(BaseMiner):
                 "annealing_time_us=%s",
                 num_reads, annealing_time_us,
             )
-        self._feeder: Optional[RandomIsingFeeder] = None
-        self._stream: Optional[Iterator] = None
         # Stashed by _pre_mine_setup; exposed for tooling that builds an
         # in-process miner and passes the event to the sampler's pump.
         self._stop_event: Optional[multiprocessing.synchronize.Event] = None
@@ -297,12 +294,6 @@ class DWaveMiner(BaseMiner):
                 f"cleaning up D-Wave resources..."
             )
         try:
-            if self._stream is not None and hasattr(self._stream, 'close'):
-                self._stream.close()
-                self._stream = None
-            if self._feeder is not None:
-                self._feeder.stop()
-                self._feeder = None
             if getattr(self, 'sampler', None) is not None and hasattr(
                 self.sampler, 'close'
             ):
@@ -505,13 +496,3 @@ class DWaveMiner(BaseMiner):
         return self.sampler.reconstruct_full_sampleset(  # ty:ignore[unresolved-attribute]
             sampleset, defect_info,
         )
-
-    def _post_mine_cleanup(self) -> None:
-        """Stop the streaming pipeline and feeder."""
-        if self._stream is not None:
-            if hasattr(self._stream, 'close'):
-                self._stream.close()
-            self._stream = None
-        if self._feeder is not None:
-            self._feeder.stop()
-            self._feeder = None

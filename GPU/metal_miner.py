@@ -170,11 +170,11 @@ class MetalMiner(BaseMiner):
             "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
             "num_reads": sample_ctx["num_reads"],
             "num_sweeps": sample_ctx["num_sweeps"],
-            "topology": getattr(self, "topology", None),
-            "utilization": getattr(self, "gpu_utilization", 100),
-            "yielding": getattr(self, "yielding", True),
-            "active_util": getattr(self, "active_util", 85),
-            "idle_after_s": getattr(self, "idle_after_s", 60.0),
+            "topology": self.topology,
+            "utilization": self.gpu_utilization,
+            "yielding": self.yielding,
+            "active_util": self.active_util,
+            "idle_after_s": self.idle_after_s,
         }
 
     def _cleanup_handler(self, signum, frame):

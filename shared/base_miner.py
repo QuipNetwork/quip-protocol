@@ -146,15 +146,11 @@ class _DispatchSetup:
 
     loop_state: "_MiningLoopState"
     is_substrate: bool
-    sample_ctx: Dict[str, Any]
     num_reads: int
     num_sweeps: int
-    # The shared-sample ring, the descriptor queue, the stream-driver process
-    # and its stop event for this dispatch.
-    ring: Optional[Any]
+    # The descriptor queue and the stream-driver process for this dispatch.
     desc_q: Optional[Any]
     driver_proc: Optional[Any]
-    driver_stop: Optional[Any]
     # Round generation this dispatch accepts; descriptors tagged with any
     # other generation are stale and dropped by the consumer.
     generation: int = 0
@@ -1148,13 +1144,10 @@ class BaseMiner(ABC):
         return _DispatchSetup(
             loop_state=loop_state,
             is_substrate=is_substrate,
-            sample_ctx=sample_ctx,
             num_reads=num_reads,
             num_sweeps=current_num_sweeps,
-            ring=self._ring,
             desc_q=self._desc_q,
             driver_proc=self._driver_proc,
-            driver_stop=self._driver_stop,
             generation=generation,
         )
 
@@ -1744,9 +1737,7 @@ class BaseMiner(ABC):
                 "[%s] Mining attempt - Energy: %.0f (pre-check skip: not in "
                 "top-5, worst stashed=%.0f, live threshold<=%d)",
                 self.miner_id, iter_best_energy,
-                (state.top_k[-1].result.energy
-                 if len(state.top_k) >= state.top_k_cap
-                 else float("inf")),
+                ratchet_threshold,
                 live_threshold_milli,
             )
 

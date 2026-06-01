@@ -39,7 +39,13 @@ from GPU.metal_sa import (
     reads_per_buffer_for_budget,
 )
 from GPU.metal_scheduler import DutyCycleController, MetalScheduler
-from GPU.metal_utils import build_csr_from_ising, compute_beta_schedule, unpack_metal_results
+from GPU.metal_utils import (
+    build_csr_from_ising,
+    compute_beta_schedule,
+    pooled_buffer,
+    pooled_input,
+    unpack_metal_results,
+)
 from shared.ising_model import IsingModel
 
 # Streaming PAUSE poll interval (seconds): how long to idle before re-reading
@@ -231,32 +237,14 @@ class MetalGibbsSampler:
         self._buf_pool: Dict[str, Any] = {}
 
     def _pooled_buffer(self, role: str, nbytes: int):
-        """Return a reused shared MTLBuffer of at least ``nbytes`` for ``role``.
-
-        Grows on demand and persists in ``self._buf_pool``, so a streaming loop
-        allocates each role's buffer once instead of every batch.
-        """
-        nbytes = max(1, int(nbytes))
-        buf = self._buf_pool.get(role)
-        if buf is None or buf.length() < nbytes:
-            buf = self.device.newBufferWithLength_options_(
-                nbytes, Metal.MTLResourceStorageModeShared,
-            )
-            self._buf_pool[role] = buf
-        return buf
+        """Reused shared MTLBuffer of at least ``nbytes`` for ``role`` (see
+        ``metal_utils.pooled_buffer``)."""
+        return pooled_buffer(self.device, self._buf_pool, role, nbytes)
 
     def _pooled_input(self, role: str, data: np.ndarray):
-        """Pooled buffer for ``role`` filled with ``data`` (copied to shared mem).
-
-        Safe across batches because the dispatch is synchronous
-        (``waitUntilCompleted``) before the buffer is refilled.
-        """
-        if not data.flags["C_CONTIGUOUS"]:
-            data = np.ascontiguousarray(data)
-        byte_data = data.tobytes()
-        buf = self._pooled_buffer(role, len(byte_data))
-        buf.contents().as_buffer(len(byte_data))[:] = byte_data
-        return buf
+        """Pooled buffer for ``role`` filled with ``data`` (see
+        ``metal_utils.pooled_input``)."""
+        return pooled_input(self.device, self._buf_pool, role, data)
 
     def sample_ising(
         self,

@@ -1395,16 +1395,17 @@ def _decode_result_delivery(value) -> ResultDelivery:
 
 
 def _encode_compact_u32(n: int) -> bytes:
-    """SCALE compact encoding for u32. Mirrors substrate's `Compact<u32>`."""
+    """SCALE compact encoding for u32. Mirrors substrate's `Compact<u32>`.
+
+    For values below 2^30 this is identical to ``_encode_compact_u128``;
+    the only divergence is the narrower u32 ceiling, which is kept as an
+    explicit guard before delegating to the shared encoder.
+    """
     if n < 0:
         raise ValueError(f"compact u32 must be non-negative, got {n}")
-    if n < 0x40:
-        return bytes([n << 2])
-    if n < 0x4000:
-        return ((n << 2) | 0b01).to_bytes(2, "little")
-    if n < 0x4000_0000:
-        return ((n << 2) | 0b10).to_bytes(4, "little")
-    raise NotImplementedError("compact u32 big-int mode not needed here")
+    if n >= 0x4000_0000:
+        raise NotImplementedError("compact u32 big-int mode not needed here")
+    return _encode_compact_u128(n)
 
 
 def _encode_compact_u128(n: int) -> bytes:

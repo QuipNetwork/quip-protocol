@@ -18,6 +18,13 @@ from substrateinterface import Keypair, KeypairType
 SignatureKind = Literal["Sr25519", "Ed25519", "Ecdsa", "Hybrid"]
 
 
+def _normalize_sr25519_sig(raw: object) -> bytes:
+    """Coerce substrate-interface's sign() return (bytes or hex str) to raw bytes."""
+    if isinstance(raw, str):
+        raw = bytes.fromhex(raw[2:] if raw.startswith("0x") else raw)
+    return bytes(raw)
+
+
 class Signer(ABC):
     """Sign extrinsic payloads for the substrate chain.
 
@@ -104,10 +111,7 @@ class Sr25519Signer(Signer):
     def sign(self, payload: bytes) -> bytes:
         # substrate-interface's sign() accepts bytes via `data=` and returns
         # raw 64-byte sr25519 signature.
-        signed = self._keypair.sign(data=payload)
-        if isinstance(signed, str):
-            signed = bytes.fromhex(signed[2:] if signed.startswith("0x") else signed)
-        return bytes(signed)
+        return _normalize_sr25519_sig(self._keypair.sign(data=payload))
 
     def signature_kind(self) -> SignatureKind:
         return "Sr25519"

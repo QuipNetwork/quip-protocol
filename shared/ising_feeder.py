@@ -40,6 +40,17 @@ logger = logging.getLogger(__name__)
 _SPAWN_CTX = _mp.get_context("spawn")
 
 
+def _empty_feeder_counters() -> dict:
+    """Fresh zeroed cumulative-counter dict for RandomIsingFeeder stats."""
+    return {
+        "max_depth_seen": 0,
+        "min_depth_seen": 0,
+        "drained_count": 0,
+        "pop_wait_total_s": 0.0,
+        "pop_wait_count": 0,
+    }
+
+
 def _generate_one_model(
     last_proof_block_hash: bytes,
     miner_bytes: bytes,
@@ -181,13 +192,7 @@ class RandomIsingFeeder:
         # pop_blocking(). Read by telemetry to confirm the buffer stays
         # full under load (drained_count > 0 means the QPU stream out-ran
         # the worker pool).
-        self._stats: dict = {
-            "max_depth_seen": 0,
-            "min_depth_seen": 0,
-            "drained_count": 0,
-            "pop_wait_total_s": 0.0,
-            "pop_wait_count": 0,
-        }
+        self._stats: dict = _empty_feeder_counters()
         self._min_depth_init = False
         self._fill()
 
@@ -324,13 +329,7 @@ class RandomIsingFeeder:
 
     def reset_stats(self) -> None:
         """Zero the cumulative counters (point-in-time fields unaffected)."""
-        self._stats = {
-            "max_depth_seen": 0,
-            "min_depth_seen": 0,
-            "drained_count": 0,
-            "pop_wait_total_s": 0.0,
-            "pop_wait_count": 0,
-        }
+        self._stats = _empty_feeder_counters()
         self._min_depth_init = False
 
     def __iter__(self):
@@ -548,8 +547,8 @@ def build_feeder(spec, nodes, edges, buffer_size):
     """Build an IsingFeeder from a switch ``feeder_spec`` tuple.
 
     ``("pow", last_proof_block_hash, miner_bytes)`` -> ``RandomIsingFeeder``.
-    ``("mempool", problem_slot)`` and ``("oneshot", models)`` are wired in
-    later unification steps; for now they raise so a missing case fails loudly.
+    ``("mempool", attach_args, slot)`` -> ``FixedIsingFeeder`` (non-owner
+    attaches a ``ProblemView`` from ``attach_args`` and reads h/J from ``slot``).
 
     Args:
         spec: A feeder-spec tuple whose first element is the kind string.
@@ -561,7 +560,8 @@ def build_feeder(spec, nodes, edges, buffer_size):
         A configured feeder implementing the pop/stop interface.
 
     Raises:
-        NotImplementedError: If ``spec[0]`` is not ``"pow"``.
+        NotImplementedError: If ``spec[0]`` is neither ``"pow"`` nor
+            ``"mempool"``.
     """
     kind = spec[0]
     if kind == "pow":

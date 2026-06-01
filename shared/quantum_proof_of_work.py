@@ -146,8 +146,7 @@ def generate_ising_model_from_nonce(
             raise ValueError(
                 "pass either `allowed_h` or legacy `h_values`, not both"
             )
-        from shared.allowed_value_spec import AllowedValueSet as _Set
-        allowed_h = _Set(
+        allowed_h = AllowedValueSet(
             tuple(int(round(float(v) * MILLI_SCALE)) for v in h_values)
         )
 
@@ -916,17 +915,15 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         valid_solutions = full_unique_solutions[pool_indices]
         valid_energies = full_unique_energies[pool_indices]
 
-        # Diversity snapshot over whatever below-target solutions we
-        # have, even if fewer than min_solutions. Without this the log
-        # prints diversity=0.000 (the init value) on any "Insufficient
-        # valid solutions" rejection, hiding whether the sampler is
-        # producing diverse-but-too-few samples vs. clustering in one
-        # basin. Recomputed below with farthest-point selection when we
-        # have enough to reach the success path.
-        if len(valid_solutions) >= 2:
-            diversity = calculate_diversity(valid_solutions)
-
         if len(valid_solutions) < min_solutions:
+            # Diversity snapshot for the rejection log only (the `finally`
+            # below prints it). Without it the log shows diversity=0.000
+            # (the init value), hiding diverse-but-too-few from clustered.
+            # The success path doesn't need it — it overwrites `diversity`
+            # via farthest-point selection — so this full-pool GEMM stays
+            # off the per-attempt hot path.
+            if len(valid_solutions) >= 2:
+                diversity = calculate_diversity(valid_solutions)
             raise ValueError(f"Insufficient valid solutions: {len(valid_solutions)} < {min_solutions}")
 
         # Select diverse solutions — try farthest-point first, then

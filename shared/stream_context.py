@@ -23,6 +23,27 @@ from shared.ising_model import IsingModel
 log = logging.getLogger(__name__)
 
 
+def stream_from_feeder(sampler, feeder, *, num_reads, num_sweeps):
+    """Stream ``(model, sampleset)`` pairs from a caller-owned feeder.
+
+    Shared body for the trivial ``sample_ising_streaming`` generators (CPU SA,
+    Modal): pop a model, sample it via ``sampler.sample_ising``, yield the pair
+    until the feeder drains. The feeder is owned by ``StreamContext`` and never
+    stopped here. PEP 479: returning on ``StopIteration`` lets the driver
+    reseed cleanly instead of turning a bare StopIteration into a RuntimeError.
+    """
+    while True:
+        try:
+            model = feeder.pop_blocking()
+        except StopIteration:
+            return
+        ss = sampler.sample_ising(
+            h=model.h, J=model.J,
+            num_reads=num_reads, num_sweeps=num_sweeps,
+        )
+        yield model, ss
+
+
 class StreamContext:
     """Generic producer context: feeder (from spec) + sampler -> tagged sets."""
 

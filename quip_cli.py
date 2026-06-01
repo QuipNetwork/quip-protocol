@@ -623,21 +623,8 @@ def quip_miner_resolve_mode(
                   --default cpu --image-supports cpu,qpu) || exit 1
         exec quip-miner "$MODE" --config /data/config.toml ...
     """
-    if config_path is None:
-        backends: dict = {}
-    else:
-        try:
-            backends = load_backend_config(Path(config_path).expanduser())
-        except MinerConfigError as exc:
-            raise click.ClickException(str(exc)) from exc
-
-    image_supports: Optional[list] = None
-    if image_supports_csv is not None:
-        image_supports = [
-            tok.strip().lower()
-            for tok in image_supports_csv.split(",")
-            if tok.strip()
-        ]
+    backends = _load_backends_or_fail(config_path)
+    image_supports = _parse_image_supports(image_supports_csv)
 
     try:
         resolved = resolve_mode(
@@ -696,21 +683,8 @@ def quip_miner_resolve_modes(
             quip-miner "$mode" --config "$CFG" ... &
         done
     """
-    if config_path is None:
-        backends: dict = {}
-    else:
-        try:
-            backends = load_backend_config(Path(config_path).expanduser())
-        except MinerConfigError as exc:
-            raise click.ClickException(str(exc)) from exc
-
-    image_supports: Optional[list] = None
-    if image_supports_csv is not None:
-        image_supports = [
-            tok.strip().lower()
-            for tok in image_supports_csv.split(",")
-            if tok.strip()
-        ]
+    backends = _load_backends_or_fail(config_path)
+    image_supports = _parse_image_supports(image_supports_csv)
 
     try:
         modes = resolve_modes(
@@ -1152,6 +1126,17 @@ def _load_backends_or_fail(config_path: Optional[str]) -> dict:
         raise click.ClickException(str(exc)) from exc
 
 
+def _parse_image_supports(image_supports_csv: Optional[str]) -> Optional[list]:
+    """Parse a `--image-supports cpu,gpu,qpu` CSV into a lowercased list."""
+    if image_supports_csv is None:
+        return None
+    return [
+        tok.strip().lower()
+        for tok in image_supports_csv.split(",")
+        if tok.strip()
+    ]
+
+
 def _load_submission_config_or_default(
     config_path: Optional[str],
 ) -> SubmissionConfig:
@@ -1389,10 +1374,11 @@ async def _run_concurrent_miner(
         # collapses to 8086.
         telemetry_port = rest_port if rest_port and rest_port > 0 else 8086
 
-        if pow_handles:
-            # PoW requires the sampler's topology to match the chain's
-            # registered DefaultTopology (the chain validates this in
-            # `submit_proof` via `InvalidTopology`).
+        if pow_handles or mempool_handles:
+            # Canonical topology hash (nodes, edges, allowed_h/j/spin) — the
+            # same form the chain's `hash_topology` uses, shared by both the
+            # PoW mismatch check and the mempool sampler binding. `snapshot`
+            # is non-None here (the guard above returns 3 otherwise).
             expected_hash = topology_hash(
                 topology.nodes,
                 topology.edges,
@@ -1400,6 +1386,11 @@ async def _run_concurrent_miner(
                 snapshot.allowed_j_values,
                 snapshot.allowed_spin_values,
             )
+
+        if pow_handles:
+            # PoW requires the sampler's topology to match the chain's
+            # registered DefaultTopology (the chain validates this in
+            # `submit_proof` via `InvalidTopology`).
             if snapshot.topology_hash != expected_hash:
                 click.echo(
                     f"PoW mode topology mismatch: --topology {topology_spec} "
@@ -1436,17 +1427,9 @@ async def _run_concurrent_miner(
             )
 
         if mempool_handles:
-            # Bind the mempool sampler hash to the same canonical form
-            # the chain uses (nodes, edges, allowed_h, allowed_j,
-            # allowed_spin). The allowed-value specs come from the chain
-            # snapshot so client and chain stay in lockstep.
-            mempool_topology_hash = topology_hash(
-                topology.nodes,
-                topology.edges,
-                snapshot.allowed_h_values,
-                snapshot.allowed_j_values,
-                snapshot.allowed_spin_values,
-            )
+            # Bind the mempool sampler hash to the same canonical form the
+            # chain uses (computed once above as `expected_hash`).
+            mempool_topology_hash = expected_hash
             mempool_controller = MempoolMinerController(
                 pool=pool,
                 signer=keystore.signer,

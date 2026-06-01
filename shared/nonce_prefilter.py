@@ -11,7 +11,7 @@ logic as generate_ising_model_from_nonce) to avoid Python dict overhead.
 from __future__ import annotations
 
 import random
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
 import numpy as np
 from scipy.sparse import csr_matrix
@@ -91,7 +91,7 @@ class IsingTopologyCache:
 
     def greedy_descent_fast(
         self,
-        nonce,
+        nonce: Union[int, bytes],
         num_passes: int = 3,
         num_starts: int = 4,
         allowed_h: AllowedValueSpec = DEFAULT_ALLOWED_H,

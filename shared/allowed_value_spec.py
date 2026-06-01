@@ -6,9 +6,10 @@ picks per-node h fields, per-edge j couplings, and per-spin solution values.
 The variant determines both the sampling distribution and the on-chain
 bit-width used when a value is encoded in a SCALE payload.
 
-All milli-precision values are i32 (multiply by ``MILLI_SCALE`` to read as
-float). The shared scale constant lives in ``substrate.submitter`` —
-re-exported here as ``MILLI_SCALE`` so callers don't need both imports.
+All milli-precision values are i32 (divide by ``MILLI_SCALE`` to read as
+float). ``MILLI_SCALE`` is defined here and re-exported from
+``substrate.submitter`` so existing submitter callers don't need a second
+import.
 """
 from __future__ import annotations
 

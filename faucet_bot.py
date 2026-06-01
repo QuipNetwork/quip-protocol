@@ -249,13 +249,9 @@ def _strip_0x(s: str) -> str:
 def _encode_compact_u32(n: int) -> bytes:
     if n < 0:
         raise ValueError(f"compact must be non-negative, got {n}")
-    if n < 0x40:
-        return bytes([n << 2])
-    if n < 0x4000:
-        return ((n << 2) | 0b01).to_bytes(2, "little")
-    if n < 0x4000_0000:
-        return ((n << 2) | 0b10).to_bytes(4, "little")
-    raise NotImplementedError("compact u32 big-int mode not needed here")
+    if n >= 0x4000_0000:
+        raise NotImplementedError("compact u32 big-int mode not needed here")
+    return _encode_compact_u128(n)
 
 
 def _encode_compact_u128(n: int) -> bytes:

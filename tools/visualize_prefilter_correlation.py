@@ -63,7 +63,6 @@ def collect_data(
 
     prev_hash = random.randbytes(32)
     miner_bytes = hashlib.blake2b(b"viz-0", digest_size=32).digest()
-    cur_index = 1
 
     greedy_by_pass = {p: [] for p in range(1, max_passes + 1)}
     sa_min_energies = []

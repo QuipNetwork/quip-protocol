@@ -21,7 +21,7 @@ import dimod
 import numpy as np
 
 from GPU.base_cuda_sampler import BaseCudaSampler
-from GPU.gpu_scheduler import throttle_if_busy
+from GPU.gpu_scheduler import throttled_stream
 from shared.ising_model import IsingModel
 
 
@@ -176,20 +176,16 @@ class CudaSASampler(BaseCudaSampler):
 
         # Throttle before pulling each result (yielding mode): the unified
         # driver path bypasses the old _sample_batch back-off, so honor it here.
-        gen = self._run_streaming_loop(
-            chain([first], model_iter),
-            num_k=num_k,
-            num_betas=num_betas,
-            seed=seed,
-            poll_timeout=poll_timeout,
+        yield from throttled_stream(
+            self._run_streaming_loop(
+                chain([first], model_iter),
+                num_k=num_k,
+                num_betas=num_betas,
+                seed=seed,
+                poll_timeout=poll_timeout,
+            ),
+            scheduler,
         )
-        while True:
-            throttle_if_busy(scheduler)
-            try:
-                model, sampleset = next(gen)
-            except StopIteration:
-                return
-            yield model, sampleset
 
     # -- SA-specific sample_ising --
 

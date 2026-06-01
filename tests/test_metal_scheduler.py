@@ -214,7 +214,7 @@ class TestMetalSchedulerStop:
 
 
 class TestMetalSchedulerCachedUtilization:
-    """Test get_cached_utilization method."""
+    """Test get_measured_gpu method."""
 
     def test_returns_zero_initially(self):
         from GPU.metal_scheduler import MetalScheduler
@@ -223,7 +223,7 @@ class TestMetalSchedulerCachedUtilization:
             gpu_utilization_pct=100,
             yielding=False,
         )
-        assert sched.get_cached_utilization() == 0
+        assert sched.get_measured_gpu() == 0
 
     def test_returns_set_value(self):
         from GPU.metal_scheduler import MetalScheduler
@@ -233,7 +233,7 @@ class TestMetalSchedulerCachedUtilization:
             yielding=True,
         )
         sched._util_value.value = 42
-        assert sched.get_cached_utilization() == 42
+        assert sched.get_measured_gpu() == 42
         sched.stop()
 
 

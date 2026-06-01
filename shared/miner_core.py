@@ -246,6 +246,10 @@ class MinerCore:
     # Telemetry surface (preserved across the v0.1 -> v0.2 refactor)
     # ------------------------------------------------------------------
 
+    def _miner_summaries(self) -> List[Dict[str, Any]]:
+        """Per-miner id/type list shared by descriptor() and get_stats()."""
+        return [{"id": mid, "type": mtype} for mid, mtype in self._summary_miners]
+
     def descriptor(self) -> Dict[str, Any]:
         """Hardware descriptor, cached after the first build.
 
@@ -259,9 +263,7 @@ class MinerCore:
         if self._descriptor_builder is None:
             self._descriptor_cache = {
                 "node_id": self.node_id,
-                "miners": [
-                    {"id": mid, "type": mtype} for mid, mtype in self._summary_miners
-                ],
+                "miners": self._miner_summaries(),
             }
             return self._descriptor_cache
         try:
@@ -271,9 +273,7 @@ class MinerCore:
             self._descriptor_cache = {
                 "node_id": self.node_id,
                 "error": f"{type(exc).__name__}: {exc}",
-                "miners": [
-                    {"id": mid, "type": mtype} for mid, mtype in self._summary_miners
-                ],
+                "miners": self._miner_summaries(),
             }
         return self._descriptor_cache
 
@@ -298,9 +298,7 @@ class MinerCore:
             "total_mining_time": self.timing_stats["total_mining_time"],
             "avg_mining_time": avg_mining_time,
             "wins_per_miner": dict(self.timing_stats["wins_per_miner"]),
-            "miners": [
-                {"id": mid, "type": mtype} for mid, mtype in self._summary_miners
-            ],
+            "miners": self._miner_summaries(),
         }
 
     def record_dispatch(self) -> None:

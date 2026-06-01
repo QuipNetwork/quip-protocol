@@ -597,6 +597,21 @@ async def _handle_solve(request: web.Request) -> web.Response:
     )
 
 
+def _attempts_dir_from_snapshot(request: web.Request) -> Path:
+    """Resolve the attempt/solution JSONL dir from the controller snapshot.
+
+    Falls back to ``DEFAULT_LOG_DIR`` when no snapshot (or no ``attempts_dir``
+    field) is available. Shared by the attempts and solutions handlers, which
+    both ignore the 503 error response.
+    """
+    snapshot, _err = _read_snapshot_or_503(request)
+    return (
+        Path(snapshot["attempts_dir"])
+        if snapshot is not None and snapshot.get("attempts_dir")
+        else DEFAULT_LOG_DIR
+    )
+
+
 async def _handle_mining_attempts(request: web.Request) -> web.Response:
     """GET /api/v1/mining/attempts — query the attempt + submission log.
 
@@ -613,12 +628,7 @@ async def _handle_mining_attempts(request: web.Request) -> web.Response:
     snapshot) produced by the worker and controller. See
     ``shared/mining_attempt_log.py`` for the schema.
     """
-    snapshot, _err = _read_snapshot_or_503(request)
-    attempts_dir = (
-        Path(snapshot["attempts_dir"])
-        if snapshot is not None and snapshot.get("attempts_dir")
-        else DEFAULT_LOG_DIR
-    )
+    attempts_dir = _attempts_dir_from_snapshot(request)
 
     params = request.rel_url.query
     try:
@@ -679,12 +689,7 @@ async def _handle_mining_solutions(request: web.Request) -> web.Response:
     1146 hex chars / solution). Decode with numpy.unpackbits +
     transformation 0→-1, 1→+1 to recover Ising spin vectors.
     """
-    snapshot, _err = _read_snapshot_or_503(request)
-    attempts_dir = (
-        Path(snapshot["attempts_dir"])
-        if snapshot is not None and snapshot.get("attempts_dir")
-        else DEFAULT_LOG_DIR
-    )
+    attempts_dir = _attempts_dir_from_snapshot(request)
 
     params = request.rel_url.query
     miner_id_filter = params.get("miner_id")

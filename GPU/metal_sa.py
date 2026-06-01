@@ -30,7 +30,12 @@ except ImportError:  # Apple Metal framework is macOS-only; absent on Linux/CI.
 
 from shared.ising_model import IsingModel
 from GPU.metal_scheduler import MetalScheduler, UNCAPPED
-from GPU.metal_utils import compute_beta_schedule, unpack_metal_results
+from GPU.metal_utils import (
+    compute_beta_schedule,
+    pooled_buffer,
+    pooled_input,
+    unpack_metal_results,
+)
 
 # Seconds to idle between budget re-checks while paused (budget == 0).
 _PAUSE_POLL_S = 0.5
@@ -363,35 +368,14 @@ class MetalSASampler:
         )
 
     def _pooled_buffer(self, role: str, nbytes: int):
-        """Return a reused shared MTLBuffer of at least ``nbytes`` for ``role``.
-
-        Grows on demand and is kept in ``self._buf_pool`` for the sampler's
-        lifetime, so a streaming loop allocates each role's buffer once (at its
-        max size) instead of every batch. ``role`` namespaces buffers so two
-        same-sized roles never alias.
-        """
-        nbytes = max(1, int(nbytes))
-        buf = self._buf_pool.get(role)
-        if buf is None or buf.length() < nbytes:
-            buf = self.device.newBufferWithLength_options_(
-                nbytes, Metal.MTLResourceStorageModeShared,
-            )
-            self._buf_pool[role] = buf
-        return buf
+        """Reused shared MTLBuffer of at least ``nbytes`` for ``role`` (see
+        ``metal_utils.pooled_buffer``)."""
+        return pooled_buffer(self.device, self._buf_pool, role, nbytes)
 
     def _pooled_input(self, role: str, data: np.ndarray):
-        """Pooled buffer for ``role`` filled with ``data`` (copied to shared mem).
-
-        Replaces a per-batch ``newBufferWithBytes`` with copy-into-reused-buffer.
-        Safe because the dispatch is synchronous (``waitUntilCompleted``) — the
-        GPU is done with the prior batch before the buffer is refilled.
-        """
-        if not data.flags["C_CONTIGUOUS"]:
-            data = np.ascontiguousarray(data)
-        byte_data = data.tobytes()
-        buf = self._pooled_buffer(role, len(byte_data))
-        buf.contents().as_buffer(len(byte_data))[:] = byte_data
-        return buf
+        """Pooled buffer for ``role`` filled with ``data`` (see
+        ``metal_utils.pooled_input``)."""
+        return pooled_input(self.device, self._buf_pool, role, data)
 
     def _dispatch_batch(
         self,

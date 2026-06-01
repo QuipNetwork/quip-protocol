@@ -321,14 +321,6 @@ class MetalScheduler:
         """Whether yielding mode is active."""
         return self._yielding
 
-    def get_cached_utilization(self) -> int:
-        """Return latest IOKit GPU utilization without querying.
-
-        Returns:
-            Cached utilization 0-100, or 0 if unavailable.
-        """
-        return self._util_value.value
-
     def stop(self) -> None:
         """Stop IOKit utilization monitor process."""
         if self._util_proc is not None:

@@ -370,10 +370,6 @@ def _run_batch(
         annealing_time_us=annealing_time_us,
         n_requested=n_submissions,
         concurrency=queue_depth,
-        # Production's sample_ising_streaming logs its own pipeline
-        # depth periodically (every 100 completions per Phase 1).
-        # The canary doesn't duplicate that tracking here.
-        depth_samples=[],
     )
 
 
@@ -479,17 +475,10 @@ def _summarize(
     annealing_time_us: float,
     n_requested: int,
     concurrency: int,
-    depth_samples: List[int],
 ) -> Dict[str, Any]:
     """Reduce per-submission records to headline metrics + variance."""
     ok = [r for r in per_submission if "error" not in r]
     errors = [r for r in per_submission if "error" in r]
-    # wall_ms is absent in streaming-pipeline runs (submissions overlap;
-    # per-submission wall isn't meaningful). Old fixed-batch path stored
-    # it; the comprehension tolerates either schema.
-    wall_samples = [
-        r["wall_ms"] for r in ok if r.get("wall_ms") is not None
-    ]
     qpu_samples = [r["qpu_access_us"] for r in ok]
     energy_samples = [
         r["best_energy"] for r in ok
@@ -501,11 +490,6 @@ def _summarize(
     effective_fraction = (
         (total_qpu_us / 1e6) / overall_wall_s
         if overall_wall_s > 0 else 0.0
-    )
-
-    pipeline_min = min(depth_samples) if depth_samples else None
-    pipeline_mean = (
-        statistics.fmean(depth_samples) if depth_samples else None
     )
 
     valid_count = sum(valid_flags)
@@ -550,7 +534,6 @@ def _summarize(
             "submissions_per_sec": (
                 len(ok) / overall_wall_s if overall_wall_s > 0 else 0.0
             ),
-            "wall_per_submission_ms": _moments(wall_samples),
             "qpu_access_per_submission_us": _moments(qpu_samples),
             "best_energy": _moments(energy_samples),
             "best_energy_min": (
@@ -558,9 +541,6 @@ def _summarize(
             ),
             "total_qpu_access_us": total_qpu_us,
             "effective_qpu_fraction": effective_fraction,
-            "pipeline_depth_min": pipeline_min,
-            "pipeline_depth_mean": pipeline_mean,
-            "pipeline_depth_target": concurrency,
             "solution_meta": sm_aggregate,
         },
         "qpu_samples": qpu_samples,
@@ -1062,17 +1042,11 @@ def main() -> int:
     if args.mode == "canary":
         result = cmd_canary(miner, args, validator, energy_threshold)
         s = result["summary"]
-        wall_stats = s["wall_per_submission_ms"]
-        wall_str = (
-            f"wall_mean={wall_stats['mean']:.1f}ms "
-            if wall_stats.get("mean") is not None else ""
-        )
         print(
             f"[canary] {s['submissions_completed']}/{args.n} ok in "
             f"{s['total_wall_s']:.2f}s "
             f"({s['submissions_per_sec']:.2f}/s) | "
             f"effective_qpu_fraction={s['effective_qpu_fraction']:.3f} | "
-            f"{wall_str}"
             f"qpu_mean={s['qpu_access_per_submission_us']['mean']:.0f}us "
             f"(sd={s['qpu_access_per_submission_us']['stdev']:.0f}) | "
             f"p_success={s['p_success_chain']:.4f} "

@@ -415,13 +415,10 @@ class MempoolJobContext:
             min_solutions=ising.min_solutions,
         )
 
-    def resolve_ising(
+    def _materialize_hj(
         self,
-        salt: bytes,
-        nodes: Sequence[int],
-        edges: Sequence[Tuple[int, int]],
-    ) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float], int]:
-        """Map chain-carried (h_values, j_values) directly. Salt and nodes unused."""
+    ) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float]]:
+        """Decode chain-carried millivalues into float h/J dicts."""
         h = {
             int(node): float(hv) / 1000.0
             for node, hv in zip(self.nodes, self.h_values)
@@ -430,6 +427,16 @@ class MempoolJobContext:
             (int(edge[0]), int(edge[1])): float(jv) / 1000.0
             for edge, jv in zip(self.edges, self.j_values)
         }
+        return h, J
+
+    def resolve_ising(
+        self,
+        salt: bytes,
+        nodes: Sequence[int],
+        edges: Sequence[Tuple[int, int]],
+    ) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float], int]:
+        """Map chain-carried (h_values, j_values) directly. Salt and nodes unused."""
+        h, J = self._materialize_hj()
         return h, J, 0  # 0 = placeholder nonce for telemetry
 
     def make_feeder(
@@ -454,14 +461,7 @@ class MempoolJobContext:
         fixed model list has fixed length.
         """
         del nodes, edges, buffer_size  # See docstring.
-        h = {
-            int(node): float(hv) / 1000.0
-            for node, hv in zip(self.nodes, self.h_values)
-        }
-        J = {
-            (int(edge[0]), int(edge[1])): float(jv) / 1000.0
-            for edge, jv in zip(self.edges, self.j_values)
-        }
+        h, J = self._materialize_hj()
         model = IsingModel(
             h=h,
             J=J,

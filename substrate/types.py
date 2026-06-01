@@ -170,8 +170,8 @@ class SubstrateMiningContext:
 
         d = self.difficulty
         return BlockRequirements(
-            difficulty_energy=float(d.max_energy_milli) / 1000.0,
-            min_diversity=float(d.min_diversity_milli) / 1000.0,
+            difficulty_energy=d.max_energy,
+            min_diversity=d.min_diversity,
             min_solutions=int(d.min_solutions),
             timeout_to_difficulty_adjustment_decay=2**31 - 1,
             allowed_h_values=self.allowed_h_values,
