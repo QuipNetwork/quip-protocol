@@ -40,17 +40,28 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "_query_iokit_gpu_utilization", "poll_iokit_gpu_util",
     "MetalScheduler", "DutyCycleController", "CapConfig", "Signals",
-    "HysteresisState", "decide_tier", "tier_target_pct", "cap_monitor_main",
-    "PAUSE", "LOW", "IDLE", "ACTIVE", "LEAVE_POLLS",
+    "HysteresisState", "decide_tier", "tier_budget", "cap_monitor_main",
+    "PAUSE", "LOW", "IDLE", "ACTIVE", "LEAVE_POLLS", "UNCAPPED",
 ]
 
 
 # ── adaptive cap tier policy (Metal-only, pure) ──────────────────────────
+#
+# The jank lever on Apple GPUs is *occupancy* — concurrent threads in flight
+# per command buffer (problems x reads), NOT duty cycle, core count, or buffer
+# duration. Below a hardware/kernel-specific threshold the cores aren't
+# saturated so the compositor's work interleaves → smooth; above it the
+# execution units / memory bandwidth saturate → UI stalls. So the cap the
+# governor publishes is a *thread budget*: each command buffer is held under
+# it (by splitting reads), keeping the full problem batch and full sweeps.
 
 PAUSE = "pause"
 LOW = "low"
 IDLE = "idle"
 ACTIVE = "active"
+
+# Sentinel budget meaning "no cap" (idle/headless → full speed).
+UNCAPPED = -1
 
 # Consecutive polls required to *leave* a protective tier (PAUSE/LOW). Entry
 # into a protective tier is immediate; only relaxing one is debounced.
@@ -59,20 +70,19 @@ LEAVE_POLLS = 2
 
 @dataclass(frozen=True)
 class CapConfig:
-    """Caps + thresholds the cap policy maps tiers onto.
+    """Thresholds + the occupancy budget the cap policy maps tiers onto.
 
     Args:
-        idle_after_s: Seconds of no HID input before entering IDLE.
-        active_util: Cap (%) while the user is present (ACTIVE tier).
-        idle_util: Cap (%) when HID-idle or headless (IDLE tier) — the
-            existing ``utilization`` key; default 100 keeps headless flat-out.
-        serious_util: Cap (%) at thermal == serious (LOW tier).
+        idle_after_s: Seconds of no HID input before going IDLE (away).
+        active_threads: Occupancy budget (max concurrent GPU threads per
+            command buffer) while the user is present. ~2048 is smooth on a
+            40-core M4 Max with this kernel (≈ 2x maxTotalThreadsPerThreadgroup);
+            tune per machine. IDLE/headless runs uncapped; thermal-Serious uses
+            half this; battery/critical pauses.
     """
 
     idle_after_s: float = 60.0
-    active_util: int = 70
-    idle_util: int = 100
-    serious_util: int = 30
+    active_threads: int = 2048
 
 
 @dataclass(frozen=True)
@@ -138,15 +148,19 @@ def decide_tier(
     return HysteresisState(raw, 0)
 
 
-def tier_target_pct(tier: str, config: CapConfig) -> int:
-    """Map a tier to its ``target_pct`` cap (0-100)."""
+def tier_budget(tier: str, config: CapConfig) -> int:
+    """Map a tier to its occupancy budget (threads/command buffer).
+
+    PAUSE → 0 (stop), LOW → half the active budget, IDLE → UNCAPPED
+    (full speed when nobody's present), ACTIVE → ``active_threads``.
+    """
     if tier == PAUSE:
         return 0
     if tier == LOW:
-        return config.serious_util
+        return max(1, config.active_threads // 2)
     if tier == IDLE:
-        return config.idle_util
-    return config.active_util
+        return UNCAPPED
+    return config.active_threads
 
 
 def _read_signals() -> Signals:
@@ -160,34 +174,30 @@ def _read_signals() -> Signals:
 
 
 def cap_monitor_main(
-    target_value,
+    budget_value,
     measured_value,
     heartbeat_value,
     stop_event,
     poll_interval: float,
     idle_after_s: float,
-    active_util: int,
-    idle_util: int,
-    serious_util: int,
+    active_threads: int,
 ) -> None:
     """Metal adaptive-cap monitor process entry (picklable, spawn-safe).
 
     Polls the macOS sensors every ``poll_interval``, runs the tier state
-    machine, and publishes into three shared ints: the ``target_pct`` cap, the
-    measured GPU residency (trim signal), and an incrementing heartbeat for
-    staleness detection. Config is passed as plain scalars; sensors are
-    resolved in the child. Never raises into the loop (sensors degrade safely).
+    machine, and publishes into three shared ints: the occupancy budget
+    (threads/command buffer; 0=pause, -1=uncapped, else cap), the measured GPU
+    residency, and an incrementing heartbeat for staleness detection. Config is
+    passed as plain scalars; sensors resolve in the child. Never raises into
+    the loop (sensors degrade safely).
     """
-    config = CapConfig(
-        idle_after_s=idle_after_s, active_util=active_util,
-        idle_util=idle_util, serious_util=serious_util,
-    )
+    config = CapConfig(idle_after_s=idle_after_s, active_threads=active_threads)
     state = HysteresisState(tier=ACTIVE, leave_count=0)
     if heartbeat_value.value < 0:
         heartbeat_value.value = 0
     while not stop_event.is_set():
         state = decide_tier(_read_signals(), config, state)
-        target_value.value = tier_target_pct(state.tier, config)
+        budget_value.value = tier_budget(state.tier, config)
         measured_value.value = int(macos_sensors.gpu_active_residency())
         heartbeat_value.value += 1
         stop_event.wait(poll_interval)
@@ -202,13 +212,12 @@ class MetalScheduler:
 
     Args:
         gpu_core_count: Apple Silicon GPU core count.
-        gpu_utilization_pct: Config ceiling (1-100); also the IDLE/headless cap.
-        yielding: True = run the adaptive cap monitor. False = static budget,
-            no monitor, flat-out.
+        gpu_utilization_pct: Problem-batch sizing (core budget = cores x pct%).
+        yielding: True = run the adaptive cap monitor. False = no monitor,
+            uncapped.
         poll_interval: Seconds between sensor polls (yielding).
-        active_util: Cap (%) while the user is present (ACTIVE tier).
-        idle_after_s: Seconds of no HID input before entering IDLE.
-        serious_util: Cap (%) at thermal == serious (LOW tier).
+        active_threads: Occupancy budget (threads/command buffer) while present.
+        idle_after_s: Seconds of no HID input before going IDLE (away).
     """
 
     def __init__(
@@ -217,17 +226,15 @@ class MetalScheduler:
         gpu_utilization_pct: int = 100,
         yielding: bool = False,
         poll_interval: float = 0.3,
-        active_util: int = 70,
+        active_threads: int = 2048,
         idle_after_s: float = 60.0,
-        serious_util: int = 30,
     ):
         self._gpu_core_count = gpu_core_count
         self._gpu_utilization_pct = gpu_utilization_pct
         self._yielding = yielding
         self._poll_interval = poll_interval
-        self._active_util = max(1, min(100, active_util))
+        self._active_threads = max(1, active_threads)
         self._idle_after_s = idle_after_s
-        self._serious_util = max(1, min(100, serious_util))
 
         self._static_budget = max(
             1,
@@ -236,21 +243,16 @@ class MetalScheduler:
 
         # Shared monitor state (published by cap_monitor_main).
         ctx = mp.get_context("spawn")
-        self._util_value = ctx.Value("i", 0)          # measured GPU residency
-        self._target_value = ctx.Value("i", self._active_util)  # cap %
-        self._heartbeat_value = ctx.Value("i", -1)    # ++ each poll
+        self._util_value = ctx.Value("i", 0)             # measured GPU residency
+        self._budget_value = ctx.Value("i", self._active_threads)  # thread cap
+        self._heartbeat_value = ctx.Value("i", -1)       # ++ each poll
         self._util_proc: Optional[mp.process.BaseProcess] = None
         self._util_stop = None
 
-        # Staleness detection for get_target_pct (fail-safe to active cap).
+        # Staleness detection for get_thread_budget (fail-safe to active cap).
         self._last_heartbeat = -1
         self._last_hb_time = time.monotonic()
         self._stale_timeout_s = max(2.0, poll_interval * 6)
-
-        # Hysteresis for stable target threadgroups (legacy spatial path;
-        # dead under the governor — flagged for dead-code triage).
-        self._prev_target = 0
-        self._stable_ticks = 0
 
         if yielding:
             self._start_cap_monitor()
@@ -267,40 +269,40 @@ class MetalScheduler:
         self._util_stop = mp.get_context("spawn").Event()
         self._util_proc = spawn_worker(
             cap_monitor_main,
-            (self._target_value, self._util_value, self._heartbeat_value,
+            (self._budget_value, self._util_value, self._heartbeat_value,
              self._util_stop, self._poll_interval, self._idle_after_s,
-             self._active_util, self._gpu_utilization_pct, self._serious_util),
+             self._active_threads),
             name="metal-cap-monitor",
         )
         logger.info(
-            "Metal cap monitor started (yielding, idle_cap=%d%%, "
-            "active_cap=%d%%, serious_cap=%d%%, idle_after=%.0fs, "
-            "cores=%d, poll=%.1fs)",
-            self._gpu_utilization_pct, self._active_util, self._serious_util,
-            self._idle_after_s, self._gpu_core_count, self._poll_interval,
+            "Metal cap monitor started (yielding, active_threads=%d, "
+            "idle_after=%.0fs, cores=%d, poll=%.1fs)",
+            self._active_threads, self._idle_after_s,
+            self._gpu_core_count, self._poll_interval,
         )
 
-    def get_target_pct(self) -> int:
-        """Return the current cap % (0=pause … 100=flat-out).
+    def get_thread_budget(self) -> int:
+        """Return the current occupancy budget (threads/command buffer).
 
-        When yielding is off there is no monitor — returns 100 (flat-out).
-        While yielding, returns the monitor's published cap, but falls back to
-        the ACTIVE cap (never flat-out) if the monitor heartbeat has been
-        stale for longer than ``_stale_timeout_s`` (monitor death = fail safe).
+        0 = pause, ``UNCAPPED`` (-1) = no cap, else max threads per buffer.
+        When yielding is off there is no monitor — returns UNCAPPED. While
+        yielding, returns the monitor's published budget, but falls back to the
+        ACTIVE budget (never uncapped) if the heartbeat has been stale beyond
+        ``_stale_timeout_s`` (monitor death = fail safe, stay polite).
         """
         if not self._yielding:
-            return 100
+            return UNCAPPED
         hb = self._heartbeat_value.value
         now = time.monotonic()
         if hb != self._last_heartbeat:
             self._last_heartbeat = hb
             self._last_hb_time = now
         elif now - self._last_hb_time > self._stale_timeout_s:
-            return self._active_util
-        return self._target_value.value
+            return self._active_threads
+        return self._budget_value.value
 
     def get_measured_gpu(self) -> int:
-        """Return the latest measured GPU residency 0-100 (trim signal)."""
+        """Return the latest measured GPU residency 0-100."""
         return self._util_value.value
 
     def get_core_budget(self) -> int:
@@ -313,79 +315,6 @@ class MetalScheduler:
             Number of threadgroups (>= 1).
         """
         return self._static_budget
-
-    def should_throttle(self) -> bool:
-        """True when external GPU load > 90% (yielding only).
-
-        Mirrors KernelScheduler.should_throttle().
-        """
-        if not self._yielding:
-            return False
-        return self._util_value.value > 90
-
-    def compute_target_threadgroups(
-        self,
-        max_tg: int,
-        active_tg: int,
-    ) -> int:
-        """Target threadgroups based on IOKit utilization.
-
-        Simple fair-share: if external utilization is high,
-        reduce dispatch proportionally. Falls back to max_tg
-        when yielding is off or IOKit is unavailable.
-
-        Returns:
-            Target threadgroup count (>= 1).
-        """
-        if not self._yielding:
-            return max_tg
-
-        ext_util = self._util_value.value
-
-        if ext_util <= 0:
-            return max_tg
-
-        # Estimate our contribution
-        our_est = (
-            self._gpu_utilization_pct
-            * active_tg
-            / max(max_tg, 1)
-        )
-
-        if our_est >= ext_util:
-            # Can't distinguish our load — keep current
-            return max_tg
-
-        external_load = ext_util - our_est
-        target_pct = max(
-            self._gpu_utilization_pct / 2,
-            self._gpu_utilization_pct - external_load / 2,
-        )
-        target = round(
-            target_pct / self._gpu_utilization_pct * max_tg,
-        )
-        return max(1, min(target, max_tg))
-
-    def check_stable_target_threadgroups(
-        self,
-        max_tg: int,
-        active_tg: int,
-    ) -> Optional[int]:
-        """Return target threadgroups only if stable for 2 checks.
-
-        Calls compute_target_threadgroups internally. Returns None
-        if the target is still changing between polls (hysteresis
-        to prevent stream recreation oscillation).
-        """
-        current = self.compute_target_threadgroups(max_tg, active_tg)
-        if current == self._prev_target:
-            self._stable_ticks += 1
-        else:
-            self._prev_target = current
-            self._stable_ticks = 1
-        if self._stable_ticks >= 2:
-            return current
-        return None
 
     @property
     def yielding(self) -> bool:
@@ -524,23 +453,3 @@ class DutyCycleController:
         self._ema_initialized = False
         self._duty_multiplier = 1.0
         self._integral = 0.0
-
-    def set_target(self, target_pct: int) -> None:
-        """Retarget the duty cycle at runtime, resetting EMA + PI together.
-
-        Updates ``target_pct`` / duty ratio / enabled flag AND resets the EMA
-        and PI integral in lock-step, so a tier change can't carry windup or a
-        stale compute-time EMA into the next ``compute_sleep``. A no-op when
-        the target is unchanged (preserves accumulated convergence state).
-
-        Args:
-            target_pct: New target GPU utilization (1-100). 100 disables
-                duty cycling (flat-out monolithic dispatch).
-        """
-        new_target = max(1, min(100, target_pct))
-        if new_target == self._target_pct:
-            return
-        self._target_pct = new_target
-        self._duty_ratio = new_target / 100.0
-        self._enabled = new_target < 100
-        self.reset()

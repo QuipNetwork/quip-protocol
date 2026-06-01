@@ -75,17 +75,13 @@ class MetalMiner(BaseMiner):
         gpu_util = cfg.pop('utilization', cfg.pop('gpu_utilization', 100))
         yielding = cfg.pop('yielding', True)
         # Metal-only adaptive-cap keys (see metal_scheduler.CapConfig). Popped
-        # here and threaded into the stream-driver context. active_util
-        # defaults to 70 (polite while the user is present); drop it to ~30 if
-        # the machine still feels janky under load.
-        self.active_util = cfg.pop('active_util', 70)
+        # here and threaded into the stream-driver context. active_threads is
+        # the occupancy budget (max concurrent GPU threads per command buffer)
+        # while the user is present — the jank lever. ~2048 is smooth on a
+        # 40-core M4 Max; lower it (e.g. 1024) if the UI still stutters, raise
+        # it for more throughput while present. Idle/headless runs uncapped.
+        self.active_threads = cfg.pop('active_threads', 2048)
         self.idle_after_s = cfg.pop('idle_after_s', 60.0)
-        self.burst_ms = cfg.pop('burst_ms', 8.0)
-        self.serious_util = cfg.pop('serious_util', 30)
-        # When throttled, run reads in buffers of this many (distinct seed per
-        # chunk, concatenated) so each command buffer stays near the one-sweep
-        # floor. Preserves total reads; costs throughput. 0 disables.
-        self.reads_per_buffer = cfg.pop('reads_per_buffer', 128)
         self.yielding = yielding
         # Remove CUDA-only keys that flow through common_cfg
         cfg.pop('sms_per_nonce', None)
@@ -177,11 +173,8 @@ class MetalMiner(BaseMiner):
             "topology": getattr(self, "topology", None),
             "utilization": getattr(self, "gpu_utilization", 100),
             "yielding": getattr(self, "yielding", True),
-            "active_util": getattr(self, "active_util", 100),
+            "active_threads": getattr(self, "active_threads", 2048),
             "idle_after_s": getattr(self, "idle_after_s", 60.0),
-            "burst_ms": getattr(self, "burst_ms", 8.0),
-            "serious_util": getattr(self, "serious_util", 30),
-            "reads_per_buffer": getattr(self, "reads_per_buffer", 128),
         }
 
     def _cleanup_handler(self, signum, frame):

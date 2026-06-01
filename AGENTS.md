@@ -61,16 +61,16 @@ Live integration uses the docker-compose validator under `docker/`
 `ws://127.0.0.1:9944` by default.
 
 **Metal interactive cap (Apple Silicon):** the `[metal]` section runs an
-adaptive utilization governor when `yielding` is on (default). It senses
-HID-idle / thermal / battery / displays and caps GPU use accordingly —
-flat-out when idle/headless (`utilization`, default 100), `active_util`
-(default 70) while you're at the keyboard, `serious_util` at thermal-Serious,
-and a full pause on battery or critical thermal. `burst_ms` bounds each
-command buffer (~one frame) for compositor responsiveness. Drop `active_util`
-to ~30 if the UI still feels janky. This path is **independent of the CUDA
-util monitor** — it lives entirely in `GPU/metal_scheduler.py` +
-`GPU/macos_sensors.py` and shares no utilization machinery with `GPU/util_monitor.py`.
-See `docs/metal-gpu-governor.md`.
+adaptive governor when `yielding` is on (default). It senses HID-idle /
+thermal / battery / displays and caps **GPU occupancy** — the jank lever is
+concurrent threads per command buffer (`problems × reads`), not core count or
+duty cycle. While you're present it splits reads so each command buffer stays
+under `active_threads` (default 2048; lower to ~1024 if the UI still stutters);
+idle/headless runs uncapped (full speed); thermal-serious halves it; battery /
+critical thermal pause. Total reads and sweeps are always preserved. This path
+is **independent of the CUDA util monitor** — it lives in
+`GPU/metal_scheduler.py` + `GPU/macos_sensors.py` and shares no utilization
+machinery with `GPU/util_monitor.py`. See `docs/metal-gpu-governor.md`.
 
 ## Testing
 

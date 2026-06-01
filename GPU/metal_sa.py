@@ -27,22 +27,11 @@ except ImportError:  # Apple Metal framework is macOS-only; absent on Linux/CI.
     Metal = None  # type: ignore[assignment]
 
 from shared.ising_model import IsingModel
-from GPU.metal_scheduler import DutyCycleController, MetalScheduler
+from GPU.metal_scheduler import MetalScheduler, UNCAPPED
 from GPU.metal_utils import _create_buffer, compute_beta_schedule, unpack_metal_results
 
-# Default per-command-buffer wall-clock budget (~one 120Hz/60Hz frame). Sizing
-# each committed chunk to ~burst_ms gives the macOS compositor a GPU preemption
-# seam every frame, which is the real responsiveness lever on Apple Silicon.
-DEFAULT_BURST_MS = 8.0
-
-# Betas dispatched in the first (calibration) chunk to seed the per-beta EMA.
-_CALIB_BETAS = 2
-
-# Seconds to idle between target re-checks while paused (target_pct == 0).
+# Seconds to idle between budget re-checks while paused (budget == 0).
 _PAUSE_POLL_S = 0.5
-
-# EMA smoothing for the per-beta GPU wall-time estimate.
-_BETA_EMA_ALPHA = 0.3
 
 # pthread QoS class for the Metal sampler thread. QOS_CLASS_UTILITY (0x11, per
 # <sys/qos.h>) deprioritizes us against the foreground UI on the P-cores.
@@ -58,10 +47,9 @@ def apply_qos_utility() -> bool:
     """Lower this thread's QoS to UTILITY (darwin only). Returns True if applied.
 
     Metal-only CPU-side politeness: reduces P-core contention with the UI. It
-    does NOT bound GPU occupancy (a command buffer runs to completion
-    regardless of submitter QoS) — it composes with the burst/duty cap. Run in
-    the child process (spawn isolation means a parent call wouldn't carry over)
-    and invoked from the Metal sampler only — never from the shared QPU stream
+    does NOT bound GPU occupancy (the occupancy cap does that) — run in the
+    child process (spawn isolation means a parent call wouldn't carry over) and
+    invoked from the Metal sampler only — never from the shared QPU stream
     driver. Idempotent and non-fatal.
     """
     global _qos_applied
@@ -80,40 +68,29 @@ def apply_qos_utility() -> bool:
         return False
 
 
-def compute_betas_per_chunk(
-    burst_ms: float,
-    ema_per_beta_ms: float,
-    total_betas: int,
-) -> int:
-    """Betas per command buffer to keep each chunk near ``burst_ms``.
+def reads_per_buffer_for_budget(budget: int, num_problems: int, num_reads: int) -> int:
+    """Reads per command buffer so ``problems x reads <= budget`` (occupancy).
 
-    Args:
-        burst_ms: Per-command-buffer wall-clock budget (ms).
-        ema_per_beta_ms: Smoothed per-beta GPU wall time (ms). ``<= 0`` means
-            "not yet calibrated" — dispatch the whole schedule.
-        total_betas: Total betas in the schedule (the chunk upper bound).
-
-    Returns:
-        Chunk size in [1, total_betas].
+    The jank lever is concurrent GPU threads per command buffer
+    (``problems x reads``). Capping that to ``budget`` keeps the compositor
+    responsive. Returns the full ``num_reads`` when uncapped or already under
+    budget (single dispatch); otherwise the per-buffer read count (>= 1), so the
+    caller runs ceil(num_reads / result) read-buffers.
     """
-    if ema_per_beta_ms <= 0:
-        return total_betas
-    n = round(burst_ms / ema_per_beta_ms)
-    return max(1, min(int(n), total_betas))
+    if budget == UNCAPPED or num_problems * num_reads <= budget:
+        return num_reads
+    return max(1, budget // max(1, num_problems))
 
 
-def _resolve_target_pct(scheduler, duty_cycle) -> int:
-    """Resolve the per-batch cap %: scheduler (adaptive) > duty cycle > 100.
+def _resolve_budget(scheduler) -> int:
+    """Resolve the per-batch occupancy budget (threads/command buffer).
 
-    The scheduler's ``get_target_pct`` is the live, sensor-driven cap. With no
-    scheduler, fall back to the duty cycle's static target; with neither, run
-    flat-out (100).
+    The scheduler's ``get_thread_budget`` is the live, sensor-driven budget
+    (0=pause, UNCAPPED=full speed, else cap). With no scheduler, run uncapped.
     """
-    if scheduler is not None and hasattr(scheduler, "get_target_pct"):
-        return int(scheduler.get_target_pct())
-    if duty_cycle is not None:
-        return int(duty_cycle.target_pct)
-    return 100
+    if scheduler is not None and hasattr(scheduler, "get_thread_budget"):
+        return int(scheduler.get_thread_budget())
+    return UNCAPPED
 
 
 class MetalSASampler:
@@ -547,266 +524,7 @@ class MetalSASampler:
             )
 
         return samplesets
-
-    def _dispatch_batch_chunked(
-        self,
-        models: List[IsingModel],
-        *,
-        num_reads: int,
-        beta_schedule_arr: np.ndarray,
-        beta_range: Tuple[float, float],
-        beta_schedule_type: str,
-        num_sweeps_per_beta: int,
-        seed: int,
-        burst_ms: float = DEFAULT_BURST_MS,
-        duty_cycle: Optional[DutyCycleController] = None,
-        scheduler: Optional['MetalScheduler'] = None,
-    ) -> List[dimod.SampleSet]:
-        """Dispatch a batch in adaptively-sized beta-schedule chunks.
-
-        The first (calibration) chunk dispatches ``_CALIB_BETAS`` betas to seed
-        a per-beta GPU-wall-time EMA; every subsequent chunk is sized via
-        ``compute_betas_per_chunk`` so each committed command buffer runs
-        ≈ ``burst_ms`` — bounding burst length (the real jank lever) and giving
-        the compositor a preemption seam every frame. Between chunks the GPU is
-        released and a duty-cycle sleep paces the average occupancy.
-
-        State is persisted between chunks via device buffers, so the result is
-        identical to a monolithic dispatch given the same seed (chunk-size
-        changes are safe: the kernel takes beta_start/beta_count).
-        """
-        num_problems = len(models)
-        N = self._topo_N
-        node_to_idx = self._topo_node_to_idx
-
-        (
-            all_row_ptr, all_col_ind, all_J_vals,
-            all_h_vals, row_ptr_offsets, col_ind_offsets,
-        ) = self._fill_batch_values(models)
-
-        # Topology buffers (shared across all chunks)
-        rp_buf = _create_buffer(self.device, all_row_ptr, "rp")
-        ci_buf = _create_buffer(self.device, all_col_ind, "ci")
-        jv_buf = _create_buffer(self.device, all_J_vals, "jv")
-        hv_buf = _create_buffer(self.device, all_h_vals, "hv")
-        rpo_buf = _create_buffer(
-            self.device, row_ptr_offsets, "rpo",
-        )
-        cio_buf = _create_buffer(
-            self.device, col_ind_offsets, "cio",
-        )
-        beta_buf = _create_buffer(
-            self.device, beta_schedule_arr, "beta",
-        )
-
-        # Scalar bytes (shared across chunks)
-        N_bytes = np.int32(N).tobytes()
-        total_betas = len(beta_schedule_arr)
-        num_betas_bytes = np.int32(total_betas).tobytes()
-        spb_bytes = np.int32(num_sweeps_per_beta).tobytes()
-        seed_bytes = np.uint32(seed).tobytes()
-
-        num_threads = num_problems * num_reads
-        nt_bytes = np.int32(num_threads).tobytes()
-        np_bytes = np.int32(num_problems).tobytes()
-        nr_bytes = np.int32(num_reads).tobytes()
-
-        packed_size = (N + 7) // 8
-
-        # Output buffers (read only after last chunk)
-        samples_buf = self.device.newBufferWithLength_options_(
-            num_threads * packed_size,
-            Metal.MTLResourceStorageModeShared,
-        )
-        energies_buf = self.device.newBufferWithLength_options_(
-            num_threads * 4,
-            Metal.MTLResourceStorageModeShared,
-        )
-
-        # Persistent state buffers (read/written every chunk)
-        persist_state_buf = (
-            self.device.newBufferWithLength_options_(
-                num_threads * packed_size,
-                Metal.MTLResourceStorageModeShared,
-            )
-        )
-        persist_de_buf = (
-            self.device.newBufferWithLength_options_(
-                num_threads * N,
-                Metal.MTLResourceStorageModeShared,
-            )
-        )
-        persist_rng_buf = (
-            self.device.newBufferWithLength_options_(
-                num_threads * 4,
-                Metal.MTLResourceStorageModeShared,
-            )
-        )
-        persist_energy_buf = (
-            self.device.newBufferWithLength_options_(
-                num_threads * 4,
-                Metal.MTLResourceStorageModeShared,
-            )
-        )
-
-        tg = Metal.MTLSize(width=num_problems, height=1, depth=1)
-        tpt = Metal.MTLSize(width=num_reads, height=1, depth=1)
-
-        # Dispatch adaptively-sized beta chunks. The first chunk calibrates the
-        # per-beta wall-time EMA; later chunks target burst_ms.
-        ema_per_beta_ms = 0.0
-        chunk_start = 0
-        chunk_idx = 0
-        while chunk_start < total_betas:
-            if ema_per_beta_ms <= 0:
-                chunk_count = min(_CALIB_BETAS, total_betas - chunk_start)
-            else:
-                chunk_count = min(
-                    compute_betas_per_chunk(
-                        burst_ms, ema_per_beta_ms, total_betas,
-                    ),
-                    total_betas - chunk_start,
-                )
-            bs_bytes = np.int32(chunk_start).tobytes()
-            bc_bytes = np.int32(chunk_count).tobytes()
-
-            t0 = time.perf_counter()
-
-            cmd_buf = self._command_queue.commandBuffer()
-            encoder = cmd_buf.computeCommandEncoder()
-            encoder.setComputePipelineState_(self._pipeline)
-
-            encoder.setBuffer_offset_atIndex_(rp_buf, 0, 0)
-            encoder.setBuffer_offset_atIndex_(ci_buf, 0, 1)
-            encoder.setBuffer_offset_atIndex_(jv_buf, 0, 2)
-            encoder.setBuffer_offset_atIndex_(rpo_buf, 0, 3)
-            encoder.setBuffer_offset_atIndex_(cio_buf, 0, 4)
-
-            encoder.setBytes_length_atIndex_(N_bytes, 4, 5)
-            encoder.setBytes_length_atIndex_(
-                num_betas_bytes, 4, 6,
-            )
-            encoder.setBytes_length_atIndex_(spb_bytes, 4, 7)
-            encoder.setBytes_length_atIndex_(seed_bytes, 4, 8)
-
-            encoder.setBuffer_offset_atIndex_(beta_buf, 0, 9)
-            encoder.setBuffer_offset_atIndex_(
-                samples_buf, 0, 10,
-            )
-            encoder.setBuffer_offset_atIndex_(
-                energies_buf, 0, 11,
-            )
-
-            encoder.setBytes_length_atIndex_(nt_bytes, 4, 12)
-            encoder.setBytes_length_atIndex_(np_bytes, 4, 13)
-            encoder.setBytes_length_atIndex_(nr_bytes, 4, 14)
-
-            encoder.setBuffer_offset_atIndex_(hv_buf, 0, 15)
-
-            encoder.setBytes_length_atIndex_(bs_bytes, 4, 16)
-            encoder.setBytes_length_atIndex_(bc_bytes, 4, 17)
-            encoder.setBuffer_offset_atIndex_(
-                persist_state_buf, 0, 18,
-            )
-            encoder.setBuffer_offset_atIndex_(
-                persist_de_buf, 0, 19,
-            )
-            encoder.setBuffer_offset_atIndex_(
-                persist_rng_buf, 0, 20,
-            )
-            encoder.setBuffer_offset_atIndex_(
-                persist_energy_buf, 0, 21,
-            )
-
-            encoder.dispatchThreadgroups_threadsPerThreadgroup_(
-                tg, tpt,
-            )
-
-            encoder.endEncoding()
-            cmd_buf.commit()
-            cmd_buf.waitUntilCompleted()
-
-            if cmd_buf.status() != (
-                Metal.MTLCommandBufferStatusCompleted
-            ):
-                error = cmd_buf.error()
-                raise RuntimeError(
-                    f"Metal command buffer failed "
-                    f"(chunk {chunk_start}): {error}",
-                )
-
-            # Update the per-beta wall-time EMA from this chunk (drives the
-            # next chunk's size toward burst_ms).
-            compute_s = time.perf_counter() - t0
-            per_beta_ms = (compute_s * 1000.0) / max(1, chunk_count)
-            if ema_per_beta_ms <= 0:
-                ema_per_beta_ms = per_beta_ms
-            else:
-                ema_per_beta_ms = (
-                    _BETA_EMA_ALPHA * per_beta_ms
-                    + (1.0 - _BETA_EMA_ALPHA) * ema_per_beta_ms
-                )
-
-            # Duty-cycle sleep between chunks (paces average occupancy).
-            if duty_cycle and duty_cycle.enabled:
-                sleep_s = duty_cycle.compute_sleep(compute_s)
-                self.logger.debug(
-                    "[duty-cycle] chunk %d betas=%d "
-                    "compute=%.1fms sleep=%.1fms "
-                    "per_beta=%.2fms ema_compute=%.1fms mult=%.2f",
-                    chunk_idx, chunk_count,
-                    compute_s * 1000, sleep_s * 1000,
-                    ema_per_beta_ms,
-                    duty_cycle._ema_compute_s * 1000,
-                    duty_cycle._duty_multiplier,
-                )
-                time.sleep(sleep_s)
-
-                # Closed-loop trim: feed whole-system GPU% so the cap acts as a
-                # CEILING — when other apps use the GPU the PI backs us off
-                # BELOW target (fair-share) so the total stays under it; alone
-                # we fill up to target but never exceed it.
-                if scheduler is not None:
-                    measured = scheduler.get_cached_utilization()
-                    duty_cycle.feedback(measured)
-                    self.logger.debug(
-                        "[duty-cycle] measured=%d%%", measured,
-                    )
-
-            chunk_start += chunk_count
-            chunk_idx += 1
-
-        # Unpack results from final chunk
-        packed_data = np.frombuffer(
-            samples_buf.contents().as_buffer(
-                num_threads * packed_size,
-            ),
-            dtype=np.int8,
-        ).reshape(num_threads, packed_size)
-
-        energies_data = np.frombuffer(
-            energies_buf.contents().as_buffer(
-                num_threads * 4,
-            ),
-            dtype=np.int32,
-        )
-
-        samplesets = []
-        for prob_idx in range(num_problems):
-            start = prob_idx * num_reads
-            end = start + num_reads
-            samplesets.append(
-                unpack_metal_results(
-                    packed_data[start:end],
-                    energies_data[start:end],
-                    N, num_reads, node_to_idx,
-                    beta_range, beta_schedule_type,
-                ),
-            )
-
-        return samplesets
-
-    def _dispatch_read_continued(
+    def _dispatch_read_split(
         self,
         models: List[IsingModel],
         *,
@@ -817,50 +535,41 @@ class MetalSASampler:
         beta_schedule_type: str,
         num_sweeps_per_beta: int,
         seed: int,
-        burst_ms: float = DEFAULT_BURST_MS,
-        duty_cycle: Optional[DutyCycleController] = None,
-        scheduler: Optional['MetalScheduler'] = None,
     ) -> List[dimod.SampleSet]:
         """Run ``num_reads`` reads in command buffers of ``reads_per_buffer``.
 
-        A single SA sweep over N nodes is the irreducible per-command-buffer
-        floor (~one frame at N≈4.5k). Fewer reads per buffer keeps each buffer
-        near that floor instead of ~5x it — at the cost of running more buffers
-        — so the compositor gets a preemption seam every sweep while we still
-        produce the full ``num_reads`` samples. Each read-chunk is an
-        independent SA run (distinct seed); the per-problem samplesets are
-        concatenated. ``reads_per_buffer <= 0`` or ``>= num_reads`` disables
-        chunking (single dispatch).
+        Caps occupancy (``problems x reads`` per command buffer) to keep the
+        compositor responsive while still producing the full ``num_reads``
+        samples and full sweeps. Each read-buffer is an independent SA run with
+        a distinct seed (the kernel seeds each thread from base_seed + thread
+        id, which would repeat across equal-sized buffers); the per-problem
+        samplesets are concatenated. ``reads_per_buffer >= num_reads`` is a
+        single monolithic dispatch.
         """
-        if reads_per_buffer <= 0 or reads_per_buffer >= num_reads:
-            return self._dispatch_batch_chunked(
+        if reads_per_buffer >= num_reads:
+            return self._dispatch_batch(
                 models, num_reads=num_reads,
                 beta_schedule_arr=beta_schedule_arr, beta_range=beta_range,
                 beta_schedule_type=beta_schedule_type,
                 num_sweeps_per_beta=num_sweeps_per_beta, seed=seed,
-                burst_ms=burst_ms, duty_cycle=duty_cycle, scheduler=scheduler,
             )
 
         parts: List[List[dimod.SampleSet]] = [[] for _ in models]
         done = 0
-        chunk_idx = 0
+        buf_idx = 0
         while done < num_reads:
             rc = min(reads_per_buffer, num_reads - done)
-            # Distinct seed per read-chunk so the reads are independent runs,
-            # not duplicates (the kernel seeds each thread from base_seed and
-            # its thread id, which repeats across equal-sized chunks).
-            chunk_seed = (seed + chunk_idx * 0x9E3779B1) & 0x7FFFFFFF
-            ss_list = self._dispatch_batch_chunked(
+            buf_seed = (seed + buf_idx * 0x9E3779B1) & 0x7FFFFFFF
+            ss_list = self._dispatch_batch(
                 models, num_reads=rc,
                 beta_schedule_arr=beta_schedule_arr, beta_range=beta_range,
                 beta_schedule_type=beta_schedule_type,
-                num_sweeps_per_beta=num_sweeps_per_beta, seed=chunk_seed,
-                burst_ms=burst_ms, duty_cycle=duty_cycle, scheduler=scheduler,
+                num_sweeps_per_beta=num_sweeps_per_beta, seed=buf_seed,
             )
             for prob_idx, ss in enumerate(ss_list):
                 parts[prob_idx].append(ss)
             done += rc
-            chunk_idx += 1
+            buf_idx += 1
 
         return [dimod.concatenate(p) for p in parts]
 
@@ -875,21 +584,20 @@ class MetalSASampler:
         beta_range: Optional[Tuple[float, float]] = None,
         beta_schedule_type: str = "geometric",
         seed: Optional[int] = None,
-        duty_cycle: Optional[DutyCycleController] = None,
         scheduler: Optional['MetalScheduler'] = None,
-        burst_ms: float = DEFAULT_BURST_MS,
-        reads_per_buffer: int = 0,
         stop_event=None,
         **kwargs,
     ) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
         """Stream batched results using cached topology structure.
 
         On first call, prepares the topology CSR structure once. Each batch
-        then only fills J/h values into preallocated positions. The cap
-        ``target_pct`` is re-read **per batch** (from ``scheduler`` when
-        present, else the duty cycle's static target) to pick the dispatch
-        path: 100 → monolithic (max throughput), 0 → pause (idle and re-check),
-        0<target<100 → adaptive chunked dispatch sized to ``burst_ms``.
+        then only fills J/h values into preallocated positions. The occupancy
+        budget (threads/command buffer) is re-read **per batch** from
+        ``scheduler``: ``UNCAPPED`` → one monolithic dispatch (full speed),
+        ``0`` → pause (idle and re-check), else the batch's reads are split
+        across command buffers so ``problems x reads <= budget`` — the full
+        problem batch and full sweeps are preserved (read-split is independent
+        per buffer, distinct seeds, concatenated).
 
         Args:
             models: Iterable of IsingModel (typically a RandomIsingFeeder).
@@ -900,12 +608,8 @@ class MetalSASampler:
             beta_range: Temperature range or None for auto.
             beta_schedule_type: "linear", "geometric", or "custom".
             seed: Base RNG seed (incremented per batch).
-            duty_cycle: Optional controller for GPU duty cycling.
-            scheduler: Optional MetalScheduler — the per-batch cap source.
-            burst_ms: Per-command-buffer wall-clock budget for chunked dispatch.
-            reads_per_buffer: When throttled, run reads in buffers of this many
-                (distinct seed per chunk, concatenated) so each command buffer
-                stays near the one-sweep floor; 0 disables (single dispatch).
+            scheduler: Optional MetalScheduler — the per-batch occupancy-budget
+                source. None ⇒ uncapped (full speed).
             stop_event: Optional mp.Event — checked during a PAUSE so a full
                 stop (battery / critical thermal) never blocks teardown.
 
@@ -940,33 +644,23 @@ class MetalSASampler:
         pending = [first_model]
 
         while True:
-            # Re-read the cap before consuming the feeder so a PAUSE does not
-            # burn queued models.
-            target = _resolve_target_pct(scheduler, duty_cycle)
-            # PAUSE (target <= 0, e.g. on battery / critical thermal): idle and
+            # Re-read the occupancy budget before consuming the feeder so a
+            # PAUSE does not burn queued models.
+            budget = _resolve_budget(scheduler)
+            # PAUSE (budget == 0, e.g. on battery / critical thermal): idle and
             # re-check without dispatching or pulling models. Stop-aware so
             # teardown never blocks; returns promptly when stop_event is set.
-            while target <= 0:
+            while budget == 0:
                 if stop_event is not None and stop_event.is_set():
                     return
                 time.sleep(_PAUSE_POLL_S)
-                target = _resolve_target_pct(scheduler, duty_cycle)
+                budget = _resolve_budget(scheduler)
 
-            # When throttled, cap to ONE problem per command buffer: the GPU
-            # only preempts the compositor at command-buffer boundaries, and a
-            # single beta over the full batch can exceed a frame. One problem
-            # (x num_reads x a burst-bounded beta chunk) is the shortest buffer
-            # we can submit without new kernels. Idle/headless (target==100)
-            # keeps the full batch for throughput.
-            effective_max_tg = 1 if target < 100 else max_threadgroups
-
-            # Fill batch from pending + iterator; stash any overflow (from a
-            # larger prior batch) back into pending for the next iteration.
+            # Fill the full problem batch (all cores). Occupancy is bounded by
+            # splitting reads, not by shrinking the batch.
             batch_models: List[IsingModel] = list(pending)
             pending.clear()
-            while len(batch_models) > effective_max_tg:
-                pending.append(batch_models.pop())
-            while len(batch_models) < effective_max_tg:
+            while len(batch_models) < max_threadgroups:
                 try:
                     batch_models.append(next(model_iter))
                 except StopIteration:
@@ -974,38 +668,19 @@ class MetalSASampler:
             if not batch_models:
                 return
 
-            if target >= 100:
-                samplesets = self._dispatch_batch(
-                    batch_models,
-                    num_reads=num_reads,
-                    beta_schedule_arr=beta_arr,
-                    beta_range=beta_range_out,
-                    beta_schedule_type=beta_schedule_type,
-                    num_sweeps_per_beta=num_sweeps_per_beta,
-                    seed=batch_seed,
-                )
-                # Minimal yield for WindowServer compositor on
-                # Apple Silicon's shared GPU (~2% overhead).
-                time.sleep(0.002)
-            else:
-                # Throttled: adaptive chunked dispatch. Retarget the duty cycle
-                # in lock-step (resets EMA + PI integral together) so a tier
-                # change doesn't carry windup into the new cap.
-                if duty_cycle is not None:
-                    duty_cycle.set_target(target)
-                samplesets = self._dispatch_read_continued(
-                    batch_models,
-                    num_reads=num_reads,
-                    reads_per_buffer=reads_per_buffer,
-                    beta_schedule_arr=beta_arr,
-                    beta_range=beta_range_out,
-                    beta_schedule_type=beta_schedule_type,
-                    num_sweeps_per_beta=num_sweeps_per_beta,
-                    seed=batch_seed,
-                    burst_ms=burst_ms,
-                    duty_cycle=duty_cycle,
-                    scheduler=scheduler,
-                )
+            reads_per_buffer = reads_per_buffer_for_budget(
+                budget, len(batch_models), num_reads,
+            )
+            samplesets = self._dispatch_read_split(
+                batch_models,
+                num_reads=num_reads,
+                reads_per_buffer=reads_per_buffer,
+                beta_schedule_arr=beta_arr,
+                beta_range=beta_range_out,
+                beta_schedule_type=beta_schedule_type,
+                num_sweeps_per_beta=num_sweeps_per_beta,
+                seed=batch_seed,
+            )
 
             batch_seed = (batch_seed + 1) & 0x7FFFFFFF
 

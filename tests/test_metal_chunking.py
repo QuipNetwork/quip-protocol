@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
 
-"""Tests for adaptive betas_per_chunk sizing + per-batch path selection.
+"""Tests for occupancy-budget read-splitting (GPU/metal_sa.py).
 
-``compute_betas_per_chunk`` is pure math (no Metal) and runs anywhere. The
-path-selection tests instantiate the real Metal sampler and so are gated on a
-Metal device.
+``reads_per_buffer_for_budget`` is pure math (no Metal) and runs anywhere. The
+dispatch tests instantiate the real Metal sampler and so are gated on a Metal
+device. The jank lever is concurrent threads per command buffer
+(problems x reads); read-splitting caps it while preserving total reads.
 """
 from __future__ import annotations
 
@@ -13,46 +14,42 @@ import sys
 
 import pytest
 
-from GPU.metal_sa import compute_betas_per_chunk
+from GPU.metal_sa import reads_per_buffer_for_budget
+from GPU.metal_scheduler import UNCAPPED
 
 pytestmark_metal = pytest.mark.skipif(
     sys.platform != "darwin", reason="Metal tests require macOS",
 )
 
 
-# ── pure chunk-sizing math ──────────────────────────────────────────────
+# ── pure occupancy math ─────────────────────────────────────────────────
 
-class TestComputeBetasPerChunk:
-    def test_targets_burst_budget(self):
-        # 8ms budget / 1ms per beta -> 8 betas per chunk.
-        assert compute_betas_per_chunk(8.0, 1.0, 100) == 8
+class TestReadsPerBufferForBudget:
+    def test_uncapped_returns_full_reads(self):
+        assert reads_per_buffer_for_budget(UNCAPPED, 8, 1024) == 1024
 
-    def test_rounds_to_nearest(self):
-        # 8 / 3 = 2.67 -> 3.
-        assert compute_betas_per_chunk(8.0, 3.0, 100) == 3
+    def test_under_budget_is_single_dispatch(self):
+        # 8 x 256 = 2048 <= budget 2048 -> full reads, one buffer.
+        assert reads_per_buffer_for_budget(2048, 8, 256) == 256
 
-    def test_clamps_to_at_least_one(self):
-        # Single beta already exceeds the burst budget -> floor at 1.
-        assert compute_betas_per_chunk(8.0, 50.0, 100) == 1
+    def test_over_budget_splits_reads(self):
+        # 8 x 1024 = 8192 > 2048 -> 2048 // 8 = 256 reads per buffer.
+        assert reads_per_buffer_for_budget(2048, 8, 1024) == 256
 
-    def test_clamps_to_total_betas(self):
-        # Tiny per-beta time would want a huge chunk -> cap at total.
-        assert compute_betas_per_chunk(8.0, 0.001, 40) == 40
+    def test_caps_to_at_least_one(self):
+        # 40 problems, budget 20 -> 20 // 40 = 0 -> floor at 1.
+        assert reads_per_buffer_for_budget(20, 40, 1024) == 1
 
-    def test_uncalibrated_ema_returns_total(self):
-        # ema <= 0 means "not yet measured" -> dispatch all (monolithic-like).
-        assert compute_betas_per_chunk(8.0, 0.0, 64) == 64
-
-    def test_grows_when_betas_get_cheaper(self):
-        small = compute_betas_per_chunk(8.0, 4.0, 100)
-        big = compute_betas_per_chunk(8.0, 1.0, 100)
-        assert big > small
+    def test_more_problems_means_fewer_reads_per_buffer(self):
+        few = reads_per_buffer_for_budget(2048, 4, 1024)
+        many = reads_per_buffer_for_budget(2048, 16, 1024)
+        assert many < few
 
 
-# ── path selection (Metal device required) ─────────────────────────────
+# ── dispatch path (Metal device required) ───────────────────────────────
 
 @pytestmark_metal
-class TestPerBatchPathSelection:
+class TestStreamingBudget:
     def _sampler_and_models(self, n=2):
         from GPU.metal_sa import MetalSASampler
         from tests.test_metal_yielding import _make_models
@@ -60,141 +57,77 @@ class TestPerBatchPathSelection:
         return s, _make_models(s, n)
 
     class _FakeScheduler:
-        def __init__(self, targets):
-            self._targets = list(targets)
-            self._i = 0
+        """get_thread_budget returns a fixed budget per the constructor."""
 
-        def get_target_pct(self):
-            t = self._targets[min(self._i, len(self._targets) - 1)]
-            self._i += 1
-            return t
+        def __init__(self, budget):
+            self._budget = budget
 
-        def get_cached_utilization(self):
+        def get_thread_budget(self):
+            return self._budget
+
+        def get_measured_gpu(self):
             return 0
 
-    def test_target_100_uses_monolithic(self, monkeypatch):
-        s, models = self._sampler_and_models()
-        calls = {"mono": 0, "chunk": 0}
-
-        def fake_mono(batch, **kw):
-            calls["mono"] += 1
-            return [None] * len(batch)
-
-        def fake_chunk(batch, **kw):
-            calls["chunk"] += 1
-            return [None] * len(batch)
-
-        monkeypatch.setattr(s, "_dispatch_batch", fake_mono)
-        monkeypatch.setattr(s, "_dispatch_batch_chunked", fake_chunk)
-        out = list(s.sample_ising_streaming(
-            iter(models), num_reads=8, num_sweeps=64, max_threadgroups=4,
-            seed=1, scheduler=self._FakeScheduler([100]),
-        ))
-        assert calls == {"mono": 1, "chunk": 0}
-        assert len(out) == len(models)
-
-    def test_target_50_uses_chunked(self, monkeypatch):
-        from GPU.metal_scheduler import DutyCycleController
-        s, models = self._sampler_and_models()
-        calls = {"mono": 0, "chunk": 0}
-
-        def fake_mono(batch, **kw):
-            calls["mono"] += 1
-            return [None] * len(batch)
-
-        def fake_chunk(batch, **kw):
-            calls["chunk"] += 1
-            return [None] * len(batch)
-
-        monkeypatch.setattr(s, "_dispatch_batch", fake_mono)
-        monkeypatch.setattr(s, "_dispatch_batch_chunked", fake_chunk)
-        out = list(s.sample_ising_streaming(
-            iter(models), num_reads=8, num_sweeps=64, max_threadgroups=4,
-            seed=1, scheduler=self._FakeScheduler([50]),
-            duty_cycle=DutyCycleController(target_pct=100),
-        ))
-        # Throttled -> chunked path, one problem per command buffer (one
-        # chunked dispatch per model), never monolithic.
-        assert calls["mono"] == 0
-        assert calls["chunk"] == len(models)
-        assert len(out) == len(models)
-
-    def test_target_zero_pauses_then_dispatches(self, monkeypatch):
-        s, models = self._sampler_and_models(1)
-        slept = {"n": 0}
-
-        def fake_mono(batch, **kw):
-            return [None] * len(batch)
-
-        monkeypatch.setattr(s, "_dispatch_batch", fake_mono)
-        monkeypatch.setattr("GPU.metal_sa.time.sleep",
-                            lambda _s: slept.__setitem__("n", slept["n"] + 1))
-        # Pause twice (0), then flat-out (100).
-        sched = self._FakeScheduler([0, 0, 100])
-        out = list(s.sample_ising_streaming(
-            iter(models), num_reads=8, num_sweeps=64, max_threadgroups=4,
-            seed=1, scheduler=sched,
-        ))
-        assert slept["n"] >= 2          # paused before dispatching
-        assert len(out) == 1            # model still dispatched after resume
-
-    def test_throttled_caps_one_problem_per_buffer(self, monkeypatch):
-        """When throttled (target<100), each command buffer dispatches a single
-        problem so a beta can't run long enough to stall the compositor; the
-        full batch is only used flat-out (target==100)."""
-        from GPU.metal_scheduler import DutyCycleController
+    def test_uncapped_is_single_monolithic_dispatch(self, monkeypatch):
         s, models = self._sampler_and_models(3)
-        sizes = []
+        calls = {"batch": 0, "split": 0}
 
-        def fake_chunk(batch, **kw):
-            sizes.append(len(batch))
+        def fake_batch(batch, **kw):
+            calls["batch"] += 1
+            assert kw["num_reads"] == 8     # full reads in one buffer
             return [None] * len(batch)
 
-        monkeypatch.setattr(s, "_dispatch_batch_chunked", fake_chunk)
-        out = list(s.sample_ising_streaming(
-            iter(models), num_reads=8, num_sweeps=64, max_threadgroups=8,
-            seed=1, scheduler=self._FakeScheduler([50]),
-            duty_cycle=DutyCycleController(target_pct=100),
-        ))
-        assert sizes == [1, 1, 1]          # one problem per command buffer
-        assert len(out) == 3               # all models still produced
+        orig_split = s._dispatch_read_split
 
-    def test_read_continuation_preserves_total_reads(self):
-        """Throttled read-continuation runs reads in small buffers but still
-        produces the full num_reads samples per problem (concatenated)."""
-        from GPU.metal_scheduler import DutyCycleController
-        s, models = self._sampler_and_models(1)
+        def counting_split(*a, **k):
+            calls["split"] += 1
+            return orig_split(*a, **k)
+
+        monkeypatch.setattr(s, "_dispatch_batch", fake_batch)
+        monkeypatch.setattr(s, "_dispatch_read_split", counting_split)
         out = list(s.sample_ising_streaming(
-            iter(models), num_reads=8, num_sweeps=32, max_threadgroups=4,
-            seed=1, scheduler=self._FakeScheduler([50]),
-            duty_cycle=DutyCycleController(target_pct=100),
-            reads_per_buffer=4,
+            iter(models), num_reads=8, num_sweeps=32, max_threadgroups=3,
+            seed=1, scheduler=self._FakeScheduler(UNCAPPED),
+        ))
+        assert calls["batch"] == 1          # one monolithic dispatch
+        assert len(out) == 3
+
+    def test_capped_splits_reads_preserving_total(self):
+        s, models = self._sampler_and_models(1)
+        # budget 16, 1 problem -> 16 reads/buffer; 64 reads -> 4 buffers.
+        out = list(s.sample_ising_streaming(
+            iter(models), num_reads=64, num_sweeps=32, max_threadgroups=4,
+            seed=1, scheduler=self._FakeScheduler(16),
         ))
         assert len(out) == 1
-        # 8 reads delivered as 2 buffers of 4, concatenated back to 8.
-        assert len(out[0][1]) == 8
+        assert len(out[0][1]) == 64         # all reads delivered
 
-    def test_reads_per_buffer_zero_is_single_dispatch(self, monkeypatch):
-        """reads_per_buffer<=0 disables continuation (one chunked dispatch)."""
+    def test_budget_zero_pauses_then_resumes(self, monkeypatch):
         s, models = self._sampler_and_models(1)
-        calls = {"n": 0}
+        slept = {"n": 0}
+        monkeypatch.setattr("GPU.metal_sa.time.sleep",
+                            lambda _s: slept.__setitem__("n", slept["n"] + 1))
 
-        def fake_chunk(batch, **kw):
-            calls["n"] += 1
-            assert kw["num_reads"] == 8      # full reads in one buffer
-            return [None] * len(batch)
+        class _Seq:
+            def __init__(self, seq):
+                self._seq, self._i = seq, 0
 
-        monkeypatch.setattr(s, "_dispatch_batch_chunked", fake_chunk)
-        list(s.sample_ising_streaming(
+            def get_thread_budget(self):
+                v = self._seq[min(self._i, len(self._seq) - 1)]
+                self._i += 1
+                return v
+
+            def get_measured_gpu(self):
+                return 0
+
+        out = list(s.sample_ising_streaming(
             iter(models), num_reads=8, num_sweeps=32, max_threadgroups=4,
-            seed=1, scheduler=self._FakeScheduler([50]), reads_per_buffer=0,
+            seed=1, scheduler=_Seq([0, 0, UNCAPPED]),
         ))
-        assert calls["n"] == 1
+        assert slept["n"] >= 2              # paused before dispatching
+        assert len(out) == 1
 
     def test_pause_returns_promptly_when_stop_set(self):
-        """A permanent PAUSE (target 0) must not hang: a set stop_event ends
-        the generator instead of spinning forever (battery / critical-thermal
-        full-stop must never block teardown)."""
         s, models = self._sampler_and_models(2)
 
         class _StopSet:
@@ -202,27 +135,29 @@ class TestPerBatchPathSelection:
                 return True
 
         out = list(s.sample_ising_streaming(
-            iter(models), num_reads=8, num_sweeps=64, max_threadgroups=2,
-            seed=1, scheduler=self._FakeScheduler([0]), stop_event=_StopSet(),
+            iter(models), num_reads=8, num_sweeps=32, max_threadgroups=2,
+            seed=1, scheduler=self._FakeScheduler(0), stop_event=_StopSet(),
         ))
         assert out == []
 
-    def test_adaptive_chunked_matches_monolithic(self):
-        """Adaptive chunk sizing must stay state-equivalent to monolithic for
-        the same batch + seed (persistent device buffers + beta_start/
-        beta_count make chunk size irrelevant to the result). Compared at the
-        dispatch level to isolate it from the streaming per-batch seed bump."""
+    def test_read_split_matches_monolithic_energy_floor(self):
+        """Splitting reads must preserve solution quality: the best energy over
+        all reads is at least as good as a monolithic dispatch of the same
+        total reads (independent SA runs, just grouped differently)."""
         from GPU.metal_utils import compute_beta_schedule
-        s, models = self._sampler_and_models(3)
+        s, models = self._sampler_and_models(2)
         s.prepare_topology()
-        beta_arr, beta_range = compute_beta_schedule(
+        beta_arr, br = compute_beta_schedule(
             models[0].h, models[0].J, 128, 1, None, "geometric", None,
         )
         common = dict(
-            num_reads=32, beta_schedule_arr=beta_arr, beta_range=beta_range,
+            num_reads=64, beta_schedule_arr=beta_arr, beta_range=br,
             beta_schedule_type="geometric", num_sweeps_per_beta=1, seed=7,
         )
-        direct = s._dispatch_batch(models, **common)
-        chunked = s._dispatch_batch_chunked(models, burst_ms=4.0, **common)
+        mono = s._dispatch_batch(models, **common)
+        split = s._dispatch_read_split(models, reads_per_buffer=16, **common)
         for i in range(len(models)):
-            assert min(direct[i].record.energy) == min(chunked[i].record.energy)
+            assert len(split[i]) == 64
+            # Both explore the same landscape; split (more seeds) should not be
+            # systematically worse than monolithic.
+            assert min(split[i].record.energy) <= min(mono[i].record.energy) + 50

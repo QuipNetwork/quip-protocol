@@ -3,13 +3,13 @@
 
 """Metal-only adaptive-cap config keys thread end-to-end.
 
-The new keys (active_util, idle_after_s, burst_ms, serious_util) live in the
-``[metal]`` device section. They must:
+The keys (active_threads, idle_after_s) live in the ``[metal]`` device
+section. They must:
   - survive normalization into the metal device cfg,
   - NOT leak through when set only in the shared ``[gpu]`` section
     (proving Metal stays independent of the shared registry),
   - reach ``MetalMiner`` and be forwarded by ``_stream_factory_kwargs``,
-  - reach ``build_persistent_context`` and configure the scheduler/sampler.
+  - reach ``build_persistent_context`` and configure the scheduler.
 The shared ``_GPU_CFG_KEYS`` registry is not modified.
 """
 from __future__ import annotations
@@ -36,23 +36,21 @@ def _metal_cfg(tmp_path, body: str) -> dict:
 def test_metal_keys_survive_normalization(tmp_path):
     cfg = _metal_cfg(
         tmp_path,
-        "[metal]\nutilization = 100\nactive_util = 30\n"
-        "idle_after_s = 45\nburst_ms = 6\nserious_util = 25\n",
+        "[metal]\nutilization = 100\nactive_threads = 1024\nidle_after_s = 45\n",
     )
-    assert cfg["active_util"] == 30
+    assert cfg["active_threads"] == 1024
     assert cfg["idle_after_s"] == 45
-    assert cfg["burst_ms"] == 6
-    assert cfg["serious_util"] == 25
     assert cfg["utilization"] == 100
 
 
 def test_metal_keys_in_gpu_section_do_not_leak(tmp_path):
-    """active_util set only in [gpu] must NOT reach the metal device cfg."""
+    """active_threads set only in [gpu] must NOT reach the metal device cfg."""
     cfg = _metal_cfg(
         tmp_path,
-        "[gpu]\nactive_util = 30\nidle_after_s = 45\n[metal]\nutilization = 100\n",
+        "[gpu]\nactive_threads = 1024\nidle_after_s = 45\n"
+        "[metal]\nutilization = 100\n",
     )
-    assert "active_util" not in cfg
+    assert "active_threads" not in cfg
     assert "idle_after_s" not in cfg
 
 
@@ -77,31 +75,29 @@ def test_metal_miner_forwards_new_keys():
          patch("GPU.metal_miner.get_gpu_core_count", return_value=10):
         m = MetalMiner(
             "M-1", topology=None, utilization=100, yielding=True,
-            active_util=30, idle_after_s=45, burst_ms=6, serious_util=25,
+            active_threads=1024, idle_after_s=45,
         )
     kw = m._stream_factory_kwargs(
         {"edges": [(0, 1)], "num_reads": 8, "num_sweeps": 64}, [0, 1],
     )
-    assert kw["active_util"] == 30
+    assert kw["active_threads"] == 1024
     assert kw["idle_after_s"] == 45
-    assert kw["burst_ms"] == 6
-    assert kw["serious_util"] == 25
     assert kw["utilization"] == 100
     assert kw["yielding"] is True
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Metal miner init")
-def test_active_util_defaults_to_70():
+def test_active_threads_defaults_to_2048():
     from GPU.metal_miner import MetalMiner
 
     with patch("GPU.metal_miner.MetalSASampler"), \
          patch("GPU.metal_miner.get_gpu_core_count", return_value=10):
         m = MetalMiner("M-1", topology=None)
-    assert m.active_util == 70
+    assert m.active_threads == 2048
     kw = m._stream_factory_kwargs(
         {"edges": [(0, 1)], "num_reads": 8, "num_sweeps": 64}, [0, 1],
     )
-    assert kw["active_util"] == 70
+    assert kw["active_threads"] == 2048
 
 
 # ── build_persistent_context wiring ─────────────────────────────────────
@@ -115,11 +111,10 @@ def test_build_persistent_context_wires_caps():
         miner_id="M-1", nodes=[0, 1], edges=[(0, 1)],
         feeder_buffer_size=4, num_reads=8, num_sweeps=64,
         utilization=100, yielding=False,
-        active_util=30, idle_after_s=45, burst_ms=6, serious_util=25,
+        active_threads=1024, idle_after_s=45,
     )
     sk = ctx._sampler_kwargs
-    assert sk["burst_ms"] == 6
+    assert "scheduler" in sk and "stop_event" in sk
     sched = sk["scheduler"]
-    assert sched._active_util == 30
-    assert sched._serious_util == 25
+    assert sched._active_threads == 1024
     assert sched._idle_after_s == 45

@@ -3,16 +3,14 @@
 
 """Tests for the Metal adaptive-cap policy + monitor (GPU/metal_scheduler.py).
 
-The cap policy is Metal-only and entirely independent of the CUDA util
-monitor. The tier decision is a pure function over signals + previous state,
-exhaustively testable without hardware. The monitor loop is driven with mocked
-sensors (no spawn) to assert the published target/measured/heartbeat and the
-asymmetric hysteresis transitions.
+The cap policy is Metal-only and independent of the CUDA util monitor. The
+tier decision is a pure function over signals + previous state, exhaustively
+testable without hardware. Tiers map to an occupancy *budget* (max concurrent
+GPU threads per command buffer): PAUSE=0, LOW=half, IDLE=UNCAPPED, ACTIVE=full.
 """
 from __future__ import annotations
 
 from unittest.mock import patch
-
 
 from GPU import macos_sensors as ms
 from GPU.metal_scheduler import (
@@ -24,15 +22,14 @@ from GPU.metal_scheduler import (
     LOW,
     PAUSE,
     Signals,
+    UNCAPPED,
     cap_monitor_main,
     decide_tier,
-    tier_target_pct,
+    tier_budget,
 )
 
 
-CFG = CapConfig(
-    idle_after_s=60.0, active_util=30, idle_util=100, serious_util=20,
-)
+CFG = CapConfig(idle_after_s=60.0, active_threads=2048)
 
 
 def _step(signals: Signals, state: HysteresisState) -> HysteresisState:
@@ -50,20 +47,20 @@ def _sig(*, idle=0.0, thermal=ms.THERMAL_NOMINAL, battery=False, displays=1):
     )
 
 
-# ── target mapping ──────────────────────────────────────────────────────
+# ── tier → occupancy budget mapping ─────────────────────────────────────
 
-class TestTargetMapping:
+class TestTierBudget:
     def test_pause_is_zero(self):
-        assert tier_target_pct(PAUSE, CFG) == 0
+        assert tier_budget(PAUSE, CFG) == 0
 
-    def test_low_is_serious_util(self):
-        assert tier_target_pct(LOW, CFG) == 20
+    def test_low_is_half_active(self):
+        assert tier_budget(LOW, CFG) == 1024
 
-    def test_idle_is_idle_util(self):
-        assert tier_target_pct(IDLE, CFG) == 100
+    def test_idle_is_uncapped(self):
+        assert tier_budget(IDLE, CFG) == UNCAPPED
 
-    def test_active_is_active_util(self):
-        assert tier_target_pct(ACTIVE, CFG) == 30
+    def test_active_is_active_threads(self):
+        assert tier_budget(ACTIVE, CFG) == 2048
 
 
 # ── classify priority ───────────────────────────────────────────────────
@@ -154,65 +151,71 @@ class _Stop:
 
 
 class TestCapMonitorLoop:
-    def test_publishes_active_cap_and_heartbeat(self):
-        target, measured, heartbeat = _V(), _V(), _V()
+    def test_publishes_active_budget_and_heartbeat(self):
+        budget, measured, heartbeat = _V(), _V(), _V()
         with patch.object(ms, "hid_idle_seconds", return_value=5.0), \
              patch.object(ms, "thermal_state", return_value=ms.THERMAL_NOMINAL), \
              patch.object(ms, "on_battery", return_value=False), \
              patch.object(ms, "active_display_count", return_value=1), \
              patch.object(ms, "gpu_active_residency", return_value=42):
-            cap_monitor_main(
-                target, measured, heartbeat, _Stop(after=3),
-                0.0, 60.0, 30, 100, 20,
-            )
-        assert target.value == 30        # user present -> active_util
+            cap_monitor_main(budget, measured, heartbeat, _Stop(after=3),
+                             0.0, 60.0, 2048)
+        assert budget.value == 2048      # user present -> active_threads
         assert measured.value == 42
         assert heartbeat.value >= 3
 
     def test_battery_publishes_pause(self):
-        target, measured, heartbeat = _V(), _V(), _V()
+        budget, measured, heartbeat = _V(), _V(), _V()
         with patch.object(ms, "hid_idle_seconds", return_value=0.0), \
              patch.object(ms, "thermal_state", return_value=ms.THERMAL_NOMINAL), \
              patch.object(ms, "on_battery", return_value=True), \
              patch.object(ms, "active_display_count", return_value=1), \
              patch.object(ms, "gpu_active_residency", return_value=0):
-            cap_monitor_main(
-                target, measured, heartbeat, _Stop(after=4),
-                0.0, 60.0, 30, 100, 20,
-            )
-        assert target.value == 0
+            cap_monitor_main(budget, measured, heartbeat, _Stop(after=4),
+                             0.0, 60.0, 2048)
+        assert budget.value == 0
         assert heartbeat.value == 4
 
+    def test_headless_publishes_uncapped(self):
+        budget, measured, heartbeat = _V(), _V(), _V()
+        with patch.object(ms, "hid_idle_seconds", return_value=0.0), \
+             patch.object(ms, "thermal_state", return_value=ms.THERMAL_NOMINAL), \
+             patch.object(ms, "on_battery", return_value=False), \
+             patch.object(ms, "active_display_count", return_value=0), \
+             patch.object(ms, "gpu_active_residency", return_value=10):
+            cap_monitor_main(budget, measured, heartbeat, _Stop(after=2),
+                             0.0, 60.0, 2048)
+        assert budget.value == UNCAPPED
 
-# ── scheduler target readout + staleness fallback (no spawn) ────────────
 
-class TestSchedulerTargetReadout:
+# ── scheduler budget readout + staleness fallback (no spawn) ────────────
+
+class TestSchedulerBudgetReadout:
     def _sched(self):
         from GPU.metal_scheduler import MetalScheduler
         return MetalScheduler(
             gpu_core_count=10, gpu_utilization_pct=100,
-            yielding=False, active_util=30,
+            yielding=False, active_threads=2048,
         )
 
-    def test_yielding_off_is_flat_out(self):
-        s = self._sched()
-        assert s.get_target_pct() == 100
+    def test_yielding_off_is_uncapped(self):
+        assert self._sched().get_thread_budget() == UNCAPPED
 
-    def test_reads_published_target_when_fresh(self):
+    def test_reads_published_budget_when_fresh(self):
         s = self._sched()
         s._yielding = True
         s._heartbeat_value.value = 5
-        s._target_value.value = 40
-        assert s.get_target_pct() == 40
+        s._budget_value.value = 1024
+        assert s.get_thread_budget() == 1024
 
-    def test_stale_heartbeat_falls_back_to_active_cap(self):
+    def test_stale_heartbeat_falls_back_to_active_budget(self):
         s = self._sched()
         s._yielding = True
         s._heartbeat_value.value = 5
-        s._target_value.value = 40
-        assert s.get_target_pct() == 40        # first read seeds heartbeat
+        s._budget_value.value = 1024
+        assert s.get_thread_budget() == 1024   # first read seeds heartbeat
         s._stale_timeout_s = -1.0              # force "stale" on next read
-        assert s.get_target_pct() == 30        # heartbeat unchanged -> active
+        assert s.get_thread_budget() == 2048   # heartbeat unchanged -> active
 
     def test_measured_gpu_readout(self):
         s = self._sched()

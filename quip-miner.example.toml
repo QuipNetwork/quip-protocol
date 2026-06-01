@@ -113,14 +113,13 @@ signer_key = "~/.quip-miner/signing.json"
 #
 # Interactive profile — responsive Mac while mining. `yielding` (default on)
 # enables the adaptive cap monitor (HID-idle / thermal / battery / display
-# sensing). Flat-out once you walk away; throttled to `active_util` while
-# you're using the machine; auto-pauses on battery / critical thermal.
-# `active_util` defaults to 70; drop it to ~30 if the UI still feels janky.
-# yielding     = true
-# active_util  = 30          # cap (%) while present (default 70; 30 if janky)
-# idle_after_s = 60          # seconds of no input before going flat-out
-# burst_ms     = 8           # per-frame GPU burst budget (compositor seam)
-# serious_util = 30          # cap (%) at thermal == serious
+# sensing). While present it caps GPU occupancy (concurrent threads per
+# command buffer) to `active_threads`; idle/headless runs flat-out; auto-pauses
+# on battery / critical thermal. Total reads and sweeps are preserved.
+# yielding       = true
+# active_threads = 2048      # occupancy budget while present (lower to ~1024
+#                            # if the UI still stutters)
+# idle_after_s   = 60        # seconds of no input before going flat-out
 
 # Modal cloud GPUs. Set `gpu_type` to the Modal class (t4, a10g, …).
 # [modal]

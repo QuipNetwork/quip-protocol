@@ -399,21 +399,21 @@ class TestYieldingBehavior:
 # ── Streaming pipeline through the governor (yielding) ───
 
 class _ThrottleScheduler:
-    """Fake governor that caps to a fixed sub-100 target.
+    """Fake governor that caps occupancy to a fixed thread budget.
 
-    Drives ``sample_ising_streaming`` down the GOVERNED (chunked + read-
-    continued + 1-problem/buffer + duty-cycled) path so these tests exercise
-    *yielding* — short command buffers that keep the GPU below the cap —
-    rather than saturating it flat-out. That's the whole point of yielding.
+    Drives ``sample_ising_streaming`` down the GOVERNED path: reads are split
+    so ``problems x reads <= budget`` per command buffer, keeping the GPU below
+    the occupancy that janks the UI rather than saturating it. That's the whole
+    point of yielding.
     """
 
-    def __init__(self, target: int = 30):
-        self._target = target
+    def __init__(self, budget: int = 256):
+        self._budget = budget
 
-    def get_target_pct(self) -> int:
-        return self._target
+    def get_thread_budget(self) -> int:
+        return self._budget
 
-    def get_cached_utilization(self) -> int:
+    def get_measured_gpu(self) -> int:
         return 0
 
 
@@ -421,13 +421,7 @@ class TestStreamingWithScheduler:
     """End-to-end: streaming pipeline runs through the governor (throttled)."""
 
     def _governed_kwargs(self):
-        from GPU.metal_scheduler import DutyCycleController
-        return {
-            "scheduler": _ThrottleScheduler(30),
-            "duty_cycle": DutyCycleController(target_pct=100),
-            "burst_ms": 8.0,
-            "reads_per_buffer": 16,
-        }
+        return {"scheduler": _ThrottleScheduler(256)}
 
     def test_streaming_completes_all_models(self):
         """All models are yielded through the throttled (yielding) path."""
