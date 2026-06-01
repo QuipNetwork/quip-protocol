@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
 
-"""GPU miner using Metal/MPS with RandomIsingFeeder streaming pipeline.
+"""GPU miner using Metal/MPS, driven by the stream-driver pipeline.
 
-Mirrors GPUMiner (gpu_miner.py) architecture: RandomIsingFeeder for
-background model generation, MetalScheduler for core budget and
-IOKit-based yielding, and batched streaming dispatch via
-MetalSASampler.sample_ising_streaming().
+The sampler (MetalSASampler), feeder, and MetalScheduler (core budget +
+IOKit-based yielding) live in the stream-driver process
+(GPU/metal_stream.py). This worker only adapts params and supplies the
+driver-context factory kwargs.
 """
 from __future__ import annotations
 
@@ -47,18 +47,12 @@ def get_gpu_core_count() -> int:
     )
 
 
-# Pipeline stall timeout constants (match gpu_miner.py)
-_PIPELINE_STALL_FLOOR = 60.0
-_SEC_PER_SWEEP = 0.03
-_STALL_SAFETY_FACTOR = 5.0
-
-
 class MetalMiner(BaseMiner):
-    """Metal GPU miner with RandomIsingFeeder streaming pipeline.
+    """Metal GPU miner driven by the stream-driver pipeline.
 
-    Architecture mirrors GPUMiner: background model generation
-    via RandomIsingFeeder, core budget via MetalScheduler, and batched
-    multi-problem dispatch via sample_ising_streaming().
+    The sampler, feeder, and MetalScheduler live in the stream-driver
+    process (GPU/metal_stream.py); this worker only adapts params and
+    supplies the driver-context factory kwargs.
     """
 
     # Keep the feeder large enough to keep Metal threadgroup dispatch fed

@@ -3,10 +3,10 @@
 
 """Unified GPU miner base class for CUDA SA and Gibbs kernels.
 
-Owns the shared pipeline infrastructure: RandomIsingFeeder for
-background model generation, KernelScheduler for SM budget,
-SIGTERM cleanup, sparse topology filtering, and the streaming
-mining loop via sample_ising_streaming().
+Owns the per-backend setup harvested by the CUDA stream-driver factory:
+the sampler and KernelScheduler (SM budget), plus SIGTERM cleanup, sparse
+topology filtering, and adaptive parameter calculation. The streaming
+pipeline itself runs in the driver process (GPU/cuda_stream.py).
 
 Subclasses create the appropriate sampler and pass it here.
 """
@@ -16,13 +16,12 @@ import os
 import signal
 import threading
 from typing import (
-    Iterator, List, Optional, Tuple,
+    List, Tuple,
 )
 
 import dimod
 from shared.base_miner import BaseMiner
 from shared.miner_types import BlockRequirements
-from shared.ising_feeder import RandomIsingFeeder
 from GPU.gpu_scheduler import (
     KernelScheduler,
     configure_mps_thread_limit,
@@ -35,11 +34,11 @@ except ImportError:
 
 
 class GPUMiner(BaseMiner):
-    """Shared pipeline base for CUDA GPU miners.
+    """Shared base for CUDA GPU miners.
 
-    Provides RandomIsingFeeder, KernelScheduler, SIGTERM cleanup,
-    the streaming mining loop, sparse topology filtering, and
-    adaptive parameter calculation.
+    Provides the sampler + KernelScheduler the stream-driver factory
+    harvests, SIGTERM cleanup, sparse topology filtering, and adaptive
+    parameter calculation. The streaming loop runs in the driver process.
 
     Subclasses create a sampler (CudaSASampler or
     CudaGibbsSampler) and pass it to __init__.
@@ -91,16 +90,16 @@ class GPUMiner(BaseMiner):
         ).attributes['MultiProcessorCount']
         self._device_sms = device_sms
 
+        # KernelScheduler is harvested by the CUDA stream-driver factory
+        # (GPU/cuda_stream.py:build_persistent_context) to size num_kernels and
+        # honor should_throttle in the producer process. The worker keeps no
+        # feeder/stream — the driver owns the streaming pipeline.
         self._scheduler = KernelScheduler(
             device_id=int(device),
             device_sms=device_sms,
             gpu_utilization_pct=gpu_utilization,
             yielding=yielding,
         )
-
-        # Pipeline state (reset per mine_block call)
-        self._feeder: Optional[RandomIsingFeeder] = None
-        self._stream: Optional[Iterator] = None
 
         if threading.current_thread() is threading.main_thread():
             signal.signal(
@@ -136,12 +135,12 @@ class GPUMiner(BaseMiner):
     # ----------------------------------------------------------
 
     def _pre_mine_setup(self, *args, **kwargs) -> bool:
-        """Activate the CUDA device and size adaptive batching.
+        """Validate the work context and activate the CUDA device.
 
-        The Ising feeder is now built by ``BaseMiner.mine_work_item``
-        via ``context.make_feeder(...)`` immediately before the loop;
-        this hook handles the GPU-specific setup that needs a live
-        CUDA context (SM budget sizing, device activation).
+        The sampler + feeder + scheduler live in the stream-driver process
+        (GPU/cuda_stream.py); this hook only validates ``prev_block`` /
+        ``node_info`` early — the controller treats ``False`` as "skip this
+        attempt" — and re-activates the device context.
         """
         # Extract block context from BaseMiner's positional
         # args — no CUDA needed for this.
@@ -153,17 +152,6 @@ class GPUMiner(BaseMiner):
             )
             return False
 
-        # get_sm_budget() uses cached _device_sms — no
-        # CUDA call needed.
-        budget = self._scheduler.get_sm_budget()
-        num_k = max(
-            1, budget // self.sampler._sms_per_nonce,
-        )
-
-        # Adaptive nonce tracking for yielding mode
-        self._max_nonces = num_k
-        self._active_nonces = num_k
-
         try:
             cp.cuda.Device(int(self.device)).use()
         except Exception as e:
@@ -171,8 +159,6 @@ class GPUMiner(BaseMiner):
                 f"Failed to set device context: {e}",
             )
             return False
-
-        self._stream = None
 
         return True
 
@@ -198,21 +184,11 @@ class GPUMiner(BaseMiner):
         return sampleset
 
     def _post_mine_cleanup(self) -> None:
-        """Stop stream, sync GPU, kill feeder, free buffers.
+        """Sync the GPU compute stream and free sampler buffers.
 
-        Ordering:
-        1. Close stream — signals kernel to exit
-        2. Sync GPU compute stream — kernel must stop
-           before feeder data it reads is freed
-        3. Stop feeder — kills worker processes
-        4. Close sampler — frees GPU buffers
+        The feeder + streaming pipeline live in the driver process; the worker
+        only syncs any in-flight kernel and closes its sampler.
         """
-        if self._stream is not None:
-            self._stream.close()
-            self._stream = None
-
-        # Sync GPU before killing feeder — kernel must be
-        # stopped before feeder data is freed.
         if (
             hasattr(self, 'sampler')
             and self.sampler is not None
@@ -220,21 +196,11 @@ class GPUMiner(BaseMiner):
         ):
             self.sampler._sf_stream_compute.synchronize()
 
-        if self._feeder is not None:
-            self._feeder.stop()
-            self._feeder = None
-
         if hasattr(self, 'sampler') and self.sampler is not None:
             self.sampler.close()
 
     def _cleanup_handler(self, signum, frame):
-        """Handle SIGTERM: stop feeder, signal kernel, exit."""
-        # Stop the RandomIsingFeeder first — its ProcessPoolExecutor
-        # workers will block atexit if not shut down.
-        if self._feeder is not None:
-            self._feeder.stop()
-            self._feeder = None
-
+        """Handle SIGTERM: stop scheduler, signal kernel, exit."""
         if hasattr(self, '_scheduler'):
             self._scheduler.stop()
 
