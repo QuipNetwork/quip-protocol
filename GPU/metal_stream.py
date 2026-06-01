@@ -73,6 +73,9 @@ def build_persistent_context(
             "duty_cycle": duty_cycle,
             "scheduler": scheduler,
             "burst_ms": burst_ms,
+            # The sampler checks this during a PAUSE so a battery / critical-
+            # thermal full-stop never blocks teardown.
+            "stop_event": stop_event,
         },
         stop_event=stop_event,
     )

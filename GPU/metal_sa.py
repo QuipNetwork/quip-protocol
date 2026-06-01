@@ -762,7 +762,10 @@ class MetalSASampler:
                 )
                 time.sleep(sleep_s)
 
-                # Closed-loop trim: nudge the duty multiplier toward target.
+                # Closed-loop trim: feed whole-system GPU% so the cap acts as a
+                # CEILING — when other apps use the GPU the PI backs us off
+                # BELOW target (fair-share) so the total stays under it; alone
+                # we fill up to target but never exceed it.
                 if scheduler is not None:
                     measured = scheduler.get_cached_utilization()
                     duty_cycle.feedback(measured)
@@ -817,6 +820,7 @@ class MetalSASampler:
         duty_cycle: Optional[DutyCycleController] = None,
         scheduler: Optional['MetalScheduler'] = None,
         burst_ms: float = DEFAULT_BURST_MS,
+        stop_event=None,
         **kwargs,
     ) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
         """Stream batched results using cached topology structure.
@@ -840,6 +844,8 @@ class MetalSASampler:
             duty_cycle: Optional controller for GPU duty cycling.
             scheduler: Optional MetalScheduler — the per-batch cap source.
             burst_ms: Per-command-buffer wall-clock budget for chunked dispatch.
+            stop_event: Optional mp.Event — checked during a PAUSE so a full
+                stop (battery / critical thermal) never blocks teardown.
 
         Yields:
             (IsingModel, dimod.SampleSet) for each completed problem.
@@ -875,10 +881,14 @@ class MetalSASampler:
             # Re-read the cap before consuming the feeder so a PAUSE does not
             # burn queued models.
             target = _resolve_target_pct(scheduler, duty_cycle)
-            if target <= 0:
-                # PAUSE: idle and re-check; do not dispatch or pull models.
+            # PAUSE (target <= 0, e.g. on battery / critical thermal): idle and
+            # re-check without dispatching or pulling models. Stop-aware so
+            # teardown never blocks; returns promptly when stop_event is set.
+            while target <= 0:
+                if stop_event is not None and stop_event.is_set():
+                    return
                 time.sleep(_PAUSE_POLL_S)
-                continue
+                target = _resolve_target_pct(scheduler, duty_cycle)
 
             # Fill batch from pending + iterator
             batch_models: List[IsingModel] = list(pending)

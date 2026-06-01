@@ -135,6 +135,22 @@ class TestPerBatchPathSelection:
         assert slept["n"] >= 2          # paused before dispatching
         assert len(out) == 1            # model still dispatched after resume
 
+    def test_pause_returns_promptly_when_stop_set(self):
+        """A permanent PAUSE (target 0) must not hang: a set stop_event ends
+        the generator instead of spinning forever (battery / critical-thermal
+        full-stop must never block teardown)."""
+        s, models = self._sampler_and_models(2)
+
+        class _StopSet:
+            def is_set(self):
+                return True
+
+        out = list(s.sample_ising_streaming(
+            iter(models), num_reads=8, num_sweeps=64, max_threadgroups=2,
+            seed=1, scheduler=self._FakeScheduler([0]), stop_event=_StopSet(),
+        ))
+        assert out == []
+
     def test_adaptive_chunked_matches_monolithic(self):
         """Adaptive chunk sizing must stay state-equivalent to monolithic
         (persistent device buffers + beta_start/beta_count make chunk size
