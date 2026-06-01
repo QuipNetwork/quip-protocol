@@ -50,6 +50,7 @@ _GPU_CFG_KEYS = (
 # of `_build_gpu_specs`.
 _METAL_CFG_KEYS = (
     "active_util", "idle_after_s", "burst_ms", "serious_util",
+    "reads_per_buffer",
 )
 
 _GPU_DEVICE_SECTIONS = {

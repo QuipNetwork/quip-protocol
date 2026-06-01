@@ -82,6 +82,10 @@ class MetalMiner(BaseMiner):
         self.idle_after_s = cfg.pop('idle_after_s', 60.0)
         self.burst_ms = cfg.pop('burst_ms', 8.0)
         self.serious_util = cfg.pop('serious_util', 30)
+        # When throttled, run reads in buffers of this many (distinct seed per
+        # chunk, concatenated) so each command buffer stays near the one-sweep
+        # floor. Preserves total reads; costs throughput. 0 disables.
+        self.reads_per_buffer = cfg.pop('reads_per_buffer', 128)
         self.yielding = yielding
         # Remove CUDA-only keys that flow through common_cfg
         cfg.pop('sms_per_nonce', None)
@@ -177,6 +181,7 @@ class MetalMiner(BaseMiner):
             "idle_after_s": getattr(self, "idle_after_s", 60.0),
             "burst_ms": getattr(self, "burst_ms", 8.0),
             "serious_util": getattr(self, "serious_util", 30),
+            "reads_per_buffer": getattr(self, "reads_per_buffer", 128),
         }
 
     def _cleanup_handler(self, signum, frame):

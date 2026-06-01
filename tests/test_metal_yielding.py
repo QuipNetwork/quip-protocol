@@ -14,12 +14,10 @@ Run:
 """
 from __future__ import annotations
 
-import os
 import sys
 import threading
 import time
 from typing import List
-from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -191,8 +189,10 @@ class TestUtilizationScaling:
     def test_throughput_scales_with_batch_size(self):
         """More threadgroups per batch = higher throughput.
 
-        Dispatching 8 problems per batch should be faster than
-        dispatching 1 problem per batch (amortized overhead).
+        This intentionally exercises the FLAT-OUT (idle/headless, target=100)
+        path — batching only applies there; when throttled the governor caps
+        to one problem per command buffer. Kept small to avoid saturating the
+        GPU during the test run.
         """
         sampler = MetalSASampler()
         models = _make_models(sampler, 8)
@@ -204,16 +204,16 @@ class TestUtilizationScaling:
         tp_1 = _measure_streaming_throughput(
             sampler, models,
             max_threadgroups=1,
-            num_reads=32,
-            num_sweeps=64,
+            num_reads=16,
+            num_sweeps=24,
         )
 
         # 8 threadgroups per batch = 1 batched dispatch
         tp_8 = _measure_streaming_throughput(
             sampler, models,
             max_threadgroups=8,
-            num_reads=32,
-            num_sweeps=64,
+            num_reads=16,
+            num_sweeps=24,
         )
 
         # Batched should be at least 1.3x faster (less dispatch overhead)
@@ -223,11 +223,10 @@ class TestUtilizationScaling:
         )
 
     def test_utilization_reduces_batch_size(self):
-        """Lower utilization → smaller max_threadgroups → more batches.
+        """Smaller max_threadgroups → more batches → lower flat-out throughput.
 
-        With 8 models at max_tg=2, pipeline does 4 batches.
-        With 8 models at max_tg=8, pipeline does 1 batch.
-        The first should take measurably longer.
+        Also the FLAT-OUT (idle/headless, target=100) path; kept small to avoid
+        saturating the GPU during the test run.
         """
         sampler = MetalSASampler()
         sampler.prepare_topology()
@@ -236,15 +235,15 @@ class TestUtilizationScaling:
         tp_full = _measure_streaming_throughput(
             sampler, models,
             max_threadgroups=8,
-            num_reads=32,
-            num_sweeps=64,
+            num_reads=16,
+            num_sweeps=24,
         )
 
         tp_half = _measure_streaming_throughput(
             sampler, models,
             max_threadgroups=2,
-            num_reads=32,
-            num_sweeps=64,
+            num_reads=16,
+            num_sweeps=24,
         )
 
         # Full batch should be faster than quarter-batch
@@ -397,13 +396,41 @@ class TestYieldingBehavior:
         assert sched.should_throttle() is False
 
 
-# ── Streaming pipeline with scheduler ────────────────────
+# ── Streaming pipeline through the governor (yielding) ───
+
+class _ThrottleScheduler:
+    """Fake governor that caps to a fixed sub-100 target.
+
+    Drives ``sample_ising_streaming`` down the GOVERNED (chunked + read-
+    continued + 1-problem/buffer + duty-cycled) path so these tests exercise
+    *yielding* — short command buffers that keep the GPU below the cap —
+    rather than saturating it flat-out. That's the whole point of yielding.
+    """
+
+    def __init__(self, target: int = 30):
+        self._target = target
+
+    def get_target_pct(self) -> int:
+        return self._target
+
+    def get_cached_utilization(self) -> int:
+        return 0
+
 
 class TestStreamingWithScheduler:
-    """End-to-end: streaming pipeline respects core budget."""
+    """End-to-end: streaming pipeline runs through the governor (throttled)."""
+
+    def _governed_kwargs(self):
+        from GPU.metal_scheduler import DutyCycleController
+        return {
+            "scheduler": _ThrottleScheduler(30),
+            "duty_cycle": DutyCycleController(target_pct=100),
+            "burst_ms": 8.0,
+            "reads_per_buffer": 16,
+        }
 
     def test_streaming_completes_all_models(self):
-        """All models should be yielded regardless of batch size."""
+        """All models are yielded through the throttled (yielding) path."""
         sampler = MetalSASampler()
         models = _make_models(sampler, 7)  # Non-power-of-2
 
@@ -411,8 +438,9 @@ class TestStreamingWithScheduler:
             iter(models),
             num_reads=16,
             num_sweeps=32,
-            max_threadgroups=3,  # 3 batches: 3+3+1
+            max_threadgroups=3,
             seed=42,
+            **self._governed_kwargs(),
         ))
 
         assert len(results) == 7
@@ -421,7 +449,7 @@ class TestStreamingWithScheduler:
         assert returned_nonces == expected_nonces
 
     def test_streaming_energies_are_valid(self):
-        """Sample energies should be negative (Ising solutions)."""
+        """Throttled streaming still yields valid (negative) Ising energies."""
         sampler = MetalSASampler()
         models = _make_models(sampler, 3)
 
@@ -431,7 +459,9 @@ class TestStreamingWithScheduler:
             num_sweeps=64,
             max_threadgroups=3,
             seed=42,
+            **self._governed_kwargs(),
         ):
+            assert len(ss) == 32, "throttled path must preserve total reads"
             min_e = min(ss.record.energy)
             assert min_e < 0, (
                 f"Nonce {model.nonce}: expected negative "

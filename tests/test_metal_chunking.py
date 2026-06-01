@@ -159,6 +159,38 @@ class TestPerBatchPathSelection:
         assert sizes == [1, 1, 1]          # one problem per command buffer
         assert len(out) == 3               # all models still produced
 
+    def test_read_continuation_preserves_total_reads(self):
+        """Throttled read-continuation runs reads in small buffers but still
+        produces the full num_reads samples per problem (concatenated)."""
+        from GPU.metal_scheduler import DutyCycleController
+        s, models = self._sampler_and_models(1)
+        out = list(s.sample_ising_streaming(
+            iter(models), num_reads=8, num_sweeps=32, max_threadgroups=4,
+            seed=1, scheduler=self._FakeScheduler([50]),
+            duty_cycle=DutyCycleController(target_pct=100),
+            reads_per_buffer=4,
+        ))
+        assert len(out) == 1
+        # 8 reads delivered as 2 buffers of 4, concatenated back to 8.
+        assert len(out[0][1]) == 8
+
+    def test_reads_per_buffer_zero_is_single_dispatch(self, monkeypatch):
+        """reads_per_buffer<=0 disables continuation (one chunked dispatch)."""
+        s, models = self._sampler_and_models(1)
+        calls = {"n": 0}
+
+        def fake_chunk(batch, **kw):
+            calls["n"] += 1
+            assert kw["num_reads"] == 8      # full reads in one buffer
+            return [None] * len(batch)
+
+        monkeypatch.setattr(s, "_dispatch_batch_chunked", fake_chunk)
+        list(s.sample_ising_streaming(
+            iter(models), num_reads=8, num_sweeps=32, max_threadgroups=4,
+            seed=1, scheduler=self._FakeScheduler([50]), reads_per_buffer=0,
+        ))
+        assert calls["n"] == 1
+
     def test_pause_returns_promptly_when_stop_set(self):
         """A permanent PAUSE (target 0) must not hang: a set stop_event ends
         the generator instead of spinning forever (battery / critical-thermal

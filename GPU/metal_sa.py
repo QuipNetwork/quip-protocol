@@ -806,6 +806,64 @@ class MetalSASampler:
 
         return samplesets
 
+    def _dispatch_read_continued(
+        self,
+        models: List[IsingModel],
+        *,
+        num_reads: int,
+        reads_per_buffer: int,
+        beta_schedule_arr: np.ndarray,
+        beta_range: Tuple[float, float],
+        beta_schedule_type: str,
+        num_sweeps_per_beta: int,
+        seed: int,
+        burst_ms: float = DEFAULT_BURST_MS,
+        duty_cycle: Optional[DutyCycleController] = None,
+        scheduler: Optional['MetalScheduler'] = None,
+    ) -> List[dimod.SampleSet]:
+        """Run ``num_reads`` reads in command buffers of ``reads_per_buffer``.
+
+        A single SA sweep over N nodes is the irreducible per-command-buffer
+        floor (~one frame at N≈4.5k). Fewer reads per buffer keeps each buffer
+        near that floor instead of ~5x it — at the cost of running more buffers
+        — so the compositor gets a preemption seam every sweep while we still
+        produce the full ``num_reads`` samples. Each read-chunk is an
+        independent SA run (distinct seed); the per-problem samplesets are
+        concatenated. ``reads_per_buffer <= 0`` or ``>= num_reads`` disables
+        chunking (single dispatch).
+        """
+        if reads_per_buffer <= 0 or reads_per_buffer >= num_reads:
+            return self._dispatch_batch_chunked(
+                models, num_reads=num_reads,
+                beta_schedule_arr=beta_schedule_arr, beta_range=beta_range,
+                beta_schedule_type=beta_schedule_type,
+                num_sweeps_per_beta=num_sweeps_per_beta, seed=seed,
+                burst_ms=burst_ms, duty_cycle=duty_cycle, scheduler=scheduler,
+            )
+
+        parts: List[List[dimod.SampleSet]] = [[] for _ in models]
+        done = 0
+        chunk_idx = 0
+        while done < num_reads:
+            rc = min(reads_per_buffer, num_reads - done)
+            # Distinct seed per read-chunk so the reads are independent runs,
+            # not duplicates (the kernel seeds each thread from base_seed and
+            # its thread id, which repeats across equal-sized chunks).
+            chunk_seed = (seed + chunk_idx * 0x9E3779B1) & 0x7FFFFFFF
+            ss_list = self._dispatch_batch_chunked(
+                models, num_reads=rc,
+                beta_schedule_arr=beta_schedule_arr, beta_range=beta_range,
+                beta_schedule_type=beta_schedule_type,
+                num_sweeps_per_beta=num_sweeps_per_beta, seed=chunk_seed,
+                burst_ms=burst_ms, duty_cycle=duty_cycle, scheduler=scheduler,
+            )
+            for prob_idx, ss in enumerate(ss_list):
+                parts[prob_idx].append(ss)
+            done += rc
+            chunk_idx += 1
+
+        return [dimod.concatenate(p) for p in parts]
+
     def sample_ising_streaming(
         self,
         models: Iterable[IsingModel],
@@ -820,6 +878,7 @@ class MetalSASampler:
         duty_cycle: Optional[DutyCycleController] = None,
         scheduler: Optional['MetalScheduler'] = None,
         burst_ms: float = DEFAULT_BURST_MS,
+        reads_per_buffer: int = 0,
         stop_event=None,
         **kwargs,
     ) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
@@ -844,6 +903,9 @@ class MetalSASampler:
             duty_cycle: Optional controller for GPU duty cycling.
             scheduler: Optional MetalScheduler — the per-batch cap source.
             burst_ms: Per-command-buffer wall-clock budget for chunked dispatch.
+            reads_per_buffer: When throttled, run reads in buffers of this many
+                (distinct seed per chunk, concatenated) so each command buffer
+                stays near the one-sweep floor; 0 disables (single dispatch).
             stop_event: Optional mp.Event — checked during a PAUSE so a full
                 stop (battery / critical thermal) never blocks teardown.
 
@@ -931,9 +993,10 @@ class MetalSASampler:
                 # change doesn't carry windup into the new cap.
                 if duty_cycle is not None:
                     duty_cycle.set_target(target)
-                samplesets = self._dispatch_batch_chunked(
+                samplesets = self._dispatch_read_continued(
                     batch_models,
                     num_reads=num_reads,
+                    reads_per_buffer=reads_per_buffer,
                     beta_schedule_arr=beta_arr,
                     beta_range=beta_range_out,
                     beta_schedule_type=beta_schedule_type,

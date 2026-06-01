@@ -31,6 +31,7 @@ def build_persistent_context(
     idle_after_s: float = 60.0,
     burst_ms: float = 8.0,
     serious_util: int = 30,
+    reads_per_buffer: int = 128,
     stop_event: Optional[multiprocessing.synchronize.Event] = None,
     **_ignored: Any,
 ) -> StreamContext:
@@ -73,6 +74,7 @@ def build_persistent_context(
             "duty_cycle": duty_cycle,
             "scheduler": scheduler,
             "burst_ms": burst_ms,
+            "reads_per_buffer": reads_per_buffer,
             # The sampler checks this during a PAUSE so a battery / critical-
             # thermal full-stop never blocks teardown.
             "stop_event": stop_event,
