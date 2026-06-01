@@ -9,7 +9,8 @@ plus a free-list queue and the cross-process lifecycle (picklable
 and close/unlink). It is *layout-agnostic*: typed views (``SampleView``,
 ``ProblemView`` in ``shared.ring_views``) own the byte layout of a slot and
 delegate slot management here. Metadata (nonce/salt/generation) rides a
-separate descriptor queue; the ring carries only bulk arrays. See AGENTS.md.
+separate descriptor queue; the ring carries only bulk arrays.
+See docs/miner-architecture.md.
 """
 from __future__ import annotations
 

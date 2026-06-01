@@ -26,6 +26,10 @@ test:
     - pip install -U pip setuptools wheel
     - pip install -e ".[dev]"
   script:
+    # Fast guard: the unified streaming stack has no inline path. Fail early
+    # if the deleted _sample/_sample_batch/STREAMING_PUMP/DRIVER_OWNS_FEEDER
+    # symbols reappear (also covered by pytest, but cheaper as a standalone).
+    - python tools/lint_no_inline_sampling.py
     # Wrap pytest so a hang (e.g. a lingering non-daemon thread blocking
     # interpreter shutdown) produces a full all-thread stack dump rather
     # than a silent timeout. The suite runs in ~80s, so 180s catches a
