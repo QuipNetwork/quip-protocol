@@ -1,7 +1,6 @@
 # Dockerfile for CUDA-based mining comparison
-# NVIDIA CUDA 11.8 for good driver compatibility (driver 520+)
-# Driver requirements: CUDA 11.2=450+, CUDA 11.8=520+, CUDA 12.x=525+
-FROM nvidia/cuda:11.8.0-devel-ubuntu22.04
+# NVIDIA CUDA 12.6 (driver 525+)
+FROM nvidia/cuda:12.6.3-devel-ubuntu22.04
 
 LABEL maintainer="Quip Protocol"
 LABEL description="CUDA GPU miner for quantum blockchain mining rate comparison"
@@ -36,11 +35,10 @@ COPY shared/ ./shared/
 COPY tools/ ./tools/
 COPY dwave_topologies/ ./dwave_topologies/
 
-# Install Python dependencies including CuPy for CUDA 11.2
-# cupy-cuda11x = built for CUDA 11.x, version 12.x = CuPy version (not CUDA!)
+# Install Python dependencies including CuPy for CUDA 12.x
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir --ignore-installed \
-    "cupy-cuda11x>=12.0.0,<13.0.0" \
+    "cupy-cuda12x>=13.0.0" \
     "dwave-ocean-sdk>=6.0.0" \
     "numpy>=1.24.0" \
     "matplotlib>=3.6.0" \

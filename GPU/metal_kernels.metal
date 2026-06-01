@@ -89,6 +89,12 @@ inline int8_t get_flip_energy(
 // Pure SA kernel with delta energy optimization
 // Batched multi-problem evaluation for reduced kernel overhead
 // Each problem gets its own CSR structure, threads process different problems in parallel
+//
+// Supports chunked dispatch for GPU yielding: when beta_start > 0,
+// state is loaded from persistent buffers instead of random init.
+// This lets the Python side break the full beta schedule into small
+// chunks (~10 betas each) with duty-cycle sleeps between dispatches,
+// keeping the GPU responsive on Apple Silicon's shared architecture.
 kernel void pure_simulated_annealing(
     device const int* csr_row_ptr [[buffer(0)]],          // Concatenated [N+1] for all problems
     device const int* csr_col_ind [[buffer(1)]],          // Concatenated [nnz] for all problems
@@ -97,7 +103,7 @@ kernel void pure_simulated_annealing(
     device const int* col_ind_offsets [[buffer(4)]],      // [num_problems+1] offset into csr_col_ind
 
     constant int& N [[buffer(5)]],                         // number of spins (same for all problems)
-    constant int& num_betas [[buffer(6)]],                 // number of beta values
+    constant int& num_betas [[buffer(6)]],                 // number of beta values in full schedule
     constant int& sweeps_per_beta [[buffer(7)]],           // sweeps per beta
     constant uint& base_seed [[buffer(8)]],                // RNG seed
 
@@ -111,6 +117,14 @@ kernel void pure_simulated_annealing(
     // Outputs only (no working memory needed - using thread-local)
     device int8_t* final_samples [[buffer(10)]],           // [num_threads * (N+7)/8] - bit-packed
     device int* final_energies [[buffer(11)]],             // [num_threads]
+
+    // Chunked dispatch parameters for GPU yielding
+    constant int& beta_start [[buffer(16)]],               // first beta index this chunk (0 = init)
+    constant int& beta_count [[buffer(17)]],               // betas to process this chunk
+    device int8_t* persistent_state [[buffer(18)]],        // [num_threads * packed_size] persisted packed state
+    device int8_t* persistent_delta_energy [[buffer(19)]], // [num_threads * N] persisted delta_energy
+    device uint* persistent_rng [[buffer(20)]],            // [num_threads] persisted RNG state
+    device int* persistent_energy [[buffer(21)]],          // [num_threads] persisted current_energy
 
     // Thread info
     uint3 threadgroup_pos [[threadgroup_position_in_grid]],
@@ -139,7 +153,6 @@ kernel void pure_simulated_annealing(
     device const int8_t* my_h_vals = &csr_h_vals[problem_id * N];  // h values for this problem
 
     int n = N;
-    int num_beta_values = num_betas;
     int sweeps_per_beta_val = sweeps_per_beta;
     int packed_size = (n + 7) / 8;  // bytes needed for bit-packed state
 
@@ -150,47 +163,63 @@ kernel void pure_simulated_annealing(
     thread int8_t packed_state[4593 / 8 + 1];  // Bit-packed state
     thread int8_t delta_energy[4593];           // Delta energy (int8)
 
-    // Initialize RNG state with unique seed per thread
-    uint rng_state = (base_seed ? base_seed : 1u) ^ (thread_id * 12345u);
+    uint rng_state;
+    int current_energy;
 
-    // Generate random initial state (bit-packed)
-    for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
-        packed_state[byte_idx] = 0;  // Clear all bits
-    }
-    for (int var = 0; var < n; var++) {
-        uint rand_val = xorshift32(rng_state);
-        int8_t spin = (rand_val & 1) ? -1 : 1;  // Random ±1
-        set_spin_packed(var, spin, packed_state);
-    }
+    if (beta_start == 0) {
+        // ── First chunk: random initialization ──────────────
+        rng_state = (base_seed ? base_seed : 1u) ^ (thread_id * 12345u);
 
-    // Build initial delta_energy array
-    for (int var = 0; var < n; var++) {
-        delta_energy[var] = get_flip_energy(var, packed_state, my_csr_row_ptr, my_csr_col_ind, my_csr_J_vals, my_h_vals);
-    }
+        // Generate random initial state (bit-packed)
+        for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
+            packed_state[byte_idx] = 0;
+        }
+        for (int var = 0; var < n; var++) {
+            uint rand_val = xorshift32(rng_state);
+            int8_t spin = (rand_val & 1) ? -1 : 1;
+            set_spin_packed(var, spin, packed_state);
+        }
 
-    // Compute initial energy
-    int current_energy = 0;
-    for (int i = 0; i < n; i++) {
-        int8_t spin_i = get_spin_packed(i, packed_state);
+        // Build initial delta_energy array
+        for (int var = 0; var < n; var++) {
+            delta_energy[var] = get_flip_energy(var, packed_state, my_csr_row_ptr, my_csr_col_ind, my_csr_J_vals, my_h_vals);
+        }
 
-        // Add h field contribution
-        current_energy += my_h_vals[i] * spin_i;
-
-        // Add J coupling contribution (count each edge once)
-        int start = my_csr_row_ptr[i];
-        int end = my_csr_row_ptr[i + 1];
-        for (int p = start; p < end; ++p) {
-            int j = my_csr_col_ind[p];
-            if (j > i) {  // Count each edge once
-                int8_t Jij = my_csr_J_vals[p];
-                int8_t spin_j = get_spin_packed(j, packed_state);
-                current_energy += Jij * spin_i * spin_j;
+        // Compute initial energy
+        current_energy = 0;
+        for (int i = 0; i < n; i++) {
+            int8_t spin_i = get_spin_packed(i, packed_state);
+            current_energy += my_h_vals[i] * spin_i;
+            int start = my_csr_row_ptr[i];
+            int end = my_csr_row_ptr[i + 1];
+            for (int p = start; p < end; ++p) {
+                int j = my_csr_col_ind[p];
+                if (j > i) {
+                    int8_t Jij = my_csr_J_vals[p];
+                    int8_t spin_j = get_spin_packed(j, packed_state);
+                    current_energy += Jij * spin_i * spin_j;
+                }
             }
         }
+    } else {
+        // ── Continuation chunk: load from persistent buffers ──
+        device const int8_t* src_state = &persistent_state[thread_id * packed_size];
+        for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
+            packed_state[byte_idx] = src_state[byte_idx];
+        }
+
+        device const int8_t* src_de = &persistent_delta_energy[thread_id * n];
+        for (int var = 0; var < n; var++) {
+            delta_energy[var] = src_de[var];
+        }
+
+        rng_state = persistent_rng[thread_id];
+        current_energy = persistent_energy[thread_id];
     }
 
-    // Perform sweeps across beta schedule
-    for (int beta_idx = 0; beta_idx < num_beta_values; beta_idx++) {
+    // Perform sweeps for this chunk's beta range
+    int chunk_end = min(beta_start + beta_count, num_betas);
+    for (int beta_idx = beta_start; beta_idx < chunk_end; beta_idx++) {
         float beta = beta_schedule[beta_idx];
 
         // D-Wave optimization: threshold to skip impossible flips
@@ -252,7 +281,25 @@ kernel void pure_simulated_annealing(
         }
     }
 
-    // Write final state to output (bit-packed)
+    // Persist state for next chunk (always write — the Python side
+    // decides whether there will be a next chunk or not)
+    {
+        device int8_t* dst_state = &persistent_state[thread_id * packed_size];
+        for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
+            dst_state[byte_idx] = packed_state[byte_idx];
+        }
+
+        device int8_t* dst_de = &persistent_delta_energy[thread_id * n];
+        for (int var = 0; var < n; var++) {
+            dst_de[var] = delta_energy[var];
+        }
+
+        persistent_rng[thread_id] = rng_state;
+        persistent_energy[thread_id] = current_energy;
+    }
+
+    // Write final output (always — the Python side reads only after
+    // the last chunk, but writing every time is cheaper than branching)
     device int8_t* output = &final_samples[thread_id * packed_size];
     for (int byte_idx = 0; byte_idx < packed_size; byte_idx++) {
         output[byte_idx] = packed_state[byte_idx];

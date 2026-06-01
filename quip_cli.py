@@ -33,6 +33,20 @@ from shared.version import get_version
 from shared.logging_config import setup_logging
 
 
+def _set_dwave_env(section: Dict[str, Any]) -> None:
+    """Set D-Wave env vars from a config section."""
+    token = section.get("token")
+    if token and "DWAVE_API_KEY" not in os.environ:
+        os.environ["DWAVE_API_KEY"] = token
+        os.environ["DWAVE_API_TOKEN"] = token
+    solver = section.get("solver")
+    if solver and "DWAVE_API_SOLVER" not in os.environ:
+        os.environ["DWAVE_API_SOLVER"] = solver
+    region = section.get("dwave_region_url")
+    if region and "DWAVE_REGION_URL" not in os.environ:
+        os.environ["DWAVE_REGION_URL"] = region
+
+
 def _load_config(path: Optional[str]) -> Dict[str, Any]:
     if not path:
         return {}
@@ -40,25 +54,30 @@ def _load_config(path: Optional[str]) -> Dict[str, Any]:
     with open(path, "rb") as f:
         config = _toml.load(f)
 
-    # Set DWave environment variables from TOML config if present
-    qpu_config = config.get("qpu", {})
-    if "dwave_api_key" in qpu_config:
-        os.environ["DWAVE_API_KEY"] = qpu_config["dwave_api_key"]
-        os.environ["DWAVE_API_TOKEN"] = qpu_config["dwave_api_key"]
-
-    if "dwave_api_solver" in qpu_config:
-        os.environ["DWAVE_API_SOLVER"] = qpu_config["dwave_api_solver"]
-
-    if "dwave_region_url" in qpu_config:
-        os.environ["DWAVE_REGION_URL"] = qpu_config["dwave_region_url"]
+    # Set D-Wave environment variables from [dwave] section if present
+    dwave_config = config.get("dwave", {})
+    if isinstance(dwave_config, dict):
+        _set_dwave_env(dwave_config)
 
     cfg = _merge_globals_from_toml(config)
-    if qpu_config:
-        cfg["qpu"] = qpu_config
-    if "gpu" in config:
-        cfg["gpu"] = config["gpu"]
-    if "cpu" in config:
-        cfg["cpu"] = config["cpu"]
+
+    # Forward miner sections
+    for section in ("cpu", "gpu", "qpu"):
+        if section in config:
+            cfg[section] = config[section]
+
+    # Forward device-type sections (top-level [cuda.N], [metal], [dwave], etc.)
+    _device_sections = (
+        "cuda", "nvidia", "metal", "modal",
+        "dwave", "ibm", "braket", "pasqal", "ionq", "origin",
+    )
+    for section in _device_sections:
+        if section in config:
+            cfg[section] = config[section]
+
+    # Forward telemetry API configuration
+    if "telemetry_api" in config:
+        cfg["telemetry_api"] = config["telemetry_api"]
 
     _print_final_config(cfg, "load_config")
 
@@ -100,6 +119,7 @@ def _apply_global_overrides(conf: Dict[str, Any],
                              listen: Optional[str],
                              port: Optional[int],
                              public_host: Optional[str],
+                             public_port: Optional[int],
                              node_name: Optional[str],
                              secret: Optional[str],
                              auto_mine: Optional[bool],
@@ -110,7 +130,9 @@ def _apply_global_overrides(conf: Dict[str, Any],
                              fanout: Optional[int],
                              log_level: Optional[str] = None,
                              node_log: Optional[str] = None,
-                             http_log: Optional[str] = None) -> Dict[str, Any]:
+                             http_log: Optional[str] = None,
+                             rest_port: Optional[int] = None,
+                             rest_insecure_port: Optional[int] = None) -> Dict[str, Any]:
     c = dict(conf)
     if listen is not None:
         c["listen"] = listen
@@ -118,6 +140,8 @@ def _apply_global_overrides(conf: Dict[str, Any],
         c["port"] = int(port)
     if public_host is not None:
         c["public_host"] = public_host
+    if public_port is not None:
+        c["public_port"] = int(public_port)
     if node_name is not None:
         c["node_name"] = node_name
     if secret is not None:
@@ -140,6 +164,10 @@ def _apply_global_overrides(conf: Dict[str, Any],
         c["node_log"] = node_log
     if http_log is not None:
         c["http_log"] = http_log
+    if rest_port is not None:
+        c["rest_port"] = int(rest_port)
+    if rest_insecure_port is not None:
+        c["rest_insecure_port"] = int(rest_insecure_port)
     return c
 
 
@@ -181,6 +209,10 @@ async def _async_run_network_node(config: Dict[str, Any], genesis_config_file: s
 
 
 def _run_network_node_sync(config: Dict[str, Any], genesis_config_file: str) -> int:
+    # Install uvloop for 2-4x async throughput if available
+    from shared.event_loop import install_uvloop_policy
+    install_uvloop_policy()
+
     try:
         return asyncio.run(_async_run_network_node(config, genesis_config_file))
     except KeyboardInterrupt:
@@ -240,13 +272,14 @@ def quip_network_node(ctx: click.Context, config: Optional[str], version: bool, 
 
 @quip_network_node.command(name="cpu")
 # Global network options
-@click.option("--listen", type=str, default=None, help="Address to bind (defaults from [global].listen or 127.0.0.1)")
+@click.option("--listen", type=str, default=None, help="Address to bind; IPv6 supported (e.g., ::1 or ::). Defaults from [global].listen or 127.0.0.1")
 @click.option("--port", type=int, default=None, help="Port to bind (defaults from [global].port or 20049)")
-@click.option("--public-host", type=str, default=None, help="Public host:port advertised to peers")
+@click.option("--public-host", type=str, default=None, help="Public hostname or IP advertised to peers")
+@click.option("--public-port", type=int, default=None, help="Public port advertised to peers (defaults to --port)")
 @click.option("--node-name", type=str, default=None, help="Human-readable node name")
 @click.option("--secret", type=str, default=None, help="Deterministic secret for keypair")
 @click.option("--auto-mine/--no-auto-mine", default=None, help="Enable/disable auto-mining when no peers found")
-@click.option("--peer", "peers", multiple=True, help="Peer host:port (repeat for multiple)")
+@click.option("--peer", "peers", multiple=True, help="Peer host:port; use [IPv6]:port for IPv6 (repeat for multiple)")
 @click.option("--timeout", type=int, default=None, help="Node/network timeout seconds")
 @click.option("--heartbeat-interval", type=int, default=None, help="Seconds between heartbeats")
 @click.option("--heartbeat-timeout", type=int, default=None, help="Peer heartbeat timeout seconds")
@@ -255,6 +288,9 @@ def quip_network_node(ctx: click.Context, config: Optional[str], version: bool, 
 @click.option("--log-level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), default=None, help="Logging level")
 @click.option("--node-log", type=str, default=None, help="Path to main node log file (defaults to stderr)")
 @click.option("--http-log", type=str, default=None, help="Path to HTTP log file or 'stderr'/'stdout' for console (suppresses aiohttp logs if not set)")
+# REST API options
+@click.option("--rest-port", type=int, default=None, help="REST API HTTPS port (-1 disables, defaults from [global].rest_port or -1)")
+@click.option("--rest-insecure-port", type=int, default=None, help="REST API HTTP port (-1 disables, defaults from [global].rest_insecure_port or 20050)")
 # CPU options
 @click.option("--num-cpus", type=int, default=None, help="Number of CPU miners to spawn (default 1)")
 # Other
@@ -266,6 +302,7 @@ def cpu(
     listen: Optional[str],
     port: Optional[int],
     public_host: Optional[str],
+    public_port: Optional[int],
     node_name: Optional[str],
     secret: Optional[str],
     auto_mine: Optional[bool],
@@ -277,6 +314,8 @@ def cpu(
     log_level: Optional[str],
     node_log: Optional[str],
     http_log: Optional[str],
+    rest_port: Optional[int],
+    rest_insecure_port: Optional[int],
     num_cpus: Optional[int],
     genesis_config: str,
     debug_config: bool,
@@ -289,7 +328,7 @@ def cpu(
     conf.pop("gpu", None)
     conf.pop("qpu", None)
 
-    conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
+    conf = _apply_global_overrides(conf, listen, port, public_host, public_port, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log, rest_port, rest_insecure_port)
 
     # Handle CPU-specific configuration
     cpu_cfg = dict((conf.get("cpu") or {}))
@@ -313,13 +352,14 @@ def cpu(
 
 @quip_network_node.command(name="gpu")
 # Global network options
-@click.option("--listen", type=str, default=None, help="Address to bind (defaults from [global].listen or 127.0.0.1)")
+@click.option("--listen", type=str, default=None, help="Address to bind; IPv6 supported (e.g., ::1 or ::). Defaults from [global].listen or 127.0.0.1")
 @click.option("--port", type=int, default=None, help="Port to bind (defaults from [global].port or 20049)")
-@click.option("--public-host", type=str, default=None, help="Public host:port advertised to peers")
+@click.option("--public-host", type=str, default=None, help="Public hostname or IP advertised to peers")
+@click.option("--public-port", type=int, default=None, help="Public port advertised to peers (defaults to --port)")
 @click.option("--node-name", type=str, default=None, help="Human-readable node name")
 @click.option("--secret", type=str, default=None, help="Deterministic secret for keypair")
 @click.option("--auto-mine/--no-auto-mine", default=None, help="Enable/disable auto-mining when no peers found")
-@click.option("--peer", "peers", multiple=True, help="Peer host:port (repeat for multiple)")
+@click.option("--peer", "peers", multiple=True, help="Peer host:port; use [IPv6]:port for IPv6 (repeat for multiple)")
 @click.option("--timeout", type=int, default=None, help="Node/network timeout seconds")
 @click.option("--heartbeat-interval", type=int, default=None, help="Seconds between heartbeats")
 @click.option("--heartbeat-timeout", type=int, default=None, help="Peer heartbeat timeout seconds")
@@ -328,11 +368,15 @@ def cpu(
 @click.option("--log-level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), default=None, help="Logging level")
 @click.option("--node-log", type=str, default=None, help="Path to main node log file (defaults to stderr)")
 @click.option("--http-log", type=str, default=None, help="Path to HTTP log file or 'stderr'/'stdout' for console (suppresses aiohttp logs if not set)")
+# REST API options
+@click.option("--rest-port", type=int, default=None, help="REST API HTTPS port (-1 disables, defaults from [global].rest_port or -1)")
+@click.option("--rest-insecure-port", type=int, default=None, help="REST API HTTP port (-1 disables, defaults from [global].rest_insecure_port or 20050)")
 # GPU options
 @click.option("--gpu-backend", type=click.Choice(["local", "modal", "mps"], case_sensitive=False), default=None, help="GPU backend: local|modal|mps")
 @click.option("--device", "devices", multiple=True, help="GPU device(s) for local backend (e.g., 0 1)")
 @click.option("--gpu-type", "gpu_types", multiple=True, help="GPU type(s) for modal backend (e.g., t4 a10g)")
 @click.option("--gpu-utilization", type=int, default=100, help="GPU utilization percentage (1-100, default: 100)")
+@click.option("--yielding", is_flag=True, default=False, help="Yield GPU to other processes (NVML-adaptive nonce scaling)")
 # Other
 @click.option("--genesis-config", type=str, default="genesis_block.json", show_default=True, help="Genesis block configuration file")
 @click.option("--debug-config", is_flag=True, help="Print final configuration as JSON")
@@ -342,6 +386,7 @@ def gpu(
     listen: Optional[str],
     port: Optional[int],
     public_host: Optional[str],
+    public_port: Optional[int],
     node_name: Optional[str],
     secret: Optional[str],
     auto_mine: Optional[bool],
@@ -353,10 +398,13 @@ def gpu(
     log_level: Optional[str],
     node_log: Optional[str],
     http_log: Optional[str],
+    rest_port: Optional[int],
+    rest_insecure_port: Optional[int],
     gpu_backend: Optional[str],
     devices: List[str],
     gpu_types: List[str],
     gpu_utilization: int,
+    yielding: bool,
     genesis_config: str,
     debug_config: bool,
 ):
@@ -370,27 +418,33 @@ def gpu(
     conf.pop("qpu", None)
 
     # Apply CLI overrides
-    conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
+    conf = _apply_global_overrides(conf, listen, port, public_host, public_port, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log, rest_port, rest_insecure_port)
 
-    # Handle GPU-specific configuration
+    # Build GPU config from CLI args as top-level device sections.
+    # [gpu] holds global defaults; [cuda.N]/[metal]/[modal] hold devices.
     gpu_cfg = dict((conf.get("gpu") or {}))
-    if gpu_backend is not None:
-        gpu_cfg["backend"] = str(gpu_backend).lower()
-    if devices:
-        gpu_cfg["devices"] = [str(d) for d in devices]
-    if gpu_types:
-        gpu_cfg["types"] = [str(t) for t in gpu_types]
     if gpu_utilization != 100:
-        gpu_cfg["gpu_utilization"] = gpu_utilization
-    if not gpu_cfg:
-        gpu_cfg = {"backend": "local"}
-
-    # Default to device 0 if backend is local and no devices specified
-    backend = gpu_cfg.get("backend", "local")
-    if backend == "local" and "devices" not in gpu_cfg:
-        gpu_cfg["devices"] = ["0"]
-
+        gpu_cfg["utilization"] = gpu_utilization
+    if yielding:
+        gpu_cfg["yielding"] = True
     conf["gpu"] = gpu_cfg
+
+    backend = str(gpu_backend or "cuda").lower()
+    if backend in ("local", "cuda", "nvidia"):
+        dev_list = [str(d) for d in devices] if devices else ["0"]
+        cuda_section = conf.get("cuda") or {}
+        for d in dev_list:
+            if d not in cuda_section:
+                cuda_section[d] = {}
+        conf["cuda"] = cuda_section
+    elif backend == "mps":
+        if "metal" not in conf:
+            conf["metal"] = {}
+    elif backend == "modal":
+        modal_cfg = conf.get("modal") or {}
+        if gpu_types:
+            modal_cfg["gpu_type"] = str(gpu_types[0])
+        conf["modal"] = modal_cfg
 
     # Use genesis config from TOML if CLI option is default and TOML has it
     if genesis_config == "genesis_block.json" and "genesis_config" in conf:
@@ -405,13 +459,14 @@ def gpu(
 
 @quip_network_node.command(name="qpu")
 # Global network options
-@click.option("--listen", type=str, default=None, help="Address to bind (defaults from [global].listen or 127.0.0.1)")
+@click.option("--listen", type=str, default=None, help="Address to bind; IPv6 supported (e.g., ::1 or ::). Defaults from [global].listen or 127.0.0.1")
 @click.option("--port", type=int, default=None, help="Port to bind (defaults from [global].port or 20049)")
-@click.option("--public-host", type=str, default=None, help="Public host:port advertised to peers")
+@click.option("--public-host", type=str, default=None, help="Public hostname or IP advertised to peers")
+@click.option("--public-port", type=int, default=None, help="Public port advertised to peers (defaults to --port)")
 @click.option("--node-name", type=str, default=None, help="Human-readable node name")
 @click.option("--secret", type=str, default=None, help="Deterministic secret for keypair")
 @click.option("--auto-mine/--no-auto-mine", default=None, help="Enable/disable auto-mining when no peers found")
-@click.option("--peer", "peers", multiple=True, help="Peer host:port (repeat for multiple)")
+@click.option("--peer", "peers", multiple=True, help="Peer host:port; use [IPv6]:port for IPv6 (repeat for multiple)")
 @click.option("--timeout", type=int, default=None, help="Node/network timeout seconds")
 @click.option("--heartbeat-interval", type=int, default=None, help="Seconds between heartbeats")
 @click.option("--heartbeat-timeout", type=int, default=None, help="Peer heartbeat timeout seconds")
@@ -420,10 +475,15 @@ def gpu(
 @click.option("--log-level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), default=None, help="Logging level")
 @click.option("--node-log", type=str, default=None, help="Path to main node log file (defaults to stderr)")
 @click.option("--http-log", type=str, default=None, help="Path to HTTP log file or 'stderr'/'stdout' for console (suppresses aiohttp logs if not set)")
+# REST API options
+@click.option("--rest-port", type=int, default=None, help="REST API HTTPS port (-1 disables, defaults from [global].rest_port or -1)")
+@click.option("--rest-insecure-port", type=int, default=None, help="REST API HTTP port (-1 disables, defaults from [global].rest_insecure_port or 20050)")
 # QPU options
 @click.option("--dwave-api-key", type=str, default=None, help="D-Wave API key")
 @click.option("--dwave-api-solver", type=str, default=None, help="D-Wave solver name")
 @click.option("--dwave-region-url", type=str, default=None, help="D-Wave SAPI region endpoint URL")
+# QPU time budget options
+@click.option("--qpu-daily-budget", type=str, default=None, help="Daily QPU time budget (e.g., 40s, 2m) - calculate from your Leap allocation")
 # Other
 @click.option("--genesis-config", type=str, default="genesis_block.json", show_default=True, help="Genesis block configuration file")
 @click.option("--debug-config", is_flag=True, help="Print final configuration as JSON")
@@ -433,6 +493,7 @@ def qpu(
     listen: Optional[str],
     port: Optional[int],
     public_host: Optional[str],
+    public_port: Optional[int],
     node_name: Optional[str],
     secret: Optional[str],
     auto_mine: Optional[bool],
@@ -444,9 +505,12 @@ def qpu(
     log_level: Optional[str],
     node_log: Optional[str],
     http_log: Optional[str],
+    rest_port: Optional[int],
+    rest_insecure_port: Optional[int],
     dwave_api_key: Optional[str],
     dwave_api_solver: Optional[str],
     dwave_region_url: Optional[str],
+    qpu_daily_budget: Optional[str],
     genesis_config: str,
     debug_config: bool,
 ):
@@ -459,38 +523,31 @@ def qpu(
     conf.pop("cpu", None)
 
     # Apply CLI overrides
-    conf = _apply_global_overrides(conf, listen, port, public_host, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log)
+    conf = _apply_global_overrides(conf, listen, port, public_host, public_port, node_name, secret, auto_mine, list(peers) or None, timeout, heartbeat_interval, heartbeat_timeout, fanout, log_level, node_log, http_log, rest_port, rest_insecure_port)
 
-    # Handle QPU-specific configuration
-    qpu_cfg = dict((conf.get("qpu") or {}))
+    # Build QPU config — CLI args populate a [dwave] section.
+    dwave_cfg = dict(conf.get("dwave") or {})
 
-    # Set environment variables from CLI arguments
     if dwave_api_key is not None:
-        qpu_cfg["dwave_api_key"] = dwave_api_key
-        # Set environment variable for child processes
+        dwave_cfg["token"] = dwave_api_key
         os.environ["DWAVE_API_KEY"] = dwave_api_key
         os.environ["DWAVE_API_TOKEN"] = dwave_api_key
     if dwave_api_solver is not None:
-        qpu_cfg["dwave_api_solver"] = dwave_api_solver
-        # Set environment variable for child processes
+        dwave_cfg["solver"] = dwave_api_solver
         os.environ["DWAVE_API_SOLVER"] = dwave_api_solver
     if dwave_region_url is not None:
-        qpu_cfg["dwave_region_url"] = dwave_region_url
-        # Set environment variable for child processes
+        dwave_cfg["dwave_region_url"] = dwave_region_url
         os.environ["DWAVE_REGION_URL"] = dwave_region_url
+    if qpu_daily_budget is not None:
+        dwave_cfg["daily_budget"] = qpu_daily_budget
 
-    # Ensure environment variables are set from TOML config values (if not already set by CLI)
-    if "dwave_api_key" in qpu_cfg and "DWAVE_API_KEY" not in os.environ:
-        os.environ["DWAVE_API_KEY"] = qpu_cfg["dwave_api_key"]
-        os.environ["DWAVE_API_TOKEN"] = qpu_cfg["dwave_api_key"]
-    if "dwave_api_solver" in qpu_cfg and "DWAVE_API_SOLVER" not in os.environ:
-        os.environ["DWAVE_API_SOLVER"] = qpu_cfg["dwave_api_solver"]
-    if "dwave_region_url" in qpu_cfg and "DWAVE_REGION_URL" not in os.environ:
-        os.environ["DWAVE_REGION_URL"] = qpu_cfg["dwave_region_url"]
+    # Ensure env vars are set from TOML
+    _set_dwave_env(dwave_cfg)
 
-    if not qpu_cfg:
-        qpu_cfg = {}
-    conf["qpu"] = qpu_cfg
+    conf["dwave"] = dwave_cfg
+    # Ensure [qpu] exists so _initialize_miners detects QPU mode
+    if "qpu" not in conf:
+        conf["qpu"] = {}
 
     # Use genesis config from TOML if CLI option is default and TOML has it
     if genesis_config == "genesis_block.json" and "genesis_config" in conf:
@@ -557,22 +614,42 @@ def quip_network_simulator(ctx: click.Context, scenario: str, num_cpu: Optional[
 
     processes = []
 
-    def _cmd_for(kind: str, port: int, peer: Optional[str]) -> list[str]:
-        base = ["quip-network-node", kind, "--port", str(port)]
+    def _cmd_for(kind: str, port: int, peer: Optional[str], rest_port: int) -> list[str]:
+        # Pin both listen and public-host to 127.0.0.1: avoids public-IP
+        # auto-detection (which causes children to advertise themselves on
+        # the host's NAT'd public address and then fail JOINs against real
+        # mainnet peers from the genesis config).
+        base = [
+            "quip-network-node", kind,
+            "--listen", "127.0.0.1",
+            "--port", str(port),
+            "--public-host", "127.0.0.1",
+            "--rest-insecure-port", str(rest_port),
+        ]
         if peer:
             base += ["--peer", peer]
         return base
 
+    # Assign each child a unique REST HTTP port so they don't collide on
+    # the default 20050. Offset by index so the mapping is stable: the
+    # child on QUIC port base_port + i gets REST on 20050 + i.
+    rest_base = 20050
+
     # Build command list
     peer_addr = None
+    child_index = 0
     for kind, count in order:
         for _ in range(count):
+            rest_port = rest_base + child_index
             if kind == bootstrap_kind and peer_addr is None:
-                cmds.append(_cmd_for(kind, port, None))
-                peer_addr = f"localhost:{port}"
+                cmds.append(_cmd_for(kind, port, None, rest_port))
+                # Use the loopback literal so name resolution doesn't
+                # accidentally pick ::1 before the v4 listener binds.
+                peer_addr = f"127.0.0.1:{port}"
             else:
-                cmds.append(_cmd_for(kind, port, peer_addr))
+                cmds.append(_cmd_for(kind, port, peer_addr, rest_port))
             port += 1
+            child_index += 1
 
     # Print commands
     for c in cmds:
@@ -646,39 +723,6 @@ def network_node_main():
     multiprocessing.set_start_method('spawn', force=True)
 
     quip_network_node(standalone_mode=False)
-
-# -----------------------------
-# quip-node-stats (experimental)
-# -----------------------------
-
-@click.command()
-@click.option("--config", type=click.Path(exists=True, dir_okay=False), help="Path to TOML config file")
-@click.option("--interval", type=float, default=5.0, help="Seconds between stats prints")
-@click.pass_context
-def quip_node_stats(_: click.Context, config: Optional[str], interval: float):
-    """Run a single in-process node and periodically print stats to stdout.
-
-    This is an experimental helper that constructs Node directly from TOML config
-    and prints Node.get_stats() every --interval seconds. Ctrl-C to stop.
-    """
-    # Set multiprocessing start method to 'spawn' to avoid context mixing issues
-    multiprocessing.set_start_method('spawn', force=True)
-
-    cfg = _load_config(config)
-    miners_config = cfg or {}
-    genesis_block=load_genesis_block(cfg.get("genesis_config", "genesis_block.json"))
-    node = Node(node_id="stats-node", miners_config=miners_config, genesis_block=genesis_block)
-    click.echo("Starting stats loop (Ctrl-C to stop)...")
-    try:
-        while True:
-            stats = node.get_stats()
-            click.echo(json.dumps(stats, indent=2))
-            time.sleep(interval)
-    except KeyboardInterrupt:
-        click.echo("Stopping...")
-    finally:
-        node.close()
-
 
 def network_simulator_main():
     # Set multiprocessing start method to 'spawn' to avoid context mixing issues

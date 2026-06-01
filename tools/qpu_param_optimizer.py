@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""QPU parameter optimization tool for finding optimal annealing_time and num_reads.
+"""QPU parameter optimization tool for finding optimal QPU parameters.
 
 This tool systematically tests different parameter combinations to find optimal
 settings for minimizing Ising model energies on D-Wave Advantage2 quantum annealers.
+
+Supports multi-solver discovery and sweeps of: annealing_time, num_reads,
+chain_strength_multiplier, reduce_intersample_correlation, reinitialize_state.
 """
 import argparse
 import csv
@@ -11,9 +14,14 @@ import os
 import statistics
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Mapping, Optional, Tuple, cast
+from typing import Any as AnyType
+from typing import Tuple as TupleType
+
+import numpy as np
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -30,9 +38,6 @@ try:
 except ImportError:
     QPU_AVAILABLE = False
 
-from dataclasses import dataclass
-from typing import cast, Mapping, Tuple as TupleType, Any as AnyType
-
 
 class QuotaExhaustedError(Exception):
     """Raised when D-Wave solver quota is exhausted."""
@@ -43,6 +48,48 @@ def is_quota_exhausted_error(error: Exception) -> bool:
     """Check if an exception indicates quota exhaustion."""
     error_str = str(error).lower()
     return "insufficient remaining solver access time" in error_str
+
+
+DWAVE_REGIONS = ['na-west-1', 'na-east-1', 'eu-central-1']
+
+
+def discover_qpu_solvers(
+    regions: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Discover all available QPU solvers across D-Wave regions."""
+    from dwave.cloud import Client
+
+    if regions is None:
+        regions = DWAVE_REGIONS
+
+    qpu_solvers = []
+    seen_names: set = set()
+
+    for region in regions:
+        try:
+            with Client.from_config(region=region) as client:
+                solvers = client.get_solvers()
+        except Exception as e:
+            print(f"  Warning: Could not query region {region}: {e}")
+            continue
+
+        for solver in solvers:
+            props = solver.properties
+            if props.get('category', '') != 'qpu':
+                continue
+            name = solver.name
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            qpu_solvers.append({
+                'name': name,
+                'num_qubits': props.get('num_qubits', 0),
+                'topology_type': props.get('topology', {}).get('type', 'unknown'),
+                'chip_id': props.get('chip_id', name),
+                'region': region,
+            })
+
+    return qpu_solvers
 
 
 @dataclass
@@ -56,31 +103,63 @@ class PendingJob:
     num_reads: int
     annealing_time: float
     test_id: str
+    solver_name: str = ""
+    chain_strength_multiplier: float = 1.5
+    reduce_intersample_correlation: Optional[bool] = None
+    reinitialize_state: Optional[bool] = None
 
 
-# CSV column names
+# CSV column names (extended with new parameter columns)
 CSV_COLUMNS = [
-    'test_id', 'ising_seed', 'start_time', 'end_time', 'annealing_time', 'num_reads',
+    'solver_name',
+    'test_id', 'ising_seed', 'start_time', 'end_time',
+    'annealing_time', 'num_reads',
+    'chain_strength_multiplier',
+    'reduce_intersample_correlation',
+    'reinitialize_state',
     'min_energy', '5_smallest_energy_mean', '5_smallest_energy_median',
-    '5_smallest_energy_stdev', '5_smallest_energy_variance', 'diversity', 'qpu_time'
+    '5_smallest_energy_stdev', '5_smallest_energy_variance',
+    'diversity', 'qpu_time',
+    'chain_break_fraction',
 ]
 
 # Fixed seeds for reproducibility - same 1024 seeds used for ALL configurations
 FIXED_SEEDS = list(range(1024))
 
 
-def generate_test_id(num_reads: int, annealing_time: float) -> str:
+def generate_test_id(
+    num_reads: int,
+    annealing_time: float,
+    chain_strength_mult: float = 1.5,
+    reduce_intersample: Optional[bool] = None,
+    reinitialize: Optional[bool] = None,
+) -> str:
     """Generate parseable test_id from parameters.
 
-    Uses integer annealing_time since we snap to round step values.
+    Appends non-default parameter tags to keep old IDs compatible.
     """
-    return f"quip_{num_reads}sweep_{int(round(annealing_time))}time"
+    base = f"quip_{num_reads}sweep_{int(round(annealing_time))}time"
+    if chain_strength_mult != 1.5:
+        base += f"_cs{int(round(chain_strength_mult * 10))}"
+    if reduce_intersample is not None:
+        base += f"_ric{int(reduce_intersample)}"
+    if reinitialize is not None:
+        base += f"_rs{int(reinitialize)}"
+    return base
 
 
 def parse_test_id(test_id: str) -> Tuple[int, float]:
-    """Parse test_id to extract num_reads and annealing_time."""
-    # Pattern: quip_{num_reads}sweep_{annealing_time}time
-    parts = test_id.replace('quip_', '').replace('time', '').split('sweep_')
+    """Parse test_id to extract num_reads and annealing_time.
+
+    Handles both old format (quip_32sweep_10time) and new format with suffixes.
+    """
+    # Strip known suffixes before parsing base
+    base = test_id
+    for suffix_prefix in ('_cs', '_ric', '_rs'):
+        idx = base.find(suffix_prefix)
+        if idx != -1:
+            base = base[:idx]
+    parts = base.replace('quip_', '').replace('time', '').split('sweep_')
     num_reads = int(parts[0])
     annealing_time = float(parts[1])
     return num_reads, annealing_time
@@ -89,11 +168,26 @@ def parse_test_id(test_id: str) -> Tuple[int, float]:
 def normalize_test_id(test_id: str) -> str:
     """Normalize a test_id to current format (integer annealing_time).
 
-    Converts old format like 'quip_32sweep_10.5time' to 'quip_32sweep_10time'.
+    Preserves suffix tags (_cs, _ric, _rs) while normalizing the base.
     """
     try:
-        num_reads, annealing_time = parse_test_id(test_id)
-        return generate_test_id(num_reads, annealing_time)
+        # Extract suffix tags
+        suffix = ""
+        base = test_id
+        for suffix_prefix in ('_cs', '_ric', '_rs'):
+            idx = base.find(suffix_prefix)
+            if idx != -1:
+                suffix += base[idx:]
+                base = base[:idx]
+                break  # suffixes are contiguous after the base
+        # Re-extract suffix from remaining if multiple
+        if suffix:
+            # All suffixes are in the suffix string already
+            pass
+
+        num_reads, annealing_time = parse_test_id(base)
+        normalized_base = f"quip_{num_reads}sweep_{int(round(annealing_time))}time"
+        return normalized_base + suffix
     except (ValueError, IndexError):
         return test_id  # Return unchanged if can't parse
 
@@ -266,7 +360,11 @@ def submit_async_job(
     ising_seed: int,
     num_reads: int,
     annealing_time: float,
-    test_id: str
+    test_id: str,
+    solver_name: str = "",
+    chain_strength_multiplier: float = 1.5,
+    reduce_intersample_correlation: Optional[bool] = None,
+    reinitialize_state: Optional[bool] = None,
 ) -> PendingJob:
     """Submit a single QPU job asynchronously.
 
@@ -278,13 +376,20 @@ def submit_async_job(
     h_cast = cast(Mapping[AnyType, float], h)
     J_cast = cast(Mapping[TupleType[AnyType, AnyType], float], J)
 
+    # Build sample kwargs
+    sample_kwargs: Dict[str, Any] = {
+        'num_reads': num_reads,
+        'annealing_time': annealing_time,
+        'answer_mode': 'raw',
+        'chain_strength_multiplier': chain_strength_multiplier,
+    }
+    if reduce_intersample_correlation is not None:
+        sample_kwargs['reduce_intersample_correlation'] = reduce_intersample_correlation
+    if reinitialize_state is not None:
+        sample_kwargs['reinitialize_state'] = reinitialize_state
+
     # Submit asynchronously (non-blocking)
-    future = sampler.sample_ising_async(
-        h_cast, J_cast,
-        num_reads=num_reads,
-        annealing_time=annealing_time,
-        answer_mode='raw'
-    )
+    future = sampler.sample_ising_async(h_cast, J_cast, **sample_kwargs)
 
     return PendingJob(
         future=future,
@@ -294,7 +399,11 @@ def submit_async_job(
         submit_time=time.time(),
         num_reads=num_reads,
         annealing_time=annealing_time,
-        test_id=test_id
+        test_id=test_id,
+        solver_name=solver_name,
+        chain_strength_multiplier=chain_strength_multiplier,
+        reduce_intersample_correlation=reduce_intersample_correlation,
+        reinitialize_state=reinitialize_state,
     )
 
 
@@ -336,20 +445,30 @@ def process_completed_job(job: PendingJob) -> Dict[str, Any]:
         timing = sampleset.info['timing']
         qpu_time = timing.get('qpu_access_time', 0.0)
 
+    # Chain break fraction (only meaningful for embedded problems)
+    chain_break_fraction = 0.0
+    if hasattr(sampleset, 'record') and 'chain_break_fraction' in sampleset.record.dtype.names:
+        chain_break_fraction = float(np.mean(sampleset.record.chain_break_fraction))
+
     return {
+        'solver_name': job.solver_name,
         'test_id': job.test_id,
         'ising_seed': job.ising_seed,
         'start_time': start_time_iso,
         'end_time': end_time,
         'annealing_time': job.annealing_time,
         'num_reads': job.num_reads,
+        'chain_strength_multiplier': job.chain_strength_multiplier,
+        'reduce_intersample_correlation': job.reduce_intersample_correlation if job.reduce_intersample_correlation is not None else '',
+        'reinitialize_state': job.reinitialize_state if job.reinitialize_state is not None else '',
         'min_energy': min_energy,
         '5_smallest_energy_mean': five_mean,
         '5_smallest_energy_median': five_median,
         '5_smallest_energy_stdev': five_stdev,
         '5_smallest_energy_variance': five_variance,
         'diversity': diversity,
-        'qpu_time': qpu_time
+        'qpu_time': qpu_time,
+        'chain_break_fraction': chain_break_fraction,
     }
 
 
@@ -363,7 +482,11 @@ def run_configuration(
     completed: set,
     solver_props: Dict[str, Any],
     num_ising_models: int = 1024,
-    queue_depth: int = 30
+    queue_depth: int = 30,
+    solver_name: str = "",
+    chain_strength_multiplier: float = 1.5,
+    reduce_intersample_correlation: Optional[bool] = None,
+    reinitialize_state: Optional[bool] = None,
 ) -> List[float]:
     """Run all Ising models for a single configuration using streaming.
 
@@ -371,7 +494,12 @@ def run_configuration(
 
     Returns list of min_energies for statistical analysis.
     """
-    test_id = generate_test_id(num_reads, annealing_time)
+    test_id = generate_test_id(
+        num_reads, annealing_time,
+        chain_strength_mult=chain_strength_multiplier,
+        reduce_intersample=reduce_intersample_correlation,
+        reinitialize=reinitialize_state,
+    )
     min_energies = []
 
     # Validate configuration fits within QPU runtime limits
@@ -407,7 +535,11 @@ def run_configuration(
         seed = seeds_to_run[seed_index]
         try:
             job = submit_async_job(
-                sampler, nodes, edges, seed, num_reads, annealing_time, test_id
+                sampler, nodes, edges, seed, num_reads, annealing_time, test_id,
+                solver_name=solver_name,
+                chain_strength_multiplier=chain_strength_multiplier,
+                reduce_intersample_correlation=reduce_intersample_correlation,
+                reinitialize_state=reinitialize_state,
             )
             pending_jobs[job.future] = job
             seed_index += 1
@@ -444,10 +576,12 @@ def run_configuration(
             min_energies.append(result['min_energy'])
 
             # Print details for each test
+            cbf = result.get('chain_break_fraction', 0.0)
             print(f"    [{completed_count:4d}/{total_to_run}] seed={job.ising_seed:4d} | "
                   f"min_E={result['min_energy']:8.1f} | "
                   f"5best_mean={result['5_smallest_energy_mean']:8.1f} | "
                   f"diversity={result['diversity']:.3f} | "
+                  f"cbf={cbf:.3f} | "
                   f"qpu_time={result['qpu_time']/1000:.1f}ms | "
                   f"in_flight={len(pending_jobs)}")
 
@@ -468,7 +602,11 @@ def run_configuration(
             seed = seeds_to_run[seed_index]
             try:
                 new_job = submit_async_job(
-                    sampler, nodes, edges, seed, num_reads, annealing_time, test_id
+                    sampler, nodes, edges, seed, num_reads, annealing_time, test_id,
+                    solver_name=solver_name,
+                    chain_strength_multiplier=chain_strength_multiplier,
+                    reduce_intersample_correlation=reduce_intersample_correlation,
+                    reinitialize_state=reinitialize_state,
                 )
                 pending_jobs[new_job.future] = new_job
                 seed_index += 1
@@ -791,7 +929,8 @@ def run_extra_annealing_times(
     extra_times: List[float],
     num_reads: int,
     num_ising_models: int = 1024,
-    queue_depth: int = 30
+    queue_depth: int = 30,
+    solver_name: str = "",
 ):
     """Run specific annealing time values (spot checks)."""
     print("\n" + "="*60)
@@ -804,45 +943,228 @@ def run_extra_annealing_times(
         run_configuration(
             sampler, nodes, edges,
             num_reads, annealing_time,
-            csv_path, completed, solver_props, num_ising_models, queue_depth
+            csv_path, completed, solver_props, num_ising_models, queue_depth,
+            solver_name=solver_name,
         )
         # Reload completed after each config to ensure recovery works
         completed.update(load_completed_tests(csv_path))
 
 
-def run_optimization(
-    output_file: str,
+def phase6_chain_strength_sweep(
+    sampler: DWaveSamplerWrapper,
+    nodes: List[int],
+    edges: List[Tuple[int, int]],
+    solver_props: Dict[str, Any],
+    csv_path: str,
+    completed: set,
+    best_annealing_time: float,
+    best_num_reads: int,
+    num_ising_models: int = 1024,
+    queue_depth: int = 30,
+    solver_name: str = "",
+    chain_strength_multipliers: Optional[List[float]] = None,
+) -> Tuple[float, List[float]]:
+    """Phase 6: Sweep chain_strength_multiplier with best annealing_time/num_reads.
+
+    Auto-skips if sampler has no embedding (native hardware, no chains).
+
+    Returns: (best_multiplier, energies at best point)
+    """
+    print("\n" + "="*60)
+    print("PHASE 6: Chain Strength Sweep")
+    print(f"  Fixed annealing_time: {best_annealing_time} us")
+    print(f"  Fixed num_reads: {best_num_reads}")
+    print("="*60)
+
+    if sampler.embedding is None:
+        print("  SKIPPED: No embedding (native hardware) — chain strength is irrelevant")
+        return 1.5, []
+
+    if chain_strength_multipliers is None:
+        chain_strength_multipliers = [0.5, 1.0, 1.5, 2.0, 3.0, 5.0]
+
+    print(f"  Multipliers to test: {chain_strength_multipliers}")
+
+    best_mult = 1.5
+    best_energies: List[float] = []
+
+    for mult in chain_strength_multipliers:
+        print(f"\n  --- chain_strength_multiplier = {mult} ---")
+        energies = run_configuration(
+            sampler, nodes, edges,
+            best_num_reads, best_annealing_time,
+            csv_path, completed, solver_props, num_ising_models, queue_depth,
+            solver_name=solver_name,
+            chain_strength_multiplier=mult,
+        )
+
+        if energies:
+            if not best_energies or statistics.mean(energies) < statistics.mean(best_energies):
+                best_mult = mult
+                best_energies = energies
+
+    print(f"\n  Best chain_strength_multiplier: {best_mult}")
+    if best_energies:
+        print(f"  Best avg min_energy: {statistics.mean(best_energies):.1f}")
+
+    return best_mult, best_energies
+
+
+def phase7_intersample_correlation(
+    sampler: DWaveSamplerWrapper,
+    nodes: List[int],
+    edges: List[Tuple[int, int]],
+    solver_props: Dict[str, Any],
+    csv_path: str,
+    completed: set,
+    best_annealing_time: float,
+    best_num_reads: int,
+    num_ising_models: int = 1024,
+    queue_depth: int = 30,
+    solver_name: str = "",
+) -> Tuple[Optional[bool], List[float]]:
+    """Phase 7: Test reduce_intersample_correlation (False vs True).
+
+    Returns: (best_setting, energies at best point)
+    """
+    print("\n" + "="*60)
+    print("PHASE 7: reduce_intersample_correlation")
+    print(f"  Fixed annealing_time: {best_annealing_time} us")
+    print(f"  Fixed num_reads: {best_num_reads}")
+    print("="*60)
+
+    # Check solver support
+    supported_params = solver_props.get('parameters', {})
+    if not isinstance(supported_params, dict):
+        supported_params = {}
+    # Also check raw properties for parameter support
+    raw_params = sampler.properties.get('parameters', {})
+    if 'reduce_intersample_correlation' not in raw_params:
+        print("  SKIPPED: Solver does not support reduce_intersample_correlation")
+        return None, []
+
+    best_setting: Optional[bool] = None
+    best_energies: List[float] = []
+
+    for setting in [False, True]:
+        print(f"\n  --- reduce_intersample_correlation = {setting} ---")
+        energies = run_configuration(
+            sampler, nodes, edges,
+            best_num_reads, best_annealing_time,
+            csv_path, completed, solver_props, num_ising_models, queue_depth,
+            solver_name=solver_name,
+            reduce_intersample_correlation=setting,
+        )
+
+        if energies:
+            if not best_energies or statistics.mean(energies) < statistics.mean(best_energies):
+                best_setting = setting
+                best_energies = energies
+
+    print(f"\n  Best reduce_intersample_correlation: {best_setting}")
+    if best_energies:
+        print(f"  Best avg min_energy: {statistics.mean(best_energies):.1f}")
+
+    return best_setting, best_energies
+
+
+def phase8_reinitialize_state(
+    sampler: DWaveSamplerWrapper,
+    nodes: List[int],
+    edges: List[Tuple[int, int]],
+    solver_props: Dict[str, Any],
+    csv_path: str,
+    completed: set,
+    best_annealing_time: float,
+    best_num_reads: int,
+    num_ising_models: int = 1024,
+    queue_depth: int = 30,
+    solver_name: str = "",
+) -> Tuple[Optional[bool], List[float]]:
+    """Phase 8: Test reinitialize_state (False vs True).
+
+    Returns: (best_setting, energies at best point)
+    """
+    print("\n" + "="*60)
+    print("PHASE 8: reinitialize_state")
+    print(f"  Fixed annealing_time: {best_annealing_time} us")
+    print(f"  Fixed num_reads: {best_num_reads}")
+    print("="*60)
+
+    # Check solver support
+    raw_params = sampler.properties.get('parameters', {})
+    if 'reinitialize_state' not in raw_params:
+        print("  SKIPPED: Solver does not support reinitialize_state")
+        return None, []
+
+    best_setting: Optional[bool] = None
+    best_energies: List[float] = []
+
+    for setting in [False, True]:
+        print(f"\n  --- reinitialize_state = {setting} ---")
+        energies = run_configuration(
+            sampler, nodes, edges,
+            best_num_reads, best_annealing_time,
+            csv_path, completed, solver_props, num_ising_models, queue_depth,
+            solver_name=solver_name,
+            reinitialize_state=setting,
+        )
+
+        if energies:
+            if not best_energies or statistics.mean(energies) < statistics.mean(best_energies):
+                best_setting = setting
+                best_energies = energies
+
+    print(f"\n  Best reinitialize_state: {best_setting}")
+    if best_energies:
+        print(f"  Best avg min_energy: {statistics.mean(best_energies):.1f}")
+
+    return best_setting, best_energies
+
+
+def estimate_total_configs(skip_phases: List[int]) -> int:
+    """Estimate total number of configurations across all phases."""
+    configs = 0
+    if 2 not in skip_phases:
+        configs += 8   # ~8 annealing_time steps
+    if 3 not in skip_phases:
+        configs += 7   # 7 num_reads values
+    if 4 not in skip_phases:
+        configs += 6   # ~6 diagonal pairs
+    if 5 not in skip_phases:
+        configs += 3   # 3 max validation tests
+    if 6 not in skip_phases:
+        configs += 6   # 6 chain_strength_multiplier values
+    if 7 not in skip_phases:
+        configs += 2   # 2 reduce_intersample_correlation values
+    if 8 not in skip_phases:
+        configs += 2   # 2 reinitialize_state values
+    return configs
+
+
+def run_solver_optimization(
+    sampler: DWaveSamplerWrapper,
+    csv_path: str,
+    solver_display_name: str,
     num_ising_models: int = 1024,
     baseline_num_reads: int = 32,
     improvement_threshold: float = 0.01,
     skip_phases: Optional[List[int]] = None,
     queue_depth: int = 30,
-    extra_annealing_times: Optional[List[float]] = None
-):
-    """Run the full parameter optimization workflow."""
-    print("=" * 60)
-    print("QPU Parameter Optimization Tool")
-    print("=" * 60)
+    extra_annealing_times: Optional[List[float]] = None,
+    solver_name: str = "",
+    chain_strength_multipliers: Optional[List[float]] = None,
+) -> Dict[str, Any]:
+    """Run the full parameter optimization workflow for a single solver.
 
-    if not QPU_AVAILABLE:
-        print("ERROR: QPU not available (dwave-system not installed)")
-        return None
-
-    # Initialize sampler
-    print("\nInitializing QPU sampler...")
-    try:
-        sampler = DWaveSamplerWrapper()
-        print(f"  Sampler ready: {len(sampler.nodes)} nodes, {len(sampler.edges)} edges")
-    except Exception as e:
-        print(f"ERROR: Failed to initialize sampler: {e}")
-        return None
-
+    Returns dict with best parameters and stats.
+    """
     nodes = sampler.nodes
     edges = sampler.edges
 
     # Phase 1: Get solver properties
     print("\n" + "="*60)
-    print("PHASE 1: Parameter Range Discovery")
+    print(f"PHASE 1: Parameter Range Discovery [{solver_display_name}]")
     print("="*60)
 
     solver_props = get_solver_properties(sampler)
@@ -852,114 +1174,262 @@ def run_optimization(
     print(f"  Annealing time range: {solver_props['annealing_time_range']} us")
     print(f"  Num reads range: {solver_props['num_reads_range']}")
     print(f"  Default annealing time: {solver_props['default_annealing_time']} us")
+    print(f"  Embedding: {'yes' if sampler.embedding else 'no (native)'}")
+
+    # Show supported new parameters
+    raw_params = sampler.properties.get('parameters', {})
+    for param in ['reduce_intersample_correlation', 'reinitialize_state']:
+        supported = param in raw_params
+        print(f"  {param}: {'supported' if supported else 'not supported'}")
 
     # Load completed tests for recovery
-    completed = load_completed_tests(output_file)
+    completed = load_completed_tests(csv_path)
     if completed:
-        print(f"\n  Recovered {len(completed)} completed tests from {output_file}")
+        print(f"\n  Recovered {len(completed)} completed tests from {csv_path}")
 
     skip_phases = skip_phases or []
 
-    try:
-        # Phase 2: X-axis sweep
-        best_annealing_time = solver_props['default_annealing_time']
-        if 2 not in skip_phases:
-            best_annealing_time, _ = phase2_xaxis_sweep(
-                sampler, nodes, edges, solver_props, output_file, completed,
-                num_ising_models, baseline_num_reads, improvement_threshold, queue_depth
+    # Phase 2: X-axis sweep
+    best_annealing_time = solver_props['default_annealing_time']
+    if 2 not in skip_phases:
+        best_annealing_time, _ = phase2_xaxis_sweep(
+            sampler, nodes, edges, solver_props, csv_path, completed,
+            num_ising_models, baseline_num_reads, improvement_threshold, queue_depth
+        )
+        completed = load_completed_tests(csv_path)
+
+    # Extra annealing times (spot checks) - runs after Phase 2
+    if extra_annealing_times:
+        run_extra_annealing_times(
+            sampler, nodes, edges, solver_props, csv_path, completed,
+            extra_annealing_times, baseline_num_reads, num_ising_models,
+            queue_depth, solver_name=solver_name,
+        )
+        completed = load_completed_tests(csv_path)
+
+    # Phase 3: Y-axis sweep
+    best_num_reads = baseline_num_reads
+    if 3 not in skip_phases:
+        best_num_reads, _ = phase3_yaxis_sweep(
+            sampler, nodes, edges, solver_props, csv_path, completed,
+            best_annealing_time, num_ising_models, improvement_threshold, queue_depth
+        )
+        completed = load_completed_tests(csv_path)
+
+    # Phase 4: Diagonal sweep
+    if 4 not in skip_phases:
+        diag_time, diag_reads, diag_energies = phase4_diagonal_sweep(
+            sampler, nodes, edges, solver_props, csv_path, completed,
+            num_ising_models, improvement_threshold, queue_depth
+        )
+        if diag_energies:
+            print(f"  Diagonal best: time={diag_time}, reads={diag_reads}")
+        completed = load_completed_tests(csv_path)
+
+    # Phase 5: MAX validation
+    if 5 not in skip_phases:
+        phase5_max_validation(
+            sampler, nodes, edges, solver_props, csv_path, completed,
+            best_annealing_time, best_num_reads, num_ising_models, queue_depth
+        )
+        completed = load_completed_tests(csv_path)
+
+    # Phase 6: Chain strength sweep
+    best_chain_mult = 1.5
+    if 6 not in skip_phases:
+        best_chain_mult, _ = phase6_chain_strength_sweep(
+            sampler, nodes, edges, solver_props, csv_path, completed,
+            best_annealing_time, best_num_reads, num_ising_models, queue_depth,
+            solver_name=solver_name,
+            chain_strength_multipliers=chain_strength_multipliers,
+        )
+        completed = load_completed_tests(csv_path)
+
+    # Phase 7: reduce_intersample_correlation
+    best_ric = None
+    if 7 not in skip_phases:
+        best_ric, _ = phase7_intersample_correlation(
+            sampler, nodes, edges, solver_props, csv_path, completed,
+            best_annealing_time, best_num_reads, num_ising_models, queue_depth,
+            solver_name=solver_name,
+        )
+        completed = load_completed_tests(csv_path)
+
+    # Phase 8: reinitialize_state
+    best_rs = None
+    if 8 not in skip_phases:
+        best_rs, _ = phase8_reinitialize_state(
+            sampler, nodes, edges, solver_props, csv_path, completed,
+            best_annealing_time, best_num_reads, num_ising_models, queue_depth,
+            solver_name=solver_name,
+        )
+
+    # Summary for this solver
+    print("\n" + "="*60)
+    print(f"OPTIMIZATION COMPLETE [{solver_display_name}]")
+    print("="*60)
+    print(f"  Best annealing_time: {best_annealing_time} us")
+    print(f"  Best num_reads: {best_num_reads}")
+    print(f"  Best chain_strength_multiplier: {best_chain_mult}")
+    print(f"  Best reduce_intersample_correlation: {best_ric}")
+    print(f"  Best reinitialize_state: {best_rs}")
+    print(f"  Results saved to: {csv_path}")
+
+    final_completed = load_completed_tests(csv_path)
+    print(f"  Total tests completed: {len(final_completed)}")
+
+    return {
+        'solver_name': solver_display_name,
+        'best_annealing_time': best_annealing_time,
+        'best_num_reads': best_num_reads,
+        'best_chain_strength_multiplier': best_chain_mult,
+        'best_reduce_intersample_correlation': best_ric,
+        'best_reinitialize_state': best_rs,
+        'total_tests': len(final_completed),
+        'output_file': csv_path,
+        'quota_exhausted': False,
+    }
+
+
+def run_optimization(
+    output_prefix: str,
+    num_ising_models: int = 1024,
+    baseline_num_reads: int = 32,
+    improvement_threshold: float = 0.01,
+    skip_phases: Optional[List[int]] = None,
+    queue_depth: int = 30,
+    extra_annealing_times: Optional[List[float]] = None,
+    solvers: Optional[List[str]] = None,
+    single_solver: bool = False,
+    chain_strength_multipliers: Optional[List[float]] = None,
+):
+    """Run optimization across one or more solvers.
+
+    Args:
+        output_prefix: Output file prefix (solver name appended automatically).
+        solvers: Explicit list of solver names. Overrides auto-discovery.
+        single_solver: If True, only test the solver from DWAVE_API_SOLVER env var.
+        chain_strength_multipliers: List of multipliers for phase 6.
+    """
+    print("=" * 60)
+    print("QPU Parameter Optimization Tool (Multi-Solver)")
+    print("=" * 60)
+
+    if not QPU_AVAILABLE:
+        print("ERROR: QPU not available (dwave-system not installed)")
+        return None
+
+    skip_phases = skip_phases or []
+
+    # Determine solver list
+    if single_solver:
+        solver_list: List[Optional[Dict[str, Any]]] = [None]
+        print("\nMode: Single solver (from DWAVE_API_SOLVER env var)")
+    elif solvers:
+        solver_list = [{'name': s, 'chip_id': s, 'region': None} for s in solvers]
+        print(f"\nMode: Explicit solvers: {solvers}")
+    else:
+        print("\nDiscovering available QPU solvers across all regions...")
+        discovered = discover_qpu_solvers()
+        if not discovered:
+            print("ERROR: No QPU solvers found")
+            return None
+        solver_list = discovered
+        print(f"  Found {len(discovered)} QPU solver(s):")
+        for s in discovered:
+            print(f"    - {s['name']} ({s['num_qubits']} qubits, {s['topology_type']}, {s['region']})")
+
+    # Print time estimate
+    configs = estimate_total_configs(skip_phases)
+    est_hours = (configs * num_ising_models * 0.25 * len(solver_list)) / 3600
+    print(f"\nEstimated QPU time: {est_hours:.1f}h across {len(solver_list)} solver(s)")
+    print(f"  {configs} configurations × {num_ising_models} models × ~250ms each")
+
+    results = []
+
+    for solver_info in solver_list:
+        solver_name_arg = solver_info['name'] if solver_info else None
+        solver_region = solver_info.get('region') if solver_info else None
+        display_name = solver_name_arg or "default"
+
+        # Build CSV path: prefix_solvername.csv
+        safe_name = display_name.replace('.', '_').replace('-', '_')
+        csv_path = f"{output_prefix}_{safe_name}.csv"
+
+        region_str = f" ({solver_region})" if solver_region else ""
+        print("\n" + "#"*60)
+        print(f"# SOLVER: {display_name}{region_str}")
+        print(f"# Output: {csv_path}")
+        print("#"*60)
+
+        # Initialize sampler for this solver
+        print(f"\nInitializing QPU sampler for {display_name}...")
+        try:
+            sampler = DWaveSamplerWrapper(
+                solver_name=solver_name_arg,
+                region=solver_region,
             )
-            # Reload completed after phase
-            completed = load_completed_tests(output_file)
+            print(f"  Connected: {len(sampler.nodes)} nodes, {len(sampler.edges)} edges")
+        except Exception as e:
+            print(f"ERROR: Failed to initialize sampler for {display_name}: {e}")
+            continue
 
-        # Extra annealing times (spot checks) - runs after Phase 2
-        if extra_annealing_times:
-            run_extra_annealing_times(
-                sampler, nodes, edges, solver_props, output_file, completed,
-                extra_annealing_times, baseline_num_reads, num_ising_models, queue_depth
+        try:
+            result = run_solver_optimization(
+                sampler=sampler,
+                csv_path=csv_path,
+                solver_display_name=display_name,
+                num_ising_models=num_ising_models,
+                baseline_num_reads=baseline_num_reads,
+                improvement_threshold=improvement_threshold,
+                skip_phases=skip_phases,
+                queue_depth=queue_depth,
+                extra_annealing_times=extra_annealing_times,
+                solver_name=display_name,
+                chain_strength_multipliers=chain_strength_multipliers,
             )
-            completed = load_completed_tests(output_file)
+            results.append(result)
+        except QuotaExhaustedError as e:
+            print("\n" + "="*60)
+            print(f"⚠️  QUOTA EXHAUSTED on {display_name}: {e}")
+            print("="*60)
+            print(f"  Results saved to: {csv_path}")
+            print("  Run again later to resume from where you left off.")
+            final_completed = load_completed_tests(csv_path)
+            results.append({
+                'solver_name': display_name,
+                'total_tests': len(final_completed),
+                'output_file': csv_path,
+                'quota_exhausted': True,
+            })
+            # Continue to next solver (they may have separate quotas)
+            continue
+        finally:
+            sampler.close()
 
-        # Phase 3: Y-axis sweep
-        best_num_reads = baseline_num_reads
-        if 3 not in skip_phases:
-            best_num_reads, _ = phase3_yaxis_sweep(
-                sampler, nodes, edges, solver_props, output_file, completed,
-                best_annealing_time, num_ising_models, improvement_threshold, queue_depth
-            )
-            completed = load_completed_tests(output_file)
+    # Final summary
+    print("\n" + "="*60)
+    print("ALL SOLVERS COMPLETE")
+    print("="*60)
+    for r in results:
+        status = "QUOTA EXHAUSTED" if r.get('quota_exhausted') else "OK"
+        print(f"  {r['solver_name']}: {r['total_tests']} tests [{status}] → {r['output_file']}")
 
-        # Phase 4: Diagonal sweep
-        if 4 not in skip_phases:
-            diag_time, diag_reads, diag_energies = phase4_diagonal_sweep(
-                sampler, nodes, edges, solver_props, output_file, completed,
-                num_ising_models, improvement_threshold, queue_depth
-            )
-            # Update best if diagonal is better
-            if diag_energies:
-                current_best_energy = float('inf')
-                # We'd need to track this - for now just report
-                print(f"  Diagonal best: time={diag_time}, reads={diag_reads}")
-            completed = load_completed_tests(output_file)
-
-        # Phase 5: MAX validation
-        if 5 not in skip_phases:
-            phase5_max_validation(
-                sampler, nodes, edges, solver_props, output_file, completed,
-                best_annealing_time, best_num_reads, num_ising_models, queue_depth
-            )
-
-        # Summary
-        print("\n" + "="*60)
-        print("OPTIMIZATION COMPLETE")
-        print("="*60)
-        print(f"  Best annealing_time: {best_annealing_time} us")
-        print(f"  Best num_reads: {best_num_reads}")
-        print(f"  Results saved to: {output_file}")
-
-        # Count total tests
-        final_completed = load_completed_tests(output_file)
-        print(f"  Total tests completed: {len(final_completed)}")
-
-        return {
-            'best_annealing_time': best_annealing_time,
-            'best_num_reads': best_num_reads,
-            'total_tests': len(final_completed),
-            'output_file': output_file,
-            'quota_exhausted': False
-        }
-
-    except QuotaExhaustedError as e:
-        print("\n" + "="*60)
-        print("⚠️  OPTIMIZATION STOPPED: QPU QUOTA EXHAUSTED")
-        print("="*60)
-        print(f"  Error: {e}")
-        print(f"  Results saved to: {output_file}")
-        print("  Run again later to resume from where you left off.")
-
-        # Count total tests
-        final_completed = load_completed_tests(output_file)
-        print(f"  Total tests completed: {len(final_completed)}")
-
-        return {
-            'best_annealing_time': solver_props['default_annealing_time'],
-            'best_num_reads': baseline_num_reads,
-            'total_tests': len(final_completed),
-            'output_file': output_file,
-            'quota_exhausted': True
-        }
+    return results
 
 
 def main():
     """Main entry point with CLI argument parsing."""
     parser = argparse.ArgumentParser(
-        description='QPU parameter optimization tool for finding optimal annealing_time and num_reads'
+        description='QPU parameter optimization tool for finding optimal QPU parameters'
     )
 
     parser.add_argument(
         '--output', '-o',
         type=str,
         default=None,
-        help='Output CSV file path (default: qpu_param_optimization_{timestamp}.csv)'
+        help='Output CSV file prefix (solver name appended automatically). '
+             'Default: qpu_param_optimization_{timestamp}'
     )
 
     parser.add_argument(
@@ -987,7 +1457,7 @@ def main():
         '--skip-phases',
         type=str,
         default=None,
-        help='Comma-separated list of phases to skip (e.g., "4,5")'
+        help='Comma-separated list of phases to skip (e.g., "4,5,6,7,8")'
     )
 
     parser.add_argument(
@@ -1004,13 +1474,37 @@ def main():
         help='Comma-separated list of additional annealing times to test (e.g., "40,50,100,200")'
     )
 
+    parser.add_argument(
+        '--solvers',
+        type=str,
+        default=None,
+        help='Comma-separated solver names. Default: auto-discover all QPU solvers.'
+    )
+
+    parser.add_argument(
+        '--single-solver',
+        action='store_true',
+        help='Only test the solver from DWAVE_API_SOLVER env var.'
+    )
+
+    parser.add_argument(
+        '--chain-strength-multipliers',
+        type=str,
+        default='0.5,1.0,1.5,2.0,3.0,5.0',
+        help='Comma-separated chain strength multipliers for phase 6 '
+             '(default: "0.5,1.0,1.5,2.0,3.0,5.0")'
+    )
+
     args = parser.parse_args()
 
-    # Generate output filename if not specified
-    output_file = args.output
-    if not output_file:
+    # Generate output prefix if not specified
+    output_prefix = args.output
+    if not output_prefix:
         timestamp = int(time.time())
-        output_file = f"qpu_param_optimization_{timestamp}.csv"
+        output_prefix = f"qpu_param_optimization_{timestamp}"
+    # Strip .csv extension if user provided it (we add solver suffix)
+    if output_prefix.endswith('.csv'):
+        output_prefix = output_prefix[:-4]
 
     # Parse skip phases
     skip_phases = None
@@ -1022,18 +1516,31 @@ def main():
     if args.extra_annealing_times:
         extra_annealing_times = [float(t.strip()) for t in args.extra_annealing_times.split(',')]
 
+    # Parse solvers
+    solvers = None
+    if args.solvers:
+        solvers = [s.strip() for s in args.solvers.split(',')]
+
+    # Parse chain strength multipliers
+    chain_strength_multipliers = [
+        float(x.strip()) for x in args.chain_strength_multipliers.split(',')
+    ]
+
     # Run optimization
-    result = run_optimization(
-        output_file=output_file,
+    results = run_optimization(
+        output_prefix=output_prefix,
         num_ising_models=args.num_models,
         baseline_num_reads=args.baseline_reads,
         improvement_threshold=args.threshold,
         skip_phases=skip_phases,
         queue_depth=args.queue_depth,
-        extra_annealing_times=extra_annealing_times
+        extra_annealing_times=extra_annealing_times,
+        solvers=solvers,
+        single_solver=args.single_solver,
+        chain_strength_multipliers=chain_strength_multipliers,
     )
 
-    if result:
+    if results:
         print("\nOptimization completed successfully!")
         sys.exit(0)
     else:

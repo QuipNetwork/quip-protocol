@@ -80,7 +80,7 @@ def test_mining_time(
 
     requirements = BlockRequirements(
         difficulty_energy=difficulty_energy,
-        min_diversity=0.3,
+        min_diversity=0.2,
         min_solutions=5,
         timeout_to_difficulty_adjustment_decay=0  # Disable decay
     )

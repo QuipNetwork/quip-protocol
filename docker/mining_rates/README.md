@@ -47,7 +47,7 @@ sudo apt-get install -y nvidia-docker2
 sudo systemctl restart docker
 
 # Test
-docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.6.3-base-ubuntu22.04 nvidia-smi
 ```
 
 **Amazon Linux 2:**
@@ -246,7 +246,7 @@ docker run --rm \
 **Error: "could not select device driver"**
 ```bash
 # Verify NVIDIA runtime is installed
-docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.6.3-base-ubuntu22.04 nvidia-smi
 
 # Check Docker daemon.json
 cat /etc/docker/daemon.json
@@ -495,7 +495,7 @@ Before deploying to AWS, verify:
 
 ## Support
 
-- **Issues:** [GitLab Issues](https://gitlab.com/piqued/quip-protocol/-/issues)
+- **Issues:** [GitLab Issues](https://gitlab.com/quip.network/quip-protocol/-/issues)
 - **Documentation:** See root `README.md` and `CLAUDE.md`
 - **AWS Deployment:** See `aws/README_AWS_DEPLOYMENT.md`
 - **Akash Deployment:** See `akash/README_AKASH.md`

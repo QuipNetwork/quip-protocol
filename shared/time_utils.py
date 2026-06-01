@@ -4,9 +4,10 @@ This module provides centralized UTC time functions to ensure all nodes
 use consistent timestamps regardless of their local timezone.
 """
 
+import threading
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -199,3 +200,202 @@ def deprecated_int_time_time() -> int:
     """Deprecated: Use utc_timestamp() instead."""
     logger.warning("Using deprecated int(time.time()) - switch to utc_timestamp() for UTC consistency")
     return int(time.time())
+
+
+class NetworkClock:
+    """Program-resident network clock that tracks and compensates for clock drift.
+
+    This clock maintains an offset between local system time and network consensus time.
+    It uses peer timestamps to calculate and smooth the offset, providing stable
+    network-adjusted timestamps for blockchain operations.
+
+    Thread-safe for concurrent access from multiple async contexts.
+    """
+
+    MIN_PEERS_FOR_NETWORK_TIME = 3
+    MAX_PEER_TIMESTAMPS = 50
+    SMOOTHING_ALPHA = 0.1  # EMA smoothing factor
+    MAX_OFFSET_CHANGE_PER_UPDATE = 10.0  # Max seconds change per update
+
+    def __init__(self):
+        self._offset: float = 0.0  # seconds (positive = local clock is ahead)
+        self._peer_timestamps: List[int] = []
+        self._lock = threading.Lock()
+        self._last_update: float = 0.0
+        self._trusted: bool = False
+        self._logger = logging.getLogger(__name__)
+
+    def record_peer_timestamp(self, peer_timestamp: float) -> None:
+        """Record a timestamp received from a peer.
+
+        This should be called whenever we receive a timestamp from a peer,
+        such as in heartbeats or gossip messages.
+
+        Args:
+            peer_timestamp: The timestamp from the peer (UTC seconds)
+        """
+        local_time = datetime.now(timezone.utc).timestamp()
+
+        with self._lock:
+            # Only track timestamps within reasonable bounds (5 minutes)
+            if abs(local_time - peer_timestamp) < 300:
+                self._peer_timestamps.append(int(peer_timestamp))
+
+                # Keep only recent timestamps
+                if len(self._peer_timestamps) > self.MAX_PEER_TIMESTAMPS:
+                    self._peer_timestamps = self._peer_timestamps[-self.MAX_PEER_TIMESTAMPS:]
+
+                # Recalculate offset
+                self._recalculate_offset()
+
+    def _recalculate_offset(self) -> None:
+        """Recalculate the offset using median of peer timestamps.
+
+        Must be called with self._lock held.
+        """
+        if len(self._peer_timestamps) < self.MIN_PEERS_FOR_NETWORK_TIME:
+            self._trusted = False
+            return
+
+        self._trusted = True
+        local_time = int(datetime.now(timezone.utc).timestamp())
+
+        # Calculate median peer time
+        sorted_timestamps = sorted(self._peer_timestamps)
+        n = len(sorted_timestamps)
+        if n % 2 == 0:
+            median_peer_time = (sorted_timestamps[n//2 - 1] + sorted_timestamps[n//2]) // 2
+        else:
+            median_peer_time = sorted_timestamps[n//2]
+
+        # Raw offset (positive = local ahead of network)
+        raw_offset = float(local_time - median_peer_time)
+
+        # Apply EMA smoothing with bounded change
+        if self._last_update == 0:
+            # First update - use raw offset directly
+            self._offset = raw_offset
+        else:
+            # Bound the change to prevent jumps
+            delta = raw_offset - self._offset
+            bounded_delta = max(-self.MAX_OFFSET_CHANGE_PER_UPDATE,
+                              min(self.MAX_OFFSET_CHANGE_PER_UPDATE, delta))
+
+            # Apply EMA smoothing
+            self._offset = self._offset + self.SMOOTHING_ALPHA * bounded_delta
+
+        self._last_update = datetime.now(timezone.utc).timestamp()
+
+        # Log significant offsets (only on first detection or major changes)
+        if abs(self._offset) > 60:  # More than 1 minute drift
+            self._logger.debug(
+                f"Network clock offset: {self._offset:.1f}s "
+                f"({'ahead' if self._offset > 0 else 'behind'} network)"
+            )
+
+    def network_time(self) -> int:
+        """Get network-adjusted UTC timestamp as integer seconds.
+
+        Returns:
+            Network-adjusted UTC timestamp in seconds since epoch.
+            Falls back to local time if not enough peer data.
+        """
+        local = int(datetime.now(timezone.utc).timestamp())
+        with self._lock:
+            if not self._trusted:
+                return local
+            return int(local - self._offset)
+
+    def network_time_float(self) -> float:
+        """Get network-adjusted UTC timestamp as float seconds.
+
+        Returns:
+            Network-adjusted UTC timestamp with sub-second precision.
+            Falls back to local time if not enough peer data.
+        """
+        local = datetime.now(timezone.utc).timestamp()
+        with self._lock:
+            if not self._trusted:
+                return local
+            return local - self._offset
+
+    def local_time(self) -> int:
+        """Get local UTC timestamp (no adjustment).
+
+        Use this for operations that don't require network consensus,
+        such as heartbeats, logging, and internal timing.
+        """
+        return int(datetime.now(timezone.utc).timestamp())
+
+    def local_time_float(self) -> float:
+        """Get local UTC timestamp as float (no adjustment)."""
+        return datetime.now(timezone.utc).timestamp()
+
+    def get_offset(self) -> float:
+        """Get the current clock offset in seconds.
+
+        Returns:
+            Offset in seconds. Positive means local clock is ahead of network.
+        """
+        with self._lock:
+            return self._offset
+
+    def is_trusted(self) -> bool:
+        """Check if network time is trusted.
+
+        Returns:
+            True if we have enough peer data to trust network time,
+            False if falling back to local time.
+        """
+        with self._lock:
+            return self._trusted
+
+    def reset(self) -> None:
+        """Reset the clock state. Useful for testing."""
+        with self._lock:
+            self._offset = 0.0
+            self._peer_timestamps = []
+            self._last_update = 0.0
+            self._trusted = False
+
+
+# Module-level singleton
+_network_clock: Optional[NetworkClock] = None
+
+
+def get_network_clock() -> NetworkClock:
+    """Get the global NetworkClock instance (creates if needed).
+
+    Returns:
+        The singleton NetworkClock instance.
+    """
+    global _network_clock
+    if _network_clock is None:
+        _network_clock = NetworkClock()
+    return _network_clock
+
+
+def network_timestamp() -> int:
+    """Get network-adjusted UTC timestamp as integer seconds.
+
+    This function returns a timestamp adjusted for clock drift based on
+    peer timestamps. Use this for blockchain-critical operations like
+    block creation and difficulty calculation.
+
+    Falls back to local time if insufficient peer data (< 3 peers).
+
+    Returns:
+        int: Network-adjusted UTC timestamp in seconds since epoch.
+    """
+    return get_network_clock().network_time()
+
+
+def network_timestamp_float() -> float:
+    """Get network-adjusted UTC timestamp as float seconds.
+
+    Same as network_timestamp() but with sub-second precision.
+
+    Returns:
+        float: Network-adjusted UTC timestamp with sub-second precision.
+    """
+    return get_network_clock().network_time_float()

@@ -39,6 +39,34 @@ class MockNetworkNode:
         mock_info.version = "0.0.1"
         return mock_info
 
+    def descriptor(self):
+        """Return a minimal NodeDescriptor-shaped dict."""
+        return {
+            "descriptor_version": 1,
+            "node_name": "test-node",
+            "public_host": "127.0.0.1",
+            "public_port": 20049,
+            "auto_mine": False,
+            "log_level": "INFO",
+            "runtime": {
+                "python": "3.14.0",
+                "quip_version": "0.0.1",
+                "protocol_version": 2,
+                "in_docker": False,
+                "docker_image": None,
+            },
+            "miners": {},
+            "system_info": {
+                "os": {"system": "Linux", "release": "test", "machine": "x86_64"},
+                "cpu": {
+                    "logical_cores": 1, "physical_cores": 1,
+                    "brand": "Test CPU", "arch": "x86_64",
+                },
+                "memory_mb": 1024,
+                "gpus": [],
+            },
+        }
+
     def get_latest_block(self):
         """Return mock latest block."""
         return self._create_mock_block(10)
@@ -50,20 +78,35 @@ class MockNetworkNode:
         return None
 
     def _create_mock_block(self, index):
-        """Create a mock block."""
+        """Create a mock block matching real Block/BlockHeader schema."""
         mock_block = MagicMock()
         mock_block.header = MagicMock()
         mock_block.header.index = index
         mock_block.header.timestamp = 1700000000 + index
-        mock_block.header.prev_hash = b'\x00' * 32
-        mock_block.header.pow_hash = b'\x01' * 32
-        mock_block.header.merkle_root = b'\x02' * 32
-        mock_block.header.miner_info = self.info()
-        mock_block.header.pow_difficulty = -4100.0
-        mock_block.header.pow_energy = -4200.0
-        mock_block.header.diversity = 0.15
-        mock_block.header.num_solutions = 5
+        mock_block.header.previous_hash = b'\x00' * 32
+        mock_block.header.data_hash = b'\x02' * 32
+        mock_block.header.version = 2
+        mock_block.miner_info = MagicMock()
+        mock_block.miner_info.to_json.return_value = json.dumps({
+            "miner_id": "test_miner",
+            "miner_type": "CPU",
+            "reward_address": "aa" * 32,
+            "ecdsa_public_key": "bb" * 32,
+            "wots_public_key": "cc" * 32,
+            "next_wots_public_key": "dd" * 32,
+        })
+        mock_block.quantum_proof = MagicMock()
+        mock_block.quantum_proof.energy = -4200.0
+        mock_block.quantum_proof.diversity = 0.15
+        mock_block.quantum_proof.num_valid_solutions = 5
+        mock_block.quantum_proof.mining_time = 1.5
+        mock_block.quantum_proof.nonce = 12345
+        mock_block.next_block_requirements = MagicMock()
+        mock_block.next_block_requirements.difficulty_energy = -4100.0
+        mock_block.next_block_requirements.min_diversity = 0.2
+        mock_block.next_block_requirements.min_solutions = 5
         mock_block.transactions = []
+        mock_block.hash = b'\x04' * 32
         mock_block.signature = b'\x03' * 64
         return mock_block
 
@@ -216,6 +259,60 @@ class TestRestApiEndpoints(AioHTTPTestCase):
         assert resp.status == 200
         assert "Access-Control-Allow-Methods" in resp.headers
 
+    async def test_root_index_returns_endpoint_list(self):
+        """GET / returns a self-describing endpoint index."""
+        resp = await self.client.request("GET", "/")
+        assert resp.status == 200
+
+        data = await resp.json()
+        assert data["success"] is True
+        endpoints = data["data"]["endpoints"]
+        paths = {(e["method"], e["path"]) for e in endpoints}
+
+        # Core public endpoints must be discoverable from the index.
+        assert ("GET", "/") in paths
+        assert ("GET", "/health") in paths
+        assert ("GET", "/api/v1/status") in paths
+        assert ("GET", "/api/v1/peers") in paths
+        assert ("GET", "/api/v1/block/latest") in paths
+        assert ("POST", "/api/v1/heartbeat") in paths
+        assert ("POST", "/api/v1/join") in paths
+
+        # Each entry exposes a human-readable description.
+        for entry in endpoints:
+            assert entry.get("description")
+
+    async def test_root_index_omits_telemetry_when_disabled(self):
+        """Index must not advertise telemetry endpoints when disabled."""
+        resp = await self.client.request("GET", "/")
+        assert resp.status == 200
+
+        data = await resp.json()
+        paths = [e["path"] for e in data["data"]["endpoints"]]
+        assert not any(p.startswith("/api/v1/telemetry/") for p in paths)
+
+    async def test_unknown_path_returns_404(self):
+        """Regression: unknown paths returned 405 via OPTIONS catch-all.
+
+        Users hitting '/status' or '/nodes' previously got 405 Method
+        Not Allowed, which made it look like the endpoint existed but
+        required some other format. The fix returns a clear 404 with
+        code=NOT_FOUND pointing to the index.
+        """
+        for path in ("/status", "/nodes", "/does-not-exist"):
+            resp = await self.client.request("GET", path)
+            assert resp.status == 404, f"expected 404 for {path}, got {resp.status}"
+            body = await resp.json()
+            assert body["success"] is False
+            assert body["code"] == "NOT_FOUND"
+
+    async def test_unknown_path_options_returns_cors_200(self):
+        """OPTIONS on unknown paths must still succeed so CORS preflight works."""
+        resp = await self.client.request("OPTIONS", "/does-not-exist")
+        assert resp.status == 200
+        assert resp.headers.get("Access-Control-Allow-Origin") == "*"
+        assert "Access-Control-Allow-Methods" in resp.headers
+
 
 class TestRestApiResponses:
     """Tests for REST API response formatting."""
@@ -259,21 +356,17 @@ class TestRestApiBlockConversion:
         mock_header = MagicMock()
         mock_header.index = 5
         mock_header.timestamp = 1700000005
-        mock_header.prev_hash = b'\x00' * 32
-        mock_header.pow_hash = b'\x01' * 32
-        mock_header.merkle_root = b'\x02' * 32
-        mock_header.miner_info = mock_node.info()
-        mock_header.pow_difficulty = -4100.0
-        mock_header.pow_energy = -4200.0
-        mock_header.diversity = 0.15
-        mock_header.num_solutions = 5
+        mock_header.previous_hash = b'\x00' * 32
+        mock_header.data_hash = b'\x02' * 32
+        mock_header.version = 2
 
         result = server._header_to_dict(mock_header)
 
         assert result["index"] == 5
         assert result["timestamp"] == 1700000005
-        assert result["pow_difficulty"] == -4100.0
-        assert result["diversity"] == 0.15
+        assert result["previous_hash"] == "00" * 32
+        assert result["data_hash"] == "02" * 32
+        assert result["version"] == 2
 
     def test_block_to_dict(self):
         """Test block conversion to dict."""
@@ -286,4 +379,9 @@ class TestRestApiBlockConversion:
 
         assert result["header"]["index"] == 7
         assert "transactions" in result
-        assert "signature_hex" in result
+        assert "signature" in result
+        assert "hash" in result
+        assert result["quantum_proof"]["energy"] == -4200.0
+        assert result["quantum_proof"]["num_valid_solutions"] == 5
+        assert result["miner_info"]["miner_id"] == "test_miner"
+        assert result["next_block_requirements"]["difficulty_energy"] == -4100.0

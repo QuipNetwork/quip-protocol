@@ -13,10 +13,10 @@ The primary Docker images for running Quip P2P network nodes:
 - **CPU Node** - Uses all available CPUs (amd64 + arm64)
 - **CUDA Node** - Uses all available NVIDIA GPUs (amd64 + arm64)
 
-Available from Docker Hub:
+Available from GitLab Container Registry:
 ```
-carback1/quip-network-node-cpu
-carback1/quip-network-node-cuda
+registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu
+registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cuda
 ```
 
 **Note:** For Apple Silicon (Metal) GPU mining, run directly on macOS without Docker. See [../CLAUDE.md](../CLAUDE.md) for native macOS setup.
@@ -37,18 +37,18 @@ mkdir -p ~/quip-data
 ```bash
 docker run -d --pull always --name quip-cpu \
   -v ~/quip-data:/data \
-  -e QUIP_PUBLIC_HOST=myhost.example.com:20049 \
+  -e QUIP_PUBLIC_HOST=myhost.example.com \
   -p 20049:20049/udp -p 20049:20049/tcp \
-  carback1/quip-network-node-cpu:latest
+  registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu:latest
 ```
 
 **CUDA node (NVIDIA):**
 ```bash
 docker run -d --pull always --gpus all --name quip-cuda \
   -v ~/quip-data:/data \
-  -e QUIP_PUBLIC_HOST=myhost.example.com:20049 \
+  -e QUIP_PUBLIC_HOST=myhost.example.com \
   -p 20049:20049/udp -p 20049:20049/tcp \
-  carback1/quip-network-node-cuda:latest
+  registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cuda:latest
 ```
 
 The `--pull always` flag ensures you get the latest image from Docker Hub.
@@ -71,25 +71,83 @@ ls -la ~/quip-data/
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `QUIP_PEERS` | (see below) | Comma-separated peer list |
-| `QUIP_PORT` | `20049` | Port to bind |
-| `QUIP_LISTEN` | `0.0.0.0` | Address to bind |
-| `QUIP_PUBLIC_HOST` | "" | Public host:port for peer advertisement |
-| `QUIP_NODE_NAME` | "" | Human-readable node name |
-| `QUIP_AUTO_MINE` | `false` | Enable auto-mining |
+All settings live in `/data/config.toml` (source of truth). ENV vars override the TOML only when set (non-empty). Edit the TOML directly for persistent changes.
+
+| Variable | TOML key | TOML default | Description |
+|----------|----------|--------------|-------------|
+| `QUIP_LISTEN` | `listen` | `::` | Address to bind (dual-stack: accepts IPv4+IPv6) |
+| `QUIP_PORT` | `port` | `20049` | Port to bind |
+| `QUIP_PUBLIC_HOST` | `public_host` | (auto-detect) | Public hostname or IP for peer advertisement |
+| `QUIP_PUBLIC_PORT` | `public_port` | same as `port` | Public port (if different, e.g. behind NAT) |
+| `QUIP_NODE_NAME` | `node_name` | (hostname) | Human-readable node name |
+| `QUIP_AUTO_MINE` | `auto_mine` | `false` | Enable auto-mining |
+| `QUIP_PEERS` | `peer` | (see default peers below) | Comma-separated peer list (TOML uses array) |
+| `QUIP_REST_INSECURE_PORT` | `rest_insecure_port` | `-1` (disabled) | HTTP REST API port (set > 0 to enable) |
+| `QUIP_REST_HOST` | `rest_host` | `0.0.0.0` | REST API bind address |
+| `CERT_EMAIL` | (unset) | ACME email — enables certbot when set with a DNS domain |
+| `CERT_CHALLENGE` | (unset→http) | `http` (port 80) or `dns` |
+| `CERT_DNS_PLUGIN` | (unset) | cloudflare, route53, google, digitalocean, ovh, rfc2136 |
+| `CERT_DNS_CREDENTIALS` | (unset) | Path to DNS credentials file (e.g. `/data/certs/cf.ini`) |
+| `CERT_ACME_SERVER` | (unset→LE) | Custom ACME URL (ZeroSSL, Buypass). Default: Let's Encrypt |
+| `CERT_EAB_KID` | (unset) | EAB Key ID (ZeroSSL, Buypass) |
+| `CERT_EAB_HMAC_KEY` | (unset) | EAB HMAC Key (base64url) |
+| `CERT_STAGING` | (unset→false) | Use Let's Encrypt staging server |
+
+**IPv6 Support:** The default `QUIP_LISTEN=::` enables dual-stack mode, accepting both IPv4 and IPv6 connections. For IPv6-only, use `QUIP_LISTEN=::1`. For IPv4-only, use `QUIP_LISTEN=0.0.0.0`.
 
 **Default peers:**
 ```
-qpu-1.nodes.quip.network, cpu-1.quip.carback.us, gpu-1.quip.carback.us, gpu-2.quip.carback.us
+qpu-1.nodes.quip.network:20049, cpu-1.quip.carback.us:20049, gpu-1.quip.carback.us:20049, gpu-2.quip.carback.us:20050, nodes.quip.network:20049
 ```
+
+## TLS Certificates (Let's Encrypt)
+
+Certbot activates automatically when `QUIP_PUBLIC_HOST` is a DNS name and `CERT_EMAIL` is set:
+
+```bash
+docker run -d --name quip-cpu \
+  -v ~/quip-data:/data \
+  -e QUIP_PUBLIC_HOST=mynode.example.com \
+  -e CERT_EMAIL=admin@example.com \
+  -p 20049:20049/udp -p 20049:20049/tcp -p 80:80/tcp \
+  registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu:latest
+```
+
+For DNS-01 challenges (no port 80 needed), custom ACME providers, or advanced configuration, see [TLS.md](TLS.md).
 
 ## Persistent Data
 
 Mount a volume at `/data` to persist:
-- `config.toml` - Node configuration (secret auto-generated on first run)
+- `config.toml` - Node configuration (source of truth, seeded on first run)
 - `trust.db` - TOFU peer certificate database
+- `certs/` - TLS certificates and certbot state
+
+Edit `config.toml` directly for persistent changes — ENV vars only override when non-empty.
+
+## File Ownership (PUID/PGID)
+
+The node runs inside the container as a non-root `quip` user (UID/GID
+1000 by default), so files written under `/data` are readable by your
+host user without `sudo`. If your host user's UID/GID isn't 1000, set
+`PUID` and `PGID` to match — the entrypoint aligns the in-container
+`quip` user at startup and `chown`s `/data`:
+
+```bash
+docker run -d --name quip-cpu \
+  -v ~/quip-data:/data \
+  -e PUID=$(id -u) -e PGID=$(id -g) \
+  -e QUIP_PUBLIC_HOST=myhost.example.com \
+  -p 20049:20049/udp -p 20049:20049/tcp \
+  registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu:latest
+```
+
+- `PUID=0` keeps the container running as root (legacy mode — preserves
+  backwards compatibility with deployments that rely on root-owned
+  `/data`).
+- The recursive `chown` is skipped when `/data` is already owned by the
+  target UID, so restart is cheap even on volumes with many epoch files.
+- TLS private keys under `/data/certs/private/` stay at mode `0600`
+  after the ownership flip.
 
 ## Building Images
 
@@ -111,13 +169,13 @@ Build and push to Docker Hub:
 # CPU (amd64 + arm64)
 docker buildx build --platform linux/amd64,linux/arm64 \
   -f Dockerfile.cpu \
-  -t carback1/quip-network-node-cpu:latest \
+  -t registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cpu:latest \
   --push ..
 
 # CUDA (amd64 + arm64)
 docker buildx build --platform linux/amd64,linux/arm64 \
   -f Dockerfile.cuda \
-  -t carback1/quip-network-node-cuda:latest \
+  -t registry.gitlab.com/quip.network/quip-protocol/quip-network-node-cuda:latest \
   --push ..
 ```
 
@@ -125,6 +183,41 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 
 ```bash
 docker-compose up cpu-bootstrap cpu-node-2
+```
+
+## Local 3-Node Testing with REST API
+
+A dedicated compose file runs 3 CPU nodes with REST API enabled for telemetry testing:
+
+```bash
+# Build and start
+docker compose -f docker/docker-compose.local.yml up --build -d
+
+# Run telemetry tests
+bash docker/test-rest-telemetry.sh
+
+# View logs
+docker compose -f docker/docker-compose.local.yml logs -f
+
+# Tear down (removes volumes)
+docker compose -f docker/docker-compose.local.yml down -v
+```
+
+**REST API endpoints (HTTP):**
+
+| Node | REST URL | QUIC Port |
+|------|----------|-----------|
+| bootstrap | http://localhost:20050 | 20049 |
+| node-2 | http://localhost:20051 | internal |
+| node-3 | http://localhost:20052 | internal |
+
+**Manual testing:**
+```bash
+curl http://localhost:20050/health
+curl http://localhost:20050/api/v1/status
+curl http://localhost:20050/api/v1/stats
+curl http://localhost:20050/api/v1/peers
+curl http://localhost:20050/api/v1/block/latest
 ```
 
 ## Configuration Files
@@ -145,7 +238,7 @@ On first run, the entrypoint copies the template to `/data/config.toml` and gene
 **GPU not detected:**
 ```bash
 # Verify NVIDIA runtime
-docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.6.3-base-ubuntu22.04 nvidia-smi
 ```
 
 ---

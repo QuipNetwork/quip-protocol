@@ -3,6 +3,7 @@
 from blake3 import blake3
 import json
 import struct
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
@@ -14,6 +15,7 @@ from shared.quantum_proof_of_work import (
     energies_for_solutions
 )
 from shared.logging_config import get_logger
+from shared.version import PROTOCOL_VERSION
 
 # Initialize logger
 logger = get_logger('block')
@@ -320,6 +322,9 @@ class QuantumProof:
     solutions: List[List[int]]  # List of quantum solutions found
     mining_time: float
 
+    # Ising model parameters (needed for deterministic recomputation)
+    h_values: Optional[List[float]] = None
+
     # Computed fields (derived from validation, not stored in network format)
     energy: Optional[float] = None
     diversity: Optional[float] = None
@@ -410,16 +415,19 @@ class QuantumProof:
         return quantum_proof
 
     def compute_derived_fields(self):
-        """Calculate derived fields from solutions and requirements using Ising model.
-        Requires the Block for deterministic model generation.
+        """Calculate derived fields from solutions using the Ising model.
+
+        Uses self.h_values (if set) for model generation so the
+        recomputed energy matches what the miner used. Falls back to
+        the default [-1, 0, +1] when h_values is None.
         """
         if not self.solutions:
             return
 
-        # Generate model sized to the maximum solution length
         h, J = generate_ising_model_from_nonce(self.nonce,
                                               self.nodes,
-                                              self.edges)
+                                              self.edges,
+                                              h_values=self.h_values)
 
         energies = energies_for_solutions(self.solutions, h, J, self.nodes)
 
@@ -631,11 +639,14 @@ class BlockHeader:
     previous_hash: bytes
     index: int
     timestamp: int  # Unix timestamp
-    data_hash: bytes # hash of all non-header data fields
+    data_hash: bytes  # hash of all non-header data fields
+    version: int = PROTOCOL_VERSION  # Protocol version for compatibility checking
 
     def to_network(self) -> bytes:
         """Serialize to binary format."""
         result = b''
+        # Version first for easy detection of protocol changes
+        result += struct.pack('!H', self.version)  # unsigned 16-bit
         result += struct.pack('!I', len(self.previous_hash)) + self.previous_hash
         result += struct.pack('!Q', self.index)
         result += struct.pack('!q', self.timestamp)  # signed 64-bit for timestamp
@@ -646,6 +657,10 @@ class BlockHeader:
     def from_network(cls, data: bytes) -> 'BlockHeader':
         """Deserialize from binary format."""
         offset = 0
+
+        # Version (new field)
+        version = struct.unpack('!H', data[offset:offset+2])[0]
+        offset += 2
 
         # Previous hash
         hash_len = struct.unpack('!I', data[offset:offset+4])[0]
@@ -668,12 +683,14 @@ class BlockHeader:
             previous_hash=previous_hash,
             index=index,
             timestamp=timestamp,
-            data_hash=data_hash
+            data_hash=data_hash,
+            version=version
         )
 
     def to_json(self) -> dict:
         """Serialize to JSON-compatible dictionary."""
         return {
+            'version': self.version,
             'previous_hash': self.previous_hash.hex(),
             'index': self.index,
             'timestamp': self.timestamp,
@@ -687,7 +704,8 @@ class BlockHeader:
             previous_hash=bytes.fromhex(data['previous_hash']),
             index=data['index'],
             timestamp=int(data['timestamp']),
-            data_hash=bytes.fromhex(data['data_hash'])
+            data_hash=bytes.fromhex(data['data_hash']),
+            version=data.get('version', 1)  # Default to 1 for backward compat with old JSON
         )
 
 
@@ -939,6 +957,13 @@ def load_genesis_block(genesis_block_filepath: str) -> 'Block':
         json.JSONDecodeError: If JSON is malformed
     """
     config_path = Path(genesis_block_filepath)
+    # Resolve bundled genesis file in frozen binaries (PyInstaller)
+    if not config_path.is_absolute() and not config_path.exists():
+        _meipass = getattr(sys, "_MEIPASS", None)
+        if _meipass:
+            _bundled = Path(_meipass) / genesis_block_filepath
+            if _bundled.exists():
+                config_path = _bundled
     logger.info(f"Loading genesis block from: {config_path.name}")
     with open(config_path, 'r') as f:
         genesis_data = json.load(f)

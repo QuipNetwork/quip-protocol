@@ -1,44 +1,218 @@
-# GitLab CI/CD for Quip Network Node Docker Images
-# Builds and pushes to GitLab Container Registry
+# GitLab CI/CD for Quip Network Node
+# Tests on branches, builds + releases on main/tags
 
 stages:
+  - test
   - build
+  - release
 
 variables:
-  DOCKER_TLS_CERTDIR: "/certs"
   CPU_IMAGE: quip-network-node-cpu
   CUDA_IMAGE: quip-network-node-cuda
 
-# Template for Docker builds
-.docker_build:
-  image: docker:24
-  services:
-    - docker:24-dind
+# ---------------------------------------------------------------------------
+# Tests (branches only — main/tags skip straight to build)
+# ---------------------------------------------------------------------------
+
+test:
+  stage: test
+  image: python:3.12-slim
+  tags: [linux, amd64]
   before_script:
-    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
-
-# Build and push CPU network node image
-build-cpu:
-  extends: .docker_build
-  stage: build
+    - pip install -U pip setuptools wheel
+    - pip install -e ".[dev]"
   script:
-    - docker build -f docker/Dockerfile.cpu -t $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA .
-    - docker tag $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE/$CPU_IMAGE:latest
-    - docker push $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA
-    - docker push $CI_REGISTRY_IMAGE/$CPU_IMAGE:latest
-  only:
-    - main
-    - tags
+    - python -m pytest tests/ -v --ignore=tests/test_certificate_manager.py
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: never
+    - if: $CI_COMMIT_BRANCH
 
-# Build and push CUDA network node image
+# ---------------------------------------------------------------------------
+# Version-tag gate (tags only — fail fast if tag ≠ pyproject.toml version)
+# ---------------------------------------------------------------------------
+
+check-version:
+  stage: test
+  image: python:3.12-slim
+  tags: [linux, amd64]
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - |
+      PKG_VERSION=$(python3 -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+      TAG_VERSION="${CI_COMMIT_TAG#v}"
+      if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+        echo "ERROR: tag $CI_COMMIT_TAG has version v${PKG_VERSION} in pyproject.toml (expected v${TAG_VERSION})"
+        exit 1
+      fi
+      echo "OK: tag $CI_COMMIT_TAG matches pyproject.toml version $PKG_VERSION"
+
+# ---------------------------------------------------------------------------
+# Docker image builds (Kaniko — no daemon required)
+# ---------------------------------------------------------------------------
+
+.docker_build:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(echo -n ${CI_REGISTRY_USER}:${CI_REGISTRY_PASSWORD} | base64)\"}}}" > /kaniko/.docker/config.json
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+
+# CPU image — built per-arch then stitched into a multi-arch manifest.
+# amd64 stays on a linux/amd64 runner via Kaniko (daemonless).
+# arm64 runs on the macOS arm64 shell runner via docker buildx — we
+# don't have a dedicated linux/arm64 runner today, and the mac runner
+# builds natively (no QEMU) so it's fast and isolates us from the
+# linux-arm64 pool being empty. Swap back to a Kaniko-on-linux-arm64
+# job when a real runner comes online.
+
+build-cpu-amd64:
+  extends: .docker_build
+  tags: [linux, amd64]
+  script:
+    - /kaniko/executor
+        --context $CI_PROJECT_DIR
+        --dockerfile docker/Dockerfile.cpu
+        --build-arg QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA
+        --destination $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA-amd64
+
+build-cpu-arm64:
+  stage: build
+  tags: [macos, arm64]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+  before_script:
+    # Isolated buildx builder per project. Create-if-missing is
+    # idempotent across job retries. docker-container driver is
+    # required for --push to push in one invocation.
+    - docker buildx inspect quip-ci >/dev/null 2>&1 || docker buildx create --name quip-ci --driver docker-container --bootstrap
+    - docker buildx use quip-ci
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - >
+      docker buildx build
+      --platform linux/arm64
+      --push
+      -t "$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA-arm64"
+      -f docker/Dockerfile.cpu
+      --build-arg "QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA"
+      .
+  after_script:
+    - docker logout "$CI_REGISTRY" || true
+
+manifest-cpu:
+  stage: build
+  image:
+    name: mplatform/manifest-tool:alpine-v2.2.1
+    entrypoint: [""]
+  tags: [linux, amd64]
+  needs:
+    - build-cpu-amd64
+    - build-cpu-arm64
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+  script:
+    - >
+      manifest-tool
+      --username "$CI_REGISTRY_USER"
+      --password "$CI_REGISTRY_PASSWORD"
+      push from-args
+      --platforms linux/amd64,linux/arm64
+      --template "$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA-ARCH"
+      --target "$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA"
+    - >
+      manifest-tool
+      --username "$CI_REGISTRY_USER"
+      --password "$CI_REGISTRY_PASSWORD"
+      push from-args
+      --platforms linux/amd64,linux/arm64
+      --template "$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA-ARCH"
+      --target "$CI_REGISTRY_IMAGE/$CPU_IMAGE:latest"
+
 build-cuda:
   extends: .docker_build
-  stage: build
+  tags: [linux, amd64]
   script:
-    - docker build -f docker/Dockerfile.cuda -t $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA .
-    - docker tag $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE/$CUDA_IMAGE:latest
-    - docker push $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA
-    - docker push $CI_REGISTRY_IMAGE/$CUDA_IMAGE:latest
-  only:
-    - main
-    - tags
+    - /kaniko/executor
+        --context $CI_PROJECT_DIR
+        --dockerfile docker/Dockerfile.cuda
+        --build-arg QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA
+        --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA
+        --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:latest
+
+# ---------------------------------------------------------------------------
+# PyInstaller native binaries
+# ---------------------------------------------------------------------------
+
+.pyinstaller_build:
+  stage: build
+  variables:
+    PATH: "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+  script:
+    - bash pyinstaller/build.sh
+  artifacts:
+    paths:
+      - dist/quip-network-node-*
+    expire_in: 30 days
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+
+package-macos-arm64:
+  extends: .pyinstaller_build
+  tags: [macos, arm64]
+  before_script:
+    - rm -rf .venv-arm64
+    - /opt/homebrew/bin/python3.13 -m venv .venv-arm64
+    - source .venv-arm64/bin/activate
+    - pip install -U pip setuptools wheel
+    - pip install pyinstaller
+    - pip install -e ".[metal]"
+
+package-macos-x86_64:
+  extends: .pyinstaller_build
+  tags: [macos, x86_64]
+  before_script:
+    - rm -rf .venv-x86_64
+    - arch -x86_64 /usr/local/bin/python3.13 -m venv .venv-x86_64
+    - source .venv-x86_64/bin/activate
+    - pip install -U pip setuptools wheel
+    - pip install pyinstaller
+    - pip install -e .
+
+# ---------------------------------------------------------------------------
+# Release (tags only)
+# ---------------------------------------------------------------------------
+
+release-binaries:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/cli:latest
+  tags: [linux, amd64]
+  needs:
+    - package-macos-arm64
+    - package-macos-x86_64
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - echo "Creating release $CI_COMMIT_TAG"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    description: "Release $CI_COMMIT_TAG"
+    assets:
+      links:
+        - name: quip-network-node-macos-arm64
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-macos-arm64?job=package-macos-arm64"
+          filepath: /quip-network-node-macos-arm64
+        - name: quip-network-node-macos-x86_64
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-macos-x86_64?job=package-macos-x86_64"
+          filepath: /quip-network-node-macos-x86_64

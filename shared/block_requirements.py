@@ -9,7 +9,7 @@ from shared.block import Block, BlockRequirements
 from shared.energy_utils import adjust_energy_along_curve
 from shared.miner_types import MiningResult
 from shared.quantum_proof_of_work import validate_quantum_proof
-from shared.time_utils import utc_timestamp, validate_block_timestamp
+from shared.time_utils import utc_timestamp, validate_block_timestamp, network_timestamp
 
 internal_logger = logging.getLogger(__name__)
 
@@ -102,7 +102,7 @@ def compute_current_requirements(
         BlockRequirements with decay applied if elapsed time warrants it
     """
     if current_time is None:
-        current_time = utc_timestamp()
+        current_time = network_timestamp()
 
     if initial_requirements.timeout_to_difficulty_adjustment_decay <= 0:
         return initial_requirements
@@ -324,14 +324,26 @@ def validate_block(block: 'Block', previous_block: 'Block', logger: logging.Logg
         return False
 
     # Get requirements from previous block
-    requirements = previous_block.next_block_requirements
-    if not requirements:
+    original_requirements = previous_block.next_block_requirements
+    if not original_requirements:
         logger.error(f"Block {block.header.index} rejected: missing next block requirements")
         return False
-    
+
+    requirements = original_requirements
     # Apply timeout-based difficulty decay based on elapsed time since previous block
+    # Use block.header.timestamp so decay is deterministic for all validators
+    # (elapsed = block_timestamp - prev_block_timestamp)
     if previous_block.header.index > 0:
-        requirements = compute_current_requirements(requirements, previous_block.header.timestamp, logger, block.header.timestamp)
+        elapsed_since_prev = block.header.timestamp - previous_block.header.timestamp
+        logger.debug(
+            f"Block {block.header.index} decay calc: prev_ts={previous_block.header.timestamp}, "
+            f"block_ts={block.header.timestamp}, elapsed={elapsed_since_prev}s"
+        )
+        requirements = compute_current_requirements(original_requirements, previous_block.header.timestamp, logger, block.header.timestamp)
+        if requirements.difficulty_energy != original_requirements.difficulty_energy:
+            logger.debug(
+                f"Block {block.header.index} decay applied: energy {original_requirements.difficulty_energy:.2f} -> {requirements.difficulty_energy:.2f}"
+            )
 
     #Validate the timestamps in the block using UTC time
     if not validate_block_timestamp(block.header.timestamp, previous_block.header.timestamp):

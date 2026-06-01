@@ -35,7 +35,7 @@ class MockNodeInfo:
 @dataclass
 class MockRequirements:
     difficulty_energy: float = -14000.0
-    min_diversity: float = 0.3
+    min_diversity: float = 0.2
     min_solutions: int = 10
 
 def _cuda_available():
@@ -107,8 +107,8 @@ class TestSignalResponsiveMining:
         try:
             stop_event = mp.Event()
             
-            # Let it mine for 1 second, then signal stop
-            time.sleep(1.0)
+            # Let the worker spin up briefly, then signal stop
+            time.sleep(0.2)
             signal_time = time.time()
             stop_event.set()
             
@@ -144,8 +144,8 @@ class TestSignalResponsiveMining:
         try:
             stop_event = mp.Event()
             
-            # Let it mine for 1 second, then signal stop
-            time.sleep(1.0)
+            # Let the worker spin up briefly, then signal stop
+            time.sleep(0.2)
             signal_time = time.time()
             stop_event.set()
             
@@ -181,8 +181,8 @@ class TestSignalResponsiveMining:
         try:
             stop_event = mp.Event()
             
-            # Let it mine for 1 second, then signal stop
-            time.sleep(1.0)
+            # Let the worker spin up briefly, then signal stop
+            time.sleep(0.2)
             signal_time = time.time()
             stop_event.set()
             
@@ -218,8 +218,8 @@ class TestSignalResponsiveMining:
         try:
             stop_event = mp.Event()
             
-            # Let it mine for 1 second, then signal stop
-            time.sleep(1.0)
+            # Let the worker spin up briefly, then signal stop
+            time.sleep(0.2)
             signal_time = time.time()
             stop_event.set()
             
@@ -255,8 +255,8 @@ class TestSignalResponsiveMining:
         try:
             stop_event = mp.Event()
             
-            # Let it mine for 1 second, then signal stop
-            time.sleep(1.0)
+            # Let the worker spin up briefly, then signal stop
+            time.sleep(0.2)
             signal_time = time.time()
             stop_event.set()
             

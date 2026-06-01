@@ -12,13 +12,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evaluate_sampleset, calculate_diversity
 from shared.block_requirements import BlockRequirements
 from dwave_topologies import DEFAULT_TOPOLOGY
+from dwave_topologies.topologies.json_loader import load_topology
 from dwave_topologies.embedded_topology import create_embedded_topology
 
 from GPU.metal_sa import MetalSASampler
 from GPU.metal_miner import get_gpu_core_count
 
 
-def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None, h_values=None, num_models=1, use_embedding=None):
+def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None, h_values=None, num_models=1, topology=None):
     """Test Metal SA performance with baseline format and evaluation logic.
 
     Args:
@@ -27,8 +28,12 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None,
         only_label: Run only specific config (e.g., "Light Metal")
         h_values: List of allowed h field values
         num_models: Number of parallel models to run
-        use_embedding: If specified, use embedded hardware topology instead of perfect topology.
-                      Format: "Z(9,2)" for Z(9,2) embedding
+        topology: Topology to use. Can be:
+                  - Z(m,t) format for perfect Zephyr topology (e.g., "Z(9,2)")
+                  - Hardware name (e.g., "Advantage2_system1")
+                  - File path to topology JSON (e.g., "path/to/topology.json.gz")
+                  - File path to embedding (e.g., "path/to/*.embed.json.gz") - auto-detected
+                  Default: Advantage2_system1
     """
     if h_values is None:
         h_values = [-1.0, 0.0, 1.0]  # Default: ternary distribution
@@ -47,18 +52,35 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None,
         return None
 
     # Get topology
-    if use_embedding:
-        print(f"🔗 Using embedded hardware topology: {use_embedding}")
-        embedded_topo = create_embedded_topology(use_embedding)
-        nodes = embedded_topo.nodes
-        edges = embedded_topo.edges
-        topology_desc = f"{use_embedding} embedded ({len(nodes)} qubits, {len(edges)} couplers)"
+    if topology:
+        # Auto-detect embedding files by .embed.json.gz extension
+        if topology.endswith('.embed.json.gz'):
+            print(f"🔗 Loading embedded topology: {topology}")
+            # Parse Z(m,t) from filename like "zephyr_z9_t2.embed.json.gz"
+            import os
+            filename = os.path.basename(topology)
+            if filename.startswith("zephyr_z"):
+                parts = filename.replace("zephyr_z", "").replace(".embed.json.gz", "").split("_t")
+                topology_name = f"Z({parts[0]},{parts[1]})"
+                embedded_topo = create_embedded_topology(topology_name)
+                nodes = embedded_topo.nodes
+                edges = embedded_topo.edges
+                topology_desc = f"{topology_name} embedded ({len(nodes)} qubits, {len(edges)} couplers)"
+            else:
+                raise ValueError(f"Cannot parse embedding filename: {filename}")
+        else:
+            print(f"📂 Loading topology: {topology}")
+            topo_obj = load_topology(topology)
+            nodes = list(topo_obj.graph.nodes) if hasattr(topo_obj, 'graph') else topo_obj.nodes
+            edges = list(topo_obj.graph.edges) if hasattr(topo_obj, 'graph') else topo_obj.edges
+            topology_name = getattr(topo_obj, 'solver_name', 'unknown')
+            topology_desc = f"{topology_name} ({len(nodes)} nodes, {len(edges)} edges)"
     else:
-        print(f"✨ Using perfect topology (default)")
-        topology_graph = DEFAULT_TOPOLOGY.graph
-        nodes = list(topology_graph.nodes())
-        edges = list(topology_graph.edges())
-        topology_desc = f"perfect Z(9,2) ({len(nodes)} nodes, {len(edges)} edges)"
+        print(f"✨ Using default topology (Advantage2_system1)")
+        topo_obj = DEFAULT_TOPOLOGY
+        nodes = list(topo_obj.graph.nodes) if hasattr(topo_obj, 'graph') else topo_obj.nodes
+        edges = list(topo_obj.graph.edges) if hasattr(topo_obj, 'graph') else topo_obj.edges
+        topology_desc = f"{topo_obj.solver_name} ({len(nodes)} nodes, {len(edges)} edges)"
 
     print(f"📐 Topology: {topology_desc}")
 
@@ -98,7 +120,7 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None,
         'timeout_minutes': timeout_minutes,
         'sampler_type': 'metal-sa',
         'topology': topology_desc,
-        'use_embedding': use_embedding if use_embedding else "none",
+        'topology_arg': topology if topology else "default",
         'problem_info': {
             'num_variables': len(h),
             'num_couplings': len(J),
@@ -319,9 +341,10 @@ def main():
         help='Number of models to process in parallel (default: auto-detect GPU cores, typically 40)'
     )
     parser.add_argument(
-        '--embedding',
+        '--topology',
         type=str,
-        help='Use embedded hardware topology instead of perfect topology (e.g., "Z(9,2)")'
+        help='Topology: Z(9,2), Advantage2_system1, file path, or *.embed.json.gz for embedded. '
+             'Default: Advantage2_system1'
     )
 
     args = parser.parse_args()
@@ -362,7 +385,7 @@ def main():
         only_label=only_label,
         h_values=h_values,
         num_models=num_models,
-        use_embedding=args.embedding
+        topology=args.topology
     )
 
     print(f"\n✅ Metal SA baseline test complete!")

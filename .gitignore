@@ -25,6 +25,10 @@ results/
 quip_protocol.egg-info/
 .quip/
 
+# AI assistant config (project instructions live in AGENTS.md)
+.claude/
+CLAUDE.md
+
 # Test results and data files
 test_results/
 *_results*.json
@@ -38,6 +42,8 @@ mining_rate_*.json
 
 # Build outputs
 **/dist/
+build/pyinstaller/
+pyinstaller/boot_network_node_stamped.py
 akash/web/localhost.pem
 node_modules
 # Dependencies (installed by bun/npm - developer only)
@@ -71,3 +77,14 @@ tutte/research/scripts/
 tutte/research/data/
 tutte/research/docs/
 tutte/research/plans/
+
+# Profiling flamegraph outputs
+flamegraphs/
+# Benchmark outputs
+benchmarks/
+
+# TLS private keys (certbot output in Docker data volume)
+data/certs/private/
+
+# Node runtime output (local telemetry JSON written by TelemetryManager)
+telemetry/
