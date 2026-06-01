@@ -46,5 +46,13 @@ if [ -z "$BINARY" ]; then
 fi
 
 "$BINARY" --version
+
+# Data-bundle guard: load the scalecodec SCALE type-registry presets the way
+# SubstrateInterface does at connect time. Catches a dropped-package-data
+# regression (missing collect_data_files) here at build time rather than as a
+# runtime "'NoneType' object has no attribute 'get'" on the first validator
+# connect in production.
+"$BINARY" selftest
+
 ls -lh "$BINARY"
 echo "OK: $BINARY"

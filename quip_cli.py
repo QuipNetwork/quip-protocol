@@ -542,6 +542,39 @@ def quip_miner(log_level: str) -> None:
     setup_logging(log_level=log_level.upper(), node_name="quip-miner")
 
 
+@quip_miner.command("selftest")
+def quip_miner_selftest() -> None:
+    """Verify the packaged binary can load its bundled runtime assets.
+
+    Guards against the PyInstaller regression where scalecodec's SCALE
+    type-registry presets (shipped as package *data*, invisible to import
+    analysis) get dropped from the frozen bundle. When that happens,
+    ``SubstrateInterface.__init__`` loads preset ``core``,
+    ``load_type_registry_preset`` returns ``None`` on the missing file, and
+    ``update_type_registry(None)`` dies with "'NoneType' object has no
+    attribute 'get'" on the first validator connect — surfacing as a
+    misleading "could not reach" error.
+
+    This replicates that exact load path with no live node, so CI catches a
+    missing-data regression at build time (run on the frozen binary). Exits
+    non-zero on failure.
+    """
+    from scalecodec.base import RuntimeConfigurationObject
+    from scalecodec.type_registry import load_type_registry_preset
+
+    runtime_config = RuntimeConfigurationObject()
+    for preset_name in ("core", "legacy"):
+        preset = load_type_registry_preset(preset_name)
+        if preset is None:
+            raise click.ClickException(
+                f"scalecodec type-registry preset '{preset_name}' is missing "
+                "from the bundle — collect_data_files regression in "
+                "pyinstaller/quip_miner.spec"
+            )
+        runtime_config.update_type_registry(preset)
+    click.echo("selftest OK: scalecodec type-registry presets load")
+
+
 @quip_miner.command("resolve-mode")
 @_config_option
 @click.option(
