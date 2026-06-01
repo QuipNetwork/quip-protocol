@@ -48,9 +48,6 @@ class _StubSampler:
 class _ConcreteMiner(BaseMiner):
     """Thinnest possible concrete subclass for testing BaseMiner methods."""
 
-    def _sample(self, h, J, *, num_reads, num_sweeps, **kwargs):
-        raise NotImplementedError("stub")
-
     def _adapt_mining_params(self, requirements, nodes, edges):
         return {"num_sweeps": 64, "num_reads": 64}
 

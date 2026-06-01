@@ -45,9 +45,6 @@ class CudaMiner(GPUMiner):
     GIBBS_SWEEP_MULTIPLIER = 2
 
     # Sampling runs in a stream-driver process (GPU/cuda_stream.py).
-    # Class-level (not instance) because CudaMiner never falls back to CPU.
-    STREAMING_PUMP = True
-    DRIVER_OWNS_FEEDER = True
     STREAM_FACTORY_DOTTED = "GPU.cuda_stream:build_persistent_context"
 
     def _adapt_mining_params(
@@ -159,7 +156,7 @@ class CudaMiner(GPUMiner):
     ) -> Dict[str, Any]:
         """Return kwargs forwarded to GPU.cuda_stream:build_persistent_context.
 
-        Called by BaseMiner._ensure_driver when STREAMING_PUMP is True.
+        Called by BaseMiner._ensure_driver when spawning the stream driver.
         """
         return {
             "miner_id": self.miner_id,

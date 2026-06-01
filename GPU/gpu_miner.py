@@ -14,11 +14,9 @@ from __future__ import annotations
 
 import os
 import signal
-import sys
 import threading
-import time
 from typing import (
-    Dict, Iterator, List, Optional, Tuple,
+    Iterator, List, Optional, Tuple,
 )
 
 import dimod
@@ -34,17 +32,6 @@ try:
     import cupy as cp
 except ImportError:
     cp = None
-
-
-# ----------------------------------------------------------
-# Pipeline constants
-# ----------------------------------------------------------
-
-# Empirical: on the Advantage topology (4580 nodes, 32k edges),
-# SA takes ~30ms per sweep×read at num_reads=64.  Use a 5×
-# safety margin to cover cold start, high reads, and contention.
-_SEC_PER_SWEEP = 0.03
-_STALL_SAFETY_FACTOR = 5.0
 
 
 class GPUMiner(BaseMiner):
@@ -203,105 +190,6 @@ class GPUMiner(BaseMiner):
             num_nodes=len(nodes),
             num_edges=len(edges),
         )
-
-    def _sample_batch(
-        self,
-        prev_hash: bytes,
-        miner_id: str,
-        cur_index: int,
-        nodes: List[int],
-        edges: List[Tuple[int, int]],
-        *,
-        num_reads: int,
-        num_sweeps: int,
-        **kwargs,
-    ) -> Optional[
-        List[Tuple[int, bytes, dimod.SampleSet]]
-    ]:
-        """Stream one result from the GPU pipeline.
-
-        Lazily creates the streaming iterator on first call.
-        Returns one (nonce, salt, sampleset) per call.
-        """
-        if self._scheduler.should_throttle():
-            time.sleep(0.5)
-
-        # Adaptive nonce scaling (yielding mode only)
-        if (
-            self._scheduler.yielding
-            and self._stream is not None
-        ):
-            new_target = self._scheduler.check_stable_target(
-                self._max_nonces, self._active_nonces,
-            )
-            if (
-                new_target is not None
-                and new_target != self._active_nonces
-            ):
-                self.logger.info(
-                    "Adaptive nonce scaling: %d → %d",
-                    self._active_nonces, new_target,
-                )
-                self._stream.close()
-                self._stream = None
-                self._active_nonces = new_target
-
-        if self._stream is None:
-            extra = {
-                k: v for k, v in kwargs.items()
-                if k not in ('num_reads', 'num_sweeps')
-            }
-            num_k = self._active_nonces
-            # Timeout = expected time for one nonce to
-            # complete, with safety margin. Capped at 30min
-            # to account for slow cards.
-            stall_timeout = max(
-                num_sweeps * _SEC_PER_SWEEP
-                * _STALL_SAFETY_FACTOR,
-                1800.0,
-            )
-            self._stream = (
-                self.sampler.sample_ising_streaming(
-                    self._feeder,
-                    num_reads=num_reads,
-                    num_sweeps=num_sweeps,
-                    num_kernels=num_k,
-                    poll_timeout=stall_timeout,
-                    **extra,
-                )
-            )
-
-        try:
-            model, ss = next(self._stream)
-        except TimeoutError as e:
-            self.logger.warning(f"Pipeline stall: {e}")
-            return None
-        except StopIteration:
-            return None
-
-        return [(model.nonce, model.salt, ss)]
-
-    def _sample(
-        self,
-        h: Dict[int, float],
-        J: Dict[Tuple[int, int], float],
-        *,
-        num_reads: int,
-        num_sweeps: int,
-        **kwargs,
-    ) -> dimod.SampleSet:
-        """Single-nonce fallback (synchronous)."""
-        extra = {
-            k: v for k, v in kwargs.items()
-            if k not in ('num_reads', 'num_sweeps')
-        }
-        results = self.sampler.sample_ising(
-            [h], [J],
-            num_reads=num_reads,
-            num_sweeps=num_sweeps,
-            **extra,
-        )
-        return results[0]
 
     def _post_sample(
         self, sampleset: dimod.SampleSet,

@@ -14,8 +14,8 @@ ring and runs evaluate/ratchet/stash/preview/attempt-log). Verifies:
     `MinerHandle.mine_work_item(context)`
 
 Driver-path mechanics (see ``tests/test_base_miner_pump.py`` for the
-reference harness): a miner opts in with ``STREAMING_PUMP=True`` +
-``DRIVER_OWNS_FEEDER=True`` + a ``STREAM_FACTORY_DOTTED`` factory. Tests that
+reference harness): every miner mines through a ``STREAM_FACTORY_DOTTED``
+factory. Tests that
 control *results* override ``evaluate_sampleset`` (runs consumer-side in this
 process) and control *sampling energy* via the fake factory. Real end-to-end
 tests use the production CPU factory (``CPU.sa_stream:build_persistent_context``)
@@ -66,16 +66,12 @@ _FAKE_ENERGIES_FACTORY = "tests.fakes.fake_stream:build_fake_energies_context"
 
 
 def _driverize(miner, factory=_REAL_CPU_FACTORY):
-    """Put a CPU miner on the stream-driver path.
+    """Point a CPU miner's stream-driver factory at a test context.
 
-    The current base supports both the inline and the driver paths; opting in
-    with ``STREAMING_PUMP=True`` + a factory runs ``mine_work_item`` against a
-    real producer subprocess that writes samplesets into a shared-memory ring.
-    (Later in the program the inline path is deleted; converting these tests
-    now means the flip won't break them.)
+    Every backend mines through the stream-driver path; this just swaps the
+    factory so ``mine_work_item`` runs against a real producer subprocess that
+    writes samplesets into a shared-memory ring.
     """
-    miner.STREAMING_PUMP = True
-    miner.DRIVER_OWNS_FEEDER = True
     miner.STREAM_FACTORY_DOTTED = factory
     return miner
 
@@ -1407,9 +1403,9 @@ def test_attempt_log_qpu_access_time_us_is_none_for_non_qpu_backends(
 ):
     """Non-QPU backends (CPU/CUDA/Metal) produce no QPU sampling time, so the
     ring descriptor's ``qpu_us`` is 0. The attempt record must still carry the
-    ``qpu_access_time_us`` key (uniform schema) — its value is 0 on the driver
-    path (``_acquire_result`` sets ``qpu_access_time_us = int(qpu_us)``, which
-    is 0 rather than None for a zero-timing descriptor).
+    ``qpu_access_time_us`` key (uniform schema) — its value is None for a
+    non-QPU backend (``_acquire_result`` maps ``qpu_us == 0`` to None; QPU
+    access time is always > 0).
     """
     from unittest.mock import MagicMock
 
@@ -1436,7 +1432,7 @@ def test_attempt_log_qpu_access_time_us_is_none_for_non_qpu_backends(
     assert captured, "expected at least one AttemptLogger.record call"
     rec = captured[0]
     assert "qpu_access_time_us" in rec
-    assert rec["qpu_access_time_us"] == 0
+    assert rec["qpu_access_time_us"] is None
 
 
 def test_stored_solution_iter_matches_attempt_iter(

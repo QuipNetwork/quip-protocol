@@ -93,8 +93,8 @@ class _UnitMiner(BaseMiner):
     """Concrete BaseMiner subclass for direct _run_substrate_ratchet tests.
 
     ``evaluate_sampleset`` always returns ``None`` (never a winner) unless
-    overridden by a subclass.  ``_sample`` / ``_adapt_mining_params`` raise
-    so any accidental inline path is caught immediately.
+    overridden by a subclass.  ``_adapt_mining_params`` raises so any
+    accidental setup path is caught immediately.
     """
 
     def __init__(self) -> None:
@@ -103,9 +103,6 @@ class _UnitMiner(BaseMiner):
 
     def _adapt_mining_params(self, requirements, nodes, edges) -> dict:
         raise AssertionError("should not reach _adapt_mining_params in unit tests")
-
-    def _sample(self, *a: Any, **k: Any) -> Any:
-        raise AssertionError("should not reach _sample in unit tests")
 
     def evaluate_sampleset(self, *_args: Any, **_kwargs: Any) -> Optional[MiningResult]:
         return None

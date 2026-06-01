@@ -9,10 +9,11 @@ from types import SimpleNamespace
 from GPU.cuda_miner import CudaMiner
 
 
-def test_cuda_streaming_flags_are_class_level():
-    assert CudaMiner.STREAMING_PUMP is True
-    assert CudaMiner.DRIVER_OWNS_FEEDER is True
+def test_cuda_streaming_factory_is_class_level():
     assert CudaMiner.STREAM_FACTORY_DOTTED == "GPU.cuda_stream:build_persistent_context"
+    # The inline sampling path is gone — no _sample/_sample_batch on the class.
+    assert not hasattr(CudaMiner, "_sample")
+    assert not hasattr(CudaMiner, "_sample_batch")
 
 
 def test_cuda_stream_factory_kwargs_keys():

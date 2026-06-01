@@ -112,14 +112,12 @@ class _AcquireResult:
     salt: bytes = b""
     sampleset: Any = None
     qpu_access_time_us: Optional[int] = None
-    # Ring slot backing ``sampleset`` on the driver path; the consumer
-    # releases it after ``_finalize_iteration_logging`` reads the set.
-    # ``None`` on the inline path (no shared ring).
+    # Ring slot backing ``sampleset``; the consumer releases it after
+    # ``_finalize_iteration_logging`` reads the set.
     ring_slot: Optional[int] = None
-    # Unpickled DefectInfo from the descriptor's 8th element (driver path).
-    # ``None`` for all current code paths (CPU/GPU/Metal/inline); will be
-    # populated by DWaveMiner once that path lands. Consumer-side only —
-    # never crosses a process boundary after this point.
+    # Unpickled DefectInfo from the descriptor's 8th element. ``None`` for
+    # non-QPU backends; populated by DWaveMiner. Consumer-side only — never
+    # crosses a process boundary after this point.
     defect_info: Any = None
 
 
@@ -140,10 +138,10 @@ class MidstreamBudget:
 class _DispatchSetup:
     """Everything ``_setup_dispatch`` hands back to ``mine_work_item``.
 
-    Bundles the per-dispatch loop inputs and the (optional) result-pump
-    handles so the main method stays a thin loop driver. ``None`` from
-    ``_setup_dispatch`` means ``_pre_mine_setup`` aborted and the caller
-    returns ``None`` immediately (same as the original early return).
+    Bundles the per-dispatch loop inputs and the driver handles so the main
+    method stays a thin loop driver. ``None`` from ``_setup_dispatch`` means
+    ``_pre_mine_setup`` aborted and the caller returns ``None`` immediately
+    (same as the original early return).
     """
 
     loop_state: "_MiningLoopState"
@@ -151,9 +149,8 @@ class _DispatchSetup:
     sample_ctx: Dict[str, Any]
     num_reads: int
     num_sweeps: int
-    # Driver path (STREAMING_PUMP + DRIVER_OWNS_FEEDER): the shared-sample
-    # ring, the descriptor queue, the stream-driver process and its stop
-    # event. All ``None`` on the inline (CPU/GPU/Metal) path.
+    # The shared-sample ring, the descriptor queue, the stream-driver process
+    # and its stop event for this dispatch.
     ring: Optional[Any]
     desc_q: Optional[Any]
     driver_proc: Optional[Any]
@@ -267,8 +264,8 @@ class BaseMiner(ABC):
     """Abstract base class for concrete miners (Template Method pattern).
 
     Subclasses must implement:
-      - _sample(h, J, **kwargs): backend-specific Ising sampling
       - _adapt_mining_params(requirements, nodes, edges): return parameter dict
+      - _stream_factory_kwargs(sample_ctx, nodes): driver-context factory kwargs
 
     Subclasses may optionally override:
       - _pre_mine_setup(...): one-time setup before the mining loop
@@ -343,23 +340,20 @@ class BaseMiner(ABC):
         # Track top 3 mining results
         self.top_attempts: List[IsingSample] = []
 
-        # Feeder slot. ``mine_work_item`` writes here just before the
-        # loop and clears it in ``finally``. Subclasses (GPU/QPU/Metal)
-        # used to assign in their own ``_pre_mine_setup``; now the base
-        # class is authoritative, but their pipelines still read this
-        # attribute via ``self._feeder`` (e.g. streaming samplers and
-        # SIGTERM handlers), so it must exist before any subclass runs.
+        # Worker-side feeder slot, always None: every backend mines through
+        # the stream-driver process, which owns the feeder. Kept so subclass
+        # SIGTERM handlers that guard on ``self._feeder`` have the attribute
+        # before their own ``__init__`` runs.
         self._feeder: Optional[Any] = None
 
         # Count of QPU results dropped under result-queue backpressure.
         # Reset per dispatch by mine_work_item; logged at dispatch end.
         self._dropped_results: int = 0
 
-        # Persistent driver-path handles (DRIVER_OWNS_FEEDER). ``_ensure_driver``
-        # spawns ONE stream-driver process and keeps it alive across dispatches;
-        # ``_close_driver`` (miner shutdown) is the only thing that reaps it and
-        # close-unlinks the ring. All ``None`` on the inline (CPU/GPU/Metal) path
-        # and before the first driver dispatch.
+        # Persistent driver handles. ``_ensure_driver`` spawns ONE stream-driver
+        # process and keeps it alive across dispatches; ``_close_driver`` (miner
+        # shutdown) is the only thing that reaps it and close-unlinks the ring.
+        # All ``None`` before the first driver dispatch.
         self._ring: Optional[Any] = None
         self._desc_q: Optional[Any] = None
         self._ctl_q: Optional[Any] = None
@@ -388,7 +382,7 @@ class BaseMiner(ABC):
 
         # In-flight QPU job count forwarded to the stream-driver factory.
         # QPU subclasses override; default 0 keeps the driver factory's
-        # ``self.queue_depth`` reference safe for any STREAMING_PUMP subclass.
+        # ``self.queue_depth`` reference safe for any backend.
         self.queue_depth: int = 0
 
         # Throttle for the "_pre_mine_setup returned False" warning so
@@ -493,17 +487,11 @@ class BaseMiner(ABC):
     # that the ratchet gates on the heap's worst-energy entry.
     TOP_K_STORE: int = 5
 
-    # --- Out-of-band result pump (streaming backends only) ---
-    # When True, mine_work_item runs _sample_batch on a background pump
-    # thread and consumes results off a bounded queue, so per-result
-    # processing never blocks the QPU pipeline. CPU/GPU/Metal keep the
-    # inline single-shot / batch path (STREAMING_PUMP stays False).
-    STREAMING_PUMP: bool = False
-    # When True (QPU), the sampler + feeder live in a separate stream-driver
-    # PROCESS (see QPU/stream_driver.py); ``_setup_dispatch`` skips building a
-    # worker-side feeder and ``_ensure_driver`` spawns the driver instead
-    # of a pump thread. CPU/GPU keep this False and run the in-worker feeder.
-    DRIVER_OWNS_FEEDER: bool = False
+    # --- Stream-driver factory ---
+    # Every backend mines through the producer->ring->consumer driver: the
+    # sampler + feeder live in a separate stream-driver PROCESS (see
+    # QPU/stream_driver.py), the worker keeps no feeder, and ``_ensure_driver``
+    # always spawns the driver. Subclasses differ only in their sampler.
     # Dotted ``module:attr`` of the stream factory the driver process
     # resolves and calls. Points at ``QPU.dwave_miner:build_persistent_context``
     # for the QPU path; tests swap it for a fake so the driver path can be
@@ -684,8 +672,6 @@ class BaseMiner(ABC):
           job-state change.
         - the same sampler, adaptive param, evaluate-sampleset, top-attempts
           surface used by subclasses (CPU/GPU/QPU).
-        - batch sampling (``_sample_batch``) is intentionally bypassed
-          (see Phase 4 follow-on note on feeder identity).
 
         Args:
             context: Either a ``SubstrateMiningContext`` (PoW) or
@@ -723,7 +709,6 @@ class BaseMiner(ABC):
             return None  # _pre_mine_setup aborted (e.g. QPU budget exhausted)
         loop_state = setup.loop_state
         is_substrate = setup.is_substrate
-        sample_ctx = setup.sample_ctx
         desc_q = setup.desc_q
 
         # Dispatch accepted (gate passed): emit the write-once participation
@@ -741,13 +726,11 @@ class BaseMiner(ABC):
         progress = 0
         try:
             while self.mining and not stop_event.is_set():
-                # Each iteration sources one (nonce, salt, sampleset):
-                # streaming backends via ``_sample_batch`` (which pulls
-                # models from the feeder internally), or the single-shot
-                # path which pops one model. The PoW feeder derives a
-                # fresh ``salt -> nonce -> (h, J)`` per model in a
-                # background process; the mempool feeder cycles the
-                # order's stored ``(h, J)``.
+                # Each iteration sources one (nonce, salt, sampleset) off the
+                # stream-driver's descriptor queue. The PoW feeder (in the
+                # driver process) derives a fresh ``salt -> nonce -> (h, J)``
+                # per model; the mempool feeder cycles the order's stored
+                # ``(h, J)``.
                 preprocess_start = time.time()
                 self.current_stage = 'preprocessing'
                 self.current_stage_start = preprocess_start
@@ -757,7 +740,7 @@ class BaseMiner(ABC):
                 # stop / stream-exhausted / sampling-error control flow.
                 acquired = self._acquire_result(
                     stop_event, desc_q, preprocess_start,
-                    sample_ctx=sample_ctx, driver_proc=setup.driver_proc,
+                    driver_proc=setup.driver_proc,
                     generation=setup.generation,
                 )
                 if acquired.action == _ACQUIRE_STOP:
@@ -1092,34 +1075,16 @@ class BaseMiner(ABC):
             epoch_length=int(getattr(context, "epoch_length", 0) or 0),
         )
 
-        # Build the feeder for this attempt. Each context flavor picks
-        # the right backing implementation (RandomIsingFeeder for PoW,
-        # FixedIsingFeeder for mempool). We own the lifecycle here —
-        # ``finally`` stops and clears it so a subsequent dispatch starts
-        # from a clean state. Streaming-capable backends (QPU async
-        # pipeline, GPU multi-problem dispatch) read ``self._feeder`` from
-        # ``_sample_batch`` and keep ``queue_depth`` jobs in flight — that
-        # is what gives the QPU its throughput. Backends without batch
-        # streaming pop the feeder one model at a time (see the loop).
-        if self.DRIVER_OWNS_FEEDER:
-            # The stream-driver process builds its own feeder (RandomIsingFeeder
-            # for PoW, FixedIsingFeeder for mempool via ProblemView); the worker
-            # keeps no feeder so the model is derived in exactly one place.
-            # Capture the construction inputs into sample_ctx below.
-            self._feeder = None
-        else:
-            self._feeder = context.make_feeder(
-                nodes, edges, buffer_size=self.FEEDER_BUFFER_SIZE,
-            )
-
-        # Positional args for the legacy ``_sample_batch`` signature. The
-        # QPU/GPU streaming impls ignore them — their feeder already
-        # encapsulates the round seed and miner identity — but the base
-        # contract requires (prev_hash, miner_id, cur_index). The driver
-        # path additionally forwards the feeder-construction inputs and the
-        # QPU dispatch knobs (annealing_time / energy_threshold come from
-        # _adapt_mining_params' extra params) so _ensure_driver can hand
-        # them to the stream-driver process.
+        # The stream-driver process builds its own feeder (RandomIsingFeeder
+        # for PoW, FixedIsingFeeder for mempool via ProblemView); the worker
+        # keeps no feeder so the model is derived in exactly one place. The
+        # construction inputs are captured into sample_ctx below.
+        self._feeder = None
+        # Sampling context forwarded to the stream-driver process. Carries the
+        # feeder-construction inputs (round seed + miner identity) and the QPU
+        # dispatch knobs (annealing_time / energy_threshold come from
+        # _adapt_mining_params' extra params) so _ensure_driver can hand them
+        # to the driver.
         sample_ctx = {
             "prev_hash": bridge_prev_block.hash,
             "miner_id": bridge_node_info.miner_id,
@@ -1198,12 +1163,11 @@ class BaseMiner(ABC):
     ) -> Dict[str, Any]:
         """Kwargs for the stream-driver context factory (backend-specific).
 
-        Base raises: a backend that sets ``STREAMING_PUMP`` must override this
-        to supply exactly the kwargs its ``build_persistent_context`` accepts.
+        Base raises: every backend must override this to supply exactly the
+        kwargs its ``build_persistent_context`` accepts.
         """
         raise NotImplementedError(
-            f"{type(self).__name__} sets STREAMING_PUMP but does not override "
-            "_stream_factory_kwargs"
+            f"{type(self).__name__} does not override _stream_factory_kwargs"
         )
 
     def _ensure_driver(self, sample_ctx: Dict[str, Any]) -> bool:
@@ -1217,11 +1181,9 @@ class BaseMiner(ABC):
         across dispatches; only ``_close_driver`` (miner shutdown) reaps it.
 
         Returns:
-            ``True`` if a live driver is ready (streaming path); ``False`` for
-            the inline (CPU/GPU/Metal) path (``STREAMING_PUMP`` is False).
+            ``True`` once a live driver is ready (always — every backend mines
+            through the driver).
         """
-        if not self.STREAMING_PUMP:
-            return False
         nodes = sample_ctx["nodes"]
         dims = (int(sample_ctx["num_reads"]), len(nodes))
         alive = self._driver_proc is not None and self._driver_proc.is_alive()
@@ -1396,20 +1358,17 @@ class BaseMiner(ABC):
     def _acquire_result(
         self,
         stop_event: multiprocessing.synchronize.Event,
-        desc_q: Optional[Any],
+        desc_q: Any,
         preprocess_start: float,
         *,
-        sample_ctx: Dict[str, Any],
         driver_proc: Optional[Any] = None,
         generation: int = 0,
     ) -> _AcquireResult:
         """Source one ``(nonce, salt, sampleset)`` for a loop iteration.
 
-        Driver mode (``desc_q`` set) blocks on the descriptor queue, waking to
-        check ``stop_event``; each descriptor names a ring slot whose
-        sample/energy matrices the consumer reads zero-copy into a
-        :class:`_SharedSampleSet`. The inline path calls ``_sample_batch``
-        (falling back to a single ``_sample`` on the popped feeder model).
+        Blocks on the descriptor queue, waking to check ``stop_event``; each
+        descriptor names a ring slot whose sample/energy matrices the consumer
+        reads zero-copy into a :class:`_SharedSampleSet`.
         Appends the sampling / preprocessing timings on success. Returns an
         :class:`_AcquireResult` whose ``action`` reproduces the original
         inline control flow exactly:
@@ -1430,84 +1389,59 @@ class BaseMiner(ABC):
             sample_start = time.time()
             self.current_stage = 'sampling'
             self.current_stage_start = sample_start
-            if desc_q is not None:
-                # Driver mode: block on the descriptor queue, waking to check
-                # stop_event and driver liveness. A trailing None — or a dead
-                # driver — means the stream ended. Descriptors tagged with a
-                # superseded generation are released + skipped (consumer-side
-                # generation filter, the second of the three).
-                while True:
-                    item = self._await_descriptor(
-                        stop_event, desc_q, driver_proc,
-                    )
-                    if item == _ACQUIRE_STOP:
-                        return _AcquireResult(_ACQUIRE_STOP)
-                    if item is None or item == _ACQUIRE_DONE:
-                        return _AcquireResult(_ACQUIRE_DONE)
-                    if self._ring is None:
-                        self.logger.error(
-                            "driver descriptor received but shared ring is "
-                            "None; ending dispatch",
-                        )
-                        return _AcquireResult(_ACQUIRE_DONE)
-                    slot, n_rows, n_cols, nonce, salt, qpu_us, desc_gen = item[:7]
-                    defect_pickle = item[7] if len(item) > 7 else None
-                    if desc_gen != generation:
-                        # Straggler from a prior round; free the slot, keep
-                        # waiting for a current-generation descriptor.
-                        self._ring.release(slot)
-                        continue
-                    ring_slot = slot
-                    break
-                # Stop raced with delivery: release the slot and stop.
-                if stop_event.is_set():
-                    self._ring.release(ring_slot)
+            # Driver mode (the only mode): block on the descriptor queue,
+            # waking to check stop_event and driver liveness. A trailing None —
+            # or a dead driver — means the stream ended. Descriptors tagged with
+            # a superseded generation are released + skipped (consumer-side
+            # generation filter, the second of the three).
+            while True:
+                item = self._await_descriptor(
+                    stop_event, desc_q, driver_proc,
+                )
+                if item == _ACQUIRE_STOP:
                     return _AcquireResult(_ACQUIRE_STOP)
-                sampleset = _SharedSampleSet(
-                    *self._ring.read(ring_slot, n_rows, n_cols),
-                )
-                # pickle.loads is safe here: defect_pickle was written by the
-                # stream-driver subprocess (same operator-controlled process
-                # tree) and travels only over a local multiprocessing.Queue —
-                # there is no network boundary or untrusted input source.
-                defect_info = (
-                    pickle.loads(defect_pickle)
-                    if defect_pickle is not None else None
-                )
-                qpu_access_time_us = int(qpu_us)
-                if qpu_us > 0:
-                    self.timing_stats['qpu_access_time'].append(int(qpu_us))
-                    time_manager = getattr(self, "time_manager", None)
-                    if time_manager is not None:
-                        time_manager.record_block_time(int(qpu_us))
-            else:
-                # Inline path (CPU/GPU/Metal): unchanged.
-                qpu_access_len_before = len(
-                    self.timing_stats['qpu_access_time'],
-                )
-                batch = self._sample_batch(
-                    sample_ctx["prev_hash"], sample_ctx["miner_id"],
-                    sample_ctx["cur_index"],
-                    sample_ctx["nodes"], sample_ctx["edges"],
-                    num_reads=sample_ctx["num_reads"],
-                    num_sweeps=sample_ctx["num_sweeps"],
-                    **sample_ctx["extra"],
-                )
-                if batch is not None:
-                    nonce, salt, sampleset = batch[0]
-                else:
-                    model = self._feeder.pop_blocking()
-                    nonce, salt = model.nonce, model.salt
-                    sampleset = self._sample(
-                        model.h, model.J,
-                        num_reads=sample_ctx["num_reads"],
-                        num_sweeps=sample_ctx["num_sweeps"],
-                        nonce_seed=nonce,
-                        **sample_ctx["extra"],
+                if item is None or item == _ACQUIRE_DONE:
+                    return _AcquireResult(_ACQUIRE_DONE)
+                if self._ring is None:
+                    self.logger.error(
+                        "driver descriptor received but shared ring is "
+                        "None; ending dispatch",
                     )
-                qpu_access_list = self.timing_stats['qpu_access_time']
-                if len(qpu_access_list) > qpu_access_len_before:
-                    qpu_access_time_us = int(qpu_access_list[-1])
+                    return _AcquireResult(_ACQUIRE_DONE)
+                slot, n_rows, n_cols, nonce, salt, qpu_us, desc_gen = item[:7]
+                defect_pickle = item[7] if len(item) > 7 else None
+                if desc_gen != generation:
+                    # Straggler from a prior round; free the slot, keep
+                    # waiting for a current-generation descriptor.
+                    self._ring.release(slot)
+                    continue
+                ring_slot = slot
+                break
+            # Stop raced with delivery: release the slot and stop.
+            if stop_event.is_set():
+                self._ring.release(ring_slot)
+                return _AcquireResult(_ACQUIRE_STOP)
+            sampleset = _SharedSampleSet(
+                *self._ring.read(ring_slot, n_rows, n_cols),
+            )
+            # pickle.loads is safe here: defect_pickle was written by the
+            # stream-driver subprocess (same operator-controlled process
+            # tree) and travels only over a local multiprocessing.Queue —
+            # there is no network boundary or untrusted input source.
+            defect_info = (
+                pickle.loads(defect_pickle)
+                if defect_pickle is not None else None
+            )
+            # qpu_us is 0 for non-QPU backends (CPU/GPU/Metal/Modal) and the
+            # real QPU access time (always > 0) for the QPU backend. Preserve
+            # the telemetry contract: qpu_access_time_us is None for non-QPU
+            # backends, an int for QPU.
+            if qpu_us > 0:
+                qpu_access_time_us = int(qpu_us)
+                self.timing_stats['qpu_access_time'].append(int(qpu_us))
+                time_manager = getattr(self, "time_manager", None)
+                if time_manager is not None:
+                    time_manager.record_block_time(int(qpu_us))
             sample_time = time.time() - sample_start
             # In pump mode sample_time is queue-dequeue latency (~0µs),
             # not QPU access time — qpu_access_time_us carries the real
@@ -1529,11 +1463,11 @@ class BaseMiner(ABC):
     def _teardown_dispatch(self) -> None:
         """Tear down PER-DISPATCH state in ``mine_work_item``'s ``finally``.
 
-        On the persistent driver path this does NOT kill the driver or close
-        the ring — both persist across dispatches (that is the whole point of
-        the redesign; ``_close_driver`` reaps them on miner shutdown). On the
-        inline path it stops and clears the worker feeder. Always flushes the
-        attempt logger and delegates to subclass ``_post_mine_cleanup``.
+        Does NOT kill the driver or close the ring — both persist across
+        dispatches (that is the whole point of the redesign; ``_close_driver``
+        reaps them on miner shutdown). The worker owns no feeder (the
+        persistent driver does). Always flushes the attempt logger and
+        delegates to subclass ``_post_mine_cleanup``.
         """
         self.mining = False
         if self._dropped_results:
@@ -1541,13 +1475,6 @@ class BaseMiner(ABC):
                 "mine_work_item: %d QPU results dropped under "
                 "result-queue backpressure", self._dropped_results,
             )
-        # Inline path only: tear down the worker feeder. The driver path has
-        # no worker feeder (the persistent driver owns it).
-        if self._feeder is not None:
-            try:
-                self._feeder.stop()
-            finally:
-                self._feeder = None
         attempt_logger = getattr(self, "_attempt_logger", None)
         if attempt_logger is not None:
             attempt_logger.flush()
@@ -1993,21 +1920,11 @@ class BaseMiner(ABC):
             (time.time() - preprocess_start) * 1e6
         )
         attempt_log_kwargs["qpu_access_time_us"] = qpu_access_time_us
-        if self._feeder is not None:
-            fstats = self._feeder.stats()
-            attempt_log_kwargs["feeder_ready"] = fstats["ready"]
-            attempt_log_kwargs["feeder_drained_count"] = (
-                fstats["drained_count"]
-            )
-            attempt_log_kwargs["feeder_pop_wait_total_s"] = (
-                fstats["pop_wait_total_s"]
-            )
-        else:
-            # Driver path (QPU): the feeder lives in the stream-driver
-            # process, so its stats aren't reachable here. Record None.
-            attempt_log_kwargs["feeder_ready"] = None
-            attempt_log_kwargs["feeder_drained_count"] = None
-            attempt_log_kwargs["feeder_pop_wait_total_s"] = None
+        # The feeder lives in the stream-driver process, so its stats aren't
+        # reachable from the worker. Record None.
+        attempt_log_kwargs["feeder_ready"] = None
+        attempt_log_kwargs["feeder_drained_count"] = None
+        attempt_log_kwargs["feeder_pop_wait_total_s"] = None
         # Compute solution_meta scalars + capture top-5 solutions. Meta is
         # always embedded in the attempt log; top-5 spins go to disk only
         # when this iter is stored or submitted (see write below).
@@ -2136,21 +2053,6 @@ class BaseMiner(ABC):
         return True
 
     @abstractmethod
-    def _sample(
-        self,
-        h: Dict[int, float],
-        J: Dict[Tuple[int, int], float],
-        *,
-        num_reads: int,
-        num_sweeps: int,
-        **kwargs,
-    ) -> dimod.SampleSet:
-        """Perform backend-specific Ising sampling.
-
-        Must return a dimod.SampleSet.
-        """
-
-    @abstractmethod
     def _adapt_mining_params(
         self,
         current_requirements: BlockRequirements,
@@ -2160,29 +2062,9 @@ class BaseMiner(ABC):
         """Return adaptive mining parameters for the current difficulty.
 
         The returned dict must include at least 'num_sweeps' and
-        'num_reads'.  Extra keys are forwarded to ``_sample()`` as
-        keyword arguments.
+        'num_reads'.  Extra keys are forwarded to the stream-driver context
+        factory.
         """
-
-    def _sample_batch(
-        self,
-        prev_hash: bytes,
-        miner_id: str,
-        cur_index: int,
-        nodes: List[int],
-        edges: List[Tuple[int, int]],
-        *,
-        num_reads: int,
-        num_sweeps: int,
-        **kwargs,
-    ) -> Optional[List[Tuple[int, bytes, dimod.SampleSet]]]:
-        """Sample multiple nonces in a single kernel launch.
-
-        Returns list of (nonce, salt, sampleset) tuples, or None
-        to fall through to single-nonce _sample() path.
-        Override in miners that support multi-nonce dispatch.
-        """
-        return None
 
     def _post_sample(
         self, sampleset: dimod.SampleSet,
@@ -2258,8 +2140,6 @@ class BaseMiner(ABC):
             "miner_id": self.miner_id,
             "miner_type": self.miner_type,
         })
-        if self._feeder is not None:
-            stats["feeder_stats"] = self._feeder.stats()
         return stats
 
     def evaluate_sampleset(self, sampleset: dimod.SampleSet, requirements: BlockRequirements, nodes: List[int], edges: List[Tuple[int, int]], nonce: int, salt: bytes, prev_timestamp: int, start_time: float, *, strict_energy: bool = True, live_threshold_energy: Optional[float] = None) -> Optional[MiningResult]:

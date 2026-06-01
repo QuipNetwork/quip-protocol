@@ -1,13 +1,9 @@
 """GPU miner using Modal via ModalSampler(gpu_type)."""
 from __future__ import annotations
 
-import multiprocessing
-import multiprocessing.synchronize
 import signal
 import sys
-from typing import Dict, List, Tuple
-
-import dimod
+from typing import List, Tuple
 
 from shared.base_miner import BaseMiner
 from shared.miner_types import BlockRequirements
@@ -75,19 +71,6 @@ class ModalMiner(BaseMiner):
             current_requirements.min_solutions,
             num_nodes=len(nodes),
             num_edges=len(edges),
-        )
-
-    def _sample(
-        self,
-        h: Dict[int, float],
-        J: Dict[Tuple[int, int], float],
-        *,
-        num_reads: int,
-        num_sweeps: int,
-        **kwargs,
-    ) -> dimod.SampleSet:
-        return self.sampler.sample_ising(
-            h=h, J=J, num_reads=num_reads, num_sweeps=num_sweeps,
         )
 
     def _stream_factory_kwargs(self, sample_ctx, nodes):

@@ -13,17 +13,12 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
-import sys
-import time
-from typing import Dict, Iterator, List, Optional, Tuple
-
-import dimod
+from typing import List, Tuple
 
 from shared.base_miner import BaseMiner
 from shared.miner_types import BlockRequirements
-from shared.ising_feeder import RandomIsingFeeder
 from GPU.metal_sa import MetalSASampler
-from GPU.metal_scheduler import DutyCycleController, MetalScheduler
+from GPU.metal_scheduler import MetalScheduler
 
 
 def get_gpu_core_count() -> int:
@@ -72,9 +67,8 @@ class MetalMiner(BaseMiner):
     FEEDER_BUFFER_SIZE = 16
 
     # Dotted path to the stream-driver producer factory (GPU/metal_stream.py).
-    # STREAMING_PUMP / DRIVER_OWNS_FEEDER are set as INSTANCE attributes on the
-    # Metal-success path only, so CPU-fallback instances keep the class defaults
-    # (False) and stay on the inline sampling path.
+    # The driver process builds its own scheduler + feeder; the worker keeps
+    # neither.
     STREAM_FACTORY_DOTTED = "GPU.metal_stream:build_persistent_context"
 
     # Metal MPS strategy: fewer sweeps, more reads
@@ -89,31 +83,15 @@ class MetalMiner(BaseMiner):
         # Remove CUDA-only keys that flow through common_cfg
         cfg.pop('sms_per_nonce', None)
 
-        # Store topology before try so it's available on both success and
-        # fallback paths (harmless on fallback).
         self.topology = topology
 
-        try:
-            sampler = MetalSASampler(topology=topology)
-            super().__init__(
-                miner_id, sampler, miner_type="GPU-Metal",
-            )
-            sampler.logger = self.logger
-        except Exception as e:
-            from CPU.sa_sampler import (
-                SimulatedAnnealingStructuredSampler,
-            )
-            sampler = SimulatedAnnealingStructuredSampler(
-                topology=topology,
-            )
-            super().__init__(
-                miner_id, sampler, miner_type="CPU-FALLBACK",
-            )
-            self.logger.warning(
-                "Metal GPU init failed, falling back to "
-                "CPU: %s", e,
-            )
-            return
+        # Metal is required: a failed sampler init crashes rather than
+        # silently falling back to CPU (the driver process owns the sampler).
+        sampler = MetalSASampler(topology=topology)
+        super().__init__(
+            miner_id, sampler, miner_type="GPU-Metal",
+        )
+        sampler.logger = self.logger
 
         if not 0 < gpu_util <= 100:
             raise ValueError(
@@ -123,47 +101,27 @@ class MetalMiner(BaseMiner):
         self.gpu_utilization = gpu_util
 
         self.gpu_core_count = get_gpu_core_count()
-        self._scheduler = MetalScheduler(
+        scheduler = MetalScheduler(
             gpu_core_count=self.gpu_core_count,
             gpu_utilization_pct=gpu_util,
             yielding=yielding,
         )
-
         self.logger.info(
             "Metal miner %s: utilization=%d%%, "
             "core_budget=%d, cores=%d, yielding=%s",
             miner_id,
             gpu_util,
-            self._scheduler.get_core_budget(),
+            scheduler.get_core_budget(),
             self.gpu_core_count,
             yielding,
         )
 
-        # Duty-cycle controller: sleep proportionally to compute
-        # time so actual GPU utilization matches the target.
-        self._duty_cycle = DutyCycleController(
-            target_pct=gpu_util,
-        )
-
-        # Pipeline state (reset per mine_block call)
-        self._feeder: Optional[RandomIsingFeeder] = None
-        self._stream: Optional[Iterator] = None
-        self._active_tg = self._scheduler.get_core_budget()
-        self._max_tg = self._active_tg
-
         signal.signal(signal.SIGTERM, self._cleanup_handler)
-
-        # Sampling runs in a stream-driver process (GPU/metal_stream.py) so the
-        # GPU keeps filling the ring while the worker evaluates concurrently.
-        # Instance-level (not class) so the CPU-fallback path keeps the inline
-        # path (class defaults remain False).
-        self.STREAMING_PUMP = True
-        self.DRIVER_OWNS_FEEDER = True
 
     # ── BaseMiner hooks ──────────────────────────────────
 
     def _pre_mine_setup(self, *args, **kwargs) -> bool:
-        """Per-attempt setup. Feeder is built by ``BaseMiner.mine_work_item``.
+        """Per-attempt setup validating the work context.
 
         Kept as an override (instead of using BaseMiner's default no-op)
         so the validation of ``prev_block`` / ``node_info`` runs early
@@ -178,7 +136,6 @@ class MetalMiner(BaseMiner):
             )
             return False
 
-        self._stream = None
         return True
 
     def _adapt_mining_params(
@@ -198,7 +155,7 @@ class MetalMiner(BaseMiner):
     def _stream_factory_kwargs(self, sample_ctx, nodes):
         """Return kwargs forwarded to GPU.metal_stream:build_persistent_context.
 
-        Called by BaseMiner._ensure_driver when STREAMING_PUMP is True.
+        Called by BaseMiner._ensure_driver when spawning the stream driver.
         """
         return {
             "miner_id": self.miner_id,
@@ -211,103 +168,13 @@ class MetalMiner(BaseMiner):
             "utilization": getattr(self, "gpu_utilization", 100),
         }
 
-    def _sample_batch(
-        self,
-        prev_hash: bytes,
-        miner_id: str,
-        cur_index: int,
-        nodes: List[int],
-        edges: List[Tuple[int, int]],
-        *,
-        num_reads: int,
-        num_sweeps: int,
-        **kwargs,
-    ) -> Optional[
-        List[Tuple[int, bytes, dimod.SampleSet]]
-    ]:
-        """Stream one batch from the Metal pipeline.
-
-        Lazily creates the streaming iterator on first call.
-        Returns one (nonce, salt, sampleset) per call, or
-        None to fall through to single-nonce path.
-        """
-        # No feeder means fallback mode (CPU sampler)
-        if self._feeder is None:
-            return None
-
-        if self._scheduler.should_throttle():
-            time.sleep(0.5)
-
-        # Dynamic batch sizing: check if IOKit suggests resizing
-        if self._stream is not None and self._scheduler.yielding:
-            new_tg = self._scheduler.check_stable_target_threadgroups(
-                self._max_tg, self._active_tg,
-            )
-            if new_tg is not None and new_tg != self._active_tg:
-                self.logger.info(
-                    "Resizing Metal batch: %d → %d threadgroups",
-                    self._active_tg, new_tg,
-                )
-                if hasattr(self._stream, 'close'):
-                    self._stream.close()
-                self._stream = None
-                self._active_tg = new_tg
-                self._duty_cycle.reset()
-
-        if self._stream is None:
-            budget = self._active_tg
-            self._stream = self.sampler.sample_ising_streaming(
-                self._feeder,
-                num_reads=num_reads,
-                num_sweeps=num_sweeps,
-                max_threadgroups=budget,
-                duty_cycle=self._duty_cycle,
-                scheduler=self._scheduler,
-            )
-
-        try:
-            model, ss = next(self._stream)
-        except StopIteration:
-            return None
-
-        return [(model.nonce, model.salt, ss)]
-
-    def _sample(
-        self,
-        h: Dict[int, float],
-        J: Dict[Tuple[int, int], float],
-        *,
-        num_reads: int,
-        num_sweeps: int,
-        **kwargs,
-    ) -> dimod.SampleSet:
-        """Single-nonce fallback (synchronous)."""
-        results = self.sampler.sample_ising(
-            [h], [J],
-            num_reads=num_reads,
-            num_sweeps=num_sweeps,
-        )
-        return results[0]
-
-    def _post_mine_cleanup(self) -> None:
-        """Stop stream and feeder."""
-        if self._stream is not None:
-            if hasattr(self._stream, 'close'):
-                self._stream.close()
-            self._stream = None
-        if self._feeder is not None:
-            self._feeder.stop()
-            self._feeder = None
-
     def _cleanup_handler(self, signum, frame):
-        """Handle SIGTERM: stop feeder, scheduler, exit."""
-        if self._feeder is not None:
-            self._feeder.stop()
-            self._feeder = None
+        """Handle SIGTERM: clear cached state, exit.
 
-        if hasattr(self, '_scheduler'):
-            self._scheduler.stop()
-
+        The sampler, scheduler and feeder live in the stream-driver process
+        (reaped by ``BaseMiner._close_driver``), so this worker-side handler
+        only drops cached candidates before a hard exit.
+        """
         if hasattr(self, 'top_attempts'):
             self.top_attempts.clear()
 

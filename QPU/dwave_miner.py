@@ -145,13 +145,9 @@ class DWaveMiner(BaseMiner):
     # Keep that headroom so the streaming sampler can saturate the
     # D-Wave cloud queue without blocking on Python-side derivation.
     FEEDER_BUFFER_SIZE = 60
-    # QPU is the async-streaming backend: drive the stream in a separate
-    # process so per-result processing never blocks the cloud pipeline.
-    STREAMING_PUMP = True
     # The sampler + feeder live in the persistent stream-driver process (see
-    # QPU/stream_driver.py + build_persistent_context); BaseMiner skips the
-    # worker-side feeder and _ensure_driver spawns/reuses that process.
-    DRIVER_OWNS_FEEDER = True
+    # QPU/stream_driver.py + build_persistent_context); _ensure_driver
+    # spawns/reuses that process and the worker keeps no feeder.
 
     def __init__(
         self,
@@ -488,17 +484,6 @@ class DWaveMiner(BaseMiner):
             "token": getattr(self, "token", None),
             "topology": getattr(self, "topology", None),
         }
-
-    def _sample(self, h, J, *, num_reads, num_sweeps, **kwargs):
-        """Unused on the QPU path — sampling runs in the stream-driver process.
-
-        QPU mining is STREAMING_PUMP=True and is sourced exclusively from the
-        stream-driver descriptor queue; the legacy synchronous fallback was
-        removed. Kept only to satisfy the BaseMiner ABC.
-        """
-        raise NotImplementedError(
-            "DWaveMiner does not sample synchronously; use the stream driver"
-        )
 
     def _finalize_sample(self, sampleset: Any, defect_info: Any) -> Any:
         """Reconstruct a reduced D-Wave sampleset to full topology (survivor-only).

@@ -1,21 +1,24 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
 
-"""MetalMiner enables the streaming producer only when Metal init succeeds."""
+"""MetalMiner mines through the stream driver; init crashes without Metal."""
 from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from GPU.metal_miner import MetalMiner
 
 
-def test_streaming_flags_set_on_success():
+def test_streaming_wiring_on_success():
     with patch("GPU.metal_miner.MetalSASampler"), \
          patch("GPU.metal_miner.get_gpu_core_count", return_value=10):
         m = MetalMiner("M-1", topology=None)
-    assert m.STREAMING_PUMP is True
-    assert m.DRIVER_OWNS_FEEDER is True
     assert m.STREAM_FACTORY_DOTTED == "GPU.metal_stream:build_persistent_context"
+    # The inline sampling path is gone — no _sample/_sample_batch on the class.
+    assert not hasattr(type(m), "_sample")
+    assert not hasattr(type(m), "_sample_batch")
     kw = m._stream_factory_kwargs(
         {"nodes": [0, 1], "edges": [(0, 1)], "num_reads": 8, "num_sweeps": 64},
         [0, 1],
@@ -24,8 +27,7 @@ def test_streaming_flags_set_on_success():
     assert kw["nodes"] == [0, 1]
 
 
-def test_streaming_flags_off_on_cpu_fallback():
+def test_metal_init_raises_when_metal_unavailable():
     with patch("GPU.metal_miner.MetalSASampler", side_effect=RuntimeError("no metal")):
-        m = MetalMiner("M-2", topology=None)
-    assert m.STREAMING_PUMP is False
-    assert m.DRIVER_OWNS_FEEDER is False
+        with pytest.raises(RuntimeError):
+            MetalMiner("M-1", topology=None)

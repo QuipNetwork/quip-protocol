@@ -91,10 +91,8 @@ def _streaming_context(nodes=(0, 1, 2)) -> SubstrateMiningContext:
 
 
 class _DriverMiner(BaseMiner):
-    """STREAMING_PUMP + DRIVER_OWNS_FEEDER miner driven by the fake context."""
+    """Driver-path miner driven by the fake stream context."""
 
-    STREAMING_PUMP = True
-    DRIVER_OWNS_FEEDER = True
     STREAM_FACTORY_DOTTED = _FAKE_CTX
     RESULT_QUEUE_MAXSIZE = 4
 
@@ -118,12 +116,6 @@ class _DriverMiner(BaseMiner):
             "topology": getattr(self, "topology", None),
         }
 
-    def _sample(self, *a, **k):
-        raise AssertionError("single-shot _sample must not run on driver path")
-
-    def _sample_batch(self, *a, **k):
-        raise AssertionError("_sample_batch must not run on driver path")
-
     def evaluate_sampleset(self, *args, **kwargs):
         return None  # never a winner
 
@@ -136,29 +128,12 @@ class _DriverMiner(BaseMiner):
 class _RingConsumer(BaseMiner):
     """Bare consumer used to drive ``_acquire_result`` directly."""
 
-    STREAMING_PUMP = True
-    DRIVER_OWNS_FEEDER = True
-
     def __init__(self) -> None:
         super().__init__("ring-consumer", sampler=object(), miner_type="QPU")
         self.time_manager = None
 
     def _adapt_mining_params(self, requirements, nodes, edges) -> dict:
         return {"num_reads": 4}
-
-    def _sample(self, *a, **k):
-        raise AssertionError("no sample on driver path")
-
-    def _sample_batch(self, *a, **k):
-        raise AssertionError("no batch on driver path")
-
-
-def _sample_ctx() -> dict:
-    return {
-        "prev_hash": b"\x00" * 32, "miner_id": "m", "cur_index": 0,
-        "nodes": [0, 1, 2], "edges": [], "num_reads": 4, "num_sweeps": 1,
-        "extra": {},
-    }
 
 
 def _noop() -> None:
@@ -185,7 +160,7 @@ def test_acquire_result_dead_driver_without_sentinel_is_done():
     assert not dead.is_alive()
     try:
         acquired = consumer._acquire_result(
-            stop, desc_q, preprocess_start=0.0, sample_ctx=_sample_ctx(),
+            stop, desc_q, preprocess_start=0.0,
             driver_proc=dead,
         )
         assert acquired.action == _ACQUIRE_DONE
@@ -229,7 +204,7 @@ def test_acquire_result_reads_descriptor_from_ring():
         desc_q.put((slot, 4, 3, b"\x01" * 32, b"\x02" * 32, 51010, 1))
 
         acquired = consumer._acquire_result(
-            stop, desc_q, preprocess_start=0.0, sample_ctx=_sample_ctx(),
+            stop, desc_q, preprocess_start=0.0,
             generation=1,
         )
         assert acquired.action == _ACQUIRE_OK
@@ -254,7 +229,7 @@ def test_acquire_result_none_descriptor_is_done():
     desc_q.put(None)
     stop = mp.Event()
     acquired = consumer._acquire_result(
-        stop, desc_q, preprocess_start=0.0, sample_ctx=_sample_ctx(),
+        stop, desc_q, preprocess_start=0.0,
     )
     assert acquired.action == _ACQUIRE_DONE
 
@@ -265,7 +240,7 @@ def test_acquire_result_stop_event_returns_stop():
     stop = mp.Event()
     stop.set()
     acquired = consumer._acquire_result(
-        stop, desc_q, preprocess_start=0.0, sample_ctx=_sample_ctx(),
+        stop, desc_q, preprocess_start=0.0,
     )
     assert acquired.action == _ACQUIRE_STOP
 
@@ -290,7 +265,7 @@ def test_acquire_result_feeds_budget_time_manager():
                    np.zeros(4, np.float64))
         desc_q.put((slot, 4, 3, b"\x01" * 32, b"\x02" * 32, 4242, 1))
         acquired = consumer._acquire_result(
-            stop, desc_q, preprocess_start=0.0, sample_ctx=_sample_ctx(),
+            stop, desc_q, preprocess_start=0.0,
             generation=1,
         )
         assert acquired.action == _ACQUIRE_OK
@@ -315,7 +290,7 @@ def test_acquire_result_drops_stale_generation_descriptor():
         desc_q.put((slot, 4, 3, b"\x01" * 32, b"\x02" * 32, 0, 1))
         desc_q.put(None)
         acquired = consumer._acquire_result(
-            stop, desc_q, preprocess_start=0.0, sample_ctx=_sample_ctx(),
+            stop, desc_q, preprocess_start=0.0,
             generation=2,
         )
         # Stale one skipped; stream then ended -> DONE.
