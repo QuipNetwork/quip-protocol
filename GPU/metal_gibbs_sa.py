@@ -21,15 +21,17 @@ import logging
 import os
 import time
 from collections import defaultdict
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import dimod
 import numpy as np
 
 try:
     import Metal
+    import objc  # pyobjc — autorelease pool for per-batch Metal objects
 except ImportError:  # Apple Metal framework is macOS-only; absent on Linux/CI.
     Metal = None  # type: ignore[assignment]
+    objc = None  # type: ignore[assignment]
 
 from GPU.metal_sa import (
     apply_qos_utility,
@@ -37,7 +39,7 @@ from GPU.metal_sa import (
     reads_per_buffer_for_budget,
 )
 from GPU.metal_scheduler import DutyCycleController, MetalScheduler
-from GPU.metal_utils import _create_buffer, build_csr_from_ising, compute_beta_schedule, unpack_metal_results
+from GPU.metal_utils import build_csr_from_ising, compute_beta_schedule, unpack_metal_results
 from shared.ising_model import IsingModel
 
 # Streaming PAUSE poll interval (seconds): how long to idle before re-reading
@@ -222,7 +224,70 @@ class MetalGibbsSampler:
 
         self._command_queue = self.device.newCommandQueue()
 
+        # Per-role MTLBuffer pool (grow-on-demand, reused across batches) — see
+        # MetalSASampler for rationale. Recreating the ~13 per-batch buffers
+        # every call leaks under a long stream; reusing one per role keeps the
+        # footprint bounded and constant.
+        self._buf_pool: Dict[str, Any] = {}
+
+    def _pooled_buffer(self, role: str, nbytes: int):
+        """Return a reused shared MTLBuffer of at least ``nbytes`` for ``role``.
+
+        Grows on demand and persists in ``self._buf_pool``, so a streaming loop
+        allocates each role's buffer once instead of every batch.
+        """
+        nbytes = max(1, int(nbytes))
+        buf = self._buf_pool.get(role)
+        if buf is None or buf.length() < nbytes:
+            buf = self.device.newBufferWithLength_options_(
+                nbytes, Metal.MTLResourceStorageModeShared,
+            )
+            self._buf_pool[role] = buf
+        return buf
+
+    def _pooled_input(self, role: str, data: np.ndarray):
+        """Pooled buffer for ``role`` filled with ``data`` (copied to shared mem).
+
+        Safe across batches because the dispatch is synchronous
+        (``waitUntilCompleted``) before the buffer is refilled.
+        """
+        if not data.flags["C_CONTIGUOUS"]:
+            data = np.ascontiguousarray(data)
+        byte_data = data.tobytes()
+        buf = self._pooled_buffer(role, len(byte_data))
+        buf.contents().as_buffer(len(byte_data))[:] = byte_data
+        return buf
+
     def sample_ising(
+        self,
+        h: List[Dict[int, float]],
+        J: List[Dict[Tuple[int, int], float]],
+        num_reads: int = 200,
+        num_sweeps: int = 1000,
+        num_sweeps_per_beta: int = 1,
+        beta_range: Optional[Tuple[float, float]] = None,
+        beta_schedule_type: str = "geometric",
+        beta_schedule: Optional[np.ndarray] = None,
+        seed: Optional[int] = None,
+        **kwargs
+    ) -> List[dimod.SampleSet]:
+        """Block-Gibbs sample one batch inside an ObjC autorelease pool.
+
+        The per-batch Metal command buffer retains the GPU buffers it
+        references and is autoreleased; without a pool drain in a streaming
+        loop they accumulate until the process OOMs. Draining a pool per batch
+        frees them immediately — safe because ``unpack_metal_results`` copies
+        all results out before the pool drains.
+        """
+        with objc.autorelease_pool():
+            return self._sample_ising_impl(
+                h, J, num_reads=num_reads, num_sweeps=num_sweeps,
+                num_sweeps_per_beta=num_sweeps_per_beta, beta_range=beta_range,
+                beta_schedule_type=beta_schedule_type,
+                beta_schedule=beta_schedule, seed=seed, **kwargs,
+            )
+
+    def _sample_ising_impl(
         self,
         h: List[Dict[int, float]],
         J: List[Dict[Tuple[int, int], float]],
@@ -309,13 +374,13 @@ class MetalGibbsSampler:
             seed = np.random.randint(0, 2**31)
 
         # Create Metal buffers
-        csr_row_ptr_buf = _create_buffer(self.device, all_csr_row_ptr, "csr_row_ptr")
-        csr_col_ind_buf = _create_buffer(self.device, all_csr_col_ind, "csr_col_ind")
-        csr_J_vals_buf = _create_buffer(self.device, all_csr_J_vals, "csr_J_vals")
-        row_ptr_offsets_buf = _create_buffer(self.device, row_ptr_offsets, "row_ptr_offsets")
-        col_ind_offsets_buf = _create_buffer(self.device, col_ind_offsets, "col_ind_offsets")
-        csr_h_vals_buf = _create_buffer(self.device, all_h_vals, "csr_h_vals")
-        beta_schedule_buf = _create_buffer(self.device, beta_schedule, "beta_schedule")
+        csr_row_ptr_buf = self._pooled_input("csr_row_ptr", all_csr_row_ptr)
+        csr_col_ind_buf = self._pooled_input("csr_col_ind", all_csr_col_ind)
+        csr_J_vals_buf = self._pooled_input("csr_J_vals", all_csr_J_vals)
+        row_ptr_offsets_buf = self._pooled_input("row_ptr_offsets", row_ptr_offsets)
+        col_ind_offsets_buf = self._pooled_input("col_ind_offsets", col_ind_offsets)
+        csr_h_vals_buf = self._pooled_input("csr_h_vals", all_h_vals)
+        beta_schedule_buf = self._pooled_input("beta_schedule", beta_schedule)
 
         # Color block buffers
         # Remap color_node_indices from topology node IDs to dense CSR indices.
@@ -327,9 +392,9 @@ class MetalGibbsSampler:
             [node_to_idx[n] for n in self.color_node_indices],
             dtype=np.int32
         )
-        color_block_starts_buf = _create_buffer(self.device, self.block_starts, "color_block_starts")
-        color_block_counts_buf = _create_buffer(self.device, self.block_counts, "color_block_counts")
-        color_node_indices_buf = _create_buffer(self.device, csr_color_node_indices, "color_node_indices")
+        color_block_starts_buf = self._pooled_input("color_block_starts", self.block_starts)
+        color_block_counts_buf = self._pooled_input("color_block_counts", self.block_counts)
+        color_node_indices_buf = self._pooled_input("color_node_indices", csr_color_node_indices)
 
         # Scalar parameters
         N_bytes = np.int32(N).tobytes()
@@ -345,15 +410,13 @@ class MetalGibbsSampler:
         num_problems_bytes = np.int32(num_problems).tobytes()
         num_reads_bytes = np.int32(num_reads).tobytes()
 
-        # Output buffers
+        # Output buffers (pooled — reused across batches, kernel overwrites).
         packed_size = (N + 7) // 8
 
-        final_samples_buf = self.device.newBufferWithLength_options_(
-            num_threads * packed_size, Metal.MTLResourceStorageModeShared
-        )
-        final_energies_buf = self.device.newBufferWithLength_options_(
-            num_threads * 4, Metal.MTLResourceStorageModeShared
-        )
+        final_samples_buf = self._pooled_buffer(
+            "final_samples", num_threads * packed_size)
+        final_energies_buf = self._pooled_buffer(
+            "final_energies", num_threads * 4)
 
         # Execute kernel
         _duty_cycle: Optional[DutyCycleController] = kwargs.get(

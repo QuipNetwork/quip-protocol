@@ -16,19 +16,21 @@ import logging
 import os
 import sys
 import time
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import dimod
 import numpy as np
 
 try:
     import Metal
+    import objc  # pyobjc — autorelease pool for per-batch Metal objects
 except ImportError:  # Apple Metal framework is macOS-only; absent on Linux/CI.
     Metal = None  # type: ignore[assignment]
+    objc = None  # type: ignore[assignment]
 
 from shared.ising_model import IsingModel
 from GPU.metal_scheduler import MetalScheduler, UNCAPPED
-from GPU.metal_utils import _create_buffer, compute_beta_schedule, unpack_metal_results
+from GPU.metal_utils import compute_beta_schedule, unpack_metal_results
 
 # Seconds to idle between budget re-checks while paused (budget == 0).
 _PAUSE_POLL_S = 0.5
@@ -141,6 +143,13 @@ class MetalSASampler:
             raise RuntimeError(f"Failed to create pipeline: {err}")
 
         self._command_queue = self.device.newCommandQueue()
+
+        # Per-role MTLBuffer pool (grow-on-demand, reused across batches). The
+        # dispatch allocates ~130 MB of GPU buffers per batch; recreating them
+        # every batch accumulates (the autorelease pool frees the command
+        # buffer/encoder but not these owned buffers) and OOMs a long stream.
+        # Reusing one buffer per role keeps the footprint bounded and constant.
+        self._buf_pool: Dict[str, Any] = {}
 
         # Cached topology CSR structure (set by prepare_topology)
         self._topo_prepared = False
@@ -353,6 +362,37 @@ class MetalSASampler:
             all_h_vals, row_ptr_offsets, col_ind_offsets,
         )
 
+    def _pooled_buffer(self, role: str, nbytes: int):
+        """Return a reused shared MTLBuffer of at least ``nbytes`` for ``role``.
+
+        Grows on demand and is kept in ``self._buf_pool`` for the sampler's
+        lifetime, so a streaming loop allocates each role's buffer once (at its
+        max size) instead of every batch. ``role`` namespaces buffers so two
+        same-sized roles never alias.
+        """
+        nbytes = max(1, int(nbytes))
+        buf = self._buf_pool.get(role)
+        if buf is None or buf.length() < nbytes:
+            buf = self.device.newBufferWithLength_options_(
+                nbytes, Metal.MTLResourceStorageModeShared,
+            )
+            self._buf_pool[role] = buf
+        return buf
+
+    def _pooled_input(self, role: str, data: np.ndarray):
+        """Pooled buffer for ``role`` filled with ``data`` (copied to shared mem).
+
+        Replaces a per-batch ``newBufferWithBytes`` with copy-into-reused-buffer.
+        Safe because the dispatch is synchronous (``waitUntilCompleted``) — the
+        GPU is done with the prior batch before the buffer is refilled.
+        """
+        if not data.flags["C_CONTIGUOUS"]:
+            data = np.ascontiguousarray(data)
+        byte_data = data.tobytes()
+        buf = self._pooled_buffer(role, len(byte_data))
+        buf.contents().as_buffer(len(byte_data))[:] = byte_data
+        return buf
+
     def _dispatch_batch(
         self,
         models: List[IsingModel],
@@ -364,11 +404,36 @@ class MetalSASampler:
         num_sweeps_per_beta: int,
         seed: int,
     ) -> List[dimod.SampleSet]:
-        """Dispatch a batch using cached topology structure.
+        """Dispatch one batch inside an ObjC autorelease pool.
 
-        Fills only J/h values per batch; reuses the precomputed
-        CSR structure from prepare_topology().
+        The per-batch Metal command buffer retains every GPU buffer it
+        references and is itself autoreleased; with no pool draining in the
+        streaming loop those buffers (≈130 MB/batch — the large per-thread
+        ``persist`` buffers dominate) accumulate until the process OOMs.
+        Draining a pool per batch frees them immediately. Safe because
+        ``unpack_metal_results`` copies all results out (``np.zeros`` +
+        ``.astype``) before the pool drains.
         """
+        with objc.autorelease_pool():
+            return self._dispatch_batch_impl(
+                models, num_reads=num_reads,
+                beta_schedule_arr=beta_schedule_arr, beta_range=beta_range,
+                beta_schedule_type=beta_schedule_type,
+                num_sweeps_per_beta=num_sweeps_per_beta, seed=seed,
+            )
+
+    def _dispatch_batch_impl(
+        self,
+        models: List[IsingModel],
+        *,
+        num_reads: int,
+        beta_schedule_arr: np.ndarray,
+        beta_range: Tuple[float, float],
+        beta_schedule_type: str,
+        num_sweeps_per_beta: int,
+        seed: int,
+    ) -> List[dimod.SampleSet]:
+        """Batch dispatch body (run inside ``_dispatch_batch``'s pool)."""
         num_problems = len(models)
         N = self._topo_N
         node_to_idx = self._topo_node_to_idx
@@ -378,20 +443,14 @@ class MetalSASampler:
             all_h_vals, row_ptr_offsets, col_ind_offsets,
         ) = self._fill_batch_values(models)
 
-        # Create Metal buffers
-        rp_buf = _create_buffer(self.device, all_row_ptr, "rp")
-        ci_buf = _create_buffer(self.device, all_col_ind, "ci")
-        jv_buf = _create_buffer(self.device, all_J_vals, "jv")
-        hv_buf = _create_buffer(self.device, all_h_vals, "hv")
-        rpo_buf = _create_buffer(
-            self.device, row_ptr_offsets, "rpo",
-        )
-        cio_buf = _create_buffer(
-            self.device, col_ind_offsets, "cio",
-        )
-        beta_buf = _create_buffer(
-            self.device, beta_schedule_arr, "beta",
-        )
+        # Reused (pooled) Metal buffers — filled per batch, allocated once.
+        rp_buf = self._pooled_input("rp", all_row_ptr)
+        ci_buf = self._pooled_input("ci", all_col_ind)
+        jv_buf = self._pooled_input("jv", all_J_vals)
+        hv_buf = self._pooled_input("hv", all_h_vals)
+        rpo_buf = self._pooled_input("rpo", row_ptr_offsets)
+        cio_buf = self._pooled_input("cio", col_ind_offsets)
+        beta_buf = self._pooled_input("beta", beta_schedule_arr)
 
         # Scalar parameters
         N_bytes = np.int32(N).tobytes()
@@ -408,33 +467,18 @@ class MetalSASampler:
 
         packed_size = (N + 7) // 8
 
-        samples_buf = self.device.newBufferWithLength_options_(
-            num_threads * packed_size,
-            Metal.MTLResourceStorageModeShared,
-        )
-        energies_buf = self.device.newBufferWithLength_options_(
-            num_threads * 4,
-            Metal.MTLResourceStorageModeShared,
-        )
-
-        # Persistent buffers for chunked dispatch (kernel always
-        # writes these; monolithic dispatch just ignores them)
-        persist_state_buf = self.device.newBufferWithLength_options_(
-            max(1, num_threads * packed_size),
-            Metal.MTLResourceStorageModeShared,
-        )
-        persist_de_buf = self.device.newBufferWithLength_options_(
-            max(1, num_threads * N),
-            Metal.MTLResourceStorageModeShared,
-        )
-        persist_rng_buf = self.device.newBufferWithLength_options_(
-            max(1, num_threads * 4),
-            Metal.MTLResourceStorageModeShared,
-        )
-        persist_energy_buf = self.device.newBufferWithLength_options_(
-            max(1, num_threads * 4),
-            Metal.MTLResourceStorageModeShared,
-        )
+        # Reused (pooled) output + scratch buffers — kernel overwrites them each
+        # batch; sized to the largest batch seen, then reused (no per-batch alloc).
+        samples_buf = self._pooled_buffer("samples", num_threads * packed_size)
+        energies_buf = self._pooled_buffer("energies", num_threads * 4)
+        # Scratch for chunked dispatch (kernel always writes these; monolithic
+        # dispatch just ignores them).
+        persist_state_buf = self._pooled_buffer(
+            "persist_state", num_threads * packed_size)
+        persist_de_buf = self._pooled_buffer("persist_de", num_threads * N)
+        persist_rng_buf = self._pooled_buffer("persist_rng", num_threads * 4)
+        persist_energy_buf = self._pooled_buffer(
+            "persist_energy", num_threads * 4)
 
         total_betas = len(beta_schedule_arr)
         beta_start_bytes = np.int32(0).tobytes()
