@@ -12,8 +12,12 @@ Metal buffer creation, and result unpacking.
 from typing import Dict, List, Optional, Tuple
 
 import dimod
-import Metal
 import numpy as np
+
+try:
+    import Metal
+except ImportError:  # Apple Metal framework is macOS-only; absent on Linux/CI.
+    Metal = None  # type: ignore[assignment]
 
 from shared.beta_schedule import _default_ising_beta_range
 

@@ -24,8 +24,12 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import dimod
-import Metal
 import numpy as np
+
+try:
+    import Metal
+except ImportError:  # Apple Metal framework is macOS-only; absent on Linux/CI.
+    Metal = None  # type: ignore[assignment]
 
 from GPU.metal_scheduler import DutyCycleController
 from GPU.metal_utils import _create_buffer, build_csr_from_ising, compute_beta_schedule, unpack_metal_results

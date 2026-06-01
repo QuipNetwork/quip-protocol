@@ -17,8 +17,12 @@ import time
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 import dimod
-import Metal
 import numpy as np
+
+try:
+    import Metal
+except ImportError:  # Apple Metal framework is macOS-only; absent on Linux/CI.
+    Metal = None  # type: ignore[assignment]
 
 from shared.ising_model import IsingModel
 from GPU.metal_scheduler import DutyCycleController
