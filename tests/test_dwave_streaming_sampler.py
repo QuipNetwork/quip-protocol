@@ -219,7 +219,13 @@ def test_queue_depth_limits_concurrent_submissions():
     sampler = _FakeSamplerWrapper(results_for_sampler)
     models = _ListFeeder([_FakeModel(i) for i in range(n_models)])
 
-    gen = sampler.sample_ising_streaming(models, num_reads=8, queue_depth=queue_depth)
+    # A stop_event lets us tear down the generator's poll loop at the end so
+    # its thread exits instead of spinning forever on the never-completing
+    # futures (queue_depth..n_models) it refills with after the first batch.
+    stop = mp.get_context("spawn").Event()
+    gen = sampler.sample_ising_streaming(
+        models, num_reads=8, queue_depth=queue_depth, stop_event=stop,
+    )
 
     # Pump the generator: it fills to queue_depth, then blocks on poll.
     # We need to step it carefully — use a thread so we can mark futures done.
@@ -247,15 +253,25 @@ def test_queue_depth_limits_concurrent_submissions():
     # And exactly queue_depth submissions were made.
     assert sampler._call_count == queue_depth
 
-    # Now release all slow futures one by one.
+    # Release the first queue_depth slow futures; the pump should yield them.
     for f in slow_futures[:queue_depth]:
         f.mark_done()
 
-    t.join(timeout=2.0)
-    assert not gen_error, gen_error
+    # Condition-based wait: let the pump observe the completions and yield
+    # them before we assert (avoids a fixed sleep racing a slow CI runner).
+    deadline = _time.time() + 2.0
+    while len(yielded) < queue_depth and _time.time() < deadline:
+        _time.sleep(0.005)
 
     # At minimum, the queue_depth completions were processed.
     assert len(yielded) >= queue_depth
+
+    # Tear down: stop_event unblocks the poll loop so the thread exits cleanly
+    # instead of leaking and busy-polling the never-completing refill futures.
+    stop.set()
+    t.join(timeout=2.0)
+    assert not t.is_alive(), "generator thread leaked after stop_event"
+    assert not gen_error, gen_error
 
 
 def test_gen_close_cancels_inflight_futures():
