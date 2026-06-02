@@ -1305,3 +1305,56 @@ def test_resolve_modes_mempool_single_backend_cli_ok(tmp_path):
     )
     assert result.exit_code == 0, result.output
     assert result.output.strip() == "qpu"
+
+
+# ---------------------------------------------------------------------------
+# Guard D — transparent self-registration (_ensure_registered_or_fail)
+# ---------------------------------------------------------------------------
+
+
+def test_guard_d_registers_when_absent(capsys):
+    """First run: _ensure_registered reports a fresh registration."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    fake_client = MagicMock()
+    fake_keystore = MagicMock()
+    fake_keystore.signer.ss58_address.return_value = "5Test"
+
+    with patch.object(quip_cli, "_ensure_registered", AsyncMock(return_value=True)):
+        asyncio.run(quip_cli._ensure_registered_or_fail(fake_client, fake_keystore))
+
+    assert "registered miner: 5Test" in capsys.readouterr().out
+
+
+def test_guard_d_already_registered_reports(capsys):
+    """Subsequent run: already-registered is a no-op that reports state."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    fake_client = MagicMock()
+    fake_keystore = MagicMock()
+    fake_keystore.signer.ss58_address.return_value = "5Test"
+
+    with patch.object(quip_cli, "_ensure_registered", AsyncMock(return_value=False)):
+        asyncio.run(quip_cli._ensure_registered_or_fail(fake_client, fake_keystore))
+
+    assert "miner already registered: 5Test" in capsys.readouterr().out
+
+
+def test_guard_d_registration_failure_raises():
+    """A failed registration becomes the miner-registration-failed code."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    fake_client = MagicMock()
+    fake_keystore = MagicMock()
+    fake_keystore.signer.ss58_address.return_value = "5Test"
+
+    boom = AsyncMock(side_effect=RuntimeError("register_miner failed: DispatchError"))
+    with patch.object(quip_cli, "_ensure_registered", boom):
+        with pytest.raises(
+            click.ClickException,
+            match=r"miner-registration-failed ss58=5Test error=RuntimeError: register_miner failed",
+        ):
+            asyncio.run(quip_cli._ensure_registered_or_fail(fake_client, fake_keystore))

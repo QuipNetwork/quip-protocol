@@ -8,8 +8,9 @@ the underlying code is later judged to be load-bearing.
 The categorization rule: a test is "orphan" if its test target sits
 outside §§2–8 of `ARCHITECTURE.md` and the cross-cutting list (crypto,
 signer, keystore, SCALE codec, version, work_context, ising
-primitives). Auxiliary tools (`faucet_bot.py`), one-off scripts, and
-out-of-band utilities count as outside the architecture.
+primitives). Auxiliary tools (the faucet, since moved to its own repo at
+`gitlab.com/quip.network/faucet`), one-off scripts, and out-of-band
+utilities count as outside the architecture.
 
 ## Removed
 
@@ -29,5 +30,6 @@ out-of-band utilities count as outside the architecture.
 
 If you want to revive any of the removed tests, look up the file in
 `git log --diff-filter=D --name-only -- tests/` and restore from the
-prior commit. The faucet bot itself (`faucet_bot.py`) was not touched
-in this phase — only its tests.
+prior commit. In that phase only the faucet's tests were removed; the
+`faucet_bot.py` script itself was later deleted from this repo in favor of
+the standalone faucet at `gitlab.com/quip.network/faucet`.

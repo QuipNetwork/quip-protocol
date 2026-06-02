@@ -63,10 +63,10 @@ _DEFAULT_ALLOWED_J = AllowedValueSet((-_MILLI_SCALE, _MILLI_SCALE))
 _DEFAULT_ALLOWED_SPIN = AllowedValueSet((-_MILLI_SCALE, _MILLI_SCALE))
 
 
-# Dev chain names matched by prefix. Mirrors the list in `faucet_bot.py`,
-# which is intentionally standalone — duplicating here keeps both modules
-# loud-by-default about which chains they accept. `--chain=local3` reports
-# "Local Testnet (3 Validators)" so a prefix match keeps the list short.
+# Dev chain names matched by prefix. The standalone faucet
+# (`gitlab.com/quip.network/faucet`) keeps its own copy of this list; both
+# stay loud-by-default about which chains they accept. `--chain=local3`
+# reports "Local Testnet (3 Validators)" so a prefix match keeps the list short.
 DEV_CHAIN_PREFIXES: Tuple[str, ...] = (
     "Development",
     "Local Testnet",
@@ -138,6 +138,28 @@ DEFAULT_MIN_BALANCE_PLANCKS = 2_000_000_000_000  # 2 UNIT
 # Amount the faucet sends per request.
 DEFAULT_FAUCET_TOP_UP_PLANCKS = 10_000_000_000_000  # 10 UNIT
 
+# Faucet funding is retried for this long before startup gives up. The
+# faucet mints via `sudo(FaucetOps.mint)` and deliberately does not burn a
+# caller's rate-limit slot on failure, so transient errors (a node blip, a
+# stale websocket, the faucet still coming up alongside the chain) are meant
+# to be retried. Budget is consumed by the planned backoff sleeps below.
+FAUCET_FUNDING_TIMEOUT_SECONDS = 300.0  # 5 minutes
+_FAUCET_BACKOFF_START_SECONDS = 2.0
+_FAUCET_BACKOFF_MAX_SECONDS = 30.0
+
+# HTTP statuses worth retrying: rate-limit + the 5xx family the faucet
+# returns when a mint fails transiently. Any other 4xx means our request is
+# malformed and will fail identically on every retry.
+_RETRYABLE_FAUCET_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
+class FaucetTransientError(RuntimeError):
+    """Faucet failure that may clear on retry (429 / 5xx / connection)."""
+
+
+class FaucetPermanentError(RuntimeError):
+    """Faucet failure that retrying cannot fix (malformed request → 4xx)."""
+
 
 @dataclass
 class BootstrapConfig:
@@ -162,6 +184,9 @@ class BootstrapConfig:
     force_reseed_difficulty: bool = False
     min_balance_plancks: int = DEFAULT_MIN_BALANCE_PLANCKS
     faucet_top_up_plancks: int = DEFAULT_FAUCET_TOP_UP_PLANCKS
+    # Total wall budget (seconds) spent retrying a transient faucet failure
+    # before startup gives up. Tunable mainly so tests can shrink it.
+    faucet_timeout_seconds: float = FAUCET_FUNDING_TIMEOUT_SECONDS
 
 
 @dataclass
@@ -198,13 +223,15 @@ async def bootstrap(config: BootstrapConfig) -> BootstrapResult:
             )
 
         balance = await ensure_funded(client, keystore, config)
-        miner_registered = await _ensure_registered(client, keystore)
+        # Idempotent: returns whether it *newly* registered; either way the
+        # account is registered past this point (it raises on failure).
+        await _ensure_registered(client, keystore)
 
         return BootstrapResult(
             ss58_address=keystore.signer.ss58_address(),
             account_id_hex="0x" + keystore.signer.account_id_bytes().hex(),
             balance_plancks=balance,
-            miner_registered=miner_registered,
+            miner_registered=True,
             topology_seeded=topology_seeded,
             difficulty_seeded=difficulty_seeded,
         )
@@ -411,40 +438,86 @@ async def ensure_funded(
         )
 
     logger.info(
-        "requesting %d plancks from faucet for %s",
+        "requesting %d plancks from faucet for %s (retrying up to %.0fs)",
         config.faucet_top_up_plancks,
         keystore.signer.ss58_address(),
+        config.faucet_timeout_seconds,
     )
-    _post_faucet(
-        config.faucet_url,
-        dest_hex="0x" + account.hex(),
-        amount=config.faucet_top_up_plancks,
-    )
-
-    # Wait for the transfer to settle. With 6s slots and inclusion guaranteed
-    # by `wait_for=inblock` on the faucet side, the balance should reflect
-    # within one round trip plus one block.
-    for attempt in range(10):
-        await asyncio.sleep(2.0)
-        balance = await client.query_balance(account)
+    faucet_url = config.faucet_url  # narrowed: non-None past the guard above
+    dest_hex = "0x" + account.hex()
+    budget = config.faucet_timeout_seconds
+    backoff = _FAUCET_BACKOFF_START_SECONDS
+    last_note = "no faucet response yet"
+    attempt = 0
+    while True:
+        attempt += 1
+        # A FaucetPermanentError (malformed request) propagates straight out
+        # — no amount of retrying fixes a bad dest/amount.
+        balance, last_note = await _try_fund_once(
+            client,
+            account,
+            faucet_url=faucet_url,
+            dest_hex=dest_hex,
+            amount=config.faucet_top_up_plancks,
+        )
         if balance >= config.min_balance_plancks:
             logger.info(
-                "faucet settled after %.1fs: balance=%d plancks",
-                (attempt + 1) * 2.0,
-                balance,
+                "faucet funded after %d attempt(s): balance=%d plancks",
+                attempt, balance,
             )
             return balance
+        if budget <= 0:
+            break
+        wait = min(backoff, budget)
+        logger.info(
+            "faucet not funded yet (%s); attempt %d, retrying in %.1fs "
+            "(%.0fs budget left)",
+            last_note, attempt, wait, budget,
+        )
+        await asyncio.sleep(wait)
+        budget -= wait
+        backoff = min(backoff * 2.0, _FAUCET_BACKOFF_MAX_SECONDS)
     raise RuntimeError(
-        f"faucet transfer did not settle within ~20s; balance is still {balance}"
+        f"faucet did not fund within {config.faucet_timeout_seconds:.0f}s "
+        f"after {attempt} attempt(s); balance is still {balance} "
+        f"(last status: {last_note})"
     )
+
+
+async def _try_fund_once(
+    client: SubstrateClient,
+    account: bytes,
+    *,
+    faucet_url: str,
+    dest_hex: str,
+    amount: int,
+) -> Tuple[int, str]:
+    """One faucet POST + balance read for the ``ensure_funded`` retry loop.
+
+    Returns ``(balance, status_note)``. A transient faucet failure is
+    swallowed and surfaced in the note so the caller backs off and retries;
+    the balance read still runs (it's the source of truth, and an earlier
+    mint may have settled). ``FaucetPermanentError`` propagates so the caller
+    fails fast.
+    """
+    note = "requested"
+    try:
+        _post_faucet(faucet_url, dest_hex=dest_hex, amount=amount)
+    except FaucetTransientError as exc:
+        # Includes 429: a mint to this dest is already in flight/done, so
+        # don't treat re-requests as fatal — the balance read picks it up.
+        note = str(exc)
+    balance = await client.query_balance(account)
+    return balance, note
 
 
 def _post_faucet(url: str, *, dest_hex: str, amount: int) -> dict:
-    """Synchronous POST to the faucet. Kept blocking — we wait on chain after.
+    """POST the faucet ``/request`` contract, classifying failures for retry.
 
-    Path is `/request` — the canonical contract served by both the bundled
-    `faucet_bot.py` and the standalone `gitlab.com/quip.network/faucet`
-    deployment.
+    Raises :class:`FaucetTransientError` for failures that may clear on retry
+    (429 / 5xx / connection / timeout) and :class:`FaucetPermanentError` for
+    a malformed request (other 4xx). The contract is served by the standalone
+    faucet at ``gitlab.com/quip.network/faucet``.
     """
     body = json.dumps({"dest": dest_hex, "amount": amount}).encode()
     req = urllib.request.Request(
@@ -458,9 +531,14 @@ def _post_faucet(url: str, *, dest_hex: str, amount: int) -> dict:
             return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")
-        raise RuntimeError(
-            f"faucet returned {exc.code}: {detail}"
-        ) from exc
+        msg = f"faucet returned {exc.code}: {detail}"
+        if exc.code in _RETRYABLE_FAUCET_STATUS:
+            raise FaucetTransientError(msg) from exc
+        raise FaucetPermanentError(msg) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        # HTTPError is caught above; this is connection-refused / DNS /
+        # socket timeout — the faucet may just be slow to come up.
+        raise FaucetTransientError(f"faucet unreachable: {exc}") from exc
 
 
 # ----------------------------------------------------------------------
@@ -472,6 +550,13 @@ async def _ensure_registered(
     client: SubstrateClient,
     keystore: HybridKeystoreFile,
 ) -> bool:
+    """Register the miner if it isn't already. Idempotent.
+
+    Returns ``True`` when this call submitted ``register_miner`` (a fresh
+    registration) and ``False`` when the account was already in
+    ``QuantumPow.Miners`` — letting callers report "registered" vs "already
+    registered" without a second chain query. Raises on a failed extrinsic.
+    """
     account = keystore.signer.account_id_bytes()
     miner_info = await client.query_miner(account)
     if miner_info is not None:
@@ -481,7 +566,7 @@ async def _ensure_registered(
             miner_info.proofs_submitted,
             miner_info.proofs_won,
         )
-        return True
+        return False
 
     logger.info("registering miner: ss58=%s", keystore.signer.ss58_address())
     receipt = await client.submit_extrinsic(
@@ -503,6 +588,9 @@ __all__ = [
     "DEFAULT_SEED_TOPOLOGY",
     "DEFAULT_MIN_BALANCE_PLANCKS",
     "DEFAULT_FAUCET_TOP_UP_PLANCKS",
+    "FAUCET_FUNDING_TIMEOUT_SECONDS",
+    "FaucetPermanentError",
+    "FaucetTransientError",
     "bootstrap",
     "ensure_funded",
 ]

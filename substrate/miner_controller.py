@@ -874,11 +874,23 @@ class SubstrateMinerController:
     # ------------------------------------------------------------------
 
     async def _verify_registered(self, account: bytes) -> None:
-        miner_info = await self.pool_client.query_miner(account)
+        # Startup self-registers (CLI Guard D) before controllers spawn, but
+        # that registration landed via the setup client and may not have
+        # propagated to this pool's active validator yet. Retry a few times
+        # over ~2 blocks before treating absence as a real failure.
+        miner_info = None
+        for attempt in range(3):
+            miner_info = await self.pool_client.query_miner(account)
+            if miner_info is not None:
+                break
+            if attempt < 2:
+                await asyncio.sleep(2.0)
         if miner_info is None:
             raise RuntimeError(
                 f"signer account 0x{account.hex()} is not in "
-                "QuantumPow.Miners — run `quip-miner bootstrap` first"
+                "QuantumPow.Miners after startup registration; the "
+                "register_miner extrinsic did not land or has not yet "
+                "propagated to this validator"
             )
         logger.info(
             "miner verified registered: ss58=%s deposit=%d submitted=%d won=%d",

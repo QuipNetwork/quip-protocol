@@ -36,6 +36,7 @@ from shared.mempool_types import MinerType
 from shared.miner_bootstrap import (
     DEFAULT_MIN_BALANCE_PLANCKS,
     BootstrapConfig,
+    _ensure_registered,
     bootstrap,
     ensure_funded,
 )
@@ -63,10 +64,12 @@ from substrate.client import (
 from substrate.miner_controller import SubstrateMinerController
 from shared.system_info import (
     DescriptorValidationError,
+    _scrub,
     build_descriptor,
     to_canonical_json,
     validate_descriptor,
 )
+from shared.version import PROTOCOL_VERSION, get_version
 from substrate.pool import ValidatorPool
 
 
@@ -522,11 +525,46 @@ async def _ensure_funded_or_fail(
             f"validators-unreachable urls={urls} reasons={reasons}"
         ) from exc
     except Exception as exc:  # noqa: BLE001 — translated to a CLI error code
+        # Surface the exception text, not just the class name: the actionable
+        # detail (e.g. "faucet returned 502: transfer failed; see faucet logs"
+        # when the funder wallet is drained) lives in the message. Bare
+        # "error=RuntimeError" tells an operator nothing.
+        detail = str(exc).strip() or type(exc).__name__
         raise click.ClickException(
             f"wallet-faucet-failed ss58={keystore.signer.ss58_address()} "
             f"balance={balance} threshold={min_balance} "
-            f"error={type(exc).__name__}"
+            f"error={type(exc).__name__}: {detail}"
         ) from exc
+
+
+async def _ensure_registered_or_fail(client: SubstrateClient, keystore) -> None:
+    """Guard D — miner registered, transparently and idempotently.
+
+    Reuses ``shared.miner_bootstrap._ensure_registered`` so the manual
+    ``bootstrap`` command and the miner's own startup register through
+    identical code — they cannot drift. Already-registered is a no-op that
+    just reports state; a failure becomes the ``miner-registration-failed``
+    CLI error code.
+    """
+    ss58 = keystore.signer.ss58_address()
+    try:
+        newly_registered = await _ensure_registered(client, keystore)
+    except NoValidatorReachable as exc:
+        urls = ",".join(a.url for a in exc.attempts)
+        reasons = ",".join(a.exc_type for a in exc.attempts)
+        raise click.ClickException(
+            f"validators-unreachable urls={urls} reasons={reasons}"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 — translated to a CLI error code
+        detail = str(exc).strip() or type(exc).__name__
+        raise click.ClickException(
+            f"miner-registration-failed ss58={ss58} "
+            f"error={type(exc).__name__}: {detail}"
+        ) from exc
+    click.echo(
+        f"registered miner: {ss58}" if newly_registered
+        else f"miner already registered: {ss58}"
+    )
 
 
 @click.group(name="quip-miner")
@@ -899,13 +937,10 @@ def quip_miner_bootstrap(
     click.echo(f"  difficulty seeded  : {result.difficulty_seeded}")
 
 
-# The faucet bot is shipped as a standalone script (`faucet_bot.py` at repo
-# root) so it can be deployed independently of the rest of `quip-protocol`.
-# Run with:
-#
-#     python faucet_bot.py --node-url ws://localhost:9944 --faucet-key //Alice
-#
-# See faucet_bot.py for the full CLI surface.
+# The faucet bot lives in its own repository (`gitlab.com/quip.network/faucet`)
+# so it can be deployed and versioned independently of `quip-protocol`. The
+# miner only speaks to it over HTTP (`--faucet-url`); see that repo for the
+# server's CLI surface and the `/request` contract `_post_faucet` targets.
 
 
 @quip_miner.command("register-solver")
@@ -1226,6 +1261,34 @@ def _qpu_miner_kind_from_backends(backends: dict, fallback: str) -> str:
     return f"qpu_{fallback}" if fallback in ("ibm", "ionq", "pasqal") else "qpu"
 
 
+def _echo_runtime_config(
+    *,
+    validators: tuple,
+    faucet_url: Optional[str],
+    rest_host: str,
+    rest_port: int,
+    node_name: Optional[str],
+    node_log: Optional[str],
+    miner_config: dict,
+    submission_config: SubmissionConfig,
+) -> None:
+    """Echo non-secret runtime config at startup for diagnosability.
+
+    ``miner_config`` is passed through the shared ``_scrub`` redactor so any
+    token/password/key it carries is dropped — the banner is safe to paste
+    into a bug report. The ss58 address, mode, and topology are already
+    printed by their own banner lines, so they are not repeated here.
+    """
+    click.echo("config:")
+    click.echo(f"  validators={','.join(validators)}")
+    click.echo(f"  faucet_url={faucet_url or '(none)'}")
+    click.echo(f"  rest={rest_host}:{rest_port}")
+    click.echo(f"  node_name={node_name or _default_node_name()}")
+    click.echo(f"  node_log={node_log or '(stderr only)'}")
+    click.echo(f"  submission={submission_config}")
+    click.echo(f"  miners={_scrub(miner_config)}")
+
+
 async def _run_concurrent_miner(
     *,
     mode: str,
@@ -1260,6 +1323,8 @@ async def _run_concurrent_miner(
         click.echo(f"invalid --mode {mode!r}", err=True)
         return 2
 
+    click.echo(f"quip-miner version {get_version()} (protocol {PROTOCOL_VERSION})")
+
     # Submission tuning (tip + retry bounds). Defaults reproduce pre-tip
     # behavior, so an old config or a caller that omits this is unchanged.
     submission_config = submission_config or SubmissionConfig()
@@ -1283,6 +1348,16 @@ async def _run_concurrent_miner(
     click.echo(
         f"topology: {topology_spec} ({topology.num_nodes} nodes, "
         f"{topology.num_edges} edges)"
+    )
+    _echo_runtime_config(
+        validators=validators,
+        faucet_url=faucet_url,
+        rest_host=rest_host,
+        rest_port=rest_port,
+        node_name=node_name,
+        node_log=node_log,
+        miner_config=miner_config,
+        submission_config=submission_config,
     )
 
     core = MinerCore(
@@ -1329,6 +1404,12 @@ async def _run_concurrent_miner(
             faucet_url=faucet_url,
             min_balance=DEFAULT_MIN_BALANCE_PLANCKS,
         )
+
+        # Guard D — miner registered. Self-registers on first run (after
+        # funding, so the MinerDeposit reserve is covered) and is a no-op on
+        # every later run. Replaces the old manual `quip-miner bootstrap`
+        # prerequisite; the controller still verifies before mining.
+        await _ensure_registered_or_fail(client, keystore)
 
         # Auto-identify: publish a signed NodeDescriptor remark so
         # dashboards can map our AccountId → node_name + advertised

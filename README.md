@@ -62,7 +62,6 @@ Standalone scripts at repo root:
 
 | file | role |
 |------|------|
-| `faucet_bot.py` | Dev-only HTTP faucet (self-contained; no `shared/` imports). |
 | `quip_cli.py` | `quip-miner` CLI dispatch (keygen / bootstrap / cpu / gpu / qpu). |
 
 ## Installation
@@ -93,11 +92,10 @@ docker compose up -d
 docker compose logs -f node1   # confirm blocks being produced
 ```
 
-In another terminal, start the dev faucet (standalone script — does not require `pip install -e .`):
-
-```bash
-python faucet_bot.py --node-url ws://localhost:9944 --faucet-key //Alice
-```
+The dev faucet now lives in its own repository (`gitlab.com/quip.network/faucet`);
+local-network setup (node + faucet + chain seeding) is handled by the testing
+repo at `nodes.quip.network`. Point the miner at a running faucet with
+`--faucet-url`; it self-funds and self-registers on first run.
 
 Bootstrap a miner account (generates a keystore, funds it via the faucet, sudo-seeds `Difficulty` + `DefaultTopology` on a fresh chain, then submits `register_miner`):
 
@@ -163,18 +161,6 @@ Run the mining controller. All three subcommands share these flags:
 The `cpu` subcommand adds `--num-cpus N`; `gpu` adds `--gpu-backend {local,metal,modal}`; `qpu` adds `--qpu-type` and `--daily-budget`.
 
 Topology binding is enforced at startup: the CLI hashes the configured topology with the same `blake2_256(SCALE((sorted_nodes, canonical_edges)))` recipe the chain uses, and refuses to start if the hash doesn't match the chain's registered topology.
-
-### `faucet_bot.py` (standalone)
-
-Dev-only HTTP faucet, deployable independently of the rest of the repo. Refuses to bind unless the connected chain matches a known dev-chain prefix (`Development`, `Local Testnet`, `quip-local`). Rate-limited per destination.
-
-```
-python faucet_bot.py \
-    --node-url ws://localhost:9944 \
-    --faucet-key //Alice \
-    --listen 127.0.0.1 \
-    --port 8087
-```
 
 ## Telemetry REST API
 
