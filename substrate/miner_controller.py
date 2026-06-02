@@ -533,6 +533,9 @@ class SubstrateMinerController:
         # Set after a successful snapshot fetch; consulted by the
         # storm-prevention check in _handle_result.
         self._current_work_key: Optional[WorkKey] = None
+        # Last work key announced at INFO by the new-head banner, so a head
+        # that re-dispatches the same work item logs at DEBUG instead.
+        self._last_logged_work_key: Optional[WorkKey] = None
         # Chain-global solution number (ordinal of the solution being mined,
         # = count(WinningSolutions) + 1) per work key. Resolved once per
         # round and reused for re-dispatches and the submission record so the
@@ -1141,7 +1144,16 @@ class SubstrateMinerController:
         # Chain-global solution number for this round — the on-disk archive
         # key the workers write under. Resolved once per round (cached).
         solution_number = await self._resolve_solution_number(new_work_key)
-        logger.info(
+        # Announce at INFO only when the work item changes. A new head that
+        # re-dispatches the same (last_proof, topology) — e.g. a QPU worker
+        # that went idle between blocks — logs at DEBUG to avoid per-head spam.
+        log = (
+            logger.info
+            if new_work_key != self._last_logged_work_key
+            else logger.debug
+        )
+        self._last_logged_work_key = new_work_key
+        log(
             "new head (event manager): solution=%s last_proof=0x%s... "
             "topology=0x%s... nodes=%d edges=%d",
             solution_number,

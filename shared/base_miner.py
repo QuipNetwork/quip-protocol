@@ -288,6 +288,10 @@ class BaseMiner(ABC):
         # Initialize logger that inherits parent process configuration
         self.logger = logging.getLogger(f'miner.{miner_id}')
 
+        # Last `mine_work_item` banner emitted at INFO, so re-dispatch of an
+        # unchanged work item drops to DEBUG instead of repeating every head.
+        self._last_work_log_msg: Optional[str] = None
+
         self.logger.debug(f"{miner_id} initialized ({self.miner_type})")
 
         # Initialize timing statistics
@@ -2079,17 +2083,23 @@ class BaseMiner(ABC):
         Both flavors print enough to grep logs for a specific work item.
         """
         if isinstance(context, MempoolJobContext):
-            self.logger.info(
+            msg = (
                 f"mine_work_item: order_id={context.order_id} "
                 f"nodes={len(context.nodes)} edges={len(context.edges)} "
                 f"(mempool)"
             )
         else:
-            self.logger.info(
+            msg = (
                 f"mine_work_item: last_proof_block_hash=0x{context.last_proof_block_hash.hex()[:16]}... "
                 f"topology=0x{context.topology_hash.hex()[:16]}... "
                 f"nodes={len(context.nodes)} edges={len(context.edges)}"
             )
+        # Same work item re-dispatched (identical banner) → DEBUG, so a worker
+        # that re-arms every head on unchanged last_proof/topology stops
+        # spamming INFO. A genuinely new work item logs at INFO once.
+        log = self.logger.info if msg != self._last_work_log_msg else self.logger.debug
+        self._last_work_log_msg = msg
+        log(msg)
 
     @staticmethod
     def _graceful_exit() -> None:

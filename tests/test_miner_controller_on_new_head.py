@@ -49,6 +49,7 @@ def controller():
     ctrl = SubstrateMinerController.__new__(SubstrateMinerController)
     ctrl.miner_handles = [handle]
     ctrl._current_work_key = None
+    ctrl._last_logged_work_key = None
     ctrl._current_context = None
     ctrl._last_pushed_threshold_milli = 0
     ctrl._closed_work_keys = {}
@@ -237,3 +238,30 @@ async def test_on_new_head_zero_seed_allowed_during_bootstrap(controller):
     # Threshold was pushed (it's a normal dispatch path) AND mine_work_item ran.
     assert handle.threshold_pushes == [-5000]
     assert len(handle.dispatched_contexts) == 1
+
+
+@pytest.mark.asyncio
+async def test_on_new_head_banner_logs_info_once_then_debug(controller, monkeypatch):
+    """The new-head banner logs INFO on a new work key and DEBUG when the
+    same work item is re-dispatched (worker went idle between heads)."""
+    import substrate.miner_controller as mc
+    from unittest.mock import MagicMock
+
+    ctrl, handle = controller
+    fake = MagicMock()
+    monkeypatch.setattr(mc, "logger", fake)
+
+    ctx = _make_context(threshold_milli=-5000, last_proof_block_hash=b"\x01" * 32)
+    await ctrl.on_new_head(ctx)            # new key → INFO
+    handle._active_dispatch_id = 0          # worker idle → re-dispatch same key
+    await ctrl.on_new_head(ctx)            # unchanged key → DEBUG
+
+    def _banners(method):
+        return [
+            c for c in method.call_args_list
+            if c.args and isinstance(c.args[0], str)
+            and c.args[0].startswith("new head (event manager)")
+        ]
+
+    assert len(_banners(fake.info)) == 1, "new work key should log INFO once"
+    assert len(_banners(fake.debug)) == 1, "re-dispatch of same work logs DEBUG"
