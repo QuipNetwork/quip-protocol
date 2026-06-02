@@ -517,14 +517,10 @@ def test_default_node_name_empty_string_falls_back(monkeypatch):
     assert quip_cli._default_node_name() == "quip-miner"
 
 
-def test_auto_identify_submission_failure_logs_warning_and_returns(
-    monkeypatch, caplog
-):
-    """Per the user's failure policy: identify failures never block
-    mining. The helper catches everything, logs a warning, and returns
-    normally so _run_concurrent_miner can proceed to controllers."""
+def test_auto_identify_submission_failure_is_fatal(monkeypatch):
+    """Filing the descriptor is a fatal startup step: a submission that never
+    succeeds raises ClickException(descriptor-failed) after the retries."""
     import asyncio
-    import logging
 
     class FakeClient:
         async def has_call(self, *_a, **_kw):
@@ -543,23 +539,83 @@ def test_auto_identify_submission_failure_logs_warning_and_returns(
     class FakeKeystore:
         signer = FakeSigner()
 
-    caplog.set_level(logging.WARNING, logger="quip_miner.auto_identify")
-    # Stub public-IP detection so the test doesn't hit the network.
     async def _no_probe():
         return None
     monkeypatch.setattr(quip_cli, "_detect_public_ip", _no_probe)
+    # One attempt (no backoff sleep) so the always-failing submit fails fast.
+    monkeypatch.setattr(quip_cli, "_STARTUP_RETRY_ATTEMPTS", 1)
+    with pytest.raises(
+        click.ClickException,
+        match=r"descriptor-failed ss58=5FakeAccountId.*validator rejected",
+    ):
+        asyncio.run(quip_cli._auto_identify(
+            FakeClient(),
+            FakeKeystore(),
+            node_name="test-rig",
+            public_host=None,
+            public_port=None,
+            log_level=None,
+            miners_config={"cpu": {"num_cpus": 1}},
+        ))
+
+
+def test_auto_identify_retries_then_posts(monkeypatch, caplog):
+    """A transient submission failure (e.g. stale nonce right after
+    register_miner) is retried, and the descriptor still posts on start."""
+    import asyncio
+    import logging
+
+    async def _no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(quip_cli.asyncio, "sleep", _no_sleep)
+
+    class FakeReceipt:
+        error = None
+        extrinsic_hash = "0xabc"
+        block_hash = "0xdef"
+
+    class FakeClient:
+        def __init__(self):
+            self.attempts = 0
+
+        async def has_call(self, *_a, **_kw):
+            return False  # plain remark
+
+        async def submit_extrinsic(self, _module, _call, _args, _signer, **_kw):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("Priority is too low")  # stale-nonce shape
+            return FakeReceipt()
+
+    class FakeSigner:
+        def ss58_address(self):
+            return "5FakeAccountId00000000000000000000000000000000000"
+
+        def account_id_bytes(self):
+            return b"\x00" * 32
+
+    class FakeKeystore:
+        signer = FakeSigner()
+
+    async def _no_probe():
+        return None
+
+    monkeypatch.setattr(quip_cli, "_detect_public_ip", _no_probe)
+    caplog.set_level(logging.INFO, logger="quip_miner.auto_identify")
+    client = FakeClient()
     asyncio.run(quip_cli._auto_identify(
-        FakeClient(),
+        client,
         FakeKeystore(),
         node_name="test-rig",
-        public_host=None,
+        public_host="rig.example.com",
         public_port=None,
         log_level=None,
         miners_config={"cpu": {"num_cpus": 1}},
     ))
+    assert client.attempts == 2, "should retry after the first transient failure"
     assert any(
-        "auto-identify" in rec.message and "validator rejected" in rec.message
-        for rec in caplog.records
+        "auto-identify submitted" in rec.message for rec in caplog.records
     ), [r.message for r in caplog.records]
 
 
@@ -1342,8 +1398,9 @@ def test_guard_d_already_registered_reports(capsys):
     assert "miner already registered: 5Test" in capsys.readouterr().out
 
 
-def test_guard_d_registration_failure_raises():
-    """A failed registration becomes the miner-registration-failed code."""
+def test_guard_d_registration_failure_raises(monkeypatch):
+    """A registration that never verifies is fatal (miner-registration-failed)
+    after the retries."""
     import asyncio
     from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1351,6 +1408,8 @@ def test_guard_d_registration_failure_raises():
     fake_keystore = MagicMock()
     fake_keystore.signer.ss58_address.return_value = "5Test"
 
+    # One attempt (no backoff sleep) so the always-failing register fails fast.
+    monkeypatch.setattr(quip_cli, "_STARTUP_RETRY_ATTEMPTS", 1)
     boom = AsyncMock(side_effect=RuntimeError("register_miner failed: DispatchError"))
     with patch.object(quip_cli, "_ensure_registered", boom):
         with pytest.raises(
@@ -1358,3 +1417,25 @@ def test_guard_d_registration_failure_raises():
             match=r"miner-registration-failed ss58=5Test error=RuntimeError: register_miner failed",
         ):
             asyncio.run(quip_cli._ensure_registered_or_fail(fake_client, fake_keystore))
+
+
+def test_guard_d_registration_retries_then_succeeds(monkeypatch, capsys):
+    """A transient registration failure is retried, then verifies on start."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    async def _no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(quip_cli.asyncio, "sleep", _no_sleep)
+    fake_client = MagicMock()
+    fake_keystore = MagicMock()
+    fake_keystore.signer.ss58_address.return_value = "5Test"
+
+    # First call raises (transient), second verifies as newly registered.
+    flaky = AsyncMock(side_effect=[RuntimeError("nonce stale"), True])
+    with patch.object(quip_cli, "_ensure_registered", flaky):
+        asyncio.run(quip_cli._ensure_registered_or_fail(fake_client, fake_keystore))
+
+    assert flaky.await_count == 2
+    assert "registered miner: 5Test" in capsys.readouterr().out

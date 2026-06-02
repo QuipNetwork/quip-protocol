@@ -469,7 +469,7 @@ async def ensure_funded(
         if budget <= 0:
             break
         wait = min(backoff, budget)
-        logger.info(
+        logger.warning(
             "faucet not funded yet (%s); attempt %d, retrying in %.1fs "
             "(%.0fs budget left)",
             last_note, attempt, wait, budget,

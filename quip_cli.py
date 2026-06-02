@@ -22,7 +22,7 @@ import traceback
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import click
 
@@ -74,6 +74,42 @@ from substrate.pool import ValidatorPool
 
 
 _AUTO_IDENTIFY_LOGGER = logging.getLogger("quip_miner.auto_identify")
+_STARTUP_LOGGER = logging.getLogger("quip_miner.startup")
+
+# Funding, registration, and descriptor filing must each succeed before the
+# miner runs — they retry this many times with exponential backoff (delays
+# 5,10,20,40,45,45,45s ≈ 3.5 minutes) before failing the startup hard. The
+# node descriptor is filed right after register_miner, so its remark can race
+# the registration extrinsic's nonce (stale `accountNextIndex` for ~a block);
+# the retry rides that out. The per-round "participating" remark is separate
+# and stays best-effort — it is not gated here.
+_STARTUP_RETRY_ATTEMPTS = 8
+_STARTUP_RETRY_BASE_DELAY_SECONDS = 5.0
+_STARTUP_RETRY_MAX_DELAY_SECONDS = 45.0
+
+
+async def _retry_until_verified(label: str, attempt) -> str:
+    """Run async ``attempt() -> (ok, detail)`` until it verifies or gives up.
+
+    Retries up to ``_STARTUP_RETRY_ATTEMPTS`` times with exponential backoff,
+    logging loudly at WARNING between tries. Returns the success ``detail`` on
+    the first verified attempt; raises ``RuntimeError(detail)`` once attempts
+    are exhausted so the caller can translate it into a fatal CLI error code.
+    """
+    delay = _STARTUP_RETRY_BASE_DELAY_SECONDS
+    detail = "no response"
+    for i in range(1, _STARTUP_RETRY_ATTEMPTS + 1):
+        ok, detail = await attempt()
+        if ok:
+            return detail
+        if i < _STARTUP_RETRY_ATTEMPTS:
+            _STARTUP_LOGGER.warning(
+                "%s: attempt %d/%d NOT verified (%s); retrying in %.0fs",
+                label, i, _STARTUP_RETRY_ATTEMPTS, detail, delay,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2.0, _STARTUP_RETRY_MAX_DELAY_SECONDS)
+    raise RuntimeError(detail)
 
 
 def _default_node_name() -> str:
@@ -171,14 +207,16 @@ async def _auto_identify(
     log_level: Optional[str],
     miners_config: dict,
 ) -> None:
-    """Submit a signed NodeDescriptor remark using an already-connected client.
+    """Guard E — file a signed NodeDescriptor remark and verify it lands.
 
-    Called once on every miner startup after the funding check. The user-
-    facing contract is: identify failures never block mining — the call
-    catches all exceptions and logs a warning. The descriptor's `miners`
-    block is built from the same TOML-shaped dict that `MinerCore` used
-    to spawn worker handles, so the descriptor always reflects the
-    actual launched topology.
+    Called on every startup after registration. Filing the descriptor is a
+    fatal startup requirement: a descriptor that can't be built/validated
+    fails immediately (operator misconfiguration), and submission is retried
+    over several minutes before failing hard via the ``descriptor-failed`` CLI
+    code. The per-round "participating" remark is a separate, best-effort
+    signal and is not gated here. The descriptor's `miners` block is built
+    from the same TOML-shaped dict that `MinerCore` used to spawn worker
+    handles, so the descriptor always reflects the actual launched topology.
     """
     effective_name = (node_name or _default_node_name())[:64]
     # When the operator did not configure public_host, query
@@ -205,35 +243,61 @@ async def _auto_identify(
         )
         validate_descriptor(descriptor)
     except DescriptorValidationError as exc:
-        _AUTO_IDENTIFY_LOGGER.warning(
-            "auto-identify skipped: descriptor invalid (%s); "
-            "mining continues",
-            exc,
-        )
-        return
-    except Exception as exc:  # noqa: BLE001 — observability path
-        _AUTO_IDENTIFY_LOGGER.warning(
-            "auto-identify skipped: descriptor build failed "
-            "(%s: %s); mining continues",
-            type(exc).__name__,
-            exc,
-        )
-        return
+        # Deterministic: retrying won't fix an invalid descriptor. Fail hard.
+        raise click.ClickException(
+            f"descriptor-invalid ss58={keystore.signer.ss58_address()} "
+            f"error={exc}"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 — translated to a fatal CLI code
+        raise click.ClickException(
+            f"descriptor-build-failed ss58={keystore.signer.ss58_address()} "
+            f"error={type(exc).__name__}: {exc}"
+        ) from exc
 
     payload = to_canonical_json(descriptor)
     payload_hash = hashlib.blake2b(payload, digest_size=32).hexdigest()
+
+    # Retry submission over several minutes: a remark fired right after
+    # register_miner can be rejected on a stale nonce until the registration
+    # block is imported. Filing the descriptor is a fatal startup requirement.
+    async def _attempt():
+        return await _submit_descriptor_remark(
+            client, keystore, payload=payload, payload_hash=payload_hash
+        )
+
+    try:
+        await _retry_until_verified("file-descriptor", _attempt)
+    except RuntimeError as exc:
+        raise click.ClickException(
+            f"descriptor-failed ss58={keystore.signer.ss58_address()} "
+            f"error={exc}"
+        ) from exc
+
+
+async def _submit_descriptor_remark(
+    client: SubstrateClient,
+    keystore,
+    *,
+    payload: bytes,
+    payload_hash: str,
+) -> Tuple[bool, str]:
+    """Submit the descriptor remark once.
+
+    Returns ``(True, "")`` when it lands in-block, else ``(False, detail)``
+    so the caller can back off and retry. Prefers
+    ``System.remark_with_event`` (dashboards key off the event) and falls back
+    to plain ``remark`` if the event variant fails to compose against the live
+    runtime.
+    """
     try:
         prefer_event = await client.has_call("System", "remark_with_event")
         call_function = "remark_with_event" if prefer_event else "remark"
         try:
             receipt = await client.submit_extrinsic(
-                "System",
-                call_function,
-                {"remark": payload},
-                keystore.signer,
-                wait_for="inblock",
+                "System", call_function, {"remark": payload},
+                keystore.signer, wait_for="inblock",
             )
-        except Exception as exc:  # noqa: BLE001 — retry below or warn
+        except Exception as exc:  # noqa: BLE001 — fall back or report below
             if call_function == "remark":
                 raise
             _AUTO_IDENTIFY_LOGGER.warning(
@@ -242,20 +306,12 @@ async def _auto_identify(
                 exc,
             )
             receipt = await client.submit_extrinsic(
-                "System",
-                "remark",
-                {"remark": payload},
-                keystore.signer,
-                wait_for="inblock",
+                "System", "remark", {"remark": payload},
+                keystore.signer, wait_for="inblock",
             )
             call_function = "remark"
         if receipt.error:
-            _AUTO_IDENTIFY_LOGGER.warning(
-                "auto-identify: %s rejected (%s); mining continues",
-                call_function,
-                receipt.error,
-            )
-            return
+            return False, f"{call_function} rejected: {receipt.error}"
         _AUTO_IDENTIFY_LOGGER.info(
             "auto-identify submitted: account=%s call=System.%s "
             "extrinsic=%s payload_size=%d payload_hash=0x%s",
@@ -265,13 +321,9 @@ async def _auto_identify(
             len(payload),
             payload_hash,
         )
-    except Exception as exc:  # noqa: BLE001 — observability path
-        _AUTO_IDENTIFY_LOGGER.warning(
-            "auto-identify skipped: submission failed (%s: %s); "
-            "mining continues",
-            type(exc).__name__,
-            exc,
-        )
+        return True, ""
+    except Exception as exc:  # noqa: BLE001 — observability path; caller retries
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 _VALIDATOR_HELP = (
@@ -542,27 +594,37 @@ async def _ensure_registered_or_fail(client: SubstrateClient, keystore) -> None:
 
     Reuses ``shared.miner_bootstrap._ensure_registered`` so the manual
     ``bootstrap`` command and the miner's own startup register through
-    identical code — they cannot drift. Already-registered is a no-op that
-    just reports state; a failure becomes the ``miner-registration-failed``
-    CLI error code.
+    identical code — they cannot drift. Retries registration over several
+    minutes (verifying the account lands in ``QuantumPow.Miners``); an ultimate
+    failure is fatal via the ``miner-registration-failed`` CLI error code.
+    Already-registered is a no-op that just reports state.
     """
     ss58 = keystore.signer.ss58_address()
+
+    async def _attempt():
+        try:
+            newly = await _ensure_registered(client, keystore)
+        except NoValidatorReachable:
+            raise  # distinct fatal code; not a registration-logic failure
+        except Exception as exc:  # noqa: BLE001 — retryable, surfaced in detail
+            detail = str(exc).strip() or type(exc).__name__
+            return False, f"{type(exc).__name__}: {detail}"
+        return True, ("registered" if newly else "already-registered")
+
     try:
-        newly_registered = await _ensure_registered(client, keystore)
+        outcome = await _retry_until_verified("register-miner", _attempt)
     except NoValidatorReachable as exc:
         urls = ",".join(a.url for a in exc.attempts)
         reasons = ",".join(a.exc_type for a in exc.attempts)
         raise click.ClickException(
             f"validators-unreachable urls={urls} reasons={reasons}"
         ) from exc
-    except Exception as exc:  # noqa: BLE001 — translated to a CLI error code
-        detail = str(exc).strip() or type(exc).__name__
+    except RuntimeError as exc:
         raise click.ClickException(
-            f"miner-registration-failed ss58={ss58} "
-            f"error={type(exc).__name__}: {detail}"
+            f"miner-registration-failed ss58={ss58} error={exc}"
         ) from exc
     click.echo(
-        f"registered miner: {ss58}" if newly_registered
+        f"registered miner: {ss58}" if outcome == "registered"
         else f"miner already registered: {ss58}"
     )
 
@@ -1411,11 +1473,10 @@ async def _run_concurrent_miner(
         # prerequisite; the controller still verifies before mining.
         await _ensure_registered_or_fail(client, keystore)
 
-        # Auto-identify: publish a signed NodeDescriptor remark so
-        # dashboards can map our AccountId → node_name + advertised
-        # hardware. Runs on every startup; failures log a warning and
-        # never block mining. There is no opt-out — dashboard visibility
-        # is part of the miner contract.
+        # Guard E — file the signed NodeDescriptor remark so dashboards can
+        # map our AccountId → node_name + advertised hardware. Retried over
+        # several minutes and fatal on failure (descriptor-* codes); there is
+        # no opt-out — descriptor visibility is part of the miner contract.
         await _auto_identify(
             client,
             keystore,
