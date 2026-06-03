@@ -572,6 +572,16 @@ class DWaveSamplerWrapper:
 
         return self._sample_ising_inner(h, J, **kwargs)
 
+    def _chain_strength(self, bqm: dimod.BinaryQuadraticModel, multiplier: float) -> float:
+        """Compute chain strength as the largest absolute bias scaled by *multiplier*.
+
+        If the BQM has quadratic interactions the largest |J| is used; otherwise
+        the largest |h| is used.  Falls back to 1.0 when the BQM is empty.
+        """
+        if bqm.num_interactions > 0:
+            return max(abs(b) for b in bqm.quadratic.values()) * multiplier
+        return max(abs(b) for b in bqm.linear.values()) * multiplier if bqm.linear else 1.0
+
     def _sample_ising_inner(
         self,
         h: Union[Mapping[Variable, float], Sequence[float]],
@@ -603,10 +613,7 @@ class DWaveSamplerWrapper:
                 print(f"   Embedding vars: {len(embedding_vars)}, range: {min(embedding_vars)}-{max(embedding_vars)}", file=sys.stderr)
 
             # Calculate chain strength explicitly so we control the multiplier
-            if bqm.num_interactions > 0:
-                chain_strength = max(abs(b) for b in bqm.quadratic.values()) * chain_strength_multiplier
-            else:
-                chain_strength = max(abs(b) for b in bqm.linear.values()) * chain_strength_multiplier if bqm.linear else 1.0
+            chain_strength = self._chain_strength(bqm, chain_strength_multiplier)
 
             # Sample using BQM (not sample_ising)
             sampleset = self.sampler.sample(bqm, chain_strength=chain_strength, **kwargs)
@@ -682,11 +689,7 @@ class DWaveSamplerWrapper:
             source_bqm = dimod.BinaryQuadraticModel.from_ising(h, J)
 
             # Calculate chain strength (using same logic as FixedEmbeddingComposite)
-            # Default to magnitude of strongest interaction
-            if source_bqm.num_interactions > 0:
-                chain_strength = max(abs(bias) for bias in source_bqm.quadratic.values()) * chain_strength_multiplier
-            else:
-                chain_strength = max(abs(bias) for bias in source_bqm.linear.values()) * chain_strength_multiplier if source_bqm.linear else 1.0
+            chain_strength = self._chain_strength(source_bqm, chain_strength_multiplier)
 
             # Manually embed the BQM
             target_bqm = embed_bqm(
