@@ -15,6 +15,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evaluate_sampleset
 from shared.block_requirements import BlockRequirements
+from tools.baseline_utils import classify_energy
 import random
 
 try:
@@ -165,15 +166,7 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, min_runtime_minute
                 print(f"    ❌ Does not meet mining requirements")
 
             # Energy target analysis
-            target_reached = "none"
-            if min_energy <= -15650:
-                target_reached = "excellent"
-            elif min_energy <= -15500:
-                target_reached = "very_good"
-            elif min_energy <= -15400:
-                target_reached = "good"
-            elif min_energy <= -15300:
-                target_reached = "fair"
+            target_reached = classify_energy(min_energy)
 
             if target_reached != "none":
                 print(f"    🎖️  Quality: {target_reached}")

@@ -38,6 +38,7 @@ from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies.json_loader import load_topology
 from dwave_topologies.embedded_topology import create_embedded_topology
 from dwave_topologies.embedding_loader import load_embedding
+from tools.baseline_utils import classify_energy
 import random
 import dimod
 
@@ -321,15 +322,7 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
                 print(f"  ❌ Does not meet mining requirements")
 
             # Energy target analysis
-            target_reached = "none"
-            if min_energy <= -15650:
-                target_reached = "excellent"
-            elif min_energy <= -15500:
-                target_reached = "very_good"
-            elif min_energy <= -15400:
-                target_reached = "good"
-            elif min_energy <= -15300:
-                target_reached = "fair"
+            target_reached = classify_energy(min_energy)
 
             if target_reached != "none":
                 print(f"  🎖️  Quality: {target_reached}")
