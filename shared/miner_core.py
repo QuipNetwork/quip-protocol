@@ -199,47 +199,44 @@ class MinerCore:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def _try(self, label: str, fn: Callable[[], None]) -> None:
+        """Call *fn*; log a warning on any exception (best-effort helper)."""
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001 — best-effort tear-down
+            self.logger.warning("close: %s: %s", label, exc)
+
     def close(self) -> None:
         """Shut down all workers and the log listener. Idempotent."""
         for h in self.miner_handles:
-            try:
-                h.cancel()
-                h.req.put({"op": "shutdown"})
-            except Exception as exc:  # noqa: BLE001 — best-effort tear-down
-                self.logger.warning(
-                    "close: shutdown signal failed for %s: %s", h.miner_id, exc
-                )
+            self._try(
+                f"shutdown signal failed for {h.miner_id}",
+                lambda h=h: (h.cancel(), h.req.put({"op": "shutdown"})),
+            )
         for h in self.miner_handles:
-            try:
-                h.proc.join(timeout=5.0)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("close: join failed for %s: %s", h.miner_id, exc)
+            self._try(f"join failed for {h.miner_id}", lambda h=h: h.proc.join(timeout=5.0))
             if h.proc.is_alive():
-                try:
-                    h.proc.terminate()
-                    h.proc.join(timeout=2.0)
-                except Exception as exc:  # noqa: BLE001
-                    self.logger.warning(
-                        "close: terminate failed for %s: %s", h.miner_id, exc
-                    )
-                if h.proc.is_alive():
-                    try:
-                        h.proc.kill()
-                        h.proc.join(timeout=1.0)
-                    except Exception as exc:  # noqa: BLE001
-                        self.logger.warning(
-                            "close: kill failed for %s: %s", h.miner_id, exc
-                        )
+                self._try(
+                    f"terminate failed for {h.miner_id}",
+                    lambda h=h: (h.proc.terminate(), h.proc.join(timeout=2.0)),
+                )
+            if h.proc.is_alive():
+                self._try(
+                    f"kill failed for {h.miner_id}",
+                    lambda h=h: (h.proc.kill(), h.proc.join(timeout=1.0)),
+                )
         self.miner_handles = []
 
         if getattr(self, "_log_proc", None) is not None:
-            try:
-                self._log_stop.set()
-                self._log_queue.put(None)
-                from shared.proc_util import terminate_join
-                terminate_join(self._log_proc, 3.0)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("close: log writer stop failed: %s", exc)
+            from shared.proc_util import terminate_join
+            self._try(
+                "log writer stop failed",
+                lambda: (
+                    self._log_stop.set(),
+                    self._log_queue.put(None),
+                    terminate_join(self._log_proc, 3.0),
+                ),
+            )
             self._log_proc = None
 
     # ------------------------------------------------------------------
