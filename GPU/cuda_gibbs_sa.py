@@ -24,10 +24,7 @@ import numpy as np
 
 from GPU.base_cuda_sampler import BaseCudaSampler
 from GPU.gpu_scheduler import throttled_stream
-from GPU.sampler_utils import (
-    compute_beta_schedule,
-    compute_color_blocks,
-)
+from GPU.sampler_utils import compute_color_blocks
 from shared.ising_model import IsingModel
 
 
@@ -118,20 +115,16 @@ class CudaGibbsSampler(BaseCudaSampler):
         num_reads: int = 256,
         num_sweeps: int = 1000,
         num_sweeps_per_beta: int = 1,
-        max_nonces: int = 1,
     ) -> None:
         """Pre-allocate GPU buffers for a fixed topology.
 
-        Extends base prepare() with color block computation
-        and double-buffered GPU arrays for the non-self-feeding
-        pipeline path.
+        Extends base prepare() with color block computation.
 
         Args:
             num_reads: Max reads per job.
             num_sweeps: Max sweeps (determines beta schedule
                 size).
             num_sweeps_per_beta: Sweeps per beta value.
-            max_nonces: Max nonces for multi-nonce dispatch.
         """
         super().prepare(
             num_reads=num_reads,
@@ -172,162 +165,10 @@ class CudaGibbsSampler(BaseCudaSampler):
         self._d_problem_j = cp.asarray(problem_j)
         self._d_problem_h = cp.asarray(problem_h)
 
-        # Double-buffered mutable GPU arrays (A/B sets)
-        max_betas = self._prep_max_num_betas
-        total_samples = num_reads
-        self._d_J_vals = [
-            cp.zeros(nnz, dtype=cp.int8),
-            cp.zeros(nnz, dtype=cp.int8),
-        ]
-        self._d_h_vals = [
-            cp.zeros(N, dtype=cp.int8),
-            cp.zeros(N, dtype=cp.int8),
-        ]
-        self._d_beta_sched = [
-            cp.zeros(max_betas, dtype=cp.float32),
-            cp.zeros(max_betas, dtype=cp.float32),
-        ]
-        self._d_final_samples = [
-            cp.zeros(
-                total_samples * max_packed_size,
-                dtype=cp.int8,
-            ),
-            cp.zeros(
-                total_samples * max_packed_size,
-                dtype=cp.int8,
-            ),
-        ]
-        self._d_final_energies = [
-            cp.zeros(total_samples, dtype=cp.int32),
-            cp.zeros(total_samples, dtype=cp.int32),
-        ]
-        self._d_queue_counter = [
-            cp.zeros(1, dtype=cp.int32),
-            cp.zeros(1, dtype=cp.int32),
-        ]
-
-        # Multi-nonce double-buffered GPU arrays (A/B)
-        self._max_nonces = max_nonces
-        if max_nonces > 1:
-            mn_total_reads = max_nonces * num_reads
-            self._d_mn_J = [
-                cp.zeros(
-                    max_nonces * nnz, dtype=cp.int8,
-                ),
-                cp.zeros(
-                    max_nonces * nnz, dtype=cp.int8,
-                ),
-            ]
-            self._d_mn_h = [
-                cp.zeros(
-                    max_nonces * N, dtype=cp.int8,
-                ),
-                cp.zeros(
-                    max_nonces * N, dtype=cp.int8,
-                ),
-            ]
-            self._d_mn_samples = [
-                cp.zeros(
-                    mn_total_reads * max_packed_size,
-                    dtype=cp.int8,
-                ),
-                cp.zeros(
-                    mn_total_reads * max_packed_size,
-                    dtype=cp.int8,
-                ),
-            ]
-            self._d_mn_energies = [
-                cp.zeros(
-                    mn_total_reads, dtype=cp.int32,
-                ),
-                cp.zeros(
-                    mn_total_reads, dtype=cp.int32,
-                ),
-            ]
-            self._d_mn_queue = [
-                cp.zeros(1, dtype=cp.int32),
-                cp.zeros(1, dtype=cp.int32),
-            ]
-            self._d_mn_beta = [
-                cp.zeros(
-                    self._prep_max_num_betas,
-                    dtype=cp.float32,
-                ),
-                cp.zeros(
-                    self._prep_max_num_betas,
-                    dtype=cp.float32,
-                ),
-            ]
-            # Per-nonce metadata
-            self._d_mn_problem_N = cp.full(
-                max_nonces, N, dtype=cp.int32,
-            )
-            self._d_mn_problem_rp = cp.zeros(
-                max_nonces, dtype=cp.int32,
-            )
-            self._d_mn_problem_ci = cp.zeros(
-                max_nonces, dtype=cp.int32,
-            )
-            self._d_mn_problem_j = cp.asarray(
-                np.arange(
-                    max_nonces, dtype=np.int32,
-                ) * nnz,
-            )
-            self._d_mn_problem_h = cp.asarray(
-                np.arange(
-                    max_nonces, dtype=np.int32,
-                ) * N,
-            )
-            self._d_mn_block_starts = cp.asarray(
-                np.tile(starts, max_nonces),
-            )
-            self._d_mn_block_counts = cp.asarray(
-                np.tile(counts, max_nonces),
-            )
-
-            # Double host staging buffers (A/B)
-            self._h_mn_J = [
-                np.zeros(
-                    max_nonces * nnz, dtype=np.int8,
-                ),
-                np.zeros(
-                    max_nonces * nnz, dtype=np.int8,
-                ),
-            ]
-            self._h_mn_h = [
-                np.zeros(
-                    max_nonces * N, dtype=np.int8,
-                ),
-                np.zeros(
-                    max_nonces * N, dtype=np.int8,
-                ),
-            ]
-
-        # CUDA streams for pipeline overlap
-        self._stream_compute = cp.cuda.Stream(
-            non_blocking=True,
-        )
-        self._stream_transfer = cp.cuda.Stream(
-            non_blocking=True,
-        )
-        self._event_transfer_done = cp.cuda.Event()
-
-        # Pipeline state — single-nonce double buffer
-        self._buf_idx = 0
-        self._preloaded = False
-        self._preload_meta = None
-
-        # Pipeline state — multi-nonce double buffer
-        self._mn_buf_idx = 0
-        self._mn_preloaded = False
-        self._mn_preload_meta = None
-        self._mn_pending = None
-
         self.logger.info(
             "Prepared Gibbs buffers: N=%d, nnz=%d, "
-            "num_reads=%d, max_betas=%d, max_nonces=%d",
-            N, nnz, num_reads,
-            self._prep_max_num_betas, max_nonces,
+            "num_reads=%d, max_betas=%d",
+            N, nnz, num_reads, self._prep_max_num_betas,
         )
 
     def _allocate_kernel_buffers(
@@ -401,109 +242,6 @@ class CudaGibbsSampler(BaseCudaSampler):
             np.int32(self.update_mode),
         )
 
-    # -- Gibbs-specific close (also handles double-buffer
-    #    streams) --
-
-    def close(self) -> None:
-        """Synchronize and release all CUDA streams."""
-        super().close()
-        if hasattr(self, '_stream_compute'):
-            self._stream_compute.synchronize()
-            self._stream_transfer.synchronize()
-        self._mn_preloaded = False
-        self._preloaded = False
-
-    # -- Gibbs-specific methods --
-
-    def _get_cached_beta_schedule(
-        self,
-        h: Dict[int, float],
-        J: Dict[Tuple[int, int], float],
-        num_sweeps: int,
-        num_sweeps_per_beta: int,
-        beta_range: Optional[Tuple[float, float]],
-        beta_schedule_type: str,
-        beta_schedule: Optional[np.ndarray],
-    ) -> Tuple[np.ndarray, Tuple[float, float]]:
-        """Return cached beta schedule if params match."""
-        key = (
-            num_sweeps, num_sweeps_per_beta,
-            beta_schedule_type, beta_range,
-        )
-        if (self._cached_beta_key == key
-                and beta_schedule is None):
-            return (
-                self._cached_beta_sched,
-                self._cached_beta_range,
-            )
-
-        sched, br = compute_beta_schedule(
-            h, J, num_sweeps, num_sweeps_per_beta,
-            beta_range, beta_schedule_type, beta_schedule,
-        )
-        if beta_schedule is None:
-            self._cached_beta_key = key
-            self._cached_beta_sched = sched
-            self._cached_beta_range = br
-        return sched, br
-
-    def preload(
-        self,
-        h: Dict[int, float],
-        J: Dict[Tuple[int, int], float],
-        num_reads: int,
-        num_sweeps: int,
-        num_sweeps_per_beta: int = 1,
-        beta_range: Optional[Tuple[float, float]] = None,
-        beta_schedule_type: str = "geometric",
-        beta_schedule: Optional[np.ndarray] = None,
-        seed: Optional[int] = None,
-    ) -> None:
-        """Preload next job's data asynchronously."""
-        assert self._prepared, "Must call prepare() first"
-        next_idx = 1 - self._buf_idx
-        num_reads = min(num_reads, self._prep_num_reads)
-
-        # Vectorized staging fill
-        j_vals = np.fromiter(
-            J.values(), dtype=np.int8, count=len(J),
-        )
-        self._h_J_vals[:] = 0
-        self._h_J_vals[self._pos_ij] = j_vals
-        self._h_J_vals[self._pos_ji] = j_vals
-
-        h_vals = np.fromiter(
-            h.values(), dtype=np.int8, count=len(h),
-        )
-        self._h_h_vals[:] = 0
-        self._h_h_vals[self._h_idx] = h_vals
-
-        sched, beta_range = self._get_cached_beta_schedule(
-            h, J, num_sweeps, num_sweeps_per_beta,
-            beta_range, beta_schedule_type, beta_schedule,
-        )
-        num_betas = len(sched)
-
-        if seed is None:
-            seed = np.random.randint(0, 2**31)
-
-        # Async H2D on transfer stream
-        with self._stream_transfer:
-            self._d_J_vals[next_idx].set(self._h_J_vals)
-            self._d_h_vals[next_idx].set(self._h_h_vals)
-            self._d_beta_sched[next_idx][
-                :num_betas
-            ].set(sched)
-        self._event_transfer_done.record(
-            self._stream_transfer,
-        )
-
-        self._preloaded = True
-        self._preload_meta = (
-            num_reads, num_betas, num_sweeps_per_beta,
-            seed, beta_range, beta_schedule_type,
-        )
-
     # -- Gibbs-specific streaming API --
 
     def sample_ising_streaming(
@@ -522,8 +260,8 @@ class CudaGibbsSampler(BaseCudaSampler):
     ) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
         """Stream Ising model solutions via Gibbs kernel.
 
-        Gibbs-specific prepare logic (max_nonces,
-        sms_per_nonce) + base rotation loop.
+        Gibbs-specific prepare logic (sms_per_nonce) +
+        base rotation loop.
 
         Args:
             models: Iterable of IsingModel.
@@ -549,7 +287,6 @@ class CudaGibbsSampler(BaseCudaSampler):
                 num_reads=num_reads,
                 num_sweeps=num_sweeps,
                 num_sweeps_per_beta=num_sweeps_per_beta,
-                max_nonces=num_k,
             )
 
         if not self._sf_prepared:
@@ -632,7 +369,6 @@ class CudaGibbsSampler(BaseCudaSampler):
                 num_reads=num_reads,
                 num_sweeps=num_sweeps,
                 num_sweeps_per_beta=num_sweeps_per_beta,
-                max_nonces=num_problems,
             )
 
         # Prepare self-feeding buffers if needed
