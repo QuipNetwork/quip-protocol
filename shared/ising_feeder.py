@@ -40,6 +40,12 @@ logger = logging.getLogger(__name__)
 _SPAWN_CTX = _mp.get_context("spawn")
 
 
+def _require_len(name: str, value: bytes, n: int = 32) -> None:
+    """Raise ValueError if *value* is not exactly *n* bytes long."""
+    if len(value) != n:
+        raise ValueError(f"{name} must be {n} bytes, got {len(value)}")
+
+
 def _empty_feeder_counters() -> dict:
     """Fresh zeroed cumulative-counter dict for RandomIsingFeeder stats."""
     return {
@@ -158,13 +164,8 @@ class RandomIsingFeeder:
         max_workers: int = 2,
         seed: Optional[int] = None,
     ):
-        if len(last_proof_block_hash) != 32:
-            raise ValueError(
-                "last_proof_block_hash must be 32 bytes, got "
-                f"{len(last_proof_block_hash)}"
-            )
-        if len(miner_bytes) != 32:
-            raise ValueError(f"miner_bytes must be 32 bytes, got {len(miner_bytes)}")
+        _require_len("last_proof_block_hash", last_proof_block_hash)
+        _require_len("miner_bytes", miner_bytes)
         self._last_proof_block_hash = last_proof_block_hash
         self._miner_id = miner_bytes
         self._nodes = nodes
@@ -217,13 +218,8 @@ class RandomIsingFeeder:
         Raises:
             ValueError: If either argument is not exactly 32 bytes.
         """
-        if len(last_proof_block_hash) != 32:
-            raise ValueError(
-                "last_proof_block_hash must be 32 bytes, got "
-                f"{len(last_proof_block_hash)}"
-            )
-        if len(miner_bytes) != 32:
-            raise ValueError(f"miner_bytes must be 32 bytes, got {len(miner_bytes)}")
+        _require_len("last_proof_block_hash", last_proof_block_hash)
+        _require_len("miner_bytes", miner_bytes)
         # Abandon old-seed in-flight work. cancel() is best-effort (a
         # running worker keeps going), but clearing _futures means _fill
         # never harvests the result, so no old-seed model can reach the new

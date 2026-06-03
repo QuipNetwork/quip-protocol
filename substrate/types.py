@@ -31,6 +31,12 @@ if TYPE_CHECKING:
     from shared.miner_types import BlockRequirements
 
 
+def _require_len(name: str, value: bytes, n: int = 32) -> None:
+    """Raise ValueError if *value* is not exactly *n* bytes long."""
+    if len(value) != n:
+        raise ValueError(f"{name} must be {n} bytes, got {len(value)}")
+
+
 @dataclass(frozen=True)
 class PowConstants:
     """Pallet constants the miner needs for local decay computation.
@@ -116,25 +122,15 @@ class SubstrateMiningContext:
     epoch_length: int = 0                       # blocks per decay step (0 = disabled)
 
     def __post_init__(self) -> None:
-        if len(self.last_proof_block_hash) != 32:
-            raise ValueError(
-                "last_proof_block_hash must be 32 bytes, got "
-                f"{len(self.last_proof_block_hash)}"
-            )
-        if len(self.topology_hash) != 32:
-            raise ValueError(
-                f"topology_hash must be 32 bytes, got {len(self.topology_hash)}"
-            )
+        _require_len("last_proof_block_hash", self.last_proof_block_hash)
+        _require_len("topology_hash", self.topology_hash)
         if len(self.miner_account_bytes) != 32:
             raise ValueError(
                 "miner_account_bytes must be the 32-byte canonical miner "
                 f"identity (blake2_256(SCALE(account_id))), got "
                 f"{len(self.miner_account_bytes)}"
             )
-        if len(self.block_hash) != 32:
-            raise ValueError(
-                f"block_hash must be 32 bytes, got {len(self.block_hash)}"
-            )
+        _require_len("block_hash", self.block_hash)
         if self.block_number < 0:
             raise ValueError(
                 f"block_number must be non-negative, got {self.block_number}"
@@ -228,15 +224,9 @@ class WinningSolution:
     last_proof_block_hash: bytes
 
     def __post_init__(self) -> None:
-        if len(self.miner) != 32:
-            raise ValueError(f"miner must be 32 bytes, got {len(self.miner)}")
-        if len(self.salt) != 32:
-            raise ValueError(f"salt must be 32 bytes, got {len(self.salt)}")
-        if len(self.last_proof_block_hash) != 32:
-            raise ValueError(
-                "last_proof_block_hash must be 32 bytes, got "
-                f"{len(self.last_proof_block_hash)}"
-            )
+        _require_len("miner", self.miner)
+        _require_len("salt", self.salt)
+        _require_len("last_proof_block_hash", self.last_proof_block_hash)
 
 
 @dataclass(frozen=True)
@@ -252,8 +242,7 @@ class WinningSolutionWithNonce:
     nonce: bytes
 
     def __post_init__(self) -> None:
-        if len(self.nonce) != 32:
-            raise ValueError(f"nonce must be 32 bytes, got {len(self.nonce)}")
+        _require_len("nonce", self.nonce)
 
 
 @dataclass(frozen=True)
