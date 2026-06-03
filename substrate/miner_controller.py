@@ -1418,13 +1418,6 @@ class SubstrateMinerController:
                 accepted_block_number,
                 self.signer.ss58_address(),
             )
-            # Use the verify-path's LastProofBlock as the authoritative won
-            # block number when available (verified >= 0). Fall back to the
-            # receipt-derived accepted_block_number when verify returned None
-            # (inconclusive RPC failure).
-            won_block_number: Optional[int] = (
-                verified if (verified is not None and verified >= 0) else None
-            )
             # Precise QPU spent on this solution # (summed from the per-attempt
             # QPU times in the attempt log). Telemetry/log only — not on-chain.
             qpu_access_us_total = self._sum_qpu_access_us(solution_number)
@@ -1440,8 +1433,9 @@ class SubstrateMinerController:
                 num_valid=envelope.result.num_valid,
                 extrinsic_hash=receipt.extrinsic_hash,
                 chain_block_hash=receipt.block_hash,
-                chain_block_number=won_block_number if won_block_number is not None
-                    else accepted_block_number,
+                chain_block_number=self._resolve_won_block_number(
+                    verified, accepted_block_number
+                ),
                 qpu_access_us_total=qpu_access_us_total,
             )
             if self.core is not None:
@@ -1449,16 +1443,7 @@ class SubstrateMinerController:
                     winning_miner_id=envelope.result.miner_id,
                     mining_time=float(envelope.result.mining_time),
                 )
-            if self.on_proof_submitted is not None:
-                try:
-                    await self.on_proof_submitted(receipt, envelope.context)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "on_proof_submitted callback raised (proof was submitted): "
-                        "%s: %s",
-                        type(exc).__name__,
-                        exc,
-                    )
+            await self._invoke_proof_submitted_callback(receipt, envelope.context)
         elif outcome is SubmissionOutcome.STALE:
             self.stats.stale_drops += 1
             logger.info(
@@ -2363,17 +2348,14 @@ class SubstrateMinerController:
         )
         self._mark_work_key_closed(key, record)
         self._cancel_siblings_for_won_work(handle_id)
-        won_block_number: Optional[int] = (
-            verified if (verified is not None and verified >= 0) else None
-        )
         self._submission_log.record(
             **log_common,
             outcome="submitted_inblock",
             extrinsic_hash=extrinsic_hash,
             chain_block_hash=receipt_block,
-            chain_block_number=won_block_number
-            if won_block_number is not None
-            else accepted_block_number,
+            chain_block_number=self._resolve_won_block_number(
+                verified, accepted_block_number
+            ),
         )
         if self.core is not None:
             self.core.record_result(
@@ -2386,16 +2368,47 @@ class SubstrateMinerController:
             receipt_block,
             accepted_block_number,
         )
-        if self.on_proof_submitted is not None and receipt is not None:
-            try:
-                await self.on_proof_submitted(receipt, ctx)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "on_proof_submitted callback raised (proof was submitted): "
-                    "%s: %s",
-                    type(exc).__name__,
-                    exc,
-                )
+        await self._invoke_proof_submitted_callback(receipt, ctx)
+
+    # ------------------------------------------------------------------
+    # Shared won-block helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_won_block_number(
+        verified: Optional[int],
+        accepted_block_number: int,
+    ) -> int:
+        """Return the authoritative won block number.
+
+        Uses the verify-path's LastProofBlock when ``verified >= 0``; falls
+        back to the receipt-derived ``accepted_block_number`` when verify
+        returned ``None`` (inconclusive RPC failure).
+        """
+        if verified is not None and verified >= 0:
+            return verified
+        return accepted_block_number
+
+    async def _invoke_proof_submitted_callback(
+        self,
+        receipt: Optional[ExtrinsicReceipt],
+        ctx: SubstrateMiningContext,
+    ) -> None:
+        """Fire ``on_proof_submitted`` and swallow exceptions with a WARN.
+
+        A ``None`` receipt or unset callback is a no-op.
+        """
+        if self.on_proof_submitted is None or receipt is None:
+            return
+        try:
+            await self.on_proof_submitted(receipt, ctx)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "on_proof_submitted callback raised (proof was submitted): "
+                "%s: %s",
+                type(exc).__name__,
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # Background tasks
