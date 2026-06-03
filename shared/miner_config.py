@@ -73,16 +73,21 @@ class MinerConfigError(ValueError):
     """Operator-facing problem with a miner config file or merged settings."""
 
 
-def load_miner_config(path: Path) -> dict[str, Any]:
+def load_miner_config(
+    path: Optional[Path] = None, *, raw: Optional[Mapping[str, Any]] = None
+) -> dict[str, Any]:
     """Read a TOML file and return its `[miner]` table.
 
     Returns `{}` when the file has no `[miner]` section so callers can
     treat "config present, miner section absent" the same as "no config
     file". Raises `MinerConfigError` for missing files, parse errors, or
     schema violations the CLI can surface verbatim.
+
+    Pass `raw` (a pre-parsed mapping from :func:`load_toml`) to reuse a
+    single parse instead of re-reading `path`.
     """
-    raw = _load_toml(path)
-    miner = raw.get("miner", {})
+    data = _resolve_config(path, raw)
+    miner = data.get("miner", {})
     if not isinstance(miner, Mapping):
         raise MinerConfigError(
             f"miner config: [miner] must be a table, got {type(miner).__name__}"
@@ -113,7 +118,9 @@ class SubmissionConfig:
     retry_backoff_ms: int = 250
 
 
-def load_submission_config(path: Path) -> SubmissionConfig:
+def load_submission_config(
+    path: Optional[Path] = None, *, raw: Optional[Mapping[str, Any]] = None
+) -> SubmissionConfig:
     """Read the ``[submission]`` table into a :class:`SubmissionConfig`.
 
     Returns defaults when the file has no ``[submission]`` section, so a
@@ -121,9 +128,12 @@ def load_submission_config(path: Path) -> SubmissionConfig:
     :class:`MinerConfigError` for a non-table section or out-of-range
     values — these reach the submit path, so a malformed knob should fail
     at load time, not at the first proof.
+
+    Pass `raw` (a pre-parsed mapping from :func:`load_toml`) to reuse a
+    single parse instead of re-reading `path`.
     """
-    raw = _load_toml(path)
-    section = raw.get("submission", {})
+    data = _resolve_config(path, raw)
+    section = data.get("submission", {})
     if not isinstance(section, Mapping):
         raise MinerConfigError(
             "miner config: [submission] must be a table, got "
@@ -213,7 +223,9 @@ ALL_BACKEND_SECTIONS: tuple[str, ...] = (
 )
 
 
-def load_backend_config(path: Path) -> dict[str, Any]:
+def load_backend_config(
+    path: Optional[Path] = None, *, raw: Optional[Mapping[str, Any]] = None
+) -> dict[str, Any]:
     """Read a TOML file and return the v0.1-shape backend inventory tables.
 
     Returns a dict containing only the recognised hardware-inventory
@@ -226,11 +238,14 @@ def load_backend_config(path: Path) -> dict[str, Any]:
 
     Returns `{}` when the file has no recognised backend sections.
     Raises `MinerConfigError` for missing files or parse errors.
+
+    Pass `raw` (a pre-parsed mapping from :func:`load_toml`) to reuse a
+    single parse instead of re-reading `path`.
     """
-    raw = _load_toml(path)
+    data = _resolve_config(path, raw)
     out: dict[str, Any] = {}
     for section in ALL_BACKEND_SECTIONS:
-        value = raw.get(section)
+        value = data.get(section)
         if value is None:
             continue
         # Allow both `[gpu]` (mapping) and `[[cuda]]` (list of tables) —
@@ -376,10 +391,10 @@ def resolve_modes(
     if default is None:
         raise ModeResolutionError(
             "no-mode-resolvable",
-            f"config has no backend sections and no --default given; "
-            f"add one of [cpu]/[gpu]/[cuda.N]/[metal]/[modal]/[qpu]/"
-            f"[dwave]/[ibm]/[braket]/[pasqal]/[ionq]/[origin] to the "
-            f"config, or pass --default {{cpu,gpu,qpu}}.",
+            "config has no backend sections and no --default given; "
+            "add one of [cpu]/[gpu]/[cuda.N]/[metal]/[modal]/[qpu]/"
+            "[dwave]/[ibm]/[braket]/[pasqal]/[ionq]/[origin] to the "
+            "config, or pass --default {cpu,gpu,qpu}.",
         )
     if default not in supports:
         raise ModeResolutionError(
@@ -421,8 +436,14 @@ def resolve_mode(
     return modes[0]
 
 
-def _load_toml(path: Path) -> dict[str, Any]:
-    """Read + parse a TOML file. Shared by both load_* entry points."""
+def load_toml(path: Path) -> dict[str, Any]:
+    """Read + parse a TOML file. Shared by every ``load_*`` entry point.
+
+    Public so a caller that needs several views of the same file (e.g. the
+    cpu/gpu/qpu CLI, which wants the ``[miner]``, backend, and ``[submission]``
+    tables) can parse once and pass the result back in via the ``raw=``
+    parameter rather than re-reading + re-parsing the file three times.
+    """
     if not path.exists():
         raise MinerConfigError(f"miner config not found: {path}")
     try:
@@ -432,6 +453,21 @@ def _load_toml(path: Path) -> dict[str, Any]:
         raise MinerConfigError(
             f"miner config parse failed ({path}): {exc}"
         ) from exc
+
+
+def _resolve_config(
+    path: Optional[Path], raw: Optional[Mapping[str, Any]]
+) -> Mapping[str, Any]:
+    """Return the parsed config: ``raw`` when supplied, else parse ``path``.
+
+    Lets the ``load_*`` functions accept a pre-parsed mapping so a caller can
+    parse a file once and feed it to all of them.
+    """
+    if raw is not None:
+        return raw
+    if path is None:
+        raise MinerConfigError("config load requires a path or pre-parsed raw")
+    return load_toml(path)
 
 
 def merge_config(

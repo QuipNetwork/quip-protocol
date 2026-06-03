@@ -362,47 +362,24 @@ class MinerCore:
         # A topology is mandatory whenever we will build any handle — the chain
         # topology must reach every miner. None means it was not wired; fail
         # fast rather than silently mine the wrong (default) topology.
-        cpu_cfg = cfg.get("cpu")
-        has_gpu = cfg.get("gpu") is not None or any(
-            cfg.get(k) is not None for k in _GPU_DEVICE_SECTIONS
+        builds_miners = (
+            cfg.get("cpu") is not None
+            or _has_gpu_sections(cfg)
+            or _has_qpu_sections(cfg)
         )
-        has_qpu = cfg.get("qpu") is not None or any(
-            cfg.get(k) is not None for k in _QPU_DEVICE_SECTIONS
-        )
-        if (cpu_cfg is not None or has_gpu or has_qpu) and self._topology is None:
+        if builds_miners and self._topology is None:
             raise ValueError(
                 "MinerCore requires a topology to build miners; none was "
                 "provided (chain topology was not wired through)"
             )
 
-        # CPU section. `cfg["cpu"]["num_cpus"]` defaults to 1 if present.
-        # `cfg["cpu"]["args"]` (optional) is forwarded to the miner — used
-        # by the substrate CLI to pass `topology=zephyr(m, t)` so the
-        # sampler binds to the chain's registered topology.
-        if cpu_cfg is not None:
-            num_cpus = int(cpu_cfg.get("num_cpus", 1))
-            cpu_args = dict(cpu_cfg.get("args", {}))
-            for i in range(num_cpus):
-                spec = {
-                    "id": f"{self.node_id}-CPU-{i + 1}",
-                    "kind": "cpu",
-                    "args": cpu_args,
-                }
-                self._attach_topology(spec)
-                self.miner_handles.append(MinerHandle(spec, self._log_queue))
-
-        # GPU section. Forked from Node's normalization path; we keep only
-        # the device-section parsing the cuda/metal/modal kinds care about.
-        if has_gpu:
-            for spec in _build_gpu_specs(self.node_id, cfg):
-                self._attach_topology(spec)
-                self.miner_handles.append(MinerHandle(spec, self._log_queue))
-
-        # QPU section. Same forked pattern.
-        if has_qpu:
-            for spec in _build_qpu_specs(self.node_id, cfg):
-                self._attach_topology(spec)
-                self.miner_handles.append(MinerHandle(spec, self._log_queue))
+        # Build the spec dicts (cpu/gpu/qpu), then attach the chain topology
+        # and spawn a worker handle for each. `_build_*_specs` keep the
+        # device-section parsing the cuda/metal/modal/dwave kinds care about;
+        # the CPU `args` (e.g. `topology=zephyr(m, t)`) flow through verbatim.
+        for spec in build_miner_specs(self.node_id, cfg):
+            self._attach_topology(spec)
+            self.miner_handles.append(MinerHandle(spec, self._log_queue))
 
     def _attach_topology(self, spec: Dict[str, Any]) -> None:
         """Stash the chain topology into a spec's ``args`` so every backend's
@@ -465,6 +442,54 @@ def _build_gpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
             )
         else:
             raise ValueError(f"Unknown GPU device type: {dev_type}")
+    return specs
+
+
+def _has_gpu_sections(cfg: Dict[str, Any]) -> bool:
+    """True when ``cfg`` carries a ``[gpu]`` or any GPU device section."""
+    return cfg.get("gpu") is not None or any(
+        cfg.get(k) is not None for k in _GPU_DEVICE_SECTIONS
+    )
+
+
+def _has_qpu_sections(cfg: Dict[str, Any]) -> bool:
+    """True when ``cfg`` carries a ``[qpu]`` or any QPU device section."""
+    return cfg.get("qpu") is not None or any(
+        cfg.get(k) is not None for k in _QPU_DEVICE_SECTIONS
+    )
+
+
+def build_miner_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Materialize miner spec dicts from a parsed miner-config mapping.
+
+    Produces the plain ``{"id", "kind", ...}`` dicts for every cpu/gpu/qpu
+    miner the config describes, *without* attaching a topology or spawning
+    worker processes. :class:`MinerCore` calls this and then wires topology +
+    handles; the ``identify`` CLI calls it to populate the descriptor's
+    ``miners`` block without standing up workers.
+
+    Args:
+        node_id: Prefix for the generated per-miner ids.
+        cfg: Parsed miner-config mapping (``cpu`` / ``gpu`` / ``qpu`` plus the
+            v0.1 device sections).
+
+    Returns:
+        Spec dicts in cpu → gpu → qpu order; empty when ``cfg`` describes no
+        miners.
+    """
+    specs: List[Dict[str, Any]] = []
+    cpu_cfg = cfg.get("cpu")
+    if cpu_cfg is not None:
+        num_cpus = int(cpu_cfg.get("num_cpus", 1))
+        cpu_args = dict(cpu_cfg.get("args", {}))
+        specs.extend(
+            {"id": f"{node_id}-CPU-{i + 1}", "kind": "cpu", "args": cpu_args}
+            for i in range(num_cpus)
+        )
+    if _has_gpu_sections(cfg):
+        specs.extend(_build_gpu_specs(node_id, cfg))
+    if _has_qpu_sections(cfg):
+        specs.extend(_build_qpu_specs(node_id, cfg))
     return specs
 
 
@@ -533,4 +558,5 @@ def _build_qpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 __all__ = [
     "MinerCore",
+    "build_miner_specs",
 ]

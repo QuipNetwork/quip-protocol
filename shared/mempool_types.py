@@ -82,6 +82,21 @@ class MinerType(IntEnum):
         raise ValueError(f"unknown SCALE MinerType variant: {name!r}")
 
 
+# QPU vendors that carry a `qpu_<vendor>` suffix in the chain's `miner_kind`
+# descriptor string; D-Wave (and a bare `qpu`) stay the unsuffixed `qpu`.
+_SUFFIXED_QPU_VENDORS = ("ibm", "ionq", "pasqal")
+
+
+def qpu_miner_kind(vendor: str) -> str:
+    """Map a QPU vendor to its substrate ``miner_kind`` descriptor string.
+
+    Bare ``qpu`` for D-Wave (and any unrecognised vendor); ``qpu_<vendor>``
+    for IBM / IonQ / Pasqal. Inverse of the QPU branch of
+    :meth:`MinerType.from_kind`.
+    """
+    return f"qpu_{vendor}" if vendor in _SUFFIXED_QPU_VENDORS else "qpu"
+
+
 class Formulation(IntEnum):
     """Problem family. v0 supports Ising only."""
 

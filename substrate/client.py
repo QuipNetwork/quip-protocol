@@ -63,6 +63,9 @@ from websocket import WebSocketException
 
 from shared.hybrid_signer import HybridSigner
 from shared.logging_config import get_logger
+# Aliased: `topology_hash` is also a local param/field name throughout this
+# module, so import the canonical-hash function under a distinct name.
+from shared.topology_hash import topology_hash as compute_topology_hash
 from shared.mempool_types import (
     IsingParams,
     JobMode,
@@ -119,6 +122,38 @@ class NoValidatorReachable(RuntimeError):
         for a in attempts:
             lines.append(f"  {a.url}  -> {a.exc_type}: {a.message}")
         return "\n".join(lines)
+
+
+class NoRegisteredTopology(RuntimeError):
+    """Raised when the chain has no registered topology to mine against.
+
+    A fresh dev chain that hasn't been seeded has no ``DefaultTopology`` /
+    ``mining_snapshot``; the operator must seed it (e.g.
+    ``quip-miner bootstrap --seed-chain``) before any miner can derive work.
+    """
+
+
+@dataclass(frozen=True)
+class TopologyBinding:
+    """The local↔chain topology hashes a miner needs before it starts.
+
+    ``expected_hash`` is the canonical hash of the *local* sampler topology
+    under the chain's allowed-value specs — the same recipe the runtime's
+    ``hash_topology`` uses. ``chain_hash`` is what the chain has registered
+    (``snapshot.topology_hash``). PoW requires them to match (the pallet
+    rejects a mismatched proof via ``InvalidTopology``); mempool binds its
+    sampler to ``expected_hash`` regardless. ``snapshot`` is the full mining
+    snapshot they were derived from, carried so callers don't re-query.
+    """
+
+    expected_hash: bytes
+    chain_hash: bytes
+    snapshot: SubstrateMiningContext
+
+    @property
+    def matches(self) -> bool:
+        """True when the local topology hashes to the chain's registered one."""
+        return self.expected_hash == self.chain_hash
 
 
 # Page size for `state_getKeysPaged` storage-key enumeration (e.g. counting
@@ -478,6 +513,48 @@ class SubstrateClient:
             block_number=block_number,
         )
 
+    async def resolve_topology_binding(
+        self, topology: Any, *, miner_account_bytes: bytes
+    ) -> TopologyBinding:
+        """Resolve the chain mining snapshot + local↔chain topology hashes.
+
+        Fetches the current head and mining snapshot, then computes the
+        canonical hash of ``topology`` (the local sampler graph: any object
+        exposing ``.nodes`` and ``.edges``) under the snapshot's allowed-value
+        specs — the same recipe the runtime's ``hash_topology`` uses. Owning
+        this here keeps the chain-consensus hash recipe out of callers: they
+        compare :attr:`TopologyBinding.matches` and read the carried snapshot
+        rather than re-deriving the hash themselves.
+
+        Args:
+            topology: Local sampler topology with ``.nodes`` / ``.edges``.
+            miner_account_bytes: 32-byte AccountId for the snapshot identity.
+
+        Returns:
+            A :class:`TopologyBinding` with both hashes and the snapshot.
+
+        Raises:
+            NoRegisteredTopology: the chain has no registered topology yet.
+        """
+        head = await self.get_head()
+        snapshot = await self.get_mining_snapshot(
+            at=head, miner_account_bytes=miner_account_bytes,
+        )
+        if snapshot is None:
+            raise NoRegisteredTopology("chain has no registered topology")
+        expected_hash = compute_topology_hash(
+            topology.nodes,
+            topology.edges,
+            snapshot.allowed_h_values,
+            snapshot.allowed_j_values,
+            snapshot.allowed_spin_values,
+        )
+        return TopologyBinding(
+            expected_hash=expected_hash,
+            chain_hash=snapshot.topology_hash,
+            snapshot=snapshot,
+        )
+
     # ------------------------------------------------------------------
     # Storage queries
     # ------------------------------------------------------------------
@@ -734,6 +811,33 @@ class SubstrateClient:
             registered_at=int(v["registered_at"]),
             solutions_submitted=int(v["solutions_submitted"]),
             rewards_earned=int(v["rewards_earned"]),
+        )
+
+    async def register_solver(
+        self, signer: Signer, solver_type: MinerType
+    ) -> ExtrinsicReceipt:
+        """Register ``signer``'s account as a ``QuantumComputeMempool`` solver.
+
+        Wraps the ``register_solver`` extrinsic so callers don't hand-encode the
+        pallet name or the ``solver_type`` SCALE variant. Idempotency (skip when
+        already registered) is the caller's concern via :meth:`query_solver`.
+        """
+        return await self.submit_extrinsic(
+            "QuantumComputeMempool",
+            "register_solver",
+            {"solver_type": solver_type.to_scale_variant()},
+            signer,
+            wait_for="inblock",
+        )
+
+    async def deregister_solver(self, signer: Signer) -> ExtrinsicReceipt:
+        """Deregister ``signer``'s ``QuantumComputeMempool`` solver registration."""
+        return await self.submit_extrinsic(
+            "QuantumComputeMempool",
+            "deregister_solver",
+            {},
+            signer,
+            wait_for="inblock",
         )
 
     async def query_job_order(self, order_id: int) -> Optional[JobOrder]:
@@ -1822,6 +1926,8 @@ def _coerce_block_number(raw: Any) -> int:
 
 
 __all__ = [
+    "NoRegisteredTopology",
     "SubstrateClient",
+    "TopologyBinding",
     "WaitFor",
 ]

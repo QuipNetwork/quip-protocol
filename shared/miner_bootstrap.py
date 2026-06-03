@@ -161,6 +161,23 @@ class FaucetPermanentError(RuntimeError):
     """Faucet failure that retrying cannot fix (malformed request → 4xx)."""
 
 
+class Underfunded(RuntimeError):
+    """Balance is below threshold and no faucet is configured to top it up.
+
+    Carries ``balance`` + ``threshold`` so callers (e.g. the CLI's Guard C)
+    can render a structured error without re-querying. Subclasses
+    ``RuntimeError`` so existing ``except RuntimeError`` callers still catch it.
+    """
+
+    def __init__(self, balance: int, threshold: int) -> None:
+        self.balance = balance
+        self.threshold = threshold
+        super().__init__(
+            f"account balance {balance} below threshold {threshold} "
+            "but no --faucet-url was provided"
+        )
+
+
 @dataclass
 class BootstrapConfig:
     # Ordered failover list — `SubstrateClient` tries each in turn at
@@ -423,29 +440,63 @@ async def ensure_funded(
     keystore: HybridKeystoreFile,
     config: BootstrapConfig,
 ) -> int:
+    """Ensure the miner account holds at least ``config.min_balance_plancks``.
+
+    Thin wrapper that unpacks the funding-relevant fields from a
+    :class:`BootstrapConfig`; see :func:`ensure_funded_via_faucet` for the
+    config-free entry point the miner CLI's Guard C uses directly.
+    """
+    return await ensure_funded_via_faucet(
+        client,
+        keystore,
+        faucet_url=config.faucet_url,
+        min_balance=config.min_balance_plancks,
+        top_up_plancks=config.faucet_top_up_plancks,
+        timeout_seconds=config.faucet_timeout_seconds,
+    )
+
+
+async def ensure_funded_via_faucet(
+    client: SubstrateClient,
+    keystore: HybridKeystoreFile,
+    *,
+    faucet_url: Optional[str],
+    min_balance: int,
+    top_up_plancks: int = DEFAULT_FAUCET_TOP_UP_PLANCKS,
+    timeout_seconds: float = FAUCET_FUNDING_TIMEOUT_SECONDS,
+) -> int:
+    """Top the miner account up to ``min_balance`` via the faucet, if needed.
+
+    Returns the (already-sufficient or freshly-topped-up) balance. Takes
+    plain values rather than a :class:`BootstrapConfig` so the miner CLI can
+    drive the same faucet logic without fabricating a config it doesn't have.
+
+    Raises:
+        Underfunded: balance is below ``min_balance`` and ``faucet_url`` is
+            ``None`` — nothing to top up from.
+        FaucetPermanentError: the faucet rejected the request as malformed
+            (propagated without retry).
+        RuntimeError: the faucet did not settle within ``timeout_seconds``.
+    """
     account = keystore.signer.account_id_bytes()
     balance = await client.query_balance(account)
-    if balance >= config.min_balance_plancks:
+    if balance >= min_balance:
         logger.info(
             "miner account already funded: balance=%d plancks", balance
         )
         return balance
 
-    if config.faucet_url is None:
-        raise RuntimeError(
-            f"account balance {balance} below threshold {config.min_balance_plancks} "
-            "but no --faucet-url was provided"
-        )
+    if faucet_url is None:
+        raise Underfunded(balance, min_balance)
 
     logger.info(
         "requesting %d plancks from faucet for %s (retrying up to %.0fs)",
-        config.faucet_top_up_plancks,
+        top_up_plancks,
         keystore.signer.ss58_address(),
-        config.faucet_timeout_seconds,
+        timeout_seconds,
     )
-    faucet_url = config.faucet_url  # narrowed: non-None past the guard above
     dest_hex = "0x" + account.hex()
-    budget = config.faucet_timeout_seconds
+    budget = timeout_seconds
     backoff = _FAUCET_BACKOFF_START_SECONDS
     last_note = "no faucet response yet"
     attempt = 0
@@ -458,9 +509,9 @@ async def ensure_funded(
             account,
             faucet_url=faucet_url,
             dest_hex=dest_hex,
-            amount=config.faucet_top_up_plancks,
+            amount=top_up_plancks,
         )
-        if balance >= config.min_balance_plancks:
+        if balance >= min_balance:
             logger.info(
                 "faucet funded after %d attempt(s): balance=%d plancks",
                 attempt, balance,
@@ -478,7 +529,7 @@ async def ensure_funded(
         budget -= wait
         backoff = min(backoff * 2.0, _FAUCET_BACKOFF_MAX_SECONDS)
     raise RuntimeError(
-        f"faucet did not fund within {config.faucet_timeout_seconds:.0f}s "
+        f"faucet did not fund within {timeout_seconds:.0f}s "
         f"after {attempt} attempt(s); balance is still {balance} "
         f"(last status: {last_note})"
     )
@@ -591,6 +642,8 @@ __all__ = [
     "FAUCET_FUNDING_TIMEOUT_SECONDS",
     "FaucetPermanentError",
     "FaucetTransientError",
+    "Underfunded",
     "bootstrap",
     "ensure_funded",
+    "ensure_funded_via_faucet",
 ]

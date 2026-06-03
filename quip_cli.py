@@ -31,14 +31,14 @@ from dwave_topologies.topologies.zephyr import zephyr
 from shared.keystore_hybrid import generate, load
 from shared.logging_config import setup_logging
 from shared.mempool_miner_controller import MempoolMinerController
-from shared.topology_hash import topology_hash
-from shared.mempool_types import MinerType
+from shared.mempool_types import MinerType, qpu_miner_kind
 from shared.miner_bootstrap import (
     DEFAULT_MIN_BALANCE_PLANCKS,
     BootstrapConfig,
+    Underfunded,
     _ensure_registered,
     bootstrap,
-    ensure_funded,
+    ensure_funded_via_faucet,
 )
 from shared.miner_config import (
     GPU_BACKEND_SECTIONS,
@@ -50,18 +50,21 @@ from shared.miner_config import (
     load_backend_config,
     load_miner_config,
     load_submission_config,
+    load_toml,
     merge_config,
     present_backend_groups,
     resolve_mode,
     resolve_modes,
     validate_merged,
 )
-from shared.miner_core import MinerCore
+from shared.miner_core import MinerCore, build_miner_specs
 from substrate.client import (
+    NoRegisteredTopology,
     NoValidatorReachable,
     SubstrateClient,
 )
 from substrate.miner_controller import SubstrateMinerController
+from substrate.remark import submit_remark
 from shared.system_info import (
     DescriptorValidationError,
     _scrub,
@@ -226,9 +229,7 @@ async def _auto_identify(
     effective_public_host = public_host
     if effective_public_host is None:
         effective_public_host = await _detect_public_ip()
-    miner_specs = _identify_specs_from_miner_config(
-        effective_name, miners_config
-    )
+    miner_specs = build_miner_specs(effective_name, miners_config)
     try:
         descriptor = build_descriptor(
             node_id=effective_name,
@@ -289,27 +290,17 @@ async def _submit_descriptor_remark(
     to plain ``remark`` if the event variant fails to compose against the live
     runtime.
     """
+    def _warn_fallback(exc: Exception) -> None:
+        _AUTO_IDENTIFY_LOGGER.warning(
+            "auto-identify: remark_with_event failed (%s); "
+            "retrying with plain remark",
+            exc,
+        )
+
     try:
-        prefer_event = await client.has_call("System", "remark_with_event")
-        call_function = "remark_with_event" if prefer_event else "remark"
-        try:
-            receipt = await client.submit_extrinsic(
-                "System", call_function, {"remark": payload},
-                keystore.signer, wait_for="inblock",
-            )
-        except Exception as exc:  # noqa: BLE001 — fall back or report below
-            if call_function == "remark":
-                raise
-            _AUTO_IDENTIFY_LOGGER.warning(
-                "auto-identify: remark_with_event failed (%s); "
-                "retrying with plain remark",
-                exc,
-            )
-            receipt = await client.submit_extrinsic(
-                "System", "remark", {"remark": payload},
-                keystore.signer, wait_for="inblock",
-            )
-            call_function = "remark"
+        receipt, call_function = await submit_remark(
+            client, keystore.signer, payload, on_fallback=_warn_fallback,
+        )
         if receipt.error:
             return False, f"{call_function} rejected: {receipt.error}"
         _AUTO_IDENTIFY_LOGGER.info(
@@ -440,6 +431,7 @@ def _resolve_runtime_config(
     config_path: Optional[str],
     cli_kwargs: dict,
     defaults: Optional[dict] = None,
+    raw: Optional[dict] = None,
 ) -> dict:
     """Merge TOML config (if any) with CLI kwargs and run validate_merged.
 
@@ -448,12 +440,20 @@ def _resolve_runtime_config(
     (e.g. ~/.quip-miner/signing.json as the CLI fallback must not win
     against a TOML `signer_key = "/tmp/k.json"`).
 
+    Pass `raw` (a pre-parsed config from :func:`load_toml`) to reuse a single
+    parse; otherwise the file at `config_path` is read.
+
     Returns the merged dict on success. Raises `click.ClickException` (so
     `miner_main`'s wrapper formats it as `quip-miner: error: ...`) when
     the TOML can't be loaded or required keys (`validators`, `signer_key`)
     are missing.
     """
-    if config_path is not None:
+    if raw is not None:
+        try:
+            toml_data = load_miner_config(raw=raw)
+        except MinerConfigError as exc:
+            raise click.ClickException(str(exc)) from exc
+    elif config_path is not None:
         try:
             toml_data = load_miner_config(Path(config_path).expanduser())
         except MinerConfigError as exc:
@@ -541,32 +541,22 @@ async def _ensure_funded_or_fail(
 ) -> int:
     """Guard C — wallet funded.
 
-    If balance is already at or above threshold, returns the balance.
-    When `faucet_url` is set, reuses `shared.miner_bootstrap._ensure_funded`
-    to top up via the configured faucet bot. Underfunded with no faucet
-    raises `wallet-underfunded`; faucet failure raises
-    `wallet-faucet-failed`.
+    Delegates to `shared.miner_bootstrap.ensure_funded_via_faucet`: returns the
+    balance when it is already at/above threshold or after a successful faucet
+    top-up. `Underfunded` (below threshold, no faucet) → `wallet-underfunded`;
+    a dropped validator rotation mid-settlement → `validators-unreachable`;
+    any other faucet failure → `wallet-faucet-failed` with the detail attached.
     """
-    account = keystore.signer.account_id_bytes()
-    balance = await client.query_balance(account)
-    if balance >= min_balance:
-        return balance
-    if not faucet_url:
-        raise click.ClickException(
-            f"wallet-underfunded ss58={keystore.signer.ss58_address()} "
-            f"balance={balance} threshold={min_balance}"
-        )
-    # Construct a minimal BootstrapConfig just to drive the existing
-    # faucet helper — its `_post_faucet` + settlement-poll behavior is
-    # exactly what we want here.
-    cfg = BootstrapConfig(
-        validators=client.urls,
-        signer_key_path=keystore.path,
-        faucet_url=faucet_url,
-        min_balance_plancks=min_balance,
-    )
+    ss58 = keystore.signer.ss58_address()
     try:
-        return await ensure_funded(client, keystore, cfg)
+        return await ensure_funded_via_faucet(
+            client, keystore, faucet_url=faucet_url, min_balance=min_balance,
+        )
+    except Underfunded as exc:
+        raise click.ClickException(
+            f"wallet-underfunded ss58={ss58} "
+            f"balance={exc.balance} threshold={exc.threshold}"
+        ) from exc
     except NoValidatorReachable as exc:
         # Faucet path stays connected via SubstrateClient; if the rotation
         # collapses mid-settlement, surface it as the same code the connect
@@ -583,8 +573,7 @@ async def _ensure_funded_or_fail(
         # "error=RuntimeError" tells an operator nothing.
         detail = str(exc).strip() or type(exc).__name__
         raise click.ClickException(
-            f"wallet-faucet-failed ss58={keystore.signer.ss58_address()} "
-            f"balance={balance} threshold={min_balance} "
+            f"wallet-faucet-failed ss58={ss58} threshold={min_balance} "
             f"error={type(exc).__name__}: {detail}"
         ) from exc
 
@@ -1068,13 +1057,7 @@ def quip_miner_register_solver(
                 )
                 return 0
 
-            receipt = await client.submit_extrinsic(
-                "QuantumComputeMempool",
-                "register_solver",
-                {"solver_type": mt.to_scale_variant()},
-                keystore.signer,
-                wait_for="inblock",
-            )
+            receipt = await client.register_solver(keystore.signer, mt)
             if receipt.error:
                 click.echo(f"register_solver failed: {receipt.error}", err=True)
                 return 3
@@ -1125,13 +1108,7 @@ def quip_miner_deregister_solver(
                 click.echo("solver not registered; nothing to do")
                 return 0
 
-            receipt = await client.submit_extrinsic(
-                "QuantumComputeMempool",
-                "deregister_solver",
-                {},
-                keystore.signer,
-                wait_for="inblock",
-            )
+            receipt = await client.deregister_solver(keystore.signer)
             if receipt.error:
                 click.echo(
                     f"deregister_solver failed: {receipt.error}", err=True
@@ -1208,13 +1185,37 @@ def _parse_topology(spec: str):
 _SHUTDOWN_GRACE_SECONDS = 15.0
 
 
-def _load_backends_or_fail(config_path: Optional[str]) -> dict:
+def _parse_config_or_fail(config_path: Optional[str]) -> dict:
+    """Parse the --config TOML once (``{}`` when no --config).
+
+    Lets a command parse the file a single time and feed the result to the
+    several ``load_*`` views (miner table, backends, submission) via their
+    ``raw=`` parameter instead of re-reading + re-parsing it three times.
+    Loader errors surface as the CLI's standard `quip-miner: error: ...`.
+    """
+    if config_path is None:
+        return {}
+    try:
+        return dict(load_toml(Path(config_path).expanduser()))
+    except MinerConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _load_backends_or_fail(
+    config_path: Optional[str], *, raw: Optional[dict] = None
+) -> dict:
     """Read the v0.1-shape backend tables from --config; `{}` if no --config.
 
     Wraps `load_backend_config` so loader errors surface as the same
     `quip-miner: error: <code>` formatting the rest of the CLI uses
-    (via `miner_main`'s wrapper).
+    (via `miner_main`'s wrapper). Pass `raw` (a pre-parsed config from
+    :func:`load_toml`) to reuse a single parse.
     """
+    if raw is not None:
+        try:
+            return load_backend_config(raw=raw)
+        except MinerConfigError as exc:
+            raise click.ClickException(str(exc)) from exc
     if config_path is None:
         return {}
     try:
@@ -1235,13 +1236,19 @@ def _parse_image_supports(image_supports_csv: Optional[str]) -> Optional[list]:
 
 
 def _load_submission_config_or_default(
-    config_path: Optional[str],
+    config_path: Optional[str], *, raw: Optional[dict] = None
 ) -> SubmissionConfig:
     """Read the ``[submission]`` table from --config; defaults if no --config.
 
     Wraps `load_submission_config` so a malformed knob surfaces as the
-    CLI's standard error formatting rather than a raw traceback.
+    CLI's standard error formatting rather than a raw traceback. Pass `raw`
+    (a pre-parsed config from :func:`load_toml`) to reuse a single parse.
     """
+    if raw is not None:
+        try:
+            return load_submission_config(raw=raw)
+        except MinerConfigError as exc:
+            raise click.ClickException(str(exc)) from exc
     if config_path is None:
         return SubmissionConfig()
     try:
@@ -1319,8 +1326,8 @@ def _qpu_miner_kind_from_backends(backends: dict, fallback: str) -> str:
             # explicit `[dwave]`/`[ibm]`/etc. before falling back.
             continue
         if section in backends:
-            return f"qpu_{section}" if section in ("ibm", "ionq", "pasqal") else "qpu"
-    return f"qpu_{fallback}" if fallback in ("ibm", "ionq", "pasqal") else "qpu"
+            return qpu_miner_kind(section)
+    return qpu_miner_kind(fallback)
 
 
 def _echo_runtime_config(
@@ -1351,6 +1358,339 @@ def _echo_runtime_config(
     click.echo(f"  miners={_scrub(miner_config)}")
 
 
+async def _run_startup_guards(
+    client: SubstrateClient,
+    keystore,
+    *,
+    faucet_url: Optional[str],
+    node_name: Optional[str],
+    public_host: Optional[str],
+    public_port: Optional[int],
+    miner_config: dict,
+) -> None:
+    """Run the fund / register / descriptor guards (C, D, E) in order.
+
+    Each guard raises ``click.ClickException`` (or a descriptor-* code) on
+    ultimate failure, so all three must pass before any controller starts.
+    Extracted from :func:`_run_concurrent_miner` so the orchestration body
+    stays readable.
+    """
+    # Guard C — wallet funded (with optional faucet top-up).
+    await _ensure_funded_or_fail(
+        client,
+        keystore,
+        faucet_url=faucet_url,
+        min_balance=DEFAULT_MIN_BALANCE_PLANCKS,
+    )
+
+    # Guard D — miner registered. Self-registers on first run (after
+    # funding, so the MinerDeposit reserve is covered) and is a no-op on
+    # every later run. Replaces the old manual `quip-miner bootstrap`
+    # prerequisite; the controller still verifies before mining.
+    await _ensure_registered_or_fail(client, keystore)
+
+    # Guard E — file the signed NodeDescriptor remark so dashboards can
+    # map our AccountId → node_name + advertised hardware. Retried over
+    # several minutes and fatal on failure (descriptor-* codes); there is
+    # no opt-out — descriptor visibility is part of the miner contract.
+    await _auto_identify(
+        client,
+        keystore,
+        node_name=node_name,
+        public_host=public_host,
+        public_port=public_port,
+        log_level=None,
+        miners_config=miner_config,
+    )
+
+
+async def _orchestrate_controllers(pow_controller, mempool_controller) -> int:
+    """Run the PoW + mempool controllers until one exits, then drain.
+
+    Installs SIGINT/SIGTERM handlers that signal both controllers to stop,
+    waits for the first to finish (one failing brings the whole process down
+    so operators can re-spawn), then gives the other up to
+    ``_SHUTDOWN_GRACE_SECONDS`` to drain before cancelling. Returns the process
+    exit code. Extracted from :func:`_run_concurrent_miner`.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _signal_shutdown() -> None:
+        for c in (pow_controller, mempool_controller):
+            if c is not None:
+                try:
+                    c.shutdown()
+                except Exception:  # noqa: BLE001 -- signal handler must not raise
+                    pass
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _signal_shutdown)
+
+    tasks: list[asyncio.Task] = []
+    if pow_controller is not None:
+        tasks.append(asyncio.create_task(
+            pow_controller.run(), name="pow-controller"
+        ))
+    if mempool_controller is not None:
+        tasks.append(asyncio.create_task(
+            mempool_controller.run(), name="mempool-controller"
+        ))
+
+    if not tasks:
+        click.echo("internal error: no controller tasks created", err=True)
+        return 2
+
+    exit_code = 0
+    # Wait until any controller exits (one failing should bring down
+    # the whole process -- operators can re-spawn). Once one returns,
+    # signal the other to stop and wait for it to drain.
+    done, pending = await asyncio.wait(
+        tasks, return_when=asyncio.FIRST_COMPLETED
+    )
+    for t in done:
+        exc = t.exception()
+        if exc is not None:
+            click.echo(
+                f"controller {t.get_name()} exited with error:\n"
+                + "".join(traceback.format_exception(
+                    type(exc), exc, exc.__traceback__
+                )),
+                err=True,
+            )
+            exit_code = 1
+    _signal_shutdown()
+    for t in pending:
+        try:
+            await asyncio.wait_for(t, timeout=_SHUTDOWN_GRACE_SECONDS)
+        except asyncio.TimeoutError:
+            click.echo(
+                f"controller {t.get_name()} did not stop within "
+                f"{_SHUTDOWN_GRACE_SECONDS}s; cancelling",
+                err=True,
+            )
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+            except Exception as drain_exc:
+                click.echo(
+                    f"controller {t.get_name()} raised during cancel: "
+                    f"{drain_exc}",
+                    err=True,
+                )
+        except asyncio.CancelledError:
+            pass
+        except Exception as drain_exc:
+            click.echo(
+                f"controller {t.get_name()} raised during drain: {drain_exc}",
+                err=True,
+            )
+
+    return exit_code
+
+
+class _MiningStartupError(Exception):
+    """A miner startup failure carrying a CLI exit code + stderr message.
+
+    Raised by the ``_prepare_core`` / ``_build_controllers`` helpers so the
+    distinct exit codes (2 = no handles, 3 = chain unqueryable / unseeded,
+    4 = topology mismatch, 5 = `--mode both` unsplittable) are mapped in one
+    place while ``_run_concurrent_miner``'s ``finally`` cleanup still runs.
+    """
+
+    def __init__(self, code: int, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(message)
+
+
+def _prepare_core(
+    mode: str, miner_kind: str, miner_config: dict, topology
+) -> Tuple[MinerCore, list, list]:
+    """Build the ``MinerCore`` and split its handles for the requested mode.
+
+    Returns ``(core, pow_handles, mempool_handles)``. Raises
+    :class:`_MiningStartupError` (closing the freshly-built core first) when no
+    handles were built (code 2) or ``--mode both`` can't be split across ≥2
+    handles (code 5).
+    """
+    core = MinerCore(
+        node_id=f"quip-miner-{mode}", miners_config=miner_config,
+        topology=topology,
+    )
+    if not core.miner_handles:
+        core.close()
+        raise _MiningStartupError(
+            2, f"no miner handles built for kind={miner_kind}"
+        )
+    pow_handles, mempool_handles = _split_handles_for_mode(
+        mode, core.miner_handles
+    )
+    if mode == "both" and (not pow_handles or not mempool_handles):
+        core.close()
+        raise _MiningStartupError(
+            5,
+            f"--mode both requires at least 2 worker handles to split; "
+            f"got {len(core.miner_handles)}. Increase --num-cpus / GPU "
+            f"devices.",
+        )
+    return core, pow_handles, mempool_handles
+
+
+async def _build_controllers(
+    *,
+    client: SubstrateClient,
+    pool: ValidatorPool,
+    core: MinerCore,
+    keystore,
+    topology,
+    topology_spec: str,
+    miner_kind: str,
+    pow_handles: list,
+    mempool_handles: list,
+    telemetry_port: int,
+    submission_config: SubmissionConfig,
+) -> Tuple[Optional[SubstrateMinerController], Optional[MempoolMinerController]]:
+    """Resolve the topology binding and build the PoW / mempool controllers.
+
+    Returns ``(pow_controller, mempool_controller)``; either is ``None`` per the
+    handle split. The canonical-hash recipe lives on the client
+    (:meth:`SubstrateClient.resolve_topology_binding`) so this layer just reacts
+    to the result. Raises :class:`_MiningStartupError` when the chain has no
+    registered topology or a state query fails (code 3), or when the PoW
+    sampler topology doesn't match the chain's registered one (code 4).
+    """
+    binding = None
+    if pow_handles or mempool_handles:
+        try:
+            binding = await client.resolve_topology_binding(
+                topology,
+                miner_account_bytes=keystore.signer.account_id_bytes(),
+            )
+        except NoRegisteredTopology as exc:
+            raise _MiningStartupError(
+                3,
+                "chain has no registered topology; run "
+                "`quip-miner bootstrap --seed-chain` first",
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 — surfaced as a CLI code
+            raise _MiningStartupError(
+                3, f"failed to query chain state: {exc}",
+            ) from exc
+
+    pow_controller = None
+    mempool_controller = None
+
+    if pow_handles:
+        # PoW requires the sampler's topology to match the chain's registered
+        # DefaultTopology (the chain validates this in `submit_proof` via
+        # `InvalidTopology`).
+        if not binding.matches:
+            raise _MiningStartupError(
+                4,
+                f"PoW mode topology mismatch: --topology {topology_spec} "
+                f"hashes to 0x{binding.expected_hash.hex()} but chain has "
+                f"0x{binding.chain_hash.hex()}",
+            )
+        pow_controller = SubstrateMinerController(
+            pool=pool,
+            signer=keystore.signer,
+            miner_handles=pow_handles,
+            topology_hash=binding.chain_hash,
+            core=core,
+            telemetry_port=telemetry_port,
+            # Tag the per-process snapshot file with the miner_kind so
+            # multi-process containers don't race the same path; kind is
+            # fixed for this controller's lifetime.
+            snapshot_kind=miner_kind,
+            # The Docker entrypoint sets QUIP_TELEMETRY_EXTERNAL=1 when a
+            # separate `quip-miner telemetry` aggregator owns the REST
+            # surface — controllers then skip the in-process sibling spawn
+            # but still write snapshots.
+            spawn_telemetry_sibling=not _telemetry_external_via_env(),
+            submission_config=submission_config,
+        )
+        click.echo(
+            f"  pow handles: {[h.miner_id for h in pow_handles]} "
+            f"topology=0x{binding.chain_hash.hex()[:16]}..."
+        )
+
+    if mempool_handles:
+        # Bind the mempool sampler to the canonical local hash the chain
+        # expects (computed once in the binding above).
+        snapshot = binding.snapshot
+        mempool_controller = MempoolMinerController(
+            pool=pool,
+            signer=keystore.signer,
+            miner_handles=mempool_handles,
+            sampler_topology_hash=binding.expected_hash,
+            allowed_h_values=snapshot.allowed_h_values,
+            allowed_j_values=snapshot.allowed_j_values,
+            allowed_spin_values=snapshot.allowed_spin_values,
+            solver_type=MinerType.from_kind(miner_kind),
+            core=core,
+        )
+        click.echo(
+            f"  mempool handles: {[h.miner_id for h in mempool_handles]} "
+            f"topology=0x{binding.expected_hash.hex()[:16]}..."
+        )
+
+    return pow_controller, mempool_controller
+
+
+def _announce_and_load(
+    *,
+    mode: str,
+    validators: tuple,
+    signer_key_path: str,
+    faucet_url: Optional[str],
+    rest_port: int,
+    rest_host: str,
+    topology_spec: str,
+    miner_config: dict,
+    node_name: Optional[str],
+    node_log: Optional[str],
+    submission_config: SubmissionConfig,
+) -> Tuple[object, object]:
+    """Print the startup banner and load the keystore + topology.
+
+    Attaches the optional rotating file log, loads the hybrid keystore
+    (Guard A — raises ``click.ClickException`` when missing/unreadable), parses
+    the topology, and echoes the resolved runtime config. Returns
+    ``(keystore, topology)``.
+    """
+    click.echo(
+        f"quip-miner version {get_version()} (protocol {PROTOCOL_VERSION})"
+    )
+    # node_log is opt-in: re-run setup_logging so a RotatingFileHandler is
+    # attached alongside the click group's stderr handler (level preserved).
+    if node_log:
+        setup_logging(
+            log_level=logging.getLevelName(logging.getLogger().level),
+            node_log_file=node_log,
+            node_name=node_name or _default_node_name(),
+        )
+    keystore = _load_keystore_or_fail(signer_key_path)
+    click.echo(f"signer: {keystore.signer.ss58_address()} (hybrid) mode={mode}")
+    topology = _parse_topology(topology_spec)
+    click.echo(
+        f"topology: {topology_spec} ({topology.num_nodes} nodes, "
+        f"{topology.num_edges} edges)"
+    )
+    _echo_runtime_config(
+        validators=validators,
+        faucet_url=faucet_url,
+        rest_host=rest_host,
+        rest_port=rest_port,
+        node_name=node_name,
+        node_log=node_log,
+        miner_config=miner_config,
+        submission_config=submission_config,
+    )
+    return keystore, topology
+
+
 async def _run_concurrent_miner(
     *,
     mode: str,
@@ -1370,223 +1710,85 @@ async def _run_concurrent_miner(
 ) -> int:
     """Unified entry for `--mode pow|mempool|both` on cpu/gpu/qpu.
 
-    Worker handle allocation rule:
-      - mode=pow:     all handles → SubstrateMinerController
-      - mode=mempool: all handles → MempoolMinerController
-      - mode=both:    half (rounded down) to PoW, remainder to mempool.
-                      Requires ≥2 handles; fails fast otherwise.
-
-    Phase 8d's split is static and per-handle — no dynamic rebalancing.
-    Phase 9 can introduce a shared scheduler that lets one mode use the
-    other's idle worker, plus `--mempool-fraction` for non-half splits.
+    Runs the linear startup sequence — announce + load identity
+    (:func:`_announce_and_load`), build workers (:func:`_prepare_core`),
+    connect + guards, build controllers (:func:`_build_controllers`) — then
+    hands off to :func:`_orchestrate_controllers`. Startup failures raise
+    :class:`_MiningStartupError` (mapped to a CLI exit code below); the
+    ``finally`` tears down whatever was constructed.
     """
     mode = mode.lower()
     if mode not in ("pow", "mempool", "both"):
         click.echo(f"invalid --mode {mode!r}", err=True)
         return 2
 
-    click.echo(f"quip-miner version {get_version()} (protocol {PROTOCOL_VERSION})")
-
     # Submission tuning (tip + retry bounds). Defaults reproduce pre-tip
     # behavior, so an old config or a caller that omits this is unchanged.
     submission_config = submission_config or SubmissionConfig()
-
-    # node_log is opt-in (TOML or CLI). When set, re-run setup_logging
-    # so a RotatingFileHandler is attached alongside the stderr handler
-    # that the click group installed. The current root level is preserved.
-    if node_log:
-        current_level = logging.getLevelName(logging.getLogger().level)
-        setup_logging(
-            log_level=current_level,
-            node_log_file=node_log,
-            node_name=node_name or _default_node_name(),
-        )
-
-    # Guard A — wallet configured (keystore exists + loads).
-    keystore = _load_keystore_or_fail(signer_key_path)
-    click.echo(f"signer: {keystore.signer.ss58_address()} (hybrid) mode={mode}")
-
-    topology = _parse_topology(topology_spec)
-    click.echo(
-        f"topology: {topology_spec} ({topology.num_nodes} nodes, "
-        f"{topology.num_edges} edges)"
-    )
-    _echo_runtime_config(
+    keystore, topology = _announce_and_load(
+        mode=mode,
         validators=validators,
+        signer_key_path=signer_key_path,
         faucet_url=faucet_url,
-        rest_host=rest_host,
         rest_port=rest_port,
+        rest_host=rest_host,
+        topology_spec=topology_spec,
+        miner_config=miner_config,
         node_name=node_name,
         node_log=node_log,
-        miner_config=miner_config,
         submission_config=submission_config,
     )
 
-    core = MinerCore(
-        node_id=f"quip-miner-{mode}", miners_config=miner_config,
-        topology=topology,
-    )
-    if not core.miner_handles:
-        click.echo(f"no miner handles built for kind={miner_kind}", err=True)
-        return 2
-
-    pow_handles, mempool_handles = _split_handles_for_mode(
-        mode, core.miner_handles
-    )
-    if mode == "both" and (not pow_handles or not mempool_handles):
-        click.echo(
-            f"--mode both requires at least 2 worker handles to split; "
-            f"got {len(core.miner_handles)}. Increase --num-cpus / GPU "
-            f"devices.",
-            err=True,
-        )
-        core.close()
-        return 5
-
-    # Declare all network resources before the try so the finally block can
-    # always clean up whatever was partially constructed on setup failure.
+    # Declare all resources before the try so the finally block can always
+    # clean up whatever was partially constructed on setup failure.
+    core: Optional[MinerCore] = None
     pool: Optional[ValidatorPool] = None
     pow_controller = None
     mempool_controller = None
-
     setup_client: Optional[SubstrateClient] = None
     try:
+        core, pow_handles, mempool_handles = _prepare_core(
+            mode, miner_kind, miner_config, topology
+        )
+
         pool = ValidatorPool(urls=tuple(validators))
         # Guard B — validators reachable. The setup client is a direct
-        # SubstrateClient used for the startup sequence (Guards B/C,
-        # auto-identify, initial topology-snapshot read). It's closed
-        # before controllers start; the controllers each own their own
-        # in-parent build_client and route reads + submissions through
-        # the swap-aware pool.
+        # SubstrateClient used for the startup sequence (Guards B/C/D/E and
+        # the initial topology-snapshot read). It's closed before controllers
+        # start; the controllers each own their own in-parent build_client and
+        # route reads + submissions through the swap-aware pool.
         client = setup_client = await _connect_or_fail(tuple(validators))
-        # Guard C — wallet funded (with optional faucet top-up).
-        await _ensure_funded_or_fail(
+        # Guards C/D/E — funded, registered, descriptor filed. Each raises a
+        # CLI error code on ultimate failure; all three pass before any
+        # controller starts.
+        await _run_startup_guards(
             client,
             keystore,
             faucet_url=faucet_url,
-            min_balance=DEFAULT_MIN_BALANCE_PLANCKS,
-        )
-
-        # Guard D — miner registered. Self-registers on first run (after
-        # funding, so the MinerDeposit reserve is covered) and is a no-op on
-        # every later run. Replaces the old manual `quip-miner bootstrap`
-        # prerequisite; the controller still verifies before mining.
-        await _ensure_registered_or_fail(client, keystore)
-
-        # Guard E — file the signed NodeDescriptor remark so dashboards can
-        # map our AccountId → node_name + advertised hardware. Retried over
-        # several minutes and fatal on failure (descriptor-* codes); there is
-        # no opt-out — descriptor visibility is part of the miner contract.
-        await _auto_identify(
-            client,
-            keystore,
             node_name=node_name,
             public_host=public_host,
             public_port=public_port,
-            log_level=None,
-            miners_config=miner_config,
+            miner_config=miner_config,
         )
-
-        # Both PoW and mempool need the chain's registered allowed-value
-        # specs to derive a topology hash that matches the chain's
-        # canonical `hash_topology`. Pull the snapshot once.
-        snapshot = None
-        if pow_handles or mempool_handles:
-            try:
-                head = await client.get_head()
-                snapshot = await client.get_mining_snapshot(
-                    at=head,
-                    miner_account_bytes=keystore.signer.account_id_bytes(),
-                )
-            except Exception as exc:
-                click.echo(
-                    f"failed to query chain state: {exc}", err=True
-                )
-                return 3
-            if snapshot is None:
-                click.echo(
-                    "chain has no registered topology; run "
-                    "`quip-miner bootstrap --seed-chain` first",
-                    err=True,
-                )
-                return 3
 
         # Resolve telemetry port. The sibling process is unconditional;
         # any non-positive `rest_port` (legacy `-1` default, `0`, `None`)
         # collapses to 8086.
         telemetry_port = rest_port if rest_port and rest_port > 0 else 8086
 
-        if pow_handles or mempool_handles:
-            # Canonical topology hash (nodes, edges, allowed_h/j/spin) — the
-            # same form the chain's `hash_topology` uses, shared by both the
-            # PoW mismatch check and the mempool sampler binding. `snapshot`
-            # is non-None here (the guard above returns 3 otherwise).
-            expected_hash = topology_hash(
-                topology.nodes,
-                topology.edges,
-                snapshot.allowed_h_values,
-                snapshot.allowed_j_values,
-                snapshot.allowed_spin_values,
-            )
-
-        if pow_handles:
-            # PoW requires the sampler's topology to match the chain's
-            # registered DefaultTopology (the chain validates this in
-            # `submit_proof` via `InvalidTopology`).
-            if snapshot.topology_hash != expected_hash:
-                click.echo(
-                    f"PoW mode topology mismatch: --topology {topology_spec} "
-                    f"hashes to 0x{expected_hash.hex()} but chain has "
-                    f"0x{snapshot.topology_hash.hex()}",
-                    err=True,
-                )
-                return 4
-            pow_topology_hash = snapshot.topology_hash
-            pow_controller = SubstrateMinerController(
-                pool=pool,
-                signer=keystore.signer,
-                miner_handles=pow_handles,
-                topology_hash=pow_topology_hash,
-                core=core,
-                telemetry_port=telemetry_port,
-                # Tag the per-process snapshot file with the miner_kind
-                # so multi-process containers don't race the same path.
-                # `_run_concurrent_miner` is invoked once per
-                # quip-miner subcommand (cpu/gpu/qpu), so kind is fixed
-                # for the lifetime of this controller.
-                snapshot_kind=miner_kind,
-                # In the Docker entrypoint, the supervisor sets
-                # QUIP_TELEMETRY_EXTERNAL=1 to indicate a separate
-                # `quip-miner telemetry` aggregator owns the REST
-                # surface — controllers then skip their in-process
-                # sibling spawn but still write snapshots.
-                spawn_telemetry_sibling=not _telemetry_external_via_env(),
-                submission_config=submission_config,
-            )
-            click.echo(
-                f"  pow handles: {[h.miner_id for h in pow_handles]} "
-                f"topology=0x{pow_topology_hash.hex()[:16]}..."
-            )
-
-        if mempool_handles:
-            # Bind the mempool sampler hash to the same canonical form the
-            # chain uses (computed once above as `expected_hash`).
-            mempool_topology_hash = expected_hash
-            mempool_controller = MempoolMinerController(
-                pool=pool,
-                signer=keystore.signer,
-                miner_handles=mempool_handles,
-                sampler_topology_hash=mempool_topology_hash,
-                allowed_h_values=snapshot.allowed_h_values,
-                allowed_j_values=snapshot.allowed_j_values,
-                allowed_spin_values=snapshot.allowed_spin_values,
-                solver_type=MinerType.from_kind(miner_kind),
-                core=core,
-            )
-            click.echo(
-                f"  mempool handles: {[h.miner_id for h in mempool_handles]} "
-                f"topology=0x{mempool_topology_hash.hex()[:16]}..."
-            )
+        pow_controller, mempool_controller = await _build_controllers(
+            client=client,
+            pool=pool,
+            core=core,
+            keystore=keystore,
+            topology=topology,
+            topology_spec=topology_spec,
+            miner_kind=miner_kind,
+            pow_handles=pow_handles,
+            mempool_handles=mempool_handles,
+            telemetry_port=telemetry_port,
+            submission_config=submission_config,
+        )
 
         click.echo(
             f"telemetry api: http://{rest_host}:{telemetry_port}/api/v1/status "
@@ -1598,82 +1800,13 @@ async def _run_concurrent_miner(
         await setup_client.close()
         setup_client = None
 
-        loop = asyncio.get_running_loop()
-
-        def _signal_shutdown() -> None:
-            for c in (pow_controller, mempool_controller):
-                if c is not None:
-                    try:
-                        c.shutdown()
-                    except Exception:  # noqa: BLE001 -- signal handler must not raise
-                        pass
-
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, _signal_shutdown)
-
-        tasks: list[asyncio.Task] = []
-        if pow_controller is not None:
-            tasks.append(asyncio.create_task(
-                pow_controller.run(), name="pow-controller"
-            ))
-        if mempool_controller is not None:
-            tasks.append(asyncio.create_task(
-                mempool_controller.run(), name="mempool-controller"
-            ))
-
-        if not tasks:
-            click.echo("internal error: no controller tasks created", err=True)
-            return 2
-
-        exit_code = 0
-        # Wait until any controller exits (one failing should bring down
-        # the whole process -- operators can re-spawn). Once one returns,
-        # signal the other to stop and wait for it to drain.
-        done, pending = await asyncio.wait(
-            tasks, return_when=asyncio.FIRST_COMPLETED
+        return await _orchestrate_controllers(
+            pow_controller, mempool_controller
         )
-        for t in done:
-            exc = t.exception()
-            if exc is not None:
-                click.echo(
-                    f"controller {t.get_name()} exited with error:\n"
-                    + "".join(traceback.format_exception(
-                        type(exc), exc, exc.__traceback__
-                    )),
-                    err=True,
-                )
-                exit_code = 1
-        _signal_shutdown()
-        for t in pending:
-            try:
-                await asyncio.wait_for(t, timeout=_SHUTDOWN_GRACE_SECONDS)
-            except asyncio.TimeoutError:
-                click.echo(
-                    f"controller {t.get_name()} did not stop within "
-                    f"{_SHUTDOWN_GRACE_SECONDS}s; cancelling",
-                    err=True,
-                )
-                t.cancel()
-                try:
-                    await t
-                except asyncio.CancelledError:
-                    pass
-                except Exception as drain_exc:
-                    click.echo(
-                        f"controller {t.get_name()} raised during cancel: "
-                        f"{drain_exc}",
-                        err=True,
-                    )
-            except asyncio.CancelledError:
-                pass
-            except Exception as drain_exc:
-                click.echo(
-                    f"controller {t.get_name()} raised during drain: {drain_exc}",
-                    err=True,
-                )
 
-        return exit_code
-
+    except _MiningStartupError as exc:
+        click.echo(exc.message, err=True)
+        return exc.code
     finally:
         if pow_controller is not None:
             click.echo(f"  pow stats:     {pow_controller.stats}")
@@ -1685,7 +1818,8 @@ async def _run_concurrent_miner(
             await setup_client.close()
         if pool is not None:
             await pool.close()
-        core.close()
+        if core is not None:
+            core.close()
 
 
 def _split_handles_for_mode(mode: str, handles: list) -> tuple:
@@ -1721,26 +1855,113 @@ _MODE_HELP = (
     "mode can use the other's idle worker."
 )
 
+# Shared default fallbacks for the cpu/gpu/qpu commands (applied after the
+# TOML+CLI merge, so an explicit TOML/CLI value always wins).
+_MINING_DEFAULTS = {
+    "signer_key": "~/.quip-miner/signing.json",
+    "rest_port": -1,
+    "rest_host": "127.0.0.1",
+}
+
+
+def _mining_common_options(f):
+    """Options + guards shared verbatim by the cpu/gpu/qpu mining commands.
+
+    Bundles the validator / config / faucet / signer-key / mode / topology /
+    rest / identification options so each command declares only its
+    backend-specific flags. Apply *above* ``@click.pass_context`` so ``ctx``
+    stays the command's first positional argument.
+    """
+    f = _identification_options(f)
+    f = click.option(
+        "--rest-host", type=str, default=None, show_default=False,
+        help=_REST_HOST_HELP,
+    )(f)
+    f = click.option(
+        "--rest-port", type=int, default=None, show_default=False,
+        help=_REST_PORT_HELP,
+    )(f)
+    f = click.option(
+        "--topology", "topology_spec", default="advantage2_system1",
+        show_default=True, help=_TOPOLOGY_HELP,
+    )(f)
+    f = click.option(
+        "--mode",
+        type=click.Choice(["pow", "mempool", "both"], case_sensitive=False),
+        default="pow", show_default=True, help=_MODE_HELP,
+    )(f)
+    f = click.option(
+        "--signer-key", "signer_key_path", type=click.Path(dir_okay=False),
+        default=None,
+        help=_SIGNER_KEY_HELP + " Falls back to --config `signer_key`, "
+        "then ~/.quip-miner/signing.json.",
+    )(f)
+    f = _faucet_url_option(f)
+    f = _config_option(f)
+    f = _validator_option(f)
+    return f
+
+
+def _dispatch_mining_command(
+    *,
+    raw: dict,
+    miner_kind: str,
+    miner_config: dict,
+    validators: tuple,
+    signer_key_path: Optional[str],
+    faucet_url: Optional[str],
+    mode: str,
+    topology_spec: str,
+    rest_port: Optional[int],
+    rest_host: Optional[str],
+    node_name: Optional[str],
+    public_host: Optional[str],
+    public_port: Optional[int],
+    node_log: Optional[str],
+) -> None:
+    """Shared tail of the cpu/gpu/qpu commands; raises ``SystemExit``.
+
+    Merges CLI overrides onto the already-parsed `raw` config and hands off to
+    :func:`_run_concurrent_miner`. Each command supplies only its
+    backend-specific `miner_kind` + `miner_config`; reusing `raw` keeps the
+    config file parsed exactly once per invocation.
+    """
+    merged = _resolve_runtime_config(
+        config_path=None,
+        cli_kwargs={
+            "validators": validators,
+            "signer_key": signer_key_path,
+            "faucet_url": faucet_url,
+            "rest_port": rest_port,
+            "rest_host": rest_host,
+            "node_name": node_name,
+            "public_host": public_host,
+            "public_port": public_port,
+            "node_log": node_log,
+        },
+        defaults=_MINING_DEFAULTS,
+        raw=raw,
+    )
+    raise SystemExit(asyncio.run(_run_concurrent_miner(
+        mode=mode,
+        miner_kind=miner_kind,
+        validators=tuple(merged["validators"]),
+        signer_key_path=merged["signer_key"],
+        faucet_url=merged.get("faucet_url"),
+        rest_port=int(merged["rest_port"]),
+        rest_host=str(merged["rest_host"]),
+        topology_spec=topology_spec,
+        miner_config=miner_config,
+        node_name=merged.get("node_name"),
+        public_host=merged.get("public_host"),
+        public_port=merged.get("public_port"),
+        node_log=merged.get("node_log"),
+        submission_config=_load_submission_config_or_default(None, raw=raw),
+    )))
+
 
 @quip_miner.command("cpu")
-@_validator_option
-@_config_option
-@_faucet_url_option
-@click.option(
-    "--signer-key",
-    "signer_key_path",
-    type=click.Path(dir_okay=False),
-    default=None,
-    help=_SIGNER_KEY_HELP + " Falls back to --config `signer_key`, "
-    "then ~/.quip-miner/signing.json.",
-)
-@click.option(
-    "--mode",
-    type=click.Choice(["pow", "mempool", "both"], case_sensitive=False),
-    default="pow",
-    show_default=True,
-    help=_MODE_HELP,
-)
+@_mining_common_options
 @click.option(
     "--num-cpus",
     type=int,
@@ -1748,28 +1969,6 @@ _MODE_HELP = (
     show_default=True,
     help="Number of CPU SA workers to spawn",
 )
-@click.option(
-    "--topology",
-    "topology_spec",
-    default="advantage2_system1",
-    show_default=True,
-    help=_TOPOLOGY_HELP,
-)
-@click.option(
-    "--rest-port",
-    type=int,
-    default=None,
-    show_default=False,
-    help=_REST_PORT_HELP,
-)
-@click.option(
-    "--rest-host",
-    type=str,
-    default=None,
-    show_default=False,
-    help=_REST_HOST_HELP,
-)
-@_identification_options
 @click.pass_context
 def quip_miner_cpu(
     ctx: click.Context,
@@ -1798,26 +1997,8 @@ def quip_miner_cpu(
     For mempool / both modes, the signer must be registered as a solver
     first via `quip-miner register-solver --miner-type cpu`.
     """
-    merged = _resolve_runtime_config(
-        config_path=config_path,
-        cli_kwargs={
-            "validators": validators,
-            "signer_key": signer_key_path,
-            "faucet_url": faucet_url,
-            "rest_port": rest_port,
-            "rest_host": rest_host,
-            "node_name": node_name,
-            "public_host": public_host,
-            "public_port": public_port,
-            "node_log": node_log,
-        },
-        defaults={
-            "signer_key": "~/.quip-miner/signing.json",
-            "rest_port": -1,
-            "rest_host": "127.0.0.1",
-        },
-    )
-    backends = _load_backends_or_fail(config_path)
+    raw = _parse_config_or_fail(config_path)
+    backends = _load_backends_or_fail(config_path, raw=raw)
     _check_backend_conflicts(
         ctx,
         backends,
@@ -1832,36 +2013,26 @@ def quip_miner_cpu(
         miner_config = {"cpu": dict(backends["cpu"])}
     else:
         miner_config = {"cpu": {"num_cpus": num_cpus}}
-    raise SystemExit(asyncio.run(_run_concurrent_miner(
-        mode=mode,
+    _dispatch_mining_command(
+        raw=raw,
         miner_kind="cpu",
-        validators=tuple(merged["validators"]),
-        signer_key_path=merged["signer_key"],
-        faucet_url=merged.get("faucet_url"),
-        rest_port=int(merged["rest_port"]),
-        rest_host=str(merged["rest_host"]),
-        topology_spec=topology_spec,
         miner_config=miner_config,
-        node_name=merged.get("node_name"),
-        public_host=merged.get("public_host"),
-        public_port=merged.get("public_port"),
-        node_log=merged.get("node_log"),
-        submission_config=_load_submission_config_or_default(config_path),
-    )))
+        validators=validators,
+        signer_key_path=signer_key_path,
+        faucet_url=faucet_url,
+        mode=mode,
+        topology_spec=topology_spec,
+        rest_port=rest_port,
+        rest_host=rest_host,
+        node_name=node_name,
+        public_host=public_host,
+        public_port=public_port,
+        node_log=node_log,
+    )
 
 
 @quip_miner.command("gpu")
-@_validator_option
-@_config_option
-@_faucet_url_option
-@click.option(
-    "--signer-key",
-    "signer_key_path",
-    type=click.Path(dir_okay=False),
-    default=None,
-    help=_SIGNER_KEY_HELP + " Falls back to --config `signer_key`, "
-    "then ~/.quip-miner/signing.json.",
-)
+@_mining_common_options
 @click.option(
     "--gpu-backend",
     type=click.Choice(["local", "metal", "modal"], case_sensitive=False),
@@ -1869,35 +2040,6 @@ def quip_miner_cpu(
     show_default=True,
     help="GPU backend: local CUDA, Apple Metal, or Modal cloud",
 )
-@click.option(
-    "--mode",
-    type=click.Choice(["pow", "mempool", "both"], case_sensitive=False),
-    default="pow",
-    show_default=True,
-    help=_MODE_HELP,
-)
-@click.option(
-    "--topology",
-    "topology_spec",
-    default="advantage2_system1",
-    show_default=True,
-    help=_TOPOLOGY_HELP,
-)
-@click.option(
-    "--rest-port",
-    type=int,
-    default=None,
-    show_default=False,
-    help=_REST_PORT_HELP,
-)
-@click.option(
-    "--rest-host",
-    type=str,
-    default=None,
-    show_default=False,
-    help=_REST_HOST_HELP,
-)
-@_identification_options
 @click.pass_context
 def quip_miner_gpu(
     ctx: click.Context,
@@ -1921,7 +2063,8 @@ def quip_miner_gpu(
     verification against the chain is a Phase 6 follow-on; concurrent
     mode shares the same caveat about topology injection generalisation.
     """
-    backends = _load_backends_or_fail(config_path)
+    raw = _parse_config_or_fail(config_path)
+    backends = _load_backends_or_fail(config_path, raw=raw)
     _check_backend_conflicts(
         ctx,
         backends,
@@ -1947,55 +2090,26 @@ def quip_miner_gpu(
         else:
             raise click.BadParameter(f"unknown --gpu-backend: {backend}")
 
-    merged = _resolve_runtime_config(
-        config_path=config_path,
-        cli_kwargs={
-            "validators": validators,
-            "signer_key": signer_key_path,
-            "faucet_url": faucet_url,
-            "rest_port": rest_port,
-            "rest_host": rest_host,
-            "node_name": node_name,
-            "public_host": public_host,
-            "public_port": public_port,
-            "node_log": node_log,
-        },
-        defaults={
-            "signer_key": "~/.quip-miner/signing.json",
-            "rest_port": -1,
-            "rest_host": "127.0.0.1",
-        },
-    )
-    raise SystemExit(asyncio.run(_run_concurrent_miner(
-        mode=mode,
+    _dispatch_mining_command(
+        raw=raw,
         miner_kind="gpu",
-        validators=tuple(merged["validators"]),
-        signer_key_path=merged["signer_key"],
-        faucet_url=merged.get("faucet_url"),
-        rest_port=int(merged["rest_port"]),
-        rest_host=str(merged["rest_host"]),
-        topology_spec=topology_spec,
         miner_config=miner_config,
-        node_name=merged.get("node_name"),
-        public_host=merged.get("public_host"),
-        public_port=merged.get("public_port"),
-        node_log=merged.get("node_log"),
-        submission_config=_load_submission_config_or_default(config_path),
-    )))
+        validators=validators,
+        signer_key_path=signer_key_path,
+        faucet_url=faucet_url,
+        mode=mode,
+        topology_spec=topology_spec,
+        rest_port=rest_port,
+        rest_host=rest_host,
+        node_name=node_name,
+        public_host=public_host,
+        public_port=public_port,
+        node_log=node_log,
+    )
 
 
 @quip_miner.command("qpu")
-@_validator_option
-@_config_option
-@_faucet_url_option
-@click.option(
-    "--signer-key",
-    "signer_key_path",
-    type=click.Path(dir_okay=False),
-    default=None,
-    help=_SIGNER_KEY_HELP + " Falls back to --config `signer_key`, "
-    "then ~/.quip-miner/signing.json.",
-)
+@_mining_common_options
 @click.option(
     "--qpu-type",
     type=click.Choice(["dwave", "ibm", "ionq", "pasqal", "braket", "origin"]),
@@ -2004,40 +2118,11 @@ def quip_miner_gpu(
     help="QPU provider",
 )
 @click.option(
-    "--mode",
-    type=click.Choice(["pow", "mempool", "both"], case_sensitive=False),
-    default="pow",
-    show_default=True,
-    help=_MODE_HELP,
-)
-@click.option(
     "--daily-budget",
     type=str,
     default=None,
     help="Daily QPU access-time budget. Format: '30s', '5m', '2h', '1d' (passed to QPUTimeManager)",
 )
-@click.option(
-    "--topology",
-    "topology_spec",
-    default="advantage2_system1",
-    show_default=True,
-    help=_TOPOLOGY_HELP,
-)
-@click.option(
-    "--rest-port",
-    type=int,
-    default=None,
-    show_default=False,
-    help=_REST_PORT_HELP,
-)
-@click.option(
-    "--rest-host",
-    type=str,
-    default=None,
-    show_default=False,
-    help=_REST_HOST_HELP,
-)
-@_identification_options
 @click.pass_context
 def quip_miner_qpu(
     ctx: click.Context,
@@ -2063,7 +2148,8 @@ def quip_miner_qpu(
     as GPU: end-to-end against the chain is a Phase 6 item once topology
     binding generalises beyond CPU.
     """
-    backends = _load_backends_or_fail(config_path)
+    raw = _parse_config_or_fail(config_path)
+    backends = _load_backends_or_fail(config_path, raw=raw)
     _check_backend_conflicts(
         ctx,
         backends,
@@ -2084,45 +2170,24 @@ def quip_miner_qpu(
         if daily_budget is not None:
             section["daily_budget"] = daily_budget
         miner_config = {qpu_type: [section]}
-        miner_kind = (
-            f"qpu_{qpu_type}" if qpu_type in ("ibm", "ionq", "pasqal") else "qpu"
-        )
+        miner_kind = qpu_miner_kind(qpu_type)
 
-    merged = _resolve_runtime_config(
-        config_path=config_path,
-        cli_kwargs={
-            "validators": validators,
-            "signer_key": signer_key_path,
-            "faucet_url": faucet_url,
-            "rest_port": rest_port,
-            "rest_host": rest_host,
-            "node_name": node_name,
-            "public_host": public_host,
-            "public_port": public_port,
-            "node_log": node_log,
-        },
-        defaults={
-            "signer_key": "~/.quip-miner/signing.json",
-            "rest_port": -1,
-            "rest_host": "127.0.0.1",
-        },
-    )
-    raise SystemExit(asyncio.run(_run_concurrent_miner(
-        mode=mode,
+    _dispatch_mining_command(
+        raw=raw,
         miner_kind=miner_kind,
-        validators=tuple(merged["validators"]),
-        signer_key_path=merged["signer_key"],
-        faucet_url=merged.get("faucet_url"),
-        rest_port=int(merged["rest_port"]),
-        rest_host=str(merged["rest_host"]),
-        topology_spec=topology_spec,
         miner_config=miner_config,
-        node_name=merged.get("node_name"),
-        public_host=merged.get("public_host"),
-        public_port=merged.get("public_port"),
-        node_log=merged.get("node_log"),
-        submission_config=_load_submission_config_or_default(config_path),
-    )))
+        validators=validators,
+        signer_key_path=signer_key_path,
+        faucet_url=faucet_url,
+        mode=mode,
+        topology_spec=topology_spec,
+        rest_port=rest_port,
+        rest_host=rest_host,
+        node_name=node_name,
+        public_host=public_host,
+        public_port=public_port,
+        node_log=node_log,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -2160,64 +2225,12 @@ def _load_identify_miners_toml(path: Path) -> dict:
     The `[miner]` section, if present, is ignored — it carries
     connection/keystore config that's already supplied via CLI flags.
     """
-    import sys
-    if sys.version_info >= (3, 11):
-        import tomllib
-    else:
-        import tomli as tomllib
-
-    if not path.exists():
-        raise click.ClickException(f"miner config not found: {path}")
     try:
-        with path.open("rb") as fh:
-            raw = tomllib.load(fh)
-    except tomllib.TOMLDecodeError as exc:
-        raise click.ClickException(
-            f"miner config parse failed ({path}): {exc}"
-        ) from exc
+        raw = dict(load_toml(path))
+    except MinerConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
     raw.pop("miner", None)
     return raw
-
-
-def _identify_specs_from_miner_config(
-    node_id: str, miners_config: dict
-) -> list:
-    """Materialize miner spec dicts from a parsed miner-config TOML.
-
-    Mirrors `MinerCore._initialize_miners` but produces plain dicts
-    instead of spawning `MinerHandle` worker processes — the identify
-    flow only needs the spec shape to populate the `miners` block of
-    the descriptor.
-    """
-    from shared.miner_core import (
-        _GPU_DEVICE_SECTIONS,
-        _QPU_DEVICE_SECTIONS,
-        _build_gpu_specs,
-        _build_qpu_specs,
-    )
-
-    specs: list = []
-    cpu_cfg = miners_config.get("cpu")
-    if cpu_cfg is not None:
-        num_cpus = int(cpu_cfg.get("num_cpus", 1))
-        cpu_args = dict(cpu_cfg.get("args", {}))
-        for i in range(num_cpus):
-            specs.append({
-                "id": f"{node_id}-CPU-{i + 1}",
-                "kind": "cpu",
-                "args": cpu_args,
-            })
-    has_gpu = miners_config.get("gpu") is not None or any(
-        miners_config.get(k) is not None for k in _GPU_DEVICE_SECTIONS
-    )
-    if has_gpu:
-        specs.extend(_build_gpu_specs(node_id, miners_config))
-    has_qpu = miners_config.get("qpu") is not None or any(
-        miners_config.get(k) is not None for k in _QPU_DEVICE_SECTIONS
-    )
-    if has_qpu:
-        specs.extend(_build_qpu_specs(node_id, miners_config))
-    return specs
 
 
 @quip_miner.command("identify")
@@ -2336,7 +2349,7 @@ def quip_miner_identify(
         miners_config = _load_identify_miners_toml(
             Path(miner_config_path).expanduser()
         )
-    miner_specs = _identify_specs_from_miner_config(node_id, miners_config)
+    miner_specs = build_miner_specs(node_id, miners_config)
 
     descriptor = build_descriptor(
         node_id=node_id,
@@ -2370,35 +2383,19 @@ def quip_miner_identify(
     async def _do() -> int:
         client = await _connect_or_fail(tuple(merged["validators"]))
         try:
-            prefer_event = await client.has_call("System", "remark_with_event")
-            call_function = "remark_with_event" if prefer_event else "remark"
-            try:
-                receipt = await client.submit_extrinsic(
-                    "System",
-                    call_function,
-                    {"remark": payload},
-                    keystore.signer,
-                    wait_for="inblock",
-                )
-            except Exception as exc:  # noqa: BLE001 — surfaced via CLI code
-                if call_function == "remark":
-                    raise
-                # Some metadata caches answer "yes" but the active
-                # runtime rejects the call at compose time — degrade to
-                # plain remark rather than failing the whole identify.
+            def _warn_fallback(exc: Exception) -> None:
+                # Some metadata caches answer "yes" but the active runtime
+                # rejects the call at compose time — degrade to plain remark
+                # rather than failing the whole identify.
                 click.echo(
                     f"remark_with_event submission failed ({exc}); "
                     f"retrying with plain remark",
                     err=True,
                 )
-                receipt = await client.submit_extrinsic(
-                    "System",
-                    "remark",
-                    {"remark": payload},
-                    keystore.signer,
-                    wait_for="inblock",
-                )
-                call_function = "remark"
+
+            receipt, call_function = await submit_remark(
+                client, keystore.signer, payload, on_fallback=_warn_fallback,
+            )
             if receipt.error:
                 click.echo(f"{call_function} failed: {receipt.error}", err=True)
                 return 3

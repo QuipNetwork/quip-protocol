@@ -64,6 +64,7 @@ from shared.telemetry_process import telemetry_main
 from substrate.client import SubstrateClient
 from substrate.pool import ValidatorPool
 from substrate.pool_client import PoolClient
+from substrate.remark import submit_remark
 from substrate.decay_timing import TimingTracker
 from substrate.difficulty_decay import EnergyCurve, build_decay_schedule
 from substrate.submitter import (
@@ -1862,22 +1863,9 @@ class SubstrateMinerController:
             return
         body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         try:
-            prefer_event = await self.build_client.has_call(
-                "System", "remark_with_event"
+            receipt, _call_function = await submit_remark(
+                self.build_client, self.signer, body,
             )
-            call_function = "remark_with_event" if prefer_event else "remark"
-            try:
-                receipt = await self.build_client.submit_extrinsic(
-                    "System", call_function, {"remark": body}, self.signer,
-                    wait_for="inblock",
-                )
-            except Exception:  # noqa: BLE001 — retry plain remark or warn below
-                if call_function == "remark":
-                    raise
-                receipt = await self.build_client.submit_extrinsic(
-                    "System", "remark", {"remark": body}, self.signer,
-                    wait_for="inblock",
-                )
             if receipt.error:
                 logger.warning(
                     "participation remark rejected for %s (%s); mining continues",
