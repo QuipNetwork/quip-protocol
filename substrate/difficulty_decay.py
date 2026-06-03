@@ -204,9 +204,7 @@ def current_difficulty(
         return base_difficulty
     elapsed = max(0, block_number - last_proof_block)
     steps = elapsed // epoch_length
-    if steps == 0:
-        return base_difficulty
-    if curve is None:
+    if curve is None or steps == 0:
         return base_difficulty
     return apply_decay(base_difficulty, steps, curve)
 
