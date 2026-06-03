@@ -54,3 +54,36 @@ def test_build_persistent_context_requires_topology():
             energy_threshold_milli=0,
             topology=None,
         )
+
+
+def test_connectionless_finalize_sample_reconstructs_with_defect():
+    """The worker miner reconstructs a clamped sample WITHOUT a live sampler.
+
+    Regression for the production crash: D-Wave changed the QPU graph_id,
+    introducing an offline qubit. The stream driver then stripped that qubit
+    and shipped a reduced sampleset + DefectInfo to the connection-less worker.
+    The worker's _finalize_sample must reconstruct the full-topology sample on
+    its own — it has no D-Wave connection (self.sampler is None), so it must
+    NOT depend on a live sampler instance to do this.
+    """
+    import dimod
+    from QPU.dwave_miner import DWaveMiner
+    from QPU.dwave_sampler import DefectInfo
+
+    m = DWaveMiner(miner_id="worker-orchestrator", connect=False)
+    assert m.sampler is None  # the precondition that triggered the crash
+
+    # Topology has 3 qubits; qubit 2 went offline and was clamped to +1.
+    reduced = dimod.SampleSet.from_samples(
+        [{0: -1, 1: 1}], vartype=dimod.SPIN, energy=[-5.0],
+    )
+    defect_info = DefectInfo(
+        fixed_spins={2: 1}, energy_offset=2.0, removed_edges={},
+    )
+
+    full = m._finalize_sample(reduced, defect_info)
+
+    sample = full.first.sample
+    assert set(sample) == {0, 1, 2}, "clamped qubit must reappear in full sample"
+    assert sample[2] == 1, "clamped qubit must carry its fixed spin"
+    assert full.first.energy == -3.0, "energy must be reduced energy + offset"

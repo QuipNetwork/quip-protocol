@@ -490,8 +490,8 @@ class DWaveSamplerWrapper:
 
         return h_reduced, J_reduced, fixed_spins, energy_offset, removed_edges
 
+    @staticmethod
     def reconstruct_full_sampleset(
-        self,
         reduced_sampleset: dimod.SampleSet,
         defect_info: DefectInfo,
     ) -> dimod.SampleSet:
@@ -500,6 +500,12 @@ class DWaveSamplerWrapper:
         Inserts fixed spins and corrects energies using the precomputed
         offset + defective coupler contributions. Does NOT rebuild a BQM
         or recompute energies from scratch.
+
+        Pure transform of ``(reduced_sampleset, defect_info)`` — it reads no
+        instance/connection state, so it is a ``staticmethod``. This lets the
+        connection-less worker miner reconstruct clamped samples without a
+        live D-Wave sampler (the connection lives in the stream-driver
+        process).
 
         Call this only for samplesets that contain promising candidates
         (QPU energy + offset < threshold). Most samplesets never need it.

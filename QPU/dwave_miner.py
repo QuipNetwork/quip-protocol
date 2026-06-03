@@ -493,6 +493,9 @@ class DWaveMiner(BaseMiner):
             Full-topology sampleset with all variables present and energies
             corrected.
         """
-        return self.sampler.reconstruct_full_sampleset(  # ty:ignore[unresolved-attribute]
+        # Reconstruction is a pure transform of (sampleset, defect_info) and
+        # runs in the connection-less worker, where self.sampler is None. Call
+        # the staticmethod on the class so it does not require a live sampler.
+        return DWaveSamplerWrapper.reconstruct_full_sampleset(
             sampleset, defect_info,
         )

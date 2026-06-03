@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import multiprocessing as mp
 from typing import Any, List, Optional, Tuple
-from unittest.mock import MagicMock
 
 import dimod
 
@@ -438,34 +437,33 @@ def test_raw_energies_not_shifted():
 # Tests: DWaveMiner._finalize_sample
 # ---------------------------------------------------------------------------
 
-def test_finalize_sample_delegates_to_sampler():
-    """_finalize_sample calls sampler.reconstruct_full_sampleset."""
+def test_finalize_sample_reconstructs_without_live_sampler():
+    """_finalize_sample reconstructs even when self.sampler is None.
+
+    The worker miner has no D-Wave connection (sampler is None); reconstruction
+    must not depend on one. Regression for the graph_id-change crash where a
+    newly-offline qubit forced reconstruction on the connection-less worker.
+    """
     from QPU.dwave_miner import DWaveMiner
 
-    mock_sampler = MagicMock()
-    input_ss = _make_ss()
-    defect = _make_defect()
-    mock_sampler.reconstruct_full_sampleset.return_value = input_ss
-
     miner = DWaveMiner.__new__(DWaveMiner)
-    miner.sampler = mock_sampler
+    miner.sampler = None  # the production condition that crashed
 
-    result = miner._finalize_sample(input_ss, defect)
+    # _make_ss has vars {0, 1}; the defect clamps qubit 99 to +1, offset +10.
+    full = miner._finalize_sample(_make_ss(energy=-100.0), _make_defect(offset=10.0))
 
-    mock_sampler.reconstruct_full_sampleset.assert_called_once_with(input_ss, defect)
-    assert result is input_ss
+    sample = full.first.sample
+    assert set(sample) == {0, 1, 99}, "clamped qubit must reappear"
+    assert sample[99] == 1, "clamped qubit must carry its fixed spin"
+    assert full.first.energy == -90.0, "energy must be reduced energy + offset"
 
 
-def test_finalize_sample_passes_through_result():
-    """The return value of reconstruct_full_sampleset is returned unchanged."""
+def test_finalize_sample_preserves_all_reads():
+    """Reconstruction returns one full-topology sample per input read."""
     from QPU.dwave_miner import DWaveMiner
 
-    reconstructed = _make_ss(energy=-999.0)
-    mock_sampler = MagicMock()
-    mock_sampler.reconstruct_full_sampleset.return_value = reconstructed
-
     miner = DWaveMiner.__new__(DWaveMiner)
-    miner.sampler = mock_sampler
+    miner.sampler = None
 
-    result = miner._finalize_sample(_make_ss(), _make_defect())
-    assert result is reconstructed
+    result = miner._finalize_sample(_make_ss(n_reads=4), _make_defect())
+    assert len(result) == 4
