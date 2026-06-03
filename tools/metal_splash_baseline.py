@@ -10,6 +10,8 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -161,18 +163,16 @@ def metal_splash_baseline_test(
 
             # Collect stats from all models
             all_min_energies = []
-            all_avg_energies = []
             for sampleset in samplesets:
                 energies = list(sampleset.record.energy)
                 all_min_energies.append(float(min(energies)))
-                all_avg_energies.append(float(sum(energies) / len(energies)))
 
             # Use first sampleset for detailed analysis
             sampleset = samplesets[0]
             energies = list(sampleset.record.energy)
             min_energy = float(min(energies))
-            avg_energy = float(sum(energies) / len(energies))
-            std_energy = float((sum((e - avg_energy)**2 for e in energies) / len(energies)) ** 0.5)
+            avg_energy = float(np.mean(energies))
+            std_energy = float(np.std(energies))
 
             print(f"  Runtime: {runtime:.2f}s ({num_models} models)")
             if num_models > 1:
