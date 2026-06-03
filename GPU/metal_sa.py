@@ -464,10 +464,6 @@ class MetalSASampler:
         persist_energy_buf = self._pooled_buffer(
             "persist_energy", num_threads * 4)
 
-        total_betas = len(beta_schedule_arr)
-        beta_start_bytes = np.int32(0).tobytes()
-        beta_count_bytes = np.int32(total_betas).tobytes()
-
         # Encode and dispatch
         cmd_buf = self._command_queue.commandBuffer()
         encoder = cmd_buf.computeCommandEncoder()
@@ -494,8 +490,8 @@ class MetalSASampler:
 
         encoder.setBuffer_offset_atIndex_(hv_buf, 0, 15)
 
-        encoder.setBytes_length_atIndex_(beta_start_bytes, 4, 16)
-        encoder.setBytes_length_atIndex_(beta_count_bytes, 4, 17)
+        encoder.setBytes_length_atIndex_(np.int32(0).tobytes(), 4, 16)
+        encoder.setBytes_length_atIndex_(num_betas_bytes, 4, 17)
         encoder.setBuffer_offset_atIndex_(
             persist_state_buf, 0, 18,
         )
