@@ -320,7 +320,6 @@ async def submit_with_retry(
         raise ValueError(f"max_retries must be non-negative, got {max_retries}")
     sleep = sleeper if sleeper is not None else asyncio.sleep
     last_error: Optional[str] = None
-    last_receipt: Optional[ExtrinsicReceipt] = None
     total_attempts = max_retries + 1
 
     for attempt in range(1, total_attempts + 1):
@@ -350,7 +349,6 @@ async def submit_with_retry(
                 attempts=attempt,
             )
 
-        last_receipt = receipt
         action = _classify_receipt(receipt)
         if action is SubmitRetryAction.RETRY:
             last_error = receipt.error
@@ -373,14 +371,6 @@ async def submit_with_retry(
             error=receipt.error,
             attempts=attempt,
         )
-
-    # Unreachable: the loop always returns. Defensive fallthrough.
-    return SubmitResult(
-        action=SubmitRetryAction.RETRY,
-        receipt=last_receipt,
-        error=last_error,
-        attempts=total_attempts,
-    )
 
 
 # Exception classes that mean "the submit failed in a way a later attempt
