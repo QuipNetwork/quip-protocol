@@ -883,11 +883,6 @@ class MempoolMinerController:
             elif isinstance(msg, dict) and msg.get("op") == "shutdown_ack":
                 return
 
-    # ------------------------------------------------------------------
-    # Subscription cleanup (the substrate-interface subscription thread
-    # holds the receive loop; if it dies before shutdown we surface it.)
-    # ------------------------------------------------------------------
-
 
 def _classify_solution(error: Optional[str]) -> str:
     if error is None:
