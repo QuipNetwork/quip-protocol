@@ -1845,6 +1845,13 @@ _MODE_HELP = (
     "mode can use the other's idle worker."
 )
 
+# Default miner_config for each --gpu-backend choice (no TOML inventory).
+_GPU_BACKEND_DEFAULTS: dict[str, dict] = {
+    "local": {"cuda": [{"device": "0"}]},
+    "metal": {"metal": [{}]},
+    "modal": {"modal": [{"gpu_type": "t4"}]},
+}
+
 # Shared default fallbacks for the cpu/gpu/qpu commands (applied after the
 # TOML+CLI merge, so an explicit TOML/CLI value always wins).
 _MINING_DEFAULTS = {
@@ -2071,14 +2078,9 @@ def quip_miner_gpu(
         }
     else:
         backend = gpu_backend.lower()
-        if backend == "local":
-            miner_config = {"cuda": [{"device": "0"}]}
-        elif backend == "metal":
-            miner_config = {"metal": [{}]}
-        elif backend == "modal":
-            miner_config = {"modal": [{"gpu_type": "t4"}]}
-        else:
+        if backend not in _GPU_BACKEND_DEFAULTS:
             raise click.BadParameter(f"unknown --gpu-backend: {backend}")
+        miner_config = _GPU_BACKEND_DEFAULTS[backend]
 
     _dispatch_mining_command(
         raw=raw,
