@@ -145,7 +145,7 @@ def detect_hardware() -> Dict[str, Any]:
         import torch
         if torch.backends.mps.is_available():
             result['has_metal'] = True
-    except (ImportError, Exception):
+    except Exception:
         pass
 
     return result
@@ -188,11 +188,10 @@ def build_miner_specs(
             device_ids = ['0']
 
         kind = 'cuda-gibbs' if update_mode == 'gibbs' else 'cuda'
-        mode_label = update_mode
         for device in device_ids:
             specs.append({
                 'kind': kind,
-                'id': f'rate-test-cuda-{mode_label}-{device}',
+                'id': f'rate-test-cuda-{update_mode}-{device}',
                 'args': {'device': device}
             })
 
@@ -268,7 +267,6 @@ def aggregate_results(miner_results: List[Dict], total_time: float) -> Dict:
 def mine_worker(
     miner_spec: Dict,
     difficulty_energy: float,
-    duration_minutes: float,
     min_diversity: float,
     min_solutions: int,
     topology_name: Optional[str],
@@ -281,7 +279,6 @@ def mine_worker(
     Args:
         miner_spec: Dict with 'kind', 'id', 'args' for miner creation
         difficulty_energy: Fixed difficulty threshold
-        duration_minutes: How long to mine
         min_diversity: Minimum solution diversity
         min_solutions: Minimum solutions required
         topology_name: Topology name to load (None for default)
@@ -739,7 +736,6 @@ def main():
             args=(
                 spec,
                 args.difficulty_energy,
-                duration_minutes,
                 args.min_diversity,
                 args.min_solutions,
                 args.topology,
