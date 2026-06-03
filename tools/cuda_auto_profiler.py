@@ -126,14 +126,7 @@ def auto_instrument(
             r["parent_id"] = call_regions[0]["id"]
 
     # Recompute depths after parent fixup
-    id_map = {r["id"]: r for r in regions}
-    for region in regions:
-        depth = 0
-        cur = region
-        while cur["parent_id"] is not None:
-            depth += 1
-            cur = id_map[cur["parent_id"]]
-        region["depth"] = depth
+    _recompute_depths(regions)
 
     # Build manifest
     manifest_regions = []
@@ -194,18 +187,27 @@ def _walk(node):
         yield from _walk(child)
 
 
-def _find_kernel_function(root, kernel_name):
-    """Find function_definition for kernel_name."""
+def _iter_named_functions(root):
+    """Yield (name, function_definition_node) for every
+    function_definition whose declarator contains an identifier.
+    """
     for node in _walk(root):
         if node.type != "function_definition":
             continue
         for child in node.children:
             if child.type == "function_declarator":
                 for sub in child.children:
-                    if (sub.type == "identifier"
-                            and sub.text.decode()
-                            == kernel_name):
-                        return node
+                    if sub.type == "identifier":
+                        yield sub.text.decode(), node
+                        break
+                break
+
+
+def _find_kernel_function(root, kernel_name):
+    """Find function_definition for kernel_name."""
+    for name, node in _iter_named_functions(root):
+        if name == kernel_name:
+            return node
     return None
 
 
@@ -215,16 +217,40 @@ def _find_device_functions(root, names):
     Returns dict mapping function_name -> node.
     """
     result = {}
-    for node in _walk(root):
-        if node.type != "function_definition":
-            continue
-        for child in node.children:
-            if child.type == "function_declarator":
-                for sub in child.children:
-                    if (sub.type == "identifier"
-                            and sub.text.decode() in names):
-                        result[sub.text.decode()] = node
+    for name, node in _iter_named_functions(root):
+        if name in names:
+            result[name] = node
     return result
+
+
+def _find_body(fnode):
+    """Return the compound_statement child of a function node."""
+    for child in fnode.children:
+        if child.type == "compound_statement":
+            return child
+    return None
+
+
+def _find_param_list(fnode):
+    """Return the parameter_list child of a function node."""
+    for child in fnode.children:
+        if child.type == "function_declarator":
+            for sub in child.children:
+                if sub.type == "parameter_list":
+                    return sub
+    return None
+
+
+def _recompute_depths(regions):
+    """Recompute depth for every region from parent_id links."""
+    id_map = {r["id"]: r for r in regions}
+    for region in regions:
+        depth = 0
+        cur = region
+        while cur["parent_id"] is not None:
+            depth += 1
+            cur = id_map[cur["parent_id"]]
+        region["depth"] = depth
 
 
 def _get_callee_name(call_node):
@@ -278,11 +304,7 @@ def _find_enclosing_statement(node):
 
 def _collect_regions(kernel_node, kernel_name):
     """Walk kernel AST and collect instrumentable regions."""
-    body = None
-    for child in kernel_node.children:
-        if child.type == "compound_statement":
-            body = child
-            break
+    body = _find_body(kernel_node)
     assert body is not None, "Kernel has no body"
 
     regions = []
@@ -378,14 +400,7 @@ def _assign_parents_and_depth(regions):
         if best_parent:
             region["parent_id"] = best_parent["id"]
 
-    id_map = {r["id"]: r for r in regions}
-    for region in regions:
-        depth = 0
-        cur = region
-        while cur["parent_id"] is not None:
-            depth += 1
-            cur = id_map[cur["parent_id"]]
-        region["depth"] = depth
+    _recompute_depths(regions)
 
 
 # ── Code generation ────────────────────────────────────
@@ -420,21 +435,11 @@ def _generate_profiled_source(
     ]
 
     # Find kernel body (compound_statement)
-    body = None
-    for child in kernel_node.children:
-        if child.type == "compound_statement":
-            body = child
-            break
+    body = _find_body(kernel_node)
     assert body is not None
 
     # Find parameter list to add profile_output param
-    param_list = None
-    for child in kernel_node.children:
-        if child.type == "function_declarator":
-            for sub in child.children:
-                if sub.type == "parameter_list":
-                    param_list = sub
-                    break
+    param_list = _find_param_list(kernel_node)
     assert param_list is not None
 
     # Collect all edits as (byte_offset, insert_text)
@@ -590,23 +595,12 @@ def _instrument_device_functions(
         if not subs:
             continue
 
-        # Find parameter list
-        param_list = None
-        for child in fnode.children:
-            if child.type == "function_declarator":
-                for sub in child.children:
-                    if sub.type == "parameter_list":
-                        param_list = sub
-                        break
+        # Find parameter list and body
+        param_list = _find_param_list(fnode)
         if param_list is None:
             continue
 
-        # Find body
-        fbody = None
-        for child in fnode.children:
-            if child.type == "compound_statement":
-                fbody = child
-                break
+        fbody = _find_body(fnode)
         if fbody is None:
             continue
 
