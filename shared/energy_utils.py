@@ -2,7 +2,7 @@
 
 import math
 import numpy as np
-from typing import Dict, Tuple, List, Any, Optional
+from typing import Dict, Tuple, List, Any
 
 # Import DEFAULT_TOPOLOGY for module-level constants
 from dwave_topologies import DEFAULT_TOPOLOGY
