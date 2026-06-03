@@ -23,6 +23,7 @@ in classical SA. This is a TESTING ARTIFACT - QPU quantum annealing maintains ch
 much better. Use embedded mode to verify embedding structure, NOT to predict QPU performance.
 """
 import json
+import os
 import random
 import sys
 import time
@@ -32,6 +33,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
 import dimod
+from dwave.embedding import embed_ising, unembed_sampleset
 
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce
@@ -73,7 +75,6 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
     print(f"🎲 h_values: {h_values}")
 
     # Load topology and embedding if specified
-    import os
     embedding_data = None
     embedding_dict = None
     source_topology = None
@@ -175,7 +176,6 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
     if topology and use_embedding:
         print(f"🔗 Embedding logical problem onto hardware...")
         # Embed h and J from logical to hardware
-        from dwave.embedding import embed_ising
         # Convert edge list to adjacency dict for embed_ising
         target_adj = {u: set() for u in nodes}
         for u, v in edges:
@@ -244,7 +244,6 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
 
             # Embed if needed
             if topology and use_embedding:
-                from dwave.embedding import embed_ising, unembed_sampleset
                 h_test, J_test = embed_ising(logical_h_test, logical_J_test, embedding_dict, target_adj)
             else:
                 h_test, J_test = logical_h_test, logical_J_test
@@ -258,7 +257,6 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
 
             # Unembed if needed
             if topology and use_embedding:
-                from dwave.embedding import unembed_sampleset
                 sampleset = unembed_sampleset(sampleset, embedding_dict, source_bqm=dimod.BinaryQuadraticModel.from_ising(logical_h_test, logical_J_test))
 
             runtime = time.time() - start_time
