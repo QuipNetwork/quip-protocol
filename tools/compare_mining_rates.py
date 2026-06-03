@@ -264,6 +264,24 @@ def aggregate_results(miner_results: List[Dict], total_time: float) -> Dict:
     }
 
 
+def latest_qpu_us(miner) -> float:
+    """Return the most-recent QPU access time in microseconds, or 0.
+
+    Guards the nested hasattr/non-empty check that appears at every QPU
+    accumulation site in mine_worker.
+
+    Args:
+        miner: Any miner object; may or may not expose timing_stats.
+
+    Returns:
+        Last entry in miner.timing_stats['qpu_access_time'], or 0.0.
+    """
+    if hasattr(miner, 'timing_stats') and 'qpu_access_time' in miner.timing_stats:
+        if miner.timing_stats['qpu_access_time']:
+            return miner.timing_stats['qpu_access_time'][-1]
+    return 0.0
+
+
 def mine_worker(
     miner_spec: Dict,
     difficulty_energy: float,
@@ -439,9 +457,7 @@ def mine_worker(
         nonlocal total_qpu_time_us
         blocks_found.append(result)
         # Track QPU time
-        if hasattr(miner, 'timing_stats') and 'qpu_access_time' in miner.timing_stats:
-            if miner.timing_stats['qpu_access_time']:
-                total_qpu_time_us += miner.timing_stats['qpu_access_time'][-1]
+        total_qpu_time_us += latest_qpu_us(miner)
         qpu_msg = f", QPU: {total_qpu_time_us / 1e6:.2f}s total" if total_qpu_time_us > 0 else ""
         elapsed_min = (time.time() - start_time) / 60
         blocks_per_min = len(blocks_found) / elapsed_min if elapsed_min > 0 else 0
@@ -486,10 +502,7 @@ def mine_worker(
         result = miner.mine_block(**mine_kwargs)
 
         # Track QPU time for this attempt (if available)
-        if hasattr(miner, 'timing_stats') and 'qpu_access_time' in miner.timing_stats:
-            if miner.timing_stats['qpu_access_time']:
-                attempt_qpu_time_us = miner.timing_stats['qpu_access_time'][-1]
-                total_qpu_time_us += attempt_qpu_time_us
+        total_qpu_time_us += latest_qpu_us(miner)
 
         if result:
             blocks_found.append(result)
