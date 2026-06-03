@@ -667,20 +667,6 @@ class BaseCudaSampler(abc.ABC):
         )
         return results[0]
 
-    def mark_slot_empty(
-        self, nonce_id: int, slot_id: int,
-    ) -> None:
-        """Mark a slot as EMPTY."""
-        ctrl_offset = (
-            nonce_id * self.CTRL_STRIDE + slot_id
-        )
-        empty_val = np.array(
-            [self.SLOT_EMPTY], dtype=np.int32,
-        )
-        self._d_sf_ctrl[
-            ctrl_offset:ctrl_offset + 1
-        ].set(empty_val)
-
     # ----------------------------------------------------------
     # Kernel launch / control
     # ----------------------------------------------------------
@@ -775,42 +761,6 @@ class BaseCudaSampler(abc.ABC):
         if wait:
             self._sf_stream_compute.synchronize()
         self._sf_kernel_running = False
-
-    def relaunch_self_feeding(
-        self,
-        active_nonce_count: int,
-        num_betas: int,
-        seed: Optional[int] = None,
-    ) -> None:
-        """Stop kernel, reset ctrl, relaunch.
-
-        Args:
-            active_nonce_count: Number of active nonces.
-            num_betas: Beta schedule length.
-            seed: RNG base seed.
-        """
-        assert self._sf_prepared
-
-        self._sf_stream_compute.synchronize()
-        self._sf_kernel_running = False
-
-        # Zero the entire ctrl array
-        self._d_sf_ctrl[:] = 0
-
-        self.launch_self_feeding(
-            num_betas=num_betas,
-            seed=seed,
-            active_nonce_count=active_nonce_count,
-        )
-
-    def is_kernel_running(self) -> bool:
-        """Check if the self-feeding kernel is still running."""
-        if not self._sf_kernel_running:
-            return False
-        done = self._sf_stream_compute.done
-        if done:
-            self._sf_kernel_running = False
-        return self._sf_kernel_running
 
     def get_profile_data(self) -> np.ndarray:
         """Copy profile counters from GPU and reshape.
