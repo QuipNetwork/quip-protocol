@@ -637,13 +637,12 @@ class CudaGibbsSampler(BaseCudaSampler):
 
         # Prepare self-feeding buffers if needed
         if not self._sf_prepared:
-            sms_per_nonce = max(1, 4)
             self.prepare_self_feeding(
                 num_nonces=num_problems,
                 reads_per_nonce=num_reads,
                 num_sweeps=num_sweeps,
                 num_sweeps_per_beta=num_sweeps_per_beta,
-                sms_per_nonce=sms_per_nonce,
+                sms_per_nonce=self._sf_sms_per_nonce_val,
             )
 
         # Reset ctrl array (clears stale EXIT_NOW from
