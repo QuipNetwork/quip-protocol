@@ -1,6 +1,6 @@
-# Dockerfile for Quip Network Node - CPU
-# Uses all available CPUs for mining
-# Multi-stage build for smaller image size
+# Dockerfile for quip-miner — CPU
+# Substrate-attached miner using all available CPUs for SA mining.
+# Multi-stage build for smaller image size.
 
 #############################################
 # Stage 1: Build the wheel
@@ -9,22 +9,19 @@ FROM python:3.13-slim-bookworm AS builder
 
 WORKDIR /build
 
-# Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy source files needed for build
 COPY pyproject.toml README.md LICENSE ./
 COPY shared/ ./shared/
+COPY substrate/ ./substrate/
 COPY CPU/ ./CPU/
 COPY GPU/ ./GPU/
 COPY QPU/ ./QPU/
 COPY dwave_topologies/ ./dwave_topologies/
 COPY quip_cli.py ./
-COPY genesis_block*.json ./
 
-# Build wheel
 RUN pip install --no-cache-dir build && \
     python -m build --wheel --outdir /build/dist
 
@@ -34,7 +31,7 @@ RUN pip install --no-cache-dir build && \
 FROM python:3.13-slim-bookworm
 
 LABEL maintainer="Quip Protocol"
-LABEL description="Quip Network Node - CPU Mining"
+LABEL description="quip-miner — CPU"
 LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-protocol"
 
 # Image identity surfaced to telemetry — set by CI via
@@ -42,71 +39,45 @@ LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-prot
 ARG QUIP_DOCKER_IMAGE=""
 ENV QUIP_DOCKER_IMAGE=${QUIP_DOCKER_IMAGE}
 
-# Install runtime dependencies (tini for PID 1, busybox for crond,
-# gosu for dropping privileges from root to quip in the entrypoint).
-# build-essential is retained for arch builds (notably arm64) where
-# PyPI wheels may be missing for a base dep and pip falls back to source.
+# Runtime deps: tini for PID 1, gosu for the entrypoint's privilege
+# drop. build-essential is retained for arch builds where PyPI wheels
+# may be missing for a base dep and pip falls back to source.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    openssl tini busybox-static gosu build-essential \
+    tini gosu build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Non-root runtime user. Matches systemd-linux/quip-network-node.service
-# (User=quip / Group=quip). UID/GID 1000 is the default; entrypoint.sh
-# adjusts to PUID/PGID when set. USER stays root so entrypoint.sh can
-# handle chown, crond install, and certbot before dropping to quip.
+# Non-root runtime user. USER stays root so entrypoint.sh can chown
+# /data and keygen with the right ownership before dropping to quip.
 RUN groupadd --system --gid 1000 quip \
     && useradd --system --uid 1000 --gid 1000 --home /home/quip \
        --create-home --shell /usr/sbin/nologin quip
 
 WORKDIR /app
 
-# Copy wheel from builder and install with cpu extras
+# Install the wheel with cpu extras
 COPY --from=builder /build/dist/*.whl /tmp/
 RUN WHEEL=$(ls /tmp/*.whl) && \
     pip install --no-cache-dir "${WHEEL}[cpu]" && \
     rm /tmp/*.whl
 
-# Install certbot + DNS plugins for automated TLS certificate management
-RUN pip install --no-cache-dir \
-    certbot certbot-dns-cloudflare certbot-dns-route53 \
-    certbot-dns-google certbot-dns-digitalocean \
-    certbot-dns-ovh certbot-dns-rfc2136
-
-# Copy genesis block (needed at runtime)
-COPY genesis_block*.json ./
-
-# Copy config template, certbot wrapper, and entrypoint
-COPY docker/quip-node.cpu.toml /app/quip-node.docker.toml
-COPY docker/certbot-default.sh /app/certbot-default.sh
-RUN chmod +x /app/certbot-default.sh
+# Config template + entrypoint
+COPY docker/quip-miner.cpu.toml /app/quip-miner.docker.toml
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Environment variables — override TOML config when set (non-empty).
-# TOML template has defaults: listen=::, port=20049, auto_mine=false.
-ENV QUIP_MODE=cpu
-ENV QUIP_PEERS=""
-ENV QUIP_PORT=""
-ENV QUIP_LISTEN=""
-ENV QUIP_PUBLIC_HOST=""
-ENV QUIP_PUBLIC_PORT=""
-ENV QUIP_NODE_NAME=""
-ENV QUIP_AUTO_MINE=""
-ENV QUIP_REST_INSECURE_PORT=""
-ENV QUIP_REST_HOST=""
+# Mode resolution is config-driven (see entrypoint.sh).
+# QUIP_IMAGE_SUPPORTS = modes this image's libraries can run.
+#   cpu image has dwave-ocean-sdk (base dep) → qpu works.
+#   No cupy / no Apple Metal → cuda / metal sections error out.
+# QUIP_DEFAULT_MODE  = fallback when config.toml has no backend sections.
+ENV QUIP_IMAGE_SUPPORTS=cpu,qpu
+ENV QUIP_DEFAULT_MODE=cpu
+ENV QUIP_MINE_MODE=pow
 
-# TLS certificate management (certbot activates when CERT_EMAIL is set
-# and QUIP_PUBLIC_HOST is a DNS name). All other CERT_* vars are unset
-# by default — the certbot script defaults to Let's Encrypt HTTP-01.
-ENV CERT_EMAIL=""
-
-# Data volume for persistent config and secret
+# Persistent /data: holds config.toml + keystore.json across restarts.
 VOLUME ["/data"]
 
-# Expose QUIC port and HTTP-01 challenge port
-EXPOSE 20049/udp
-EXPOSE 20049/tcp
-EXPOSE 20050/tcp
-EXPOSE 80/tcp
+# Telemetry REST API (off by default; expose via -p when enabled).
+EXPOSE 8086/tcp
 
 ENTRYPOINT ["tini", "--", "/entrypoint.sh"]

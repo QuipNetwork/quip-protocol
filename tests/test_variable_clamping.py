@@ -60,9 +60,11 @@ class MockSamplerWrapper:
         return DWaveSamplerWrapper._clamp_defective_qubits(self, h, J, nonce_seed)
 
     def reconstruct_full_sampleset(self, reduced_ss, defect_info):
+        # reconstruct_full_sampleset is a staticmethod (pure transform of its
+        # args), so no `self` is forwarded.
         from QPU.dwave_sampler import DWaveSamplerWrapper
         return DWaveSamplerWrapper.reconstruct_full_sampleset(
-            self, reduced_ss, defect_info
+            reduced_ss, defect_info
         )
 
 

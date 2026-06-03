@@ -1,62 +1,27 @@
-[global]
-node_name = "Quantum Node Name"  # Optional human-readable name for your node.
+# quip-miner cpu — v0.2 example config
+#
+#   quip-miner cpu --config ./quip.network.cpu.example.toml
+#
+# Pure CPU simulated-annealing miner. Fastest path to get a miner
+# producing PoW proofs against a substrate validator without any
+# GPU/QPU hardware.
 
-# Local binding address (ip address) and port to listen to.
-listen = "0.0.0.0"
-port = 20049 # ("QN" -> little endian unsigned int is 0x514E -> 0x4E51 = 20049)
+[miner]
+validators = [
+    "ws://quip-validator:9944",
+]
+signer_key = "~/.quip-miner/signing.json"
+# faucet_url = "http://localhost:8087"
 
-#public_host = "my.dns.or.ip:public_port"
+# Optional telemetry REST API. Off by default (rest_port=-1). Set
+# rest_host = "0.0.0.0" to expose inside a container; CLI flags
+# --rest-port / --rest-host override these.
+# rest_port = 8086
+# rest_host = "127.0.0.1"
 
-# Optional deterministic key generation
-# Defaults to generate a brand new key on boot.
-secret = "your-secret-here" # Used to generate a deterministic key pair for this node
-
-# Enable mining on startup when no peers can be found.
-# Defaults to exit if a peer cannot be found.
-# auto_mine = true
-
-
-# Peers to try and connect to (defaults shown below)
-# peer = ["qpu-1.nodes.quip.network:20049", "cpu-1.quip.carback.us:20049", "gpu-1.quip.carback.us:20049", "gpu-2.quip.carback.us:20050", "nodes.quip.network:20049"]
-
-timeout = 3  # Timeout for peer connections and communications in seconds
-heartbeat_interval = 15  # Interval for sending heartbeats to peers in seconds
-heartbeat_timeout = 300  # Timeout for waiting for heartbeats from peers in seconds
-# Number of peers to gossip to at a time. Defaults to 3, you should never need to change this.
-# fanout = 3
-
-# TLS/SSL Configuration
-verify_tls = false  # Verify TLS certificates when connecting to peers
-# ca_bundle = "/path/to/ca-certificates.crt"  # Custom CA certificate bundle (optional)
-
-# Logging configuration
-log_level = "INFO"  # DEBUG, INFO, WARNING, ERROR
-node_log = "logs/quip-node.log"  # Path to main node log file (optional, defaults to stderr)
-http_log = "logs/quip-node-http.log"  # Path to HTTP/aiohttp log file (optional, suppresses aiohttp logs if not set)
-
-# if any of the following are defined then they will be spun up as miner processes to mine blocks.
-# By default a single CPU miner is created.
-
+# CPU worker pool — number of SA workers to spawn. When this section
+# is set, passing `--num-cpus N` on the command line fails with
+# `config-conflict`; pick one source. Defaults to 1 when [cpu] is
+# absent and no --num-cpus flag is passed.
 [cpu]
-# Limit CPU worker threads; max is number of logical CPUs on your system
 num_cpus = 4
-
-# [gpu]  # Commented out for CPU-only node
-# Backend selection: "local" (default) uses local GPUs (CUDA/ROCm/MPS). "modal" uses Modal cloud GPUs.
-# backend = "local"
-# For local backend: list devices to use (e.g., CUDA ordinals like "0", "1"). If omitted, runtime may auto-detect.
-# devices = ["0", "1"]
-# For modal backend: list GPU types to use (e.g., ["t4", "a10g"]).
-# types = ["t4", "a10g"]
-
-# [qpu]  # Commented out for CPU-only node
-# Credentials and region for D-Wave
-# If omitted here, can be supplied on CLI
-# Endpoint defaults to na-west-1 SAPI
-# DWAVE_API_TOKEN
-# DWAVE_API_SOLVER
-# DWAVE_API_ENDPOINT
-# Fill as desired:
-# dwave_api_key = "..."
-# dwave_api_solver = "Advantage_system6.4"
-# dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"

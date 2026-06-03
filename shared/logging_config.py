@@ -11,12 +11,10 @@ This module provides:
 
 import logging
 import logging.handlers
-import multiprocessing as mp
 import sys
 from datetime import datetime
-from logging.handlers import QueueListener, QueueHandler
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict
 
 
 class QuipFormatter(logging.Formatter):
@@ -47,39 +45,18 @@ class QuipFormatter(logging.Formatter):
         """Parse logger name and extract component and identifier."""
         logger_name = record.name
 
-        # Handle miner loggers: miner.{miner_id}
+        # Miner loggers: miner.{miner_id} (created by shared/miner_worker.py)
         if logger_name.startswith('miner.'):
             miner_id = logger_name.split('.', 1)[1]
             return 'miner', miner_id
 
-        # Handle network node loggers: network_node.{node_id}
-        if logger_name.startswith('network_node.'):
-            node_id = logger_name.split('.', 1)[1]
-            return 'network_node', node_id
-
-        # Handle node loggers: node.{node_id}
-        if logger_name.startswith('node.'):
-            node_id = logger_name.split('.', 1)[1]
-            return 'node', node_id
-
-        # Handle legacy shared.* loggers for backward compatibility
-        if logger_name.startswith('shared.'):
-            component = logger_name[7:]  # Remove 'shared.' prefix
-            return component, 'legacy'
-
-        # Handle other module-level loggers by extracting meaningful names
+        # Module-level loggers (e.g. 'substrate.miner_controller', 'shared.base_miner')
         if '.' in logger_name:
             parts = logger_name.split('.')
             if len(parts) >= 2:
-                # For loggers like 'quantum_blockchain_network', 'blockchain_base', etc.
-                if 'blockchain' in logger_name:
-                    return 'blockchain', parts[-1]
-                elif 'network' in logger_name:
-                    return 'network', parts[-1]
-                elif 'miner' in logger_name:
+                if 'miner' in logger_name:
                     return 'miner', parts[-1]
-                else:
-                    return parts[0], parts[-1]
+                return parts[0], parts[-1]
 
         # Fallback for other loggers
         return 'unknown', logger_name
@@ -144,12 +121,6 @@ def setup_logging(
 
     root_logger.addHandler(console_handler)
 
-    # Suppress verbose aioquic connection logs
-    # (version negotiation, ALPN, duplicate CRYPTO)
-    quic_logger = logging.getLogger("quic")
-    quic_logger.setLevel(logging.WARNING)
-    quic_logger.propagate = True
-
     # Configure aiohttp logging
     if http_log_file:
         # Create aiohttp logger
@@ -192,39 +163,12 @@ def setup_logging(
         aiohttp_logger.setLevel(logging.CRITICAL)
         aiohttp_logger.propagate = False
 
-    # Create component-specific loggers
-    loggers = {}
-
-    # NetworkNode logger - use node_name parameter
-    network_node_logger = logging.getLogger(f'network_node.{node_name}')
-    network_node_logger.setLevel(numeric_level)
-    loggers['network_node'] = network_node_logger
-
-    # Node logger - use node_name parameter
-    node_logger = logging.getLogger(f'node.{node_name}')
-    node_logger.setLevel(numeric_level)
-    loggers['node'] = node_logger
-
-    # Configure miner parent logger to ensure all miner.* loggers inherit proper formatting
+    # Configure miner parent logger so all miner.* children inherit formatting
     miner_parent_logger = logging.getLogger('miner')
     miner_parent_logger.setLevel(numeric_level)
-    # Ensure propagation is enabled (should be default, but let's be explicit)
     miner_parent_logger.propagate = True
-    loggers['miner'] = miner_parent_logger
 
-    # Keep individual miner type loggers for backward compatibility
-    miner_types = ['cpu_miner', 'gpu_miner', 'qpu_miner', 'sa_miner']
-    for miner_type in miner_types:
-        miner_logger = logging.getLogger(f'miner.{miner_type}')
-        miner_logger.setLevel(numeric_level)
-        loggers[miner_type] = miner_logger
-
-    # Blockchain logger
-    blockchain_logger = logging.getLogger('quantum_blockchain')
-    blockchain_logger.setLevel(numeric_level)
-    loggers['blockchain'] = blockchain_logger
-
-    return loggers
+    return {'miner': miner_parent_logger}
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -232,7 +176,7 @@ def get_logger(name: str) -> logging.Logger:
     Get a logger for a specific component.
 
     Args:
-        name: Logger name (e.g., 'network_node', 'cpu_miner', etc.)
+        name: Logger name (e.g., 'miner', 'base_miner', etc.)
 
     Returns:
         Configured logger instance
@@ -263,34 +207,6 @@ def update_log_level(loggers: Dict[str, logging.Logger], level: str):
         logger.setLevel(numeric_level)
 
 
-def setup_multiprocess_logging() -> Tuple[mp.Queue, QueueListener]:
-    """Set up logging for multiprocessing environment.
-
-    Returns:
-        Tuple of (log_queue, listener) for multiprocessing logging.
-    """
-    # Create queue for inter-process communication
-    log_queue = mp.Queue()
-
-    # Handler that sends log records to queue
-    queue_handler = QueueHandler(log_queue)
-
-    # Get root logger and add queue handler
-    root_logger = logging.getLogger()
-    root_logger.addHandler(queue_handler)
-    root_logger.setLevel(logging.INFO)
-
-    # Create listener that processes queue in main process
-    formatter = QuipFormatter()
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-
-    listener = QueueListener(log_queue, console_handler)
-    listener.start()
-
-    return log_queue, listener
-
-
 def init_component_logger(component: str, identifier: str) -> logging.Logger:
     """
     Initialize a component logger with proper setup.
@@ -300,7 +216,7 @@ def init_component_logger(component: str, identifier: str) -> logging.Logger:
     for use by static functions in the module.
 
     Args:
-        component: Component type (e.g., 'network_node', 'miner', 'node')
+        component: Component type (e.g., 'miner', 'substrate')
         identifier: Unique identifier for this instance
 
     Returns:
@@ -322,3 +238,68 @@ def init_component_logger(component: str, identifier: str) -> logging.Logger:
 def shutdown_logging():
     """Shutdown logging system and close all handlers."""
     logging.shutdown()
+
+
+def log_writer_main(log_queue, stop_event, log_file_path, level) -> None:
+    """Sole owner of the file/console log handlers; drains the shared queue.
+
+    Replaces the in-process QueueListener thread. All processes (controller
+    + workers) route records here via QueueHandler, so this is the only
+    writer of the log file — no double-write or rotation race. A None on the
+    queue or a set stop_event ends the loop.
+
+    Args:
+        log_queue: Multiprocessing queue of LogRecord objects.
+        stop_event: Multiprocessing Event; when set the loop exits after
+            draining any pending records.
+        log_file_path: Absolute path for the RotatingFileHandler, or None to
+            skip file output (console-only mode).
+        level: Numeric logging level applied to all handlers.
+    """
+    import queue as _queue
+
+    fmt = QuipFormatter()
+    console = logging.StreamHandler()
+    console.setLevel(level)
+    console.setFormatter(fmt)
+    handlers = [console]
+    if log_file_path:
+        fh = logging.handlers.RotatingFileHandler(
+            log_file_path, maxBytes=10 * 1024 * 1024, backupCount=5,
+        )
+        fh.setLevel(level)
+        fh.setFormatter(fmt)
+        handlers.append(fh)
+
+    def _emit(record) -> None:
+        for h in handlers:
+            if record.levelno >= h.level:
+                try:
+                    h.handle(record)
+                except Exception as exc:  # noqa: BLE001
+                    # One unformattable record must not kill the sole log
+                    # writer — that would silently lose ALL logging. Report
+                    # to stderr and keep draining.
+                    print(f"log_writer: failed to emit record: {exc}",
+                          file=sys.stderr)
+
+    while not stop_event.is_set():
+        try:
+            record = log_queue.get(timeout=0.2)
+        except _queue.Empty:
+            continue
+        if record is None:
+            break
+        _emit(record)
+    # Drain anything still queued at shutdown (stop_event may fire before the
+    # None sentinel is dequeued) so the final records aren't lost.
+    while True:
+        try:
+            record = log_queue.get_nowait()
+        except _queue.Empty:
+            break
+        if record is None:
+            break
+        _emit(record)
+    for h in handlers:
+        h.close()

@@ -38,10 +38,12 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import hashlib
+
 from shared.ising_model import IsingModel
 from shared.quantum_proof_of_work import (
+    derive_nonce,
     generate_ising_model_from_nonce,
-    ising_nonce_from_block,
 )
 from shared.energy_utils import calc_energy_range
 from tools.baseline_utils import load_baseline_topology
@@ -72,21 +74,18 @@ def generate_models(
     variable is the sampler/sweep/read setting.
     """
     rng = random.Random(seed)
-    # Use a fake block context — we just need random
-    # but reproducible Ising problems.
-    prev_hash = rng.randbytes(32)
-    miner_id = "grid-bench"
-    cur_index = 1
+    # Use a fake block context — we just need random but reproducible
+    # Ising problems. The legacy "miner_id" string is hashed to the
+    # 32-byte canonical identity that derive_nonce expects (matches what
+    # the chain pallet does with blake2_256(SCALE(account_id))).
+    last_proof_block_hash = rng.randbytes(32)
+    miner_bytes = hashlib.blake2b(b"grid-bench", digest_size=32).digest()
 
     models = []
     for _ in range(num_models):
         salt = rng.randbytes(32)
-        nonce = ising_nonce_from_block(
-            prev_hash, miner_id, cur_index, salt,
-        )
-        h, J = generate_ising_model_from_nonce(
-            nonce, nodes, edges, h_values=h_values,
-        )
+        nonce = derive_nonce(last_proof_block_hash, miner_bytes, salt)
+        h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
         models.append(IsingModel(
             h=h, J=J, nonce=nonce, salt=salt,
         ))

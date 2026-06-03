@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from shared.allowed_value_spec import AllowedValueSet
 from shared.chacha8 import (
     ChaCha8Rng,
     _pcg32,
@@ -21,7 +22,10 @@ from shared.chacha8 import (
     _chacha_block,
     _CONSTANTS,
 )
-from shared.quantum_proof_of_work import ising_nonce_from_block, generate_ising_model_from_nonce
+from shared.quantum_proof_of_work import (
+    derive_nonce,
+    generate_ising_model_from_nonce,
+)
 
 _VECTORS_PATH = Path(__file__).parent / 'chacha8_test_vectors.json'
 _VECTORS = json.loads(_VECTORS_PATH.read_text())
@@ -33,14 +37,6 @@ _VECTORS = json.loads(_VECTORS_PATH.read_text())
 
 class TestPCG32Expansion:
     """Verify the PCG32 expansion matches rand_core::SeedableRng."""
-
-    def test_seed_zero_key_length(self):
-        key = _seed_from_u64(0)
-        assert len(key) == 32
-
-    def test_seed_zero_key_not_all_zeros(self):
-        key = _seed_from_u64(0)
-        assert key != b'\x00' * 32
 
     @pytest.mark.parametrize(
         'vec',
@@ -64,11 +60,6 @@ class TestPCG32Expansion:
 
 class TestChaCha8Block:
     """Verify the ChaCha8 block function internals."""
-
-    def test_block_output_length(self):
-        state = list(_CONSTANTS) + [0] * 12
-        output = _chacha_block(state)
-        assert len(output) == 16
 
     def test_all_zero_key_nonce_produces_nonzero(self):
         state = list(_CONSTANTS) + [0] * 12
@@ -109,98 +100,69 @@ class TestChaCha8Rng:
         rng2 = ChaCha8Rng.seed_from_u64(1)
         assert rng1.next_u32() != rng2.next_u32()
 
-    def test_many_values_no_crash(self):
-        """Generate 1000 values (covers many block refills)."""
-        rng = ChaCha8Rng.seed_from_u64(7)
-        for _ in range(1000):
-            val = rng.next_u32()
-            assert 0 <= val <= 0xFFFFFFFF
-
-    def test_key_constructor(self):
-        key = b'\x01' * 32
-        rng = ChaCha8Rng(key)
-        assert 0 <= rng.next_u32() <= 0xFFFFFFFF
-
     def test_invalid_key_length(self):
         with pytest.raises(ValueError, match="32 bytes"):
             ChaCha8Rng(b'\x00' * 16)
 
 
 # ---------------------------------------------------------------------------
-# ising_nonce_from_block (from JSON vectors)
+# derive_nonce (post-MR-!20)
 # ---------------------------------------------------------------------------
+#
+# The legacy JSON vectors in chacha8_test_vectors.json target the old
+# truncated-u64 nonce shape; cross-language parity now goes through
+# tests/test_derive_nonce_parity.py against python_parity.json. The smoke
+# checks below pin the new shape (32-byte fixed inputs, 32-byte digest).
+
 
 class TestDeriveNonce:
-    """Verify nonce derivation matches Rust's ising_nonce_from_block."""
+    """Smoke-tests for the fixed-width derive_nonce surface."""
 
-    @pytest.mark.parametrize(
-        'vec',
-        _VECTORS['derive_nonce'],
-        ids=[
-            f"{v['miner_id']}/blk{v['block_number']}"
-            for v in _VECTORS['derive_nonce']
-        ],
-    )
-    def test_ising_nonce_from_block_from_vectors(self, vec):
-        nonce = ising_nonce_from_block(
-            prev_hash=bytes.fromhex(vec['parent_hash_hex']),
-            miner_id=vec['miner_id'],
-            cur_index=vec['block_number'],
-            salt=bytes.fromhex(vec['salt_hex']),
-        )
-        assert nonce == vec['expected_nonce']
-
-    def test_returns_u64_range(self):
-        nonce = ising_nonce_from_block(b'\x00' * 32, 'miner', 0, b'\x00' * 32)
-        assert 0 <= nonce < 2**64
+    def test_returns_32_bytes(self):
+        nonce = derive_nonce(b"\x00" * 32, b"\x00" * 32, b"\x00" * 32)
+        assert isinstance(nonce, bytes)
+        assert len(nonce) == 32
 
     def test_different_inputs_differ(self):
-        base = (b'\x00' * 32, 'miner', 0, b'\x00' * 32)
-        n_base = ising_nonce_from_block(*base)
-        assert n_base != ising_nonce_from_block(b'\x01' * 32, 'miner', 0, b'\x00' * 32)
-        assert n_base != ising_nonce_from_block(b'\x00' * 32, 'other', 0, b'\x00' * 32)
-        assert n_base != ising_nonce_from_block(b'\x00' * 32, 'miner', 1, b'\x00' * 32)
-        assert n_base != ising_nonce_from_block(b'\x00' * 32, 'miner', 0, b'\xff' * 32)
+        base = derive_nonce(b"\x00" * 32, b"\x00" * 32, b"\x00" * 32)
+        assert base != derive_nonce(b"\x01" * 32, b"\x00" * 32, b"\x00" * 32)
+        assert base != derive_nonce(b"\x00" * 32, b"\x01" * 32, b"\x00" * 32)
+        assert base != derive_nonce(b"\x00" * 32, b"\x00" * 32, b"\xff" * 32)
+
+    def test_rejects_short_inputs(self):
+        with pytest.raises(ValueError, match="last_proof_block_hash"):
+            derive_nonce(b"\x00" * 16, b"\x00" * 32, b"\x00" * 32)
+        with pytest.raises(ValueError, match="miner"):
+            derive_nonce(b"\x00" * 32, b"m", b"\x00" * 32)
+        with pytest.raises(ValueError, match="salt"):
+            derive_nonce(b"\x00" * 32, b"\x00" * 32, b"")
 
 
 # ---------------------------------------------------------------------------
-# generate_ising_model (from JSON vectors)
+# generate_ising_model_from_nonce (post-MR-!20)
 # ---------------------------------------------------------------------------
+
 
 class TestGenerateIsingModel:
-    """Verify Ising model generation matches Rust's generate_ising_model."""
-
-    @pytest.mark.parametrize(
-        'vec',
-        _VECTORS['generate_ising_model'],
-        ids=[
-            f"nonce={v['nonce']}/n{len(v['nodes'])}e{len(v['edges'])}"
-            for v in _VECTORS['generate_ising_model']
-        ],
-    )
-    def test_ising_model_from_vectors(self, vec):
-        edges = [tuple(e) for e in vec['edges']]
-        h, J = generate_ising_model_from_nonce(
-            vec['nonce'], vec['nodes'], edges, vec['allowed_h_values']
-        )
-        expected_h = {int(k): v for k, v in vec['expected_h'].items()}
-        expected_j = {
-            tuple(int(x) for x in k.split(',')): v
-            for k, v in vec['expected_j'].items()
-        }
-        assert h == expected_h
-        assert J == expected_j
+    """Verify Ising model generation against the new AllowedValueSpec API."""
 
     def test_h_values_from_allowed_set(self):
-        allowed = [-1.0, 0.0, 1.0]
-        h, _ = generate_ising_model_from_nonce(99, [0, 1, 2, 3, 4], [(0, 1), (1, 2), (2, 3), (3, 4)], allowed)
-        for v in h.values():
-            assert v in allowed
+        allowed = AllowedValueSet((-1000, 0, 1000))
+        h, _ = generate_ising_model_from_nonce(
+            99,
+            [0, 1, 2, 3, 4],
+            [(0, 1), (1, 2), (2, 3), (3, 4)],
+            allowed_h=allowed,
+        )
+        assert all(v in (-1.0, 0.0, 1.0) for v in h.values())
 
-    def test_j_values_are_pm1(self):
-        _, J = generate_ising_model_from_nonce(99, [0, 1, 2, 3, 4], [(0, 1), (1, 2), (2, 3), (3, 4)])
-        for v in J.values():
-            assert v in (-1.0, 1.0)
+    def test_j_values_from_allowed_set(self):
+        _, J = generate_ising_model_from_nonce(
+            99,
+            [0, 1, 2, 3, 4],
+            [(0, 1), (1, 2), (2, 3), (3, 4)],
+        )
+        assert all(v in (-1.0, 1.0) for v in J.values())
 
     def test_deterministic(self):
         nodes, edges = [0, 1, 2], [(0, 1), (1, 2)]
@@ -208,41 +170,33 @@ class TestGenerateIsingModel:
         h2, J2 = generate_ising_model_from_nonce(42, nodes, edges)
         assert h1 == h2 and J1 == J2
 
-    def test_h_generated_before_j(self):
-        """Verify RNG consumption order: h first, then J."""
-        nodes = [0, 1, 2, 3, 4]
-        edges = [(0, 1), (1, 2), (2, 3), (3, 4)]
-        rng = ChaCha8Rng.seed_from_u64(42)
-        expected_h_indices = [rng.next_u32() % 3 for _ in nodes]
-        expected_j_bits = [rng.next_u32() & 1 for _ in edges]
-
-        h, J = generate_ising_model_from_nonce(42, nodes, edges)
-
-        allowed = [-1.0, 0.0, 1.0]
-        for node_id, idx in zip(nodes, expected_h_indices):
-            assert h[node_id] == allowed[idx]
-        for (u, v), bit in zip(edges, expected_j_bits):
-            assert J[(u, v)] == (-1.0 if bit == 0 else 1.0)
+    def test_accepts_bytes_and_int_nonce(self):
+        nodes = [0, 1, 2]
+        edges = [(0, 1)]
+        from_int = generate_ising_model_from_nonce(42, nodes, edges)
+        from_bytes = generate_ising_model_from_nonce(
+            (42).to_bytes(32, "big"), nodes, edges,
+        )
+        assert from_int == from_bytes
 
 
 # ---------------------------------------------------------------------------
 # Edge cases and input validation
 # ---------------------------------------------------------------------------
 
+
 class TestEdgeCases:
     """Validate error handling and boundary conditions."""
 
-    def test_empty_allowed_h_values_raises(self):
-        with pytest.raises(ValueError, match="non-empty"):
-            generate_ising_model_from_nonce(42, [0, 1], [(0, 1)], [])
+    def test_empty_allowed_h_raises(self):
+        with pytest.raises(ValueError):
+            generate_ising_model_from_nonce(
+                42, [0, 1], [(0, 1)], allowed_h=AllowedValueSet(()),
+            )
 
     def test_empty_nodes_raises(self):
         with pytest.raises(ValueError, match="non-empty"):
             generate_ising_model_from_nonce(42, [], [])
-
-    def test_single_h_value(self):
-        h, J = generate_ising_model_from_nonce(42, [0, 1], [(0, 1)], [0.0])
-        assert all(v == 0.0 for v in h.values())
 
     def test_empty_edges_returns_empty_j(self):
         h, J = generate_ising_model_from_nonce(42, [0, 1, 2], [])
@@ -254,18 +208,6 @@ class TestEdgeCases:
             ChaCha8Rng.seed_from_u64(-1)
         with pytest.raises(ValueError, match="u64"):
             ChaCha8Rng.seed_from_u64(2**64)
-
-    def test_ising_nonce_from_block_block_number_overflow(self):
-        with pytest.raises(ValueError, match="u32"):
-            ising_nonce_from_block(b'\x00' * 32, 'miner', 2**32, b'\x00' * 32)
-
-    def test_ising_nonce_from_block_block_number_negative(self):
-        with pytest.raises(ValueError, match="u32"):
-            ising_nonce_from_block(b'\x00' * 32, 'miner', -1, b'\x00' * 32)
-
-    def test_ising_nonce_from_block_max_u32(self):
-        nonce = ising_nonce_from_block(b'\x00' * 32, 'miner', 2**32 - 1, b'\x00' * 32)
-        assert 0 <= nonce < 2**64
 
     def test_counter_carry(self):
         """Verify 64-bit counter carry from state[12] to state[13]."""

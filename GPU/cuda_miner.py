@@ -10,10 +10,10 @@ through the GPUMiner base class.
 """
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from GPU.gpu_miner import GPUMiner
-from shared.block_requirements import BlockRequirements
+from shared.miner_types import BlockRequirements
 from dwave_topologies import DEFAULT_TOPOLOGY
 
 try:
@@ -43,6 +43,9 @@ class CudaMiner(GPUMiner):
     # Gibbs needs ~2x sweeps to match SA at the same reads.
     # Measured via sweep_reads_grid on Advantage2 topology.
     GIBBS_SWEEP_MULTIPLIER = 2
+
+    # Sampling runs in a stream-driver process (GPU/cuda_stream.py).
+    STREAM_FACTORY_DOTTED = "GPU.cuda_stream:build_persistent_context"
 
     def _adapt_mining_params(
         self,
@@ -97,6 +100,8 @@ class CudaMiner(GPUMiner):
             if topology is not None
             else DEFAULT_TOPOLOGY
         )
+        self.topology = topology_obj
+        self._yielding = yielding
 
         device_sms = cp.cuda.Device(
             dev_id,
@@ -145,3 +150,25 @@ class CudaMiner(GPUMiner):
                 "(self-feeding, utilization=%d%%)",
                 device, gpu_util,
             )
+
+    def _stream_factory_kwargs(
+        self, sample_ctx: Dict[str, Any], nodes: List[int],
+    ) -> Dict[str, Any]:
+        """Return kwargs forwarded to GPU.cuda_stream:build_persistent_context.
+
+        Called by BaseMiner._ensure_driver when spawning the stream driver.
+        """
+        return {
+            "miner_id": self.miner_id,
+            "nodes": nodes,
+            "edges": sample_ctx["edges"],
+            "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
+            "num_reads": sample_ctx["num_reads"],
+            "num_sweeps": sample_ctx["num_sweeps"],
+            "topology": getattr(self, "topology", None),
+            "device": str(getattr(self, "device", "0")),
+            "update_mode": getattr(self, "_update_mode", "sa"),
+            "sms_per_nonce": getattr(self, "sms_per_nonce", 4),
+            "utilization": getattr(self, "gpu_utilization", 100),
+            "yielding": getattr(self, "_yielding", False),
+        }

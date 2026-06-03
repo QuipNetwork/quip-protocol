@@ -1,16 +1,25 @@
 """QPU time budget management for controlling D-Wave QPU usage.
 
-This module provides time budget tracking and estimation to prevent
-excessive QPU consumption during mining operations. Uses proportional
-pacing to spread usage evenly across the day.
+This module provides a **carry-over budget reservoir** that paces D-Wave QPU
+usage. A pool of QPU-access-time budget accrues continuously at
+``daily_budget / 86400`` per wall-second (unused budget banks across days,
+clamped to ``budget_cap``) and is spent by ``record_block_time``.
+
+Mining uses **start/continue hysteresis**: the miner stays idle until the pool
+accrues to ``min_block_budget`` (the buffer), then bursts — continuing to mine
+until the pool drains to 0 — at which point it idles and re-accumulates the full
+buffer. This turns the old per-block dribble into accumulate-then-burst, which
+amortizes D-Wave queue warmup on throughput-bound hardware.
 """
 # SPDX-License-Identifier: AGPL-3.0-or-later
 from __future__ import annotations
 
+import logging
 import time
-from datetime import datetime, timezone
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def parse_duration(duration_str: str) -> float:
@@ -60,7 +69,8 @@ class QPUTimeConfig:
     """
 
     daily_budget_seconds: float
-    """Daily QPU time budget in seconds. Mining stops when cumulative usage exceeds this."""
+    """Daily QPU time budget in seconds. The reservoir accrues at this rate
+    (``daily_budget_seconds / 86400`` per wall-second)."""
 
     min_blocks_for_estimation: int = 5
     """Minimum blocks mined before EMA estimation kicks in (default: 5)."""
@@ -68,44 +78,55 @@ class QPUTimeConfig:
     ema_alpha: float = 0.3
     """EMA decay factor (0.0-1.0). Higher = more weight to recent blocks."""
 
+    min_block_budget_seconds: float = 90.0
+    """Reservoir buffer (QPU access seconds) that must accrue before a burst
+    starts. Once mining, the burst continues until the pool drains to 0
+    (start/continue hysteresis)."""
+
+    budget_cap_seconds: Optional[float] = None
+    """Max banked pool size (seconds). ``None`` => ``max(daily_budget_seconds,
+    min_block_budget_seconds)`` so the buffer is always reachable and a
+    post-downtime catch-up burst is bounded to one cap's worth of QPU."""
+
 
 @dataclass
 class QPUTimeEstimate:
-    """Result of QPU time estimation for mining decision."""
+    """Result of a reservoir mining decision."""
 
     estimated_block_time_us: float
-    """Estimated microseconds needed for the next block."""
+    """Estimated microseconds needed for the next block (EMA-based)."""
 
     cumulative_used_us: float
-    """Total QPU microseconds used so far today."""
+    """Total QPU microseconds spent since process start (lifetime)."""
 
     daily_budget_us: float
-    """Daily budget in microseconds."""
-
-    proportional_limit_us: float
-    """Current proportional limit based on time of day (elapsed_fraction * daily_budget)."""
+    """Daily budget in microseconds (the reservoir accrual rate basis)."""
 
     budget_remaining_us: float
-    """Budget remaining until proportional limit (proportional_limit - cumulative_used)."""
+    """Current reservoir pool balance in microseconds (== ``pool_us``)."""
+
+    pool_us: float
+    """Current reservoir pool balance in microseconds."""
+
+    pool_cap_us: float
+    """Maximum the pool can bank, in microseconds."""
+
+    burst_active: bool
+    """True if currently in a burst (mining down toward 0); False if idle and
+    re-accumulating to the buffer."""
 
     should_mine: bool
-    """True if there's sufficient time to mine the next block."""
+    """True if there is sufficient budget to mine the next block."""
 
     confidence: str
     """Confidence level: 'low', 'medium', or 'high' based on sample count."""
 
-    elapsed_fraction: float
-    """Fraction of day elapsed since UTC midnight (0.0-1.0)."""
-
     seconds_until_can_mine: float
-    """Seconds until enough headroom accumulates (0 if can mine now). May extend past midnight."""
-
-    is_pacing_limited: bool
-    """True if blocked due to pacing, False if can mine. Always True when should_mine is False."""
+    """Seconds until the pool accrues to the buffer (0 if mining now)."""
 
 
 class QPUTimeManager:
-    """Manages QPU time budget and provides mining decisions based on usage estimates."""
+    """Manages a carry-over QPU budget reservoir and mining decisions."""
 
     def __init__(self, config: QPUTimeConfig):
         """Initialize the time manager with budget configuration.
@@ -119,44 +140,51 @@ class QPUTimeManager:
         self.ema_estimate_us: Optional[float] = None
         self.blocks_mined: int = 0
         self.blocks_skipped: int = 0
-        self.day_start_timestamp: float = self._calculate_day_start()
 
-    def _calculate_day_start(self, now: Optional[float] = None) -> float:
-        """Calculate Unix timestamp for start of current day (UTC midnight).
+        # Reservoir state.
+        self._pool_us: float = 0.0
+        self._burst_active: bool = False
+        self._last_accrual_s: float = time.time()
+        cap_s = config.budget_cap_seconds
+        if cap_s is None:
+            cap_s = max(config.daily_budget_seconds, config.min_block_budget_seconds)
+        self._pool_cap_us: float = cap_s * 1_000_000
+        self._accrual_rate_us_per_s: float = (
+            config.daily_budget_seconds * 1_000_000 / 86400.0
+        )
+
+        if config.min_block_budget_seconds > config.daily_budget_seconds > 0:
+            eta_days = config.min_block_budget_seconds / config.daily_budget_seconds
+            logger.warning(
+                "min_block_budget (%.0fs) exceeds daily_budget (%.0fs): the "
+                "reservoir fills only across ~%.1f days before the first burst.",
+                config.min_block_budget_seconds,
+                config.daily_budget_seconds,
+                eta_days,
+            )
+
+    def reset_clock(self, now: float) -> None:
+        """Test seam: pin the accrual clock to a fixed wall time."""
+        self._last_accrual_s = now
+
+    def _accrue(self, now: float) -> None:
+        """Add elapsed accrual to the pool and clamp to the cap.
 
         Args:
-            now: Optional Unix timestamp; uses current time if not provided
-
-        Returns:
-            Unix timestamp for UTC midnight of the current day
+            now: Wall-clock seconds; accrual since the last update is banked.
         """
-        now = now or time.time()
-        utc_dt = datetime.fromtimestamp(now, tz=timezone.utc)
-        day_start_dt = utc_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-        return day_start_dt.timestamp()
+        elapsed = now - self._last_accrual_s
+        if elapsed > 0:
+            self._pool_us = min(
+                self._pool_cap_us,
+                self._pool_us + self._accrual_rate_us_per_s * elapsed,
+            )
+            self._last_accrual_s = now
 
-    def _check_day_rollover(self, now: Optional[float] = None) -> bool:
-        """Reset counters if day has changed (UTC midnight rollover).
-
-        Args:
-            now: Optional Unix timestamp; uses current time if not provided
-
-        Returns:
-            True if reset occurred, False otherwise
-        """
-        now = now or time.time()
-        current_day_start = self._calculate_day_start(now)
-        if current_day_start > self.day_start_timestamp:
-            self.day_start_timestamp = current_day_start
-            self.cumulative_used_us = 0.0
-            self.blocks_mined = 0
-            self.blocks_skipped = 0
-            # Keep EMA estimate and block_times_us for estimation continuity
-            return True
-        return False
-
-    def record_block_time(self, qpu_access_time_us: float) -> None:
-        """Record QPU time used for a completed block.
+    def record_block_time(
+        self, qpu_access_time_us: float, now: Optional[float] = None,
+    ) -> None:
+        """Record QPU time used for a completed block and debit the pool.
 
         This should be called after each successful mining result is processed,
         passing the total QPU access time from the sampleset timing info.
@@ -164,7 +192,11 @@ class QPUTimeManager:
         Args:
             qpu_access_time_us: QPU access time in microseconds
                 (qpu_programming_time + qpu_sampling_time from D-Wave response)
+            now: Optional wall-clock timestamp for the accrual step; uses
+                current time if not provided (test seam).
         """
+        self._accrue(now if now is not None else time.time())
+        self._pool_us -= qpu_access_time_us
         self.block_times_us.append(qpu_access_time_us)
         self.cumulative_used_us += qpu_access_time_us
         self.blocks_mined += 1
@@ -201,69 +233,55 @@ class QPUTimeManager:
             # Fallback if EMA wasn't computed (shouldn't happen)
             return (sum(self.block_times_us) / len(self.block_times_us)) * 1.2
 
+    def _seconds_until_buffer(self) -> float:
+        """Seconds for the pool to accrue back up to the min-block buffer.
+
+        Caller-owned zero-guards (already-bursting / pool already at buffer)
+        live at the call sites; this is only the non-trivial accrual branch.
+        Assumes ``_accrue`` has already advanced ``_pool_us``.
+        """
+        deficit_us = max(
+            0.0, self.config.min_block_budget_seconds * 1_000_000 - self._pool_us
+        )
+        rate = self._accrual_rate_us_per_s
+        return deficit_us / rate if rate > 0 else float("inf")
+
     def should_mine_block(self, now: Optional[float] = None) -> QPUTimeEstimate:
-        """Determine if there's enough budget to mine the next block.
+        """Decide whether to mine, using start/continue reservoir hysteresis.
 
-        Uses proportional pacing: at any point in the day, usage cannot exceed
-        (elapsed_time / 24h) * daily_budget. This spreads QPU usage evenly
-        across the day instead of exhausting the budget early.
+        - **Idle** (no active burst): mine only once the pool has accrued to
+          ``min_block_budget`` (the buffer high-water mark).
+        - **Bursting**: keep mining while the pool is above 0 (low-water mark),
+          even below the buffer, so a started burst runs to completion.
 
-        If usage exceeds the current proportional limit, mining is paused until
-        the limit catches up (continuous pacing).
+        Draining to ``pool <= 0`` while bursting clears the burst flag, so the
+        next idle decision requires the full buffer again.
 
         Args:
-            now: Optional Unix timestamp; uses current time if not provided
+            now: Optional wall-clock timestamp; uses current time if not provided.
 
         Returns:
-            QPUTimeEstimate with decision and supporting metrics
+            QPUTimeEstimate with decision and supporting metrics.
         """
-        # Check for day rollover (resets counters at UTC midnight)
-        self._check_day_rollover(now)
-
-        now = now or time.time()
+        now = now if now is not None else time.time()
+        self._accrue(now)
         estimated_time = self.estimate_next_block_time()
         daily_budget_us = self.config.daily_budget_seconds * 1_000_000
+        buffer_us = self.config.min_block_budget_seconds * 1_000_000
+        pool_us = self._pool_us
 
-        # Calculate proportional limit based on time of day
-        elapsed_today = now - self.day_start_timestamp
-        elapsed_fraction = min(elapsed_today / 86400.0, 1.0)
-        proportional_limit_us = daily_budget_us * elapsed_fraction
+        if self._burst_active:
+            should_mine = pool_us > 0.0
+        else:
+            should_mine = pool_us >= buffer_us
+        self._burst_active = should_mine
 
-        # Budget remaining is based on proportional limit, not daily budget
-        budget_remaining = proportional_limit_us - self.cumulative_used_us
-
-        # Can mine if: cumulative + estimated <= proportional_limit
-        needed_us = self.cumulative_used_us + estimated_time
-        should_mine = needed_us <= proportional_limit_us
-
-        # Calculate when we can mine again (continuous pacing)
-        # Use last block time for headroom calculation to ensure we accumulate
-        # enough time for a similar block before trying again
         if should_mine:
             seconds_until_can_mine = 0.0
-            is_pacing_limited = False
         else:
-            # Use last block time for headroom, fallback to estimate if no blocks yet
-            headroom_needed = self.block_times_us[-1] if self.block_times_us else estimated_time
-            wait_for_us = self.cumulative_used_us + headroom_needed
+            seconds_until_can_mine = self._seconds_until_buffer()
+            self.blocks_skipped += 1
 
-            if wait_for_us <= daily_budget_us:
-                # Can mine today - calculate when proportional limit catches up
-                elapsed_needed = (wait_for_us * 86400.0) / daily_budget_us
-                can_mine_at = self.day_start_timestamp + elapsed_needed
-                seconds_until_can_mine = max(0.0, can_mine_at - now)
-            else:
-                # Need to wait past midnight - cumulative resets to 0
-                # Then wait for proportional_limit >= headroom_needed
-                next_day_start = self.day_start_timestamp + 86400.0
-                seconds_until_midnight = max(0.0, next_day_start - now)
-                # After midnight reset, need proportional_limit >= headroom_needed
-                elapsed_needed_tomorrow = (headroom_needed * 86400.0) / daily_budget_us
-                seconds_until_can_mine = seconds_until_midnight + elapsed_needed_tomorrow
-
-            is_pacing_limited = True
-
-        # Determine confidence based on sample count
         n = len(self.block_times_us)
         if n < self.config.min_blocks_for_estimation:
             confidence = "low"
@@ -272,46 +290,64 @@ class QPUTimeManager:
         else:
             confidence = "high"
 
-        if not should_mine:
-            self.blocks_skipped += 1
-
         return QPUTimeEstimate(
             estimated_block_time_us=estimated_time,
             cumulative_used_us=self.cumulative_used_us,
             daily_budget_us=daily_budget_us,
-            proportional_limit_us=proportional_limit_us,
-            budget_remaining_us=max(0, budget_remaining),
+            budget_remaining_us=pool_us,
+            pool_us=pool_us,
+            pool_cap_us=self._pool_cap_us,
+            burst_active=self._burst_active,
             should_mine=should_mine,
             confidence=confidence,
-            elapsed_fraction=elapsed_fraction,
             seconds_until_can_mine=seconds_until_can_mine,
-            is_pacing_limited=is_pacing_limited,
         )
 
-    def get_stats(self) -> Dict[str, Any]:
-        """Return current time management statistics.
+    def end_burst(self) -> None:
+        """Force re-accumulation: the next idle gate requires the full buffer.
+
+        Called by the in-loop stop gate when the pool drains to 0, so a brief
+        accrual back above 0 does not immediately restart a micro-burst.
+        """
+        self._burst_active = False
+
+    def get_stats(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """Return current reservoir statistics.
+
+        Args:
+            now: Optional wall-clock timestamp for the accrual step; uses
+                current time if not provided. All callers on a single manager
+                instance must share one clock domain (wall-clock) — the gates
+                and ``record_block_time`` advance the same ``_last_accrual_s``.
 
         Returns:
-            Dictionary with budget status, usage, and estimation metrics
+            Dictionary with pool balance, cap, buffer, burst state, and
+            estimation metrics. ``budget_remaining_seconds`` mirrors
+            ``pool_seconds`` (the in-loop drain-to-0 gate reads it).
         """
-        now = time.time()
-        daily_budget_us = self.config.daily_budget_seconds * 1_000_000
-
-        # Calculate proportional pacing info
-        elapsed_today = now - self.day_start_timestamp
-        elapsed_fraction = min(elapsed_today / 86400.0, 1.0)
-        proportional_limit_us = daily_budget_us * elapsed_fraction
-        budget_remaining = proportional_limit_us - self.cumulative_used_us
+        now = now if now is not None else time.time()
+        self._accrue(now)
+        pool_s = self._pool_us / 1_000_000
+        buffer_s = self.config.min_block_budget_seconds
+        if self._burst_active or self._pool_us >= buffer_s * 1_000_000:
+            seconds_until_buffer = 0.0
+        else:
+            seconds_until_buffer = self._seconds_until_buffer()
 
         return {
             "daily_budget_seconds": self.config.daily_budget_seconds,
+            "pool_seconds": pool_s,
+            "budget_remaining_seconds": pool_s,
+            "pool_cap_seconds": self._pool_cap_us / 1_000_000,
+            "min_block_budget_seconds": buffer_s,
+            "burst_active": self._burst_active,
+            "seconds_until_buffer": seconds_until_buffer,
             "cumulative_used_seconds": self.cumulative_used_us / 1_000_000,
-            "proportional_limit_seconds": proportional_limit_us / 1_000_000,
-            "budget_remaining_seconds": max(0, budget_remaining) / 1_000_000,
-            "elapsed_fraction": elapsed_fraction,
             "blocks_mined": self.blocks_mined,
             "blocks_skipped": self.blocks_skipped,
-            "ema_estimate_seconds": self.ema_estimate_us / 1_000_000 if self.ema_estimate_us else None,
+            "ema_estimate_seconds": (
+                self.ema_estimate_us / 1_000_000 if self.ema_estimate_us else None
+            ),
             "block_times_count": len(self.block_times_us),
             "avg_block_time_seconds": (
                 (sum(self.block_times_us) / len(self.block_times_us) / 1_000_000)
@@ -326,4 +362,6 @@ class QPUTimeManager:
         self.ema_estimate_us = None
         self.blocks_mined = 0
         self.blocks_skipped = 0
-        self.day_start_timestamp = self._calculate_day_start()
+        self._pool_us = 0.0
+        self._burst_active = False
+        self._last_accrual_s = time.time()

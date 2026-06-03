@@ -44,9 +44,11 @@ sys.stderr.reconfigure(line_buffering=True)
 import numpy as np
 
 from shared.block import create_genesis_block, BlockRequirements
+import hashlib
+
 from shared.quantum_proof_of_work import (
+    derive_nonce,
     generate_ising_model_from_nonce,
-    ising_nonce_from_block,
 )
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies import load_topology
@@ -147,12 +149,10 @@ def generate_nonce(seed: int, topology) -> Tuple[str, Dict]:
 
     prev_block = create_genesis_block()
     salt = random.randbytes(32)
-    nonce = ising_nonce_from_block(
-        prev_block.hash,
-        f"qpu-test-{seed}",
-        1,
-        salt
-    )
+    miner_bytes = hashlib.blake2b(
+        f"qpu-test-{seed}".encode(), digest_size=32,
+    ).digest()
+    nonce = derive_nonce(prev_block.hash, miner_bytes, salt)
 
     nodes = list(topology.nodes)
     edges = list(topology.edges)
@@ -221,7 +221,7 @@ def run_qpu_test(qpu_miner, h, J, nonce: int, num_reads: int,
     start_time = time.time()
 
     topology_label = qpu_miner.sampler.job_label
-    nonce_hex = hex(nonce)[2:][:8]
+    nonce_hex = nonce.hex()[:8]
     job_label = f"{topology_label}_{nonce_hex}"
 
     sampleset = qpu_miner.sampler.sample_ising(
@@ -372,7 +372,7 @@ def run_streaming(qpu_miner, nonces_and_models, num_reads_list,
 
     def submit_job(idx: int) -> PendingJob:
         seed, nonce, model, num_reads, annealing_time = work_items[idx]
-        nonce_hex = hex(nonce)[2:][:8]
+        nonce_hex = nonce.hex()[:8]
         job_label = f"{topology_label}_{nonce_hex}"
 
         future = qpu_miner.sampler.sample_ising_async(
@@ -697,7 +697,7 @@ def main():
     for seed in seeds:
         nonce, model = generate_nonce(seed, topology)
         nonces_and_models.append((seed, nonce, model))
-        nonce_hex = format(nonce, '064x')
+        nonce_hex = nonce.hex()
         print(f"  Seed {seed}: nonce={nonce_hex[:16]}...")
     print()
 

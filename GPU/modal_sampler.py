@@ -6,6 +6,7 @@ import collections.abc
 import dimod
 from dwave.system.testing import MockDWaveSampler
 from shared.quantum_proof_of_work import DEFAULT_TOPOLOGY
+from shared.stream_context import stream_from_feeder
 
 # Optional imports
 try:
@@ -196,3 +197,16 @@ class ModalSampler(MockDWaveSampler):
         
         # Create proper dimod.SampleSet
         return dimod.SampleSet.from_samples(sample_dicts, 'SPIN', energies)
+
+    def sample_ising_streaming(
+        self, feeder, *, num_reads, num_sweeps, **_ignored,
+    ):
+        """Stream samplesets from a feeder, one model at a time.
+
+        Thin generator for the unified driver path; delegates to the shared
+        ``stream_from_feeder`` helper. ``**_ignored`` absorbs any
+        sampler_kwargs a generic driver may pass.
+        """
+        yield from stream_from_feeder(
+            self, feeder, num_reads=num_reads, num_sweeps=num_sweeps,
+        )

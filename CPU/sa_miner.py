@@ -4,14 +4,11 @@ from __future__ import annotations
 import multiprocessing
 import multiprocessing.synchronize
 import signal
-import sys
 import traceback
-from typing import Dict, List, Optional, Tuple
-
-import dimod
+from typing import List, Tuple
 
 from shared.base_miner import BaseMiner
-from shared.block_requirements import BlockRequirements
+from shared.miner_types import BlockRequirements
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
 
 
@@ -25,12 +22,15 @@ class SimulatedAnnealingMiner(BaseMiner):
     ADAPT_READS_SOLUTION_MAX_FACTOR = 8
     ADAPT_READS_SOLUTION_FLOOR_FACTOR = 0
 
+    STREAM_FACTORY_DOTTED = "CPU.sa_stream:build_persistent_context"
+
     def __init__(self, miner_id: str, sampler=None, topology=None, **cfg):
         if sampler is None:
             sampler = SimulatedAnnealingStructuredSampler(topology=topology)
         self.nodes = sampler.nodes
         self.edges = sampler.edges
         super().__init__(miner_id, sampler)
+        self.topology = topology
         self.miner_type = "CPU"
 
         # Register SIGTERM handler for graceful cleanup
@@ -55,8 +55,9 @@ class SimulatedAnnealingMiner(BaseMiner):
             if hasattr(self, 'logger'):
                 self.logger.error(f"Error during CPU miner cleanup: {e}")
 
-        # Exit gracefully
-        sys.exit(0)
+        # Exit gracefully — guard against raising SystemExit during
+        # interpreter finalization (would produce "Exception ignored" noise).
+        self._graceful_exit()
 
     def _adapt_mining_params(
         self,
@@ -72,18 +73,17 @@ class SimulatedAnnealingMiner(BaseMiner):
             num_edges=len(edges),
         )
 
-    def _sample(
-        self,
-        h: Dict[int, float],
-        J: Dict[Tuple[int, int], float],
-        *,
-        num_reads: int,
-        num_sweeps: int,
-        **kwargs,
-    ) -> dimod.SampleSet:
-        return self.sampler.sample_ising(
-            h=h, J=J, num_reads=num_reads, num_sweeps=num_sweeps,
-        )
+    def _stream_factory_kwargs(self, sample_ctx, nodes):
+        """Kwargs forwarded to CPU.sa_stream:build_persistent_context."""
+        return {
+            "miner_id": self.miner_id,
+            "nodes": nodes,
+            "edges": sample_ctx["edges"],
+            "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
+            "num_reads": sample_ctx["num_reads"],
+            "num_sweeps": sample_ctx["num_sweeps"],
+            "topology": getattr(self, "topology", None),
+        }
 
     def _on_sampling_error(
         self,

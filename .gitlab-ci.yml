@@ -7,8 +7,8 @@ stages:
   - release
 
 variables:
-  CPU_IMAGE: quip-network-node-cpu
-  CUDA_IMAGE: quip-network-node-cuda
+  CPU_IMAGE: quip-miner-cpu
+  CUDA_IMAGE: quip-miner-cuda
 
 # ---------------------------------------------------------------------------
 # Tests (branches only — main/tags skip straight to build)
@@ -18,11 +18,28 @@ test:
   stage: test
   image: python:3.12-slim
   tags: [linux, amd64]
+  # Backstop only — must exceed (pip install + the inner 300s pytest
+  # timeout) so the SIGABRT dump below fires first instead of a silent
+  # job-level SIGTERM.
+  timeout: 15m
   before_script:
     - pip install -U pip setuptools wheel
     - pip install -e ".[dev]"
   script:
-    - python -m pytest tests/ -v --ignore=tests/test_certificate_manager.py
+    # Fast guard: the unified streaming stack has no inline path. Fail early
+    # if the deleted _sample/_sample_batch/STREAMING_PUMP/DRIVER_OWNS_FEEDER
+    # symbols reappear (also covered by pytest, but cheaper as a standalone).
+    - python tools/lint_no_inline_sampling.py
+    # Wrap pytest so a hang (e.g. a lingering non-daemon thread blocking
+    # interpreter shutdown) produces a full all-thread stack dump rather
+    # than a silent timeout. The suite is ~100s locally but 3-4x slower on
+    # this shared runner — it's dominated by mp.Process(spawn) tests that
+    # re-import the full dwave/scipy stack per child — so the budget is 300s
+    # to leave headroom above the real run while still catching a genuine
+    # post-summary shutdown hang. SIGABRT triggers faulthandler's all-thread
+    # dump; the 30s --kill-after guarantees the job still exits if the dump
+    # itself stalls.
+    - timeout --signal=ABRT --kill-after=30 300 python -X faulthandler -m pytest tests/ -v
   rules:
     - if: $CI_COMMIT_TAG
       when: never
@@ -54,6 +71,40 @@ check-version:
 # Docker image builds (Kaniko — no daemon required)
 # ---------------------------------------------------------------------------
 
+# Shared trigger rules + per-branch mutable tags. Referenced from every
+# image-build job so the Docker pipelines move in lockstep. MUTABLE_TAGS is
+# a space-separated list; each entry becomes an additional registry tag:
+#   main                  -> :latest                (stable)
+#   v0.2                  -> :v0.2                   (rolling branch pointer)
+#   git tag v0.2.0rc7     -> :v0.2 :v0.2.0rc7        (pre-release: rolls the
+#                                        :v0.2 pointer and pins the immutable
+#                                        :<tag>. Must NOT move :latest, which
+#                                        the production node manager tracks)
+#   git tag v0.2.0        -> :latest :v0.2 :v0.2.0   (stable release: also
+#                                        advances :latest and rolls :v0.2)
+# The immutable :CI_COMMIT_SHA tag is pushed unconditionally so downstream
+# can pin to a specific build regardless of branch.
+.shared_image_rules:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      variables:
+        MUTABLE_TAGS: latest
+    - if: $CI_COMMIT_BRANCH == "v0.2"
+      variables:
+        MUTABLE_TAGS: v0.2
+    # Pre-release tag (rc/alpha/beta): roll :v0.2 + pin :<tag>, never :latest.
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(rc|alpha|beta)[0-9]*$/
+      variables:
+        MUTABLE_TAGS: "v0.2 $CI_COMMIT_TAG"
+    # Stable release tag (vX.Y.Z): advance :latest, roll :v0.2, pin :<tag>.
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
+      variables:
+        MUTABLE_TAGS: "latest v0.2 $CI_COMMIT_TAG"
+    # Any other tag: legacy fallback to :latest.
+    - if: $CI_COMMIT_TAG
+      variables:
+        MUTABLE_TAGS: latest
+
 .docker_build:
   stage: build
   image:
@@ -62,9 +113,7 @@ check-version:
   before_script:
     - mkdir -p /kaniko/.docker
     - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(echo -n ${CI_REGISTRY_USER}:${CI_REGISTRY_PASSWORD} | base64)\"}}}" > /kaniko/.docker/config.json
-  rules:
-    - if: $CI_COMMIT_BRANCH == "main"
-    - if: $CI_COMMIT_TAG
+  rules: !reference [.shared_image_rules, rules]
 
 # CPU image — built per-arch then stitched into a multi-arch manifest.
 # amd64 stays on a linux/amd64 runner via Kaniko (daemonless).
@@ -87,9 +136,7 @@ build-cpu-amd64:
 build-cpu-arm64:
   stage: build
   tags: [macos, arm64]
-  rules:
-    - if: $CI_COMMIT_BRANCH == "main"
-    - if: $CI_COMMIT_TAG
+  rules: !reference [.shared_image_rules, rules]
   before_script:
     # Isolated buildx builder per project. Create-if-missing is
     # idempotent across job retries. docker-container driver is
@@ -118,37 +165,35 @@ manifest-cpu:
   needs:
     - build-cpu-amd64
     - build-cpu-arm64
-  rules:
-    - if: $CI_COMMIT_BRANCH == "main"
-    - if: $CI_COMMIT_TAG
+  rules: !reference [.shared_image_rules, rules]
   script:
-    - >
-      manifest-tool
-      --username "$CI_REGISTRY_USER"
-      --password "$CI_REGISTRY_PASSWORD"
-      push from-args
-      --platforms linux/amd64,linux/arm64
-      --template "$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA-ARCH"
-      --target "$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA"
-    - >
-      manifest-tool
-      --username "$CI_REGISTRY_USER"
-      --password "$CI_REGISTRY_PASSWORD"
-      push from-args
-      --platforms linux/amd64,linux/arm64
-      --template "$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA-ARCH"
-      --target "$CI_REGISTRY_IMAGE/$CPU_IMAGE:latest"
+    # Immutable SHA target, then one mutable target per MUTABLE_TAGS entry.
+    - |
+      for target in "$CI_COMMIT_SHA" $MUTABLE_TAGS; do
+        manifest-tool \
+          --username "$CI_REGISTRY_USER" \
+          --password "$CI_REGISTRY_PASSWORD" \
+          push from-args \
+          --platforms linux/amd64,linux/arm64 \
+          --template "$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA-ARCH" \
+          --target "$CI_REGISTRY_IMAGE/$CPU_IMAGE:$target"
+      done
 
 build-cuda:
   extends: .docker_build
   tags: [linux, amd64]
   script:
-    - /kaniko/executor
-        --context $CI_PROJECT_DIR
-        --dockerfile docker/Dockerfile.cuda
-        --build-arg QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA
-        --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA
-        --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:latest
+    # Immutable SHA destination, then one --destination per MUTABLE_TAGS entry.
+    - |
+      DESTINATIONS="--destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA"
+      for tag in $MUTABLE_TAGS; do
+        DESTINATIONS="$DESTINATIONS --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$tag"
+      done
+      /kaniko/executor \
+        --context $CI_PROJECT_DIR \
+        --dockerfile docker/Dockerfile.cuda \
+        --build-arg QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA \
+        $DESTINATIONS
 
 # ---------------------------------------------------------------------------
 # PyInstaller native binaries
@@ -162,7 +207,7 @@ build-cuda:
     - bash pyinstaller/build.sh
   artifacts:
     paths:
-      - dist/quip-network-node-*
+      - dist/quip-miner-*
     expire_in: 30 days
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
@@ -179,17 +224,6 @@ package-macos-arm64:
     - pip install pyinstaller
     - pip install -e ".[metal]"
 
-package-macos-x86_64:
-  extends: .pyinstaller_build
-  tags: [macos, x86_64]
-  before_script:
-    - rm -rf .venv-x86_64
-    - arch -x86_64 /usr/local/bin/python3.13 -m venv .venv-x86_64
-    - source .venv-x86_64/bin/activate
-    - pip install -U pip setuptools wheel
-    - pip install pyinstaller
-    - pip install -e .
-
 # ---------------------------------------------------------------------------
 # Release (tags only)
 # ---------------------------------------------------------------------------
@@ -200,7 +234,6 @@ release-binaries:
   tags: [linux, amd64]
   needs:
     - package-macos-arm64
-    - package-macos-x86_64
   rules:
     - if: $CI_COMMIT_TAG
   script:
@@ -210,9 +243,6 @@ release-binaries:
     description: "Release $CI_COMMIT_TAG"
     assets:
       links:
-        - name: quip-network-node-macos-arm64
-          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-macos-arm64?job=package-macos-arm64"
-          filepath: /quip-network-node-macos-arm64
-        - name: quip-network-node-macos-x86_64
-          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-network-node-macos-x86_64?job=package-macos-x86_64"
-          filepath: /quip-network-node-macos-x86_64
+        - name: quip-miner-macos-arm64
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/dist/quip-miner-macos-arm64?job=package-macos-arm64"
+          filepath: /quip-miner-macos-arm64

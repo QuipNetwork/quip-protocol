@@ -3,10 +3,10 @@
 
 """Unified GPU miner base class for CUDA SA and Gibbs kernels.
 
-Owns the shared pipeline infrastructure: IsingFeeder for
-background model generation, KernelScheduler for SM budget,
-SIGTERM cleanup, sparse topology filtering, and the streaming
-mining loop via sample_ising_streaming().
+Owns the per-backend setup harvested by the CUDA stream-driver factory:
+the sampler and KernelScheduler (SM budget), plus SIGTERM cleanup, sparse
+topology filtering, and adaptive parameter calculation. The streaming
+pipeline itself runs in the driver process (GPU/cuda_stream.py).
 
 Subclasses create the appropriate sampler and pass it here.
 """
@@ -14,17 +14,14 @@ from __future__ import annotations
 
 import os
 import signal
-import sys
 import threading
-import time
 from typing import (
-    Dict, Iterator, List, Optional, Tuple,
+    List, Tuple,
 )
 
 import dimod
 from shared.base_miner import BaseMiner
-from shared.block_requirements import BlockRequirements
-from shared.ising_feeder import IsingFeeder
+from shared.miner_types import BlockRequirements
 from GPU.gpu_scheduler import (
     KernelScheduler,
     configure_mps_thread_limit,
@@ -36,27 +33,22 @@ except ImportError:
     cp = None
 
 
-# ----------------------------------------------------------
-# Pipeline constants
-# ----------------------------------------------------------
-
-# Empirical: on the Advantage topology (4580 nodes, 32k edges),
-# SA takes ~30ms per sweep×read at num_reads=64.  Use a 5×
-# safety margin to cover cold start, high reads, and contention.
-_SEC_PER_SWEEP = 0.03
-_STALL_SAFETY_FACTOR = 5.0
-
-
 class GPUMiner(BaseMiner):
-    """Shared pipeline base for CUDA GPU miners.
+    """Shared base for CUDA GPU miners.
 
-    Provides IsingFeeder, KernelScheduler, SIGTERM cleanup,
-    the streaming mining loop, sparse topology filtering, and
-    adaptive parameter calculation.
+    Provides the sampler + KernelScheduler the stream-driver factory
+    harvests, SIGTERM cleanup, sparse topology filtering, and adaptive
+    parameter calculation. The streaming loop runs in the driver process.
 
     Subclasses create a sampler (CudaSASampler or
     CudaGibbsSampler) and pass it to __init__.
     """
+
+    # Keep the feeder roughly 2x the per-iteration nonce batch. Old code
+    # sized it as ``num_k * 2`` from the live SM budget; 16 covers the
+    # common case (4–8 in-flight kernels on a typical GPU) without
+    # over-spawning Python workers.
+    FEEDER_BUFFER_SIZE = 16
 
     def __init__(
         self,
@@ -98,16 +90,16 @@ class GPUMiner(BaseMiner):
         ).attributes['MultiProcessorCount']
         self._device_sms = device_sms
 
+        # KernelScheduler is harvested by the CUDA stream-driver factory
+        # (GPU/cuda_stream.py:build_persistent_context) to size num_kernels and
+        # honor should_throttle in the producer process. The worker keeps no
+        # feeder/stream — the driver owns the streaming pipeline.
         self._scheduler = KernelScheduler(
             device_id=int(device),
             device_sms=device_sms,
             gpu_utilization_pct=gpu_utilization,
             yielding=yielding,
         )
-
-        # Pipeline state (reset per mine_block call)
-        self._feeder: Optional[IsingFeeder] = None
-        self._stream: Optional[Iterator] = None
 
         if threading.current_thread() is threading.main_thread():
             signal.signal(
@@ -143,12 +135,12 @@ class GPUMiner(BaseMiner):
     # ----------------------------------------------------------
 
     def _pre_mine_setup(self, *args, **kwargs) -> bool:
-        """Create IsingFeeder, then activate CUDA device.
+        """Validate the work context and activate the CUDA device.
 
-        Order matters: IsingFeeder spawns worker processes
-        via 'spawn' context. Creating it BEFORE CUDA
-        activation ensures workers start from a clean
-        state with no inherited GPU driver handles.
+        The sampler + feeder + scheduler live in the stream-driver process
+        (GPU/cuda_stream.py); this hook only validates ``prev_block`` /
+        ``node_info`` early — the controller treats ``False`` as "skip this
+        attempt" — and re-activates the device context.
         """
         # Extract block context from BaseMiner's positional
         # args — no CUDA needed for this.
@@ -160,45 +152,13 @@ class GPUMiner(BaseMiner):
             )
             return False
 
-        cur_index = prev_block.header.index + 1
-
-        # get_sm_budget() uses cached _device_sms — no
-        # CUDA call needed.
-        budget = self._scheduler.get_sm_budget()
-        num_k = max(
-            1, budget // self.sampler._sms_per_nonce,
-        )
-
-        # Adaptive nonce tracking for yielding mode
-        self._max_nonces = num_k
-        self._active_nonces = num_k
-
-        # Create feeder BEFORE CUDA activation so spawn
-        # workers don't inherit GPU context.
-        feeder_seed = kwargs.pop('feeder_seed', None)
-        self._feeder = IsingFeeder(
-            prev_hash=prev_block.hash,
-            miner_id=node_info.miner_id,
-            cur_index=cur_index,
-            nodes=self.sampler.nodes,
-            edges=self.sampler.edges,
-            buffer_size=num_k * 2,
-            seed=feeder_seed,
-        )
-
-        # Now activate CUDA — safe because feeder workers
-        # are already forked from clean state.
         try:
             cp.cuda.Device(int(self.device)).use()
         except Exception as e:
             self.logger.error(
                 f"Failed to set device context: {e}",
             )
-            self._feeder.stop()
-            self._feeder = None
             return False
-
-        self._stream = None
 
         return True
 
@@ -217,105 +177,6 @@ class GPUMiner(BaseMiner):
             num_edges=len(edges),
         )
 
-    def _sample_batch(
-        self,
-        prev_hash: bytes,
-        miner_id: str,
-        cur_index: int,
-        nodes: List[int],
-        edges: List[Tuple[int, int]],
-        *,
-        num_reads: int,
-        num_sweeps: int,
-        **kwargs,
-    ) -> Optional[
-        List[Tuple[int, bytes, dimod.SampleSet]]
-    ]:
-        """Stream one result from the GPU pipeline.
-
-        Lazily creates the streaming iterator on first call.
-        Returns one (nonce, salt, sampleset) per call.
-        """
-        if self._scheduler.should_throttle():
-            time.sleep(0.5)
-
-        # Adaptive nonce scaling (yielding mode only)
-        if (
-            self._scheduler.yielding
-            and self._stream is not None
-        ):
-            new_target = self._scheduler.check_stable_target(
-                self._max_nonces, self._active_nonces,
-            )
-            if (
-                new_target is not None
-                and new_target != self._active_nonces
-            ):
-                self.logger.info(
-                    "Adaptive nonce scaling: %d → %d",
-                    self._active_nonces, new_target,
-                )
-                self._stream.close()
-                self._stream = None
-                self._active_nonces = new_target
-
-        if self._stream is None:
-            extra = {
-                k: v for k, v in kwargs.items()
-                if k not in ('num_reads', 'num_sweeps')
-            }
-            num_k = self._active_nonces
-            # Timeout = expected time for one nonce to
-            # complete, with safety margin. Capped at 30min
-            # to account for slow cards.
-            stall_timeout = max(
-                num_sweeps * _SEC_PER_SWEEP
-                * _STALL_SAFETY_FACTOR,
-                1800.0,
-            )
-            self._stream = (
-                self.sampler.sample_ising_streaming(
-                    self._feeder,
-                    num_reads=num_reads,
-                    num_sweeps=num_sweeps,
-                    num_kernels=num_k,
-                    poll_timeout=stall_timeout,
-                    **extra,
-                )
-            )
-
-        try:
-            model, ss = next(self._stream)
-        except TimeoutError as e:
-            self.logger.warning(f"Pipeline stall: {e}")
-            return None
-        except StopIteration:
-            return None
-
-        return [(model.nonce, model.salt, ss)]
-
-    def _sample(
-        self,
-        h: Dict[int, float],
-        J: Dict[Tuple[int, int], float],
-        *,
-        num_reads: int,
-        num_sweeps: int,
-        **kwargs,
-    ) -> dimod.SampleSet:
-        """Single-nonce fallback (synchronous)."""
-        extra = {
-            k: v for k, v in kwargs.items()
-            if k not in ('num_reads', 'num_sweeps')
-        }
-        results = self.sampler.sample_ising(
-            [h], [J],
-            num_reads=num_reads,
-            num_sweeps=num_sweeps,
-            **extra,
-        )
-        return results[0]
-
     def _post_sample(
         self, sampleset: dimod.SampleSet,
     ) -> dimod.SampleSet:
@@ -323,21 +184,11 @@ class GPUMiner(BaseMiner):
         return sampleset
 
     def _post_mine_cleanup(self) -> None:
-        """Stop stream, sync GPU, kill feeder, free buffers.
+        """Sync the GPU compute stream and free sampler buffers.
 
-        Ordering:
-        1. Close stream — signals kernel to exit
-        2. Sync GPU compute stream — kernel must stop
-           before feeder data it reads is freed
-        3. Stop feeder — kills worker processes
-        4. Close sampler — frees GPU buffers
+        The feeder + streaming pipeline live in the driver process; the worker
+        only syncs any in-flight kernel and closes its sampler.
         """
-        if self._stream is not None:
-            self._stream.close()
-            self._stream = None
-
-        # Sync GPU before killing feeder — kernel must be
-        # stopped before feeder data is freed.
         if (
             hasattr(self, 'sampler')
             and self.sampler is not None
@@ -345,21 +196,11 @@ class GPUMiner(BaseMiner):
         ):
             self.sampler._sf_stream_compute.synchronize()
 
-        if self._feeder is not None:
-            self._feeder.stop()
-            self._feeder = None
-
         if hasattr(self, 'sampler') and self.sampler is not None:
             self.sampler.close()
 
     def _cleanup_handler(self, signum, frame):
-        """Handle SIGTERM: stop feeder, signal kernel, exit."""
-        # Stop the IsingFeeder first — its ProcessPoolExecutor
-        # workers will block atexit if not shut down.
-        if self._feeder is not None:
-            self._feeder.stop()
-            self._feeder = None
-
+        """Handle SIGTERM: stop scheduler, signal kernel, exit."""
         if hasattr(self, '_scheduler'):
             self._scheduler.stop()
 

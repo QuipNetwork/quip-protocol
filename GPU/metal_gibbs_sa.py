@@ -21,14 +21,37 @@ import logging
 import os
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import dimod
-import Metal
 import numpy as np
 
-from GPU.metal_scheduler import DutyCycleController
-from GPU.metal_utils import _create_buffer, build_csr_from_ising, compute_beta_schedule, unpack_metal_results
+try:
+    import Metal
+    import objc  # pyobjc — autorelease pool for per-batch Metal objects
+except ImportError:  # Apple Metal framework is macOS-only; absent on Linux/CI.
+    Metal = None  # type: ignore[assignment]
+    objc = None  # type: ignore[assignment]
+
+from GPU.metal_sa import (
+    apply_qos_utility,
+    _resolve_budget,
+    reads_per_buffer_for_budget,
+)
+from GPU.metal_scheduler import DutyCycleController, MetalScheduler
+from GPU.metal_utils import (
+    build_csr_from_ising,
+    compute_beta_schedule,
+    pooled_buffer,
+    pooled_input,
+    unpack_metal_results,
+)
+from shared.ising_model import IsingModel
+
+# Streaming PAUSE poll interval (seconds): how long to idle before re-reading
+# the occupancy budget when throttled to a full stop (battery / critical
+# thermal).
+_PAUSE_POLL_S = 0.5
 
 
 def zephyr_four_color_linear(linear_idx: int, m: int = 9, t: int = 2) -> int:
@@ -207,7 +230,52 @@ class MetalGibbsSampler:
 
         self._command_queue = self.device.newCommandQueue()
 
+        # Per-role MTLBuffer pool (grow-on-demand, reused across batches) — see
+        # MetalSASampler for rationale. Recreating the ~13 per-batch buffers
+        # every call leaks under a long stream; reusing one per role keeps the
+        # footprint bounded and constant.
+        self._buf_pool: Dict[str, Any] = {}
+
+    def _pooled_buffer(self, role: str, nbytes: int):
+        """Reused shared MTLBuffer of at least ``nbytes`` for ``role`` (see
+        ``metal_utils.pooled_buffer``)."""
+        return pooled_buffer(self.device, self._buf_pool, role, nbytes)
+
+    def _pooled_input(self, role: str, data: np.ndarray):
+        """Pooled buffer for ``role`` filled with ``data`` (see
+        ``metal_utils.pooled_input``)."""
+        return pooled_input(self.device, self._buf_pool, role, data)
+
     def sample_ising(
+        self,
+        h: List[Dict[int, float]],
+        J: List[Dict[Tuple[int, int], float]],
+        num_reads: int = 200,
+        num_sweeps: int = 1000,
+        num_sweeps_per_beta: int = 1,
+        beta_range: Optional[Tuple[float, float]] = None,
+        beta_schedule_type: str = "geometric",
+        beta_schedule: Optional[np.ndarray] = None,
+        seed: Optional[int] = None,
+        **kwargs
+    ) -> List[dimod.SampleSet]:
+        """Block-Gibbs sample one batch inside an ObjC autorelease pool.
+
+        The per-batch Metal command buffer retains the GPU buffers it
+        references and is autoreleased; without a pool drain in a streaming
+        loop they accumulate until the process OOMs. Draining a pool per batch
+        frees them immediately — safe because ``unpack_metal_results`` copies
+        all results out before the pool drains.
+        """
+        with objc.autorelease_pool():
+            return self._sample_ising_impl(
+                h, J, num_reads=num_reads, num_sweeps=num_sweeps,
+                num_sweeps_per_beta=num_sweeps_per_beta, beta_range=beta_range,
+                beta_schedule_type=beta_schedule_type,
+                beta_schedule=beta_schedule, seed=seed, **kwargs,
+            )
+
+    def _sample_ising_impl(
         self,
         h: List[Dict[int, float]],
         J: List[Dict[Tuple[int, int], float]],
@@ -294,13 +362,13 @@ class MetalGibbsSampler:
             seed = np.random.randint(0, 2**31)
 
         # Create Metal buffers
-        csr_row_ptr_buf = _create_buffer(self.device, all_csr_row_ptr, "csr_row_ptr")
-        csr_col_ind_buf = _create_buffer(self.device, all_csr_col_ind, "csr_col_ind")
-        csr_J_vals_buf = _create_buffer(self.device, all_csr_J_vals, "csr_J_vals")
-        row_ptr_offsets_buf = _create_buffer(self.device, row_ptr_offsets, "row_ptr_offsets")
-        col_ind_offsets_buf = _create_buffer(self.device, col_ind_offsets, "col_ind_offsets")
-        csr_h_vals_buf = _create_buffer(self.device, all_h_vals, "csr_h_vals")
-        beta_schedule_buf = _create_buffer(self.device, beta_schedule, "beta_schedule")
+        csr_row_ptr_buf = self._pooled_input("csr_row_ptr", all_csr_row_ptr)
+        csr_col_ind_buf = self._pooled_input("csr_col_ind", all_csr_col_ind)
+        csr_J_vals_buf = self._pooled_input("csr_J_vals", all_csr_J_vals)
+        row_ptr_offsets_buf = self._pooled_input("row_ptr_offsets", row_ptr_offsets)
+        col_ind_offsets_buf = self._pooled_input("col_ind_offsets", col_ind_offsets)
+        csr_h_vals_buf = self._pooled_input("csr_h_vals", all_h_vals)
+        beta_schedule_buf = self._pooled_input("beta_schedule", beta_schedule)
 
         # Color block buffers
         # Remap color_node_indices from topology node IDs to dense CSR indices.
@@ -312,9 +380,9 @@ class MetalGibbsSampler:
             [node_to_idx[n] for n in self.color_node_indices],
             dtype=np.int32
         )
-        color_block_starts_buf = _create_buffer(self.device, self.block_starts, "color_block_starts")
-        color_block_counts_buf = _create_buffer(self.device, self.block_counts, "color_block_counts")
-        color_node_indices_buf = _create_buffer(self.device, csr_color_node_indices, "color_node_indices")
+        color_block_starts_buf = self._pooled_input("color_block_starts", self.block_starts)
+        color_block_counts_buf = self._pooled_input("color_block_counts", self.block_counts)
+        color_node_indices_buf = self._pooled_input("color_node_indices", csr_color_node_indices)
 
         # Scalar parameters
         N_bytes = np.int32(N).tobytes()
@@ -330,15 +398,13 @@ class MetalGibbsSampler:
         num_problems_bytes = np.int32(num_problems).tobytes()
         num_reads_bytes = np.int32(num_reads).tobytes()
 
-        # Output buffers
+        # Output buffers (pooled — reused across batches, kernel overwrites).
         packed_size = (N + 7) // 8
 
-        final_samples_buf = self.device.newBufferWithLength_options_(
-            num_threads * packed_size, Metal.MTLResourceStorageModeShared
-        )
-        final_energies_buf = self.device.newBufferWithLength_options_(
-            num_threads * 4, Metal.MTLResourceStorageModeShared
-        )
+        final_samples_buf = self._pooled_buffer(
+            "final_samples", num_threads * packed_size)
+        final_energies_buf = self._pooled_buffer(
+            "final_energies", num_threads * 4)
 
         # Execute kernel
         _duty_cycle: Optional[DutyCycleController] = kwargs.get(
@@ -463,3 +529,137 @@ class MetalGibbsSampler:
             samplesets.append(sampleset)
 
         return samplesets
+
+    def sample_ising_streaming(
+        self,
+        models: Iterable[IsingModel],
+        *,
+        num_reads: int,
+        num_sweeps: int,
+        max_threadgroups: int,
+        num_sweeps_per_beta: int = 1,
+        beta_range: Optional[Tuple[float, float]] = None,
+        beta_schedule_type: str = "geometric",
+        seed: Optional[int] = None,
+        scheduler: Optional["MetalScheduler"] = None,
+        stop_event=None,
+        **kwargs,
+    ) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
+        """Stream batched Gibbs results from a feeder of ``IsingModel``s.
+
+        Mirrors ``MetalSASampler.sample_ising_streaming`` and honours the same
+        occupancy budget (max concurrent GPU threads per command buffer) from
+        ``scheduler.get_thread_budget()``, re-read **before** each batch:
+
+        - ``0`` → PAUSE: idle ``_PAUSE_POLL_S`` and re-check without pulling
+          models. Stop-aware so teardown never blocks.
+        - ``UNCAPPED`` → one full-batch dispatch (idle/headless throughput).
+        - else → keep the full problem batch and split the reads across
+          dispatches so ``problems x reads <= budget`` (each read-buffer an
+          independent Gibbs run with a distinct seed, concatenated). Total reads
+          preserved.
+
+        Args:
+            models: Iterable of ``IsingModel`` (typically a ``RandomIsingFeeder``).
+            num_reads: Independent Gibbs runs per problem.
+            num_sweeps: Total sweeps per run.
+            max_threadgroups: Max problems per batch dispatch.
+            num_sweeps_per_beta: Sweeps per beta value.
+            beta_range: Temperature range or None for auto.
+            beta_schedule_type: "linear", "geometric", or "custom".
+            seed: Base RNG seed (incremented per batch).
+            scheduler: Optional ``MetalScheduler`` — the per-batch occupancy
+                budget source. None ⇒ uncapped (full speed).
+            stop_event: Optional ``mp.Event`` — checked during PAUSE so a full
+                stop never blocks teardown.
+
+        Yields:
+            ``(IsingModel, dimod.SampleSet)`` for each completed problem.
+        """
+        # CPU-side politeness: lower this (producer) thread's QoS so we yield
+        # P-cores to the foreground UI. Matches the SA streaming path.
+        apply_qos_utility()
+
+        model_iter = iter(models)
+        batch_seed = (
+            seed if seed is not None else int(np.random.randint(0, 2**31))
+        )
+
+        while True:
+            budget = _resolve_budget(scheduler)
+            # PAUSE: idle and re-check without consuming the feeder.
+            while budget == 0:
+                if stop_event is not None and stop_event.is_set():
+                    return
+                time.sleep(_PAUSE_POLL_S)
+                budget = _resolve_budget(scheduler)
+
+            # Full problem batch (occupancy is bounded by splitting reads).
+            batch_models: List[IsingModel] = []
+            while len(batch_models) < max_threadgroups:
+                try:
+                    batch_models.append(next(model_iter))
+                except StopIteration:
+                    break
+            if not batch_models:
+                return
+
+            samplesets = self._sample_read_split(
+                batch_models,
+                num_reads=num_reads,
+                reads_per_buffer=reads_per_buffer_for_budget(
+                    budget, len(batch_models), num_reads,
+                ),
+                num_sweeps=num_sweeps,
+                num_sweeps_per_beta=num_sweeps_per_beta,
+                beta_range=beta_range,
+                beta_schedule_type=beta_schedule_type,
+                seed=batch_seed,
+            )
+            batch_seed = (batch_seed + 1) & 0x7FFFFFFF
+
+            for model, ss in zip(batch_models, samplesets):
+                yield (model, ss)
+
+    def _sample_read_split(
+        self,
+        models: List[IsingModel],
+        *,
+        num_reads: int,
+        reads_per_buffer: int,
+        num_sweeps: int,
+        num_sweeps_per_beta: int,
+        beta_range: Optional[Tuple[float, float]],
+        beta_schedule_type: str,
+        seed: int,
+    ) -> List[dimod.SampleSet]:
+        """Dispatch ``num_reads`` in command buffers of ``reads_per_buffer``.
+
+        Caps occupancy (``problems x reads`` per buffer) while preserving the
+        full read count. ``reads_per_buffer >= num_reads`` is a single
+        dispatch; otherwise each read-buffer is an independent Gibbs run with a
+        distinct seed and the per-problem samplesets are concatenated.
+        """
+        h = [m.h for m in models]
+        j = [m.J for m in models]
+        common = dict(
+            num_sweeps=num_sweeps, num_sweeps_per_beta=num_sweeps_per_beta,
+            beta_range=beta_range, beta_schedule_type=beta_schedule_type,
+        )
+        if reads_per_buffer >= num_reads:
+            return self.sample_ising(h=h, J=j, num_reads=num_reads,
+                                     seed=seed, **common)
+
+        parts: List[List[dimod.SampleSet]] = [[] for _ in models]
+        done = 0
+        buf_idx = 0
+        while done < num_reads:
+            rc = min(reads_per_buffer, num_reads - done)
+            buf_seed = (seed + buf_idx * 0x9E3779B1) & 0x7FFFFFFF
+            ss_list = self.sample_ising(h=h, J=j, num_reads=rc,
+                                        seed=buf_seed, **common)
+            for prob_idx, ss in enumerate(ss_list):
+                parts[prob_idx].append(ss)
+            done += rc
+            buf_idx += 1
+        return [dimod.concatenate(p) for p in parts]

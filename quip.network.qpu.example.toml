@@ -1,71 +1,99 @@
-[global]
-node_name = "Quantum Node Name"  # Optional human-readable name for your node.
+# quip-miner qpu — v0.2 example config
+#
+#   quip-miner qpu --config ./quip.network.qpu.example.toml
+#
+# Quantum-annealer / gate-model providers. Credentials come from
+# environment variables (e.g. DWAVE_API_KEY) — never store them in
+# this file. Passing `--qpu-type` or `--daily-budget` on the command
+# line when any vendor section below is set raises `config-conflict`;
+# pick one source for the inventory.
 
-# Local binding address (ip address) and port to listen to.
-listen = "0.0.0.0"
-port = 20049 # ("QN" -> little endian unsigned int is 0x514E -> 0x4E51 = 20049)
+[miner]
+validators = [
+    "ws://quip-validator:9944",
+]
+signer_key = "~/.quip-miner/signing.json"
+# faucet_url = "http://localhost:8087"
 
-#public_host = "my.dns.or.ip:public_port"
+# Optional telemetry REST API. Off by default (rest_port=-1).
+# rest_port = 8086
+# rest_host = "127.0.0.1"
 
-# Optional deterministic key generation
-# Defaults to generate a brand new key on boot.
-secret = "your-secret-here" # Used to generate a deterministic key pair for this node
+# ── Proof submission ──────────────────────────────────────────────────
+# Tuning for the submit_proof extrinsic. The chain awards the round to the
+# lowest-energy proof *within a block*, so the race is about landing in the
+# right block, not broadcasting first.
+[submission]
+# Transaction tip in plancks (the chain's base unit). A non-zero tip raises
+# the extrinsic's transaction-pool priority so a busy block includes our
+# proof ahead of un-tipped traffic. Default 0 = no tip (unchanged wire
+# bytes). Set a small tip only if you observe proofs missing inclusion.
+tip_plancks      = 0
+# Resilient submit retry (used by the anticipatory fire loop). max_retries
+# is the number of *additional* attempts after the first; retry_backoff_ms
+# is the per-attempt linear backoff. Transient drops, InsufficientEnergy
+# (fired a hair early), and ProofLimitReached (block full) are retried; a
+# round advancing (InvalidNonce) or a bad candidate stops the loop.
+max_retries      = 3
+retry_backoff_ms = 250
 
-# Enable mining on startup when no peers can be found.
-# Defaults to exit if a peer cannot be found.
-# auto_mine = true
-
-
-# Peers to try and connect to (defaults shown below)
-# peer = ["qpu-1.nodes.quip.network:20049", "cpu-1.quip.carback.us:20049", "gpu-1.quip.carback.us:20049", "gpu-2.quip.carback.us:20050", "nodes.quip.network:20049"]
-
-timeout = 3  # Timeout for peer connections and communications in seconds
-heartbeat_interval = 15  # Interval for sending heartbeats to peers in seconds
-heartbeat_timeout = 300  # Timeout for waiting for heartbeats from peers in seconds
-# Number of peers to gossip to at a time. Defaults to 3, you should never need to change this.
-# fanout = 3
-
-# TLS/SSL Configuration
-verify_tls = false  # Verify TLS certificates when connecting to peers
-# ca_bundle = "/path/to/ca-certificates.crt"  # Custom CA certificate bundle (optional)
-
-# Logging configuration
-log_level = "INFO"  # DEBUG, INFO, WARNING, ERROR
-node_log = "logs/quip-node.log"  # Path to main node log file (optional, defaults to stderr)
-http_log = "logs/quip-node-http.log"  # Path to HTTP/aiohttp log file (optional, suppresses aiohttp logs if not set)
-
-# if any of the following are defined then they will be spun up as miner processes to mine blocks.
-# By default a single CPU miner is created.
-
-# [cpu]  # Commented out for QPU-only node
-# Limit CPU worker threads; max is number of logical CPUs on your system
-# num_cpus = 4
-
-# [gpu]  # Commented out for QPU-only node
-# Backend selection: "local" (default) uses local GPUs (CUDA/ROCm/MPS). "modal" uses Modal cloud GPUs.
-# backend = "local"
-# For local backend: list devices to use (e.g., CUDA ordinals like "0", "1"). If omitted, runtime may auto-detect.
-# devices = ["0", "1"]
-# For modal backend: list GPU types to use (e.g., ["t4", "a10g"]).
-# types = ["t4", "a10g"]
-
-[qpu]
-# Global QPU defaults
-
-# Supported QPU types: dwave, ibm, braket, pasqal, ionq, origin
-# D-Wave requires: dwave_api_key, dwave_api_solver, dwave_region_url
-# All others require: token
-
+# ── D-Wave annealer ───────────────────────────────────────────────────
+# QPU access-time budget (per UTC day) is the main knob — it sets the rate
+# at which the budget reservoir accrues (daily_budget / 86400 per second).
+# The miner banks unused budget into the reservoir and pauses until it has
+# `min_block_budget` of QPU runway accrued, then bursts until the pool
+# drains to 0 (accumulate-then-burst, to amortize D-Wave queue warmup).
+# The sampler's active solver and region come from environment variables —
+# DWAVE_API_SOLVER and DWAVE_REGION_URL — at runtime; `solver` and
+# `dwave_region_url` here are operator-asserted pass-through values
+# surfaced to dashboards. EMA + min-blocks tune the pacing estimator
+# inside QPUTimeManager.
 [dwave]
-token = "..."
-solver = "Advantage_system6.4"
-dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
-daily_budget = "60s"
+daily_budget                   = "30m"
+# min_block_budget: QPU runway (access seconds) that must accrue before a
+# burst starts. Mining then continues until the pool drains to 0. Must be
+# < daily_budget or the reservoir fills only across multiple days (a
+# startup warning fires). Default "90s".
+min_block_budget               = "90s"
+# budget_cap: max banked pool size. Bounds a post-downtime catch-up burst.
+# Defaults to max(daily_budget, min_block_budget) when unset.
+# budget_cap                     = "30m"
+# solver                         = "Advantage2_system1"
+# dwave_region_url               = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
+# qpu_min_blocks_for_estimation  = 5
+# qpu_ema_alpha                  = 0.3
 
-# IBM Quantum example:
+# Per-submission cost knobs. Defaults (112 reads, 80us anneal) are the
+# throughput-tuned values from the 2026-05 QPU time-to-solution study
+# (qpu_tts_test/): the QPU-TTS optimum, ~5x faster than the older
+# 512x120 quality-tuned setting. p_success plateaus above ~96-128
+# reads, so higher values mostly add QPU access time. Operators tuning
+# for solution *quality* rather than throughput can raise these; see
+# the canary's --mode sweep output (tools/qpu_throughput_canary.py)
+# for the normalized time-to-solution at each grid point.
+# num_reads                      = 112
+# annealing_time_us              = 80.0
+
+# ── Gate-model providers ──────────────────────────────────────────────
+# Uncomment one. `token` is conventionally an environment-variable
+# reference; do not paste secrets into this file. `daily_budget` caps
+# wall-clock access per UTC day same as the D-Wave section.
 # [ibm]
-# token = "..."
+# token        = "..."
+# daily_budget = "5m"
 
-# Amazon Braket example:
 # [braket]
-# token = "..."
+# token        = "..."
+# daily_budget = "5m"
+
+# [pasqal]
+# token        = "..."
+# daily_budget = "5m"
+
+# [ionq]
+# token        = "..."
+# daily_budget = "5m"
+
+# [origin]
+# token        = "..."
+# daily_budget = "5m"

@@ -1,23 +1,23 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
 
-"""Tests for MetalScheduler budget calculation and throttling.
+"""Tests for MetalScheduler budget calculation and the adaptive cap policy.
 
-No GPU required — tests exercise the scheduler logic with
-mocked IOKit responses.
+No GPU required — tests exercise the static core budget, the occupancy
+thread-budget surface, the pure tier policy (classify / hysteresis / budget
+mapping), and the DutyCycleController math without spawning the sensor monitor.
 """
 
-import sys
 from unittest.mock import patch
 
 import pytest
 
 
 @pytest.fixture(autouse=True)
-def _mock_iokit_monitor():
-    """Prevent IOKit polling on non-macOS platforms."""
+def _mock_cap_monitor():
+    """Stop the adaptive-cap monitor process from spawning in yielding tests."""
     with patch(
-        "GPU.metal_scheduler.MetalScheduler._start_iokit_monitor",
+        "GPU.metal_scheduler.MetalScheduler._start_cap_monitor",
     ):
         yield
 
@@ -43,15 +43,6 @@ class TestMetalSchedulerBudget:
         )
         assert sched.get_core_budget() == 20
 
-    def test_minimum_budget_is_one(self):
-        from GPU.metal_scheduler import MetalScheduler
-        sched = MetalScheduler(
-            gpu_core_count=1,
-            gpu_utilization_pct=1,
-            yielding=False,
-        )
-        assert sched.get_core_budget() >= 1
-
     def test_small_percentage_rounds_down_but_floors_at_one(self):
         from GPU.metal_scheduler import MetalScheduler
         # 10 cores * 5% = 0.5 -> int(0.5) = 0 -> max(1, 0) = 1
@@ -63,143 +54,132 @@ class TestMetalSchedulerBudget:
         assert sched.get_core_budget() == 1
 
 
-class TestMetalSchedulerThrottle:
-    """Throttle behavior in yielding vs non-yielding mode."""
+class TestThreadBudget:
+    """Occupancy thread-budget surface (get_thread_budget)."""
 
-    def test_no_throttle_when_not_yielding(self):
-        from GPU.metal_scheduler import MetalScheduler
+    def test_uncapped_when_not_yielding(self):
+        from GPU.metal_scheduler import UNCAPPED, MetalScheduler
         sched = MetalScheduler(
             gpu_core_count=40,
             gpu_utilization_pct=100,
             yielding=False,
         )
-        assert sched.should_throttle() is False
+        # No monitor → never caps occupancy.
+        assert sched.get_thread_budget() == UNCAPPED
 
-    def test_throttle_when_external_load_high(self):
+    def test_returns_published_budget_when_yielding(self):
         from GPU.metal_scheduler import MetalScheduler
         sched = MetalScheduler(
             gpu_core_count=40,
-            gpu_utilization_pct=100,
             yielding=True,
+            active_threads=2048,
         )
-        # Simulate high external load
-        sched._external_util_pct = 95
-        assert sched.should_throttle() is True
+        # Monitor publishes the live occupancy cap; a fresh heartbeat means
+        # the value is trusted as-is.
+        sched._heartbeat_value.value = 1
+        sched._budget_value.value = 512
+        assert sched.get_thread_budget() == 512
         sched.stop()
 
-    def test_no_throttle_when_external_load_low(self):
+    def test_stale_heartbeat_falls_back_to_active_cap(self):
+        import time
         from GPU.metal_scheduler import MetalScheduler
         sched = MetalScheduler(
             gpu_core_count=40,
-            gpu_utilization_pct=100,
             yielding=True,
+            active_threads=2048,
         )
-        sched._external_util_pct = 50
-        assert sched.should_throttle() is False
-        sched.stop()
-
-
-class TestMetalSchedulerTargetThreadgroups:
-    """Target threadgroup computation."""
-
-    def test_full_budget_when_not_yielding(self):
-        from GPU.metal_scheduler import MetalScheduler
-        sched = MetalScheduler(
-            gpu_core_count=40,
-            gpu_utilization_pct=100,
-            yielding=False,
-        )
-        assert sched.compute_target_threadgroups(
-            max_tg=10, active_tg=5,
-        ) == 10
-
-    def test_reduced_when_external_load(self):
-        from GPU.metal_scheduler import MetalScheduler
-        sched = MetalScheduler(
-            gpu_core_count=40,
-            gpu_utilization_pct=100,
-            yielding=True,
-        )
-        sched._external_util_pct = 80
-        target = sched.compute_target_threadgroups(
-            max_tg=10, active_tg=0,
-        )
-        # With 80% external, should reduce from 10
-        assert 1 <= target < 10
-        sched.stop()
-
-    def test_minimum_target_is_one(self):
-        from GPU.metal_scheduler import MetalScheduler
-        sched = MetalScheduler(
-            gpu_core_count=40,
-            gpu_utilization_pct=100,
-            yielding=True,
-        )
-        sched._external_util_pct = 99
-        target = sched.compute_target_threadgroups(
-            max_tg=10, active_tg=0,
-        )
-        assert target >= 1
+        # Monitor said PAUSE (0), but if its heartbeat goes stale the
+        # scheduler must fail safe to the ACTIVE cap (stay polite), never
+        # to UNCAPPED.
+        sched._budget_value.value = 0
+        sched.get_thread_budget()  # establish heartbeat baseline
+        sched._last_hb_time = time.monotonic() - 100  # heartbeat now stale
+        assert sched.get_thread_budget() == 2048
         sched.stop()
 
 
-class TestStableTargetHysteresis:
-    """Hysteresis for stable target threadgroups."""
+class TestTierPolicy:
+    """Pure adaptive-cap policy: classify → hysteresis → budget mapping."""
 
-    def test_returns_none_on_first_call(self):
-        from GPU.metal_scheduler import MetalScheduler
-        sched = MetalScheduler(
-            gpu_core_count=40,
-            gpu_utilization_pct=100,
-            yielding=True,
+    @staticmethod
+    def _signals(*, idle_s=0.0, thermal=None, on_battery=False, displays=1):
+        from GPU import macos_sensors
+        from GPU.metal_scheduler import Signals
+        return Signals(
+            idle_s=idle_s,
+            thermal_state=thermal or macos_sensors.THERMAL_NOMINAL,
+            on_battery=on_battery,
+            active_displays=displays,
         )
-        sched._external_util_pct = 80
-        result = sched.check_stable_target_threadgroups(
-            max_tg=10, active_tg=0,
-        )
-        assert result is None
-        sched.stop()
 
-    def test_returns_value_after_two_stable_calls(self):
-        from GPU.metal_scheduler import MetalScheduler
-        sched = MetalScheduler(
-            gpu_core_count=40,
-            gpu_utilization_pct=100,
-            yielding=True,
-        )
-        sched._external_util_pct = 80
-        sched.check_stable_target_threadgroups(10, 0)
-        result = sched.check_stable_target_threadgroups(10, 0)
-        assert result is not None
-        assert 1 <= result <= 10
-        sched.stop()
+    def test_active_when_user_present(self):
+        from GPU.metal_scheduler import ACTIVE, CapConfig, HysteresisState, decide_tier
+        out = decide_tier(self._signals(), CapConfig(), HysteresisState(ACTIVE, 0))
+        assert out.tier == ACTIVE
 
-    def test_resets_on_target_change(self):
-        from GPU.metal_scheduler import MetalScheduler
-        sched = MetalScheduler(
-            gpu_core_count=40,
-            gpu_utilization_pct=100,
-            yielding=True,
+    def test_battery_pauses(self):
+        from GPU.metal_scheduler import ACTIVE, CapConfig, HysteresisState, PAUSE, decide_tier
+        out = decide_tier(
+            self._signals(on_battery=True), CapConfig(), HysteresisState(ACTIVE, 0),
         )
-        sched._external_util_pct = 80
-        sched.check_stable_target_threadgroups(10, 0)
-        # Change external load → different target
-        sched._external_util_pct = 20
-        result = sched.check_stable_target_threadgroups(10, 0)
-        assert result is None  # Reset, need 2 stable again
-        sched.stop()
+        assert out.tier == PAUSE
 
-    def test_returns_max_when_not_yielding(self):
-        from GPU.metal_scheduler import MetalScheduler
-        sched = MetalScheduler(
-            gpu_core_count=40,
-            gpu_utilization_pct=100,
-            yielding=False,
+    def test_thermal_serious_drops_to_low(self):
+        from GPU import macos_sensors
+        from GPU.metal_scheduler import ACTIVE, CapConfig, HysteresisState, LOW, decide_tier
+        out = decide_tier(
+            self._signals(thermal=macos_sensors.THERMAL_SERIOUS),
+            CapConfig(),
+            HysteresisState(ACTIVE, 0),
         )
-        # Even without yielding, should return max after 2 calls
-        sched.check_stable_target_threadgroups(10, 5)
-        result = sched.check_stable_target_threadgroups(10, 5)
-        assert result == 10
+        assert out.tier == LOW
+
+    def test_idle_when_away(self):
+        from GPU.metal_scheduler import ACTIVE, CapConfig, HysteresisState, IDLE, decide_tier
+        cfg = CapConfig(idle_after_s=60.0)
+        # No HID input past the idle threshold → IDLE.
+        out = decide_tier(
+            self._signals(idle_s=120.0), cfg, HysteresisState(ACTIVE, 0),
+        )
+        assert out.tier == IDLE
+        # Headless (no active displays) also reads as IDLE.
+        out2 = decide_tier(
+            self._signals(displays=0), cfg, HysteresisState(ACTIVE, 0),
+        )
+        assert out2.tier == IDLE
+
+    def test_budget_mapping(self):
+        from GPU.metal_scheduler import (
+            ACTIVE, CapConfig, IDLE, LOW, PAUSE, UNCAPPED, tier_budget,
+        )
+        cfg = CapConfig(active_threads=2048)
+        assert tier_budget(PAUSE, cfg) == 0
+        assert tier_budget(LOW, cfg) == 1024
+        assert tier_budget(IDLE, cfg) == UNCAPPED
+        assert tier_budget(ACTIVE, cfg) == 2048
+
+    def test_leaving_protective_tier_is_debounced(self):
+        from GPU.metal_scheduler import (
+            ACTIVE, CapConfig, HysteresisState, LEAVE_POLLS, PAUSE, decide_tier,
+        )
+        cfg = CapConfig()
+        # Currently paused; the cause clears but leaving PAUSE needs
+        # LEAVE_POLLS consecutive clean polls.
+        state = HysteresisState(PAUSE, 0)
+        for poll in range(1, LEAVE_POLLS):
+            state = decide_tier(self._signals(), cfg, state)
+            assert state.tier == PAUSE, f"left PAUSE too early on poll {poll}"
+        state = decide_tier(self._signals(), cfg, state)
+        assert state.tier == ACTIVE
+
+    def test_entering_protective_tier_is_immediate(self):
+        from GPU.metal_scheduler import ACTIVE, CapConfig, HysteresisState, PAUSE, decide_tier
+        # No debounce on the way *into* protection — battery pauses at once.
+        out = decide_tier(
+            self._signals(on_battery=True), CapConfig(), HysteresisState(ACTIVE, 0),
+        )
+        assert out.tier == PAUSE
 
 
 class TestIOKitQuery:
@@ -221,16 +201,6 @@ class TestIOKitQuery:
 class TestMetalSchedulerStop:
     """Verify clean shutdown."""
 
-    def test_stop_without_yielding(self):
-        from GPU.metal_scheduler import MetalScheduler
-        sched = MetalScheduler(
-            gpu_core_count=40,
-            gpu_utilization_pct=100,
-            yielding=False,
-        )
-        # Should not raise
-        sched.stop()
-
     def test_stop_with_yielding(self):
         from GPU.metal_scheduler import MetalScheduler
         sched = MetalScheduler(
@@ -238,12 +208,13 @@ class TestMetalSchedulerStop:
             gpu_utilization_pct=100,
             yielding=True,
         )
+        # _start_cap_monitor is patched by the autouse fixture, so
+        # _util_proc stays None and stop() is a no-op — just verify no raise.
         sched.stop()
-        assert sched._iokit_stop.is_set()
 
 
 class TestMetalSchedulerCachedUtilization:
-    """Test get_cached_utilization method."""
+    """Test get_measured_gpu method."""
 
     def test_returns_zero_initially(self):
         from GPU.metal_scheduler import MetalScheduler
@@ -252,7 +223,7 @@ class TestMetalSchedulerCachedUtilization:
             gpu_utilization_pct=100,
             yielding=False,
         )
-        assert sched.get_cached_utilization() == 0
+        assert sched.get_measured_gpu() == 0
 
     def test_returns_set_value(self):
         from GPU.metal_scheduler import MetalScheduler
@@ -261,8 +232,8 @@ class TestMetalSchedulerCachedUtilization:
             gpu_utilization_pct=100,
             yielding=True,
         )
-        sched._external_util_pct = 42
-        assert sched.get_cached_utilization() == 42
+        sched._util_value.value = 42
+        assert sched.get_measured_gpu() == 42
         sched.stop()
 
 

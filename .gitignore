@@ -28,6 +28,7 @@ quip_protocol.egg-info/
 # AI assistant config (project instructions live in AGENTS.md)
 .claude/
 CLAUDE.md
+docs/superpowers/
 
 # Test results and data files
 test_results/
@@ -79,3 +80,6 @@ data/certs/private/
 
 # Node runtime output (local telemetry JSON written by TelemetryManager)
 telemetry/
+
+# Downloaded + validated PoW win archives (tools/download_and_validate_wins.py)
+qpu_results_wins/

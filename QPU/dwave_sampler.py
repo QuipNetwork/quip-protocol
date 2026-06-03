@@ -2,7 +2,11 @@
 
 import logging
 import os
-from typing import Dict, List, Tuple, Any, Union, Mapping, Sequence, cast, Optional, TYPE_CHECKING
+import time
+from typing import (
+    Dict, Iterator, List, Optional, Sequence, Tuple, TYPE_CHECKING,
+    Any, Union, Mapping, cast,
+)
 import collections.abc
 import numpy as np
 from dwave.system import DWaveSampler, FixedEmbeddingComposite
@@ -128,6 +132,7 @@ class DWaveSamplerWrapper:
         job_label_prefix: Optional[str] = None,
         solver_name: Optional[str] = None,
         region: Optional[str] = None,
+        token: Optional[str] = None,
     ):
         """
         Initialize D-Wave sampler wrapper.
@@ -144,6 +149,12 @@ class DWaveSamplerWrapper:
                         If None, uses DWAVE_API_SOLVER env var.
             region: Optional D-Wave region (e.g. "na-east-1").
                    If None, uses default from config.
+            token: Optional D-Wave API token. Passed verbatim to
+                  `DWaveSampler(token=...)`. When unset the SDK falls
+                  back to DWAVE_API_KEY env var → ~/.config/dwave/dwave.conf
+                  → fails with "API token not defined". Honoring an
+                  explicit kwarg lets a TOML `[dwave].token` value win
+                  without requiring operators to also set the env var.
         """
         self.topology = topology
         self.topology_name = topology.solver_name
@@ -166,12 +177,21 @@ class DWaveSamplerWrapper:
 
         self.job_label_prefix = job_label_prefix
 
-        # Check for API key before attempting connection
-        api_key = os.environ.get('DWAVE_API_KEY')
-        if not api_key:
-            logger.warning("[QPU] DWAVE_API_KEY environment variable not set!")
+        # Token resolution order: explicit kwarg (TOML `[dwave].token`)
+        # → DWAVE_API_KEY env var → SDK config file. Only warn when none
+        # of those are present; the SDK itself will fail loudly at the
+        # DWaveSampler() call below.
+        if token:
+            logger.debug(f"[QPU] using explicit D-Wave token (length: {len(token)})")
         else:
-            logger.debug(f"[QPU] DWAVE_API_KEY set (length: {len(api_key)})")
+            api_key = os.environ.get('DWAVE_API_KEY')
+            if not api_key:
+                logger.warning(
+                    "[QPU] no D-Wave token set (DWAVE_API_KEY env unset, "
+                    "no token kwarg, no SDK config file)"
+                )
+            else:
+                logger.debug(f"[QPU] DWAVE_API_KEY set (length: {len(api_key)})")
 
         # Initialize base QPU sampler
         logger.info("[QPU] Connecting to D-Wave API...")
@@ -181,6 +201,8 @@ class DWaveSamplerWrapper:
                 sampler_kwargs['solver'] = solver_name
             if region is not None:
                 sampler_kwargs['region'] = region
+            if token is not None:
+                sampler_kwargs['token'] = token
             base_sampler = DWaveSampler(**sampler_kwargs)
             logger.info(f"[QPU] Connected to solver: {base_sampler.properties.get('chip_id', 'unknown')}")
             logger.info(f"[QPU] Qubits available: {len(base_sampler.nodelist)}")
@@ -382,7 +404,7 @@ class DWaveSamplerWrapper:
         self,
         h: Dict[int, float],
         J: Dict[Tuple[int, int], float],
-        nonce_seed: int,
+        nonce_seed: Union[int, bytes],
     ) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float], Dict[int, int]]:
         """Clamp defective qubits to deterministic spins and adjust neighbors.
 
@@ -396,7 +418,9 @@ class DWaveSamplerWrapper:
         Args:
             h: Linear biases for all nodes (full topology).
             J: Quadratic biases for all edges (full topology).
-            nonce_seed: Seed for deterministic spin assignment (from block nonce).
+            nonce_seed: Seed for deterministic spin assignment. Accepts either
+                the 32-byte block nonce (post-MR-!20 wire shape) or a legacy
+                int seed.
 
         Returns:
             (h_reduced, J_reduced, fixed_spins) where:
@@ -405,6 +429,12 @@ class DWaveSamplerWrapper:
             - fixed_spins: {qubit_id: spin_value} for solution reconstruction
         """
         defective_set = set(self._defective_qubits)
+        # numpy's SeedSequence rejects bytes ("expects int or sequence of
+        # ints for entropy"). Post-MR-!20, `derive_nonce` returns 32 bytes
+        # rather than an int, so the seed needs explicit conversion at
+        # the QPU boundary. big-endian matches the U256 wire encoding.
+        if isinstance(nonce_seed, (bytes, bytearray)):
+            nonce_seed = int.from_bytes(nonce_seed, "big")
         rng = np.random.default_rng(nonce_seed)
 
         # Assign deterministic ±1 spins to defective qubits
@@ -460,8 +490,8 @@ class DWaveSamplerWrapper:
 
         return h_reduced, J_reduced, fixed_spins, energy_offset, removed_edges
 
+    @staticmethod
     def reconstruct_full_sampleset(
-        self,
         reduced_sampleset: dimod.SampleSet,
         defect_info: DefectInfo,
     ) -> dimod.SampleSet:
@@ -470,6 +500,12 @@ class DWaveSamplerWrapper:
         Inserts fixed spins and corrects energies using the precomputed
         offset + defective coupler contributions. Does NOT rebuild a BQM
         or recompute energies from scratch.
+
+        Pure transform of ``(reduced_sampleset, defect_info)`` — it reads no
+        instance/connection state, so it is a ``staticmethod``. This lets the
+        connection-less worker miner reconstruct clamped samples without a
+        live D-Wave sampler (the connection lives in the stream-driver
+        process).
 
         Call this only for samplesets that contain promising candidates
         (QPU energy + offset < threshold). Most samplesets never need it.
@@ -665,3 +701,150 @@ class DWaveSamplerWrapper:
             # No embedding - submit to underlying solver directly (returns raw Future)
             bqm = dimod.BinaryQuadraticModel.from_ising(h, J)
             return self.qpu_solver.solver.sample_bqm(bqm, **kwargs)
+
+    def sample_ising_streaming(
+        self,
+        models: Any,
+        *,
+        num_reads: int,
+        num_sweeps: int = 0,
+        queue_depth: int = 30,
+        annealing_time: Optional[float] = None,
+        energy_threshold_milli: int = 0,
+        stop_event: Optional[Any] = None,
+        **_kw: Any,
+    ) -> Iterator[Tuple[Any, Any]]:
+        """Async streaming pump: keep queue_depth submissions in flight; yield
+        (model, raw_reduced_sampleset) with sampleset.info['defect_info'] set.
+
+        No reconstruction gating — the consumer reconstructs survivors.
+        Cancels in-flight futures on GeneratorExit (the generic StreamContext
+        closes this generator on a chain-head switch).
+
+        Args:
+            models: Feeder providing IsingModel objects via ``pop_blocking()``
+                or ``__next__``.
+            num_reads: QPU reads per submission.
+            num_sweeps: Unused (accepted for interface compatibility with the
+                generic ``StreamContext``).
+            queue_depth: Number of concurrent in-flight QPU jobs.
+            annealing_time: Anneal duration in microseconds; ``None`` uses the
+                QPU default.
+            energy_threshold_milli: Accepted for interface compatibility; not
+                used (no gating in this path — the consumer gates).
+            stop_event: When set, stop submitting and cancel in-flight work.
+            **_kw: Extra kwargs accepted silently for interface compatibility.
+
+        Yields:
+            ``(model, raw_reduced_sampleset)`` in completion order, with
+            ``sampleset.info['defect_info']`` set to the
+            :class:`DefectInfo` (or ``None`` when no defects).
+        """
+        # pending: {id(future): (model, future, defect_info, job_index)}
+        pending: Dict[int, Tuple[Any, Any, Optional[DefectInfo], int]] = {}
+        job_index: int = 0
+        feeder_exhausted: bool = False
+
+        def _stopped() -> bool:
+            return stop_event is not None and stop_event.is_set()
+
+        def _best_effort_cancel_future(fut: Any, fidx: int) -> None:
+            cancel_fn = getattr(fut, "cancel", None)
+            if not callable(cancel_fn):
+                return
+            try:
+                cancel_fn()
+            except Exception as exc:  # noqa: BLE001 — advisory; log and continue
+                logger.debug(
+                    "D-Wave future.cancel() failed for job %d (best-effort): "
+                    "%s: %s",
+                    fidx, type(exc).__name__, exc,
+                )
+
+        def _cancel_all() -> None:
+            """Best-effort cancel every in-flight future and clear pending."""
+            for _mdl, fut, _d, fidx in list(pending.values()):
+                _best_effort_cancel_future(fut, fidx)
+            pending.clear()
+
+        def _try_submit_one() -> None:
+            """Submit one model; sets feeder_exhausted on StopIteration."""
+            nonlocal job_index, feeder_exhausted
+            pop = getattr(models, "pop_blocking", None)
+            try:
+                model = pop() if callable(pop) else next(models)  # type: ignore[call-overload]
+            except StopIteration:
+                feeder_exhausted = True
+                return
+            submit_kwargs: Dict[str, Any] = {
+                "num_reads": num_reads,
+                "answer_mode": "raw",
+                "label": f"{self.job_label}_s{job_index}",
+                "nonce_seed": model.nonce,
+            }
+            if annealing_time is not None:
+                submit_kwargs["annealing_time"] = annealing_time
+            future, defect_info = self.sample_ising_async(
+                model.h, model.J, **submit_kwargs
+            )
+            pending[id(future)] = (model, future, defect_info, job_index)
+            job_index += 1
+
+        try:
+            # Fill to queue_depth before entering the poll loop.
+            while len(pending) < queue_depth and not _stopped() and not feeder_exhausted:
+                _try_submit_one()
+
+            while pending:
+                if _stopped():
+                    _cancel_all()
+                    return
+
+                # Fill any open slots (after a completion was popped below).
+                while (
+                    len(pending) < queue_depth
+                    and not _stopped()
+                    and not feeder_exhausted
+                ):
+                    _try_submit_one()
+
+                # Poll for the next completed future.
+                completed_id: Optional[int] = None
+                while completed_id is None and not _stopped():
+                    for fid, (_, fut, _, _) in pending.items():
+                        if fut.done():
+                            completed_id = fid
+                            break
+                    if completed_id is None:
+                        time.sleep(0.005)
+
+                if completed_id is None:
+                    # stop_event fired while polling.
+                    _cancel_all()
+                    return
+
+                model, future, defect_info, _ = pending.pop(completed_id)
+                raw_ss = future.sampleset
+
+                # Attach defect_info so the consumer can reconstruct survivors.
+                raw_ss.info["defect_info"] = defect_info
+
+                # Periodic throughput diagnostic (operator observability).
+                if job_index % 50 == 0:
+                    pop_stats = getattr(models, "stats", None)
+                    if callable(pop_stats):
+                        fstats = pop_stats()
+                        logger.info(
+                            "[QPU] stream depth: in_flight=%d/%d "
+                            "feeder_ready=%d/%d drained=%d wait_total=%.2fs",
+                            len(pending), queue_depth,
+                            fstats.get("ready", 0),
+                            fstats.get("buffer_size", 0),
+                            fstats.get("drained_count", 0),
+                            fstats.get("pop_wait_total_s", 0.0),
+                        )
+
+                yield model, raw_ss
+
+        finally:
+            _cancel_all()

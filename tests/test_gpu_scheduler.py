@@ -238,7 +238,7 @@ class TestSmBudget:
         # Even with simulated high external load,
         # budget stays at static ceiling
         sched._nvml_handle = "fake"
-        sched._external_util_pct = 50
+        sched._util_value.value = 50
 
         budget = sched.get_sm_budget()
         assert budget == 80
@@ -254,7 +254,7 @@ class TestSmBudget:
             yielding=True,
         )
         sched._nvml_handle = "fake"
-        sched._external_util_pct = 95
+        sched._util_value.value = 95
         assert sched.should_throttle()
         sched.stop()
 
@@ -268,7 +268,7 @@ class TestSmBudget:
             yielding=True,
         )
         sched._nvml_handle = "fake"
-        sched._external_util_pct = 30
+        sched._util_value.value = 30
         assert not sched.should_throttle()
         sched.stop()
 
@@ -282,7 +282,7 @@ class TestSmBudget:
             yielding=True,
         )
         sched._nvml_handle = "fake"
-        sched._external_util_pct = 100
+        sched._util_value.value = 100
         assert sched.get_sm_budget() >= 1
         sched.stop()
 
@@ -316,11 +316,11 @@ class TestBuildGpuMinerCfg:
     """Verify per-device config merging logic."""
 
     def test_empty_section_returns_empty(self):
-        from shared.node import _build_gpu_miner_cfg
+        from shared.miner_core import _build_gpu_miner_cfg
         assert _build_gpu_miner_cfg({}) == {}
 
     def test_extracts_known_keys(self):
-        from shared.node import _build_gpu_miner_cfg
+        from shared.miner_core import _build_gpu_miner_cfg
 
         section = {
             "utilization": 80,
@@ -334,7 +334,7 @@ class TestBuildGpuMinerCfg:
         }
 
     def test_per_device_overrides_common(self):
-        from shared.node import _build_gpu_miner_cfg
+        from shared.miner_core import _build_gpu_miner_cfg
 
         common = _build_gpu_miner_cfg({
             "utilization": 80,
@@ -350,7 +350,7 @@ class TestBuildGpuMinerCfg:
         }
 
     def test_partial_override_keeps_defaults(self):
-        from shared.node import _build_gpu_miner_cfg
+        from shared.miner_core import _build_gpu_miner_cfg
 
         common = _build_gpu_miner_cfg({
             "utilization": 80,
@@ -366,7 +366,7 @@ class TestBuildGpuMinerCfg:
         }
 
     def test_defaults_used_when_no_override(self):
-        from shared.node import _build_gpu_miner_cfg
+        from shared.miner_core import _build_gpu_miner_cfg
 
         common = _build_gpu_miner_cfg({
             "utilization": 100,
@@ -451,7 +451,7 @@ class TestAdaptiveNonces:
             yielding=True,
         )
         sched._nvml_handle = "fake"
-        sched._external_util_pct = 50
+        sched._util_value.value = 50
 
         # Mock count_external_gpu_processes to return 1
         sched.count_external_gpu_processes = lambda: 1
@@ -472,7 +472,7 @@ class TestAdaptiveNonces:
             yielding=True,
         )
         sched._nvml_handle = "fake"
-        sched._external_util_pct = 90
+        sched._util_value.value = 90
 
         # 3 external processes — fair share is ~1/4
         sched.count_external_gpu_processes = lambda: 3
@@ -526,7 +526,7 @@ class TestAdaptiveNonces:
 
         # Simulate external process appearing
         sched.count_external_gpu_processes = lambda: 2
-        sched._external_util_pct = 80
+        sched._util_value.value = 80
 
         # Target changed → counter resets
         result = sched.check_stable_target(

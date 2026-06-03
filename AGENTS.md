@@ -2,185 +2,195 @@
 
 Cross-tool instructions for AI coding assistants (Claude Code, Codex, Cursor, Gemini CLI).
 
-## Environment Setup
+For the **runtime architecture**, read [`ARCHITECTURE.md`](./ARCHITECTURE.md).
+This file is the developer-facing how-to: commands, dependencies, code
+style. Anything about how the system *runs* belongs in
+`ARCHITECTURE.md`.
+
+## Environment
+
+The `.quip` virtualenv is already active in development shells —
+don't prefix shell commands with `source .quip/bin/activate`.
 
 ```bash
+# Fresh install (only if .quip doesn't exist yet)
 python3 -m venv .quip
 source .quip/bin/activate
 pip install -U pip setuptools wheel
-pip install -e .
-
-# D-Wave credentials (optional, for QPU access)
-# .env contains sensitive credentials — never read or display its contents
+pip install -e .            # core + CPU
+pip install -e .[cuda]      # CUDA backend
+pip install -e .[metal]     # Apple Silicon backend
+pip install -e .[dev]       # pytest + pytest-asyncio
 ```
 
-## Commands
+`.env` holds `DWAVE_API_KEY` and other credentials. **Never read or
+display its contents.**
 
-### Running Network Nodes
+## Running the miner
+
+The CLI is `quip-miner` (defined in `quip_cli.py`, entry point in
+`pyproject.toml`). It attaches to a substrate validator over WS or
+HTTP; there is no longer any in-process P2P node to run.
 
 ```bash
-# CPU node (bootstrap, standalone single-node mode)
-quip-network-node cpu --listen 127.0.0.1 --port 8085 --public-host 127.0.0.1:8085 \
-  --auto-mine --peer 127.0.0.1:8085 --genesis-config genesis_block_public.json
+# Generate a hybrid sr25519 + ML-DSA-44 keystore
+quip-miner keygen --out ~/.quip-miner/signing.json
 
-# GPU node (CUDA)
-quip-network-node gpu --listen 127.0.0.1 --port 8085 --public-host 127.0.0.1:8085 \
-  --auto-mine --peer 127.0.0.1:8085 --gpu-backend local --genesis-config genesis_block_public.json
+# Bootstrap (one-shot reachability + funding check against a validator)
+quip-miner bootstrap --validator ws://127.0.0.1:9944 \
+  --signer-key ~/.quip-miner/signing.json
 
-# Mac Metal node
-quip-network-node gpu --gpu-backend mps --listen 127.0.0.1 --port 8085 \
-  --auto-mine --peer 127.0.0.1:8085 --genesis-config genesis_block_public.json
+# CPU PoW miner
+quip-miner cpu --validator ws://127.0.0.1:9944 \
+  --signer-key ~/.quip-miner/signing.json
 
-# TOML config (see QUIP-node.example.toml)
-quip-network-node --config ./QUIP-node.example.toml
+# CUDA / Metal / D-Wave
+quip-miner gpu --validator ws://127.0.0.1:9944 --gpu-backend local --signer-key ...
+quip-miner gpu --validator ws://127.0.0.1:9944 --gpu-backend metal --signer-key ...
+quip-miner qpu --validator ws://127.0.0.1:9944 --daily-budget 30s --signer-key ...
 
-# Network simulator
-quip-network-simulator --scenario mixed
-quip-network-simulator --scenario cpu --base-port 9000
+# Concurrent PoW + mempool in one process
+quip-miner cpu --validator ws://... --mode both --num-cpus 4 --signer-key ...
+
+# TOML config (see docker/quip-miner.cpu.toml, docker/quip-miner.cuda.toml)
+quip-miner cpu --config ./docker/quip-miner.cpu.toml
 ```
 
-### Testing
+Live integration uses the docker-compose validator under `docker/`
+(`docker compose up quip-validator`); the validator listens on
+`ws://127.0.0.1:9944` by default.
+
+**Metal interactive cap (Apple Silicon):** the `[metal]` section runs an
+adaptive governor when `yielding` is on (default). It senses HID-idle /
+thermal / battery / displays and caps **GPU occupancy** — the jank lever is
+concurrent threads per command buffer (`problems × reads`), not core count or
+duty cycle. While you're present it splits reads so each command buffer stays
+under `active_util` % of the GPU's max thread capacity
+(`maxTotalThreadsPerThreadgroup × cores`; default 85); idle/headless runs
+uncapped (full speed); thermal-serious halves it; battery / critical thermal
+pause. Total reads and sweeps are always preserved. (On an M4 Max steady-state
+mining is smooth even at full saturation, so the cap is mainly insurance for
+weaker GPUs / sustained thermal load.) This path
+is **independent of the CUDA util monitor** — it lives in
+`GPU/metal_scheduler.py` + `GPU/macos_sensors.py` and shares no utilization
+machinery with `GPU/util_monitor.py`. See `docs/metal-gpu-governor.md`.
+
+## Testing
 
 ```bash
 # All tests
 python -m pytest tests/ -v
 
 # Single file / single test
-python -m pytest tests/test_block_signer.py -v
-python -m pytest tests/test_block_signer.py::test_sign_and_verify -v
-
-# Smoke tests (run as scripts, not pytest)
-python tests/smoke_node_cpu_only.py
-python tests/smoke_node_gpu_metal.py   # Mac MPS
-python tests/smoke_node_gpu_local.py   # CUDA
-python tests/smoke_node_qpu.py         # D-Wave QPU
+python -m pytest tests/test_pool_client.py -v
+python -m pytest tests/test_pool_client.py::test_get_head_forwards_empty_args -v
 ```
 
-### Benchmarking and Tools
+There are no `smoke_node_*.py` scripts in `tests/` anymore — the old
+in-process P2P node smoke tests are gone. Live integration is via
+the docker-compose validator described above.
+
+## Benchmarking and tools
 
 ```bash
+# CPU baseline
 python tools/cpu_baseline.py --quick
 python tools/cpu_baseline.py --quick \
   --topology dwave_topologies/topologies/advantage2_system1.json.gz
+
+# Topology analysis
 python tools/analyze_topology_sizes.py --configs "8,2" --samples 10
 python tools/validate_mined_topology.py --all
-python reference/test_quantum_pow.py
+
+# Precompute embedding for QPU (slow)
+python tools/analyze_topology_sizes.py --configs "9,2" \
+  --precompute-embedding --embedding-timeout 1w
+
+# GPU benchmarks (Modal Labs)
 modal run benchmarks/gpu_benchmark_modal.py
+
+# Download + re-validate every on-chain win (walks the proof chain)
+python tools/download_and_validate_wins.py \
+  --url wss://qpu-1.nodes.quip.network/rpc --out quip_wins
 ```
 
-## Architecture
+**Never run QPU benchmarks in the background.** Provide the command;
+let the operator execute it.
 
-### CLI Entry Points (`quip_cli.py`)
+### Downloading winning-solution BQMs
 
-- `quip-network-node`: Run a single P2P node (cpu/gpu/qpu subcommands)
-- `quip-network-simulator`: Launch multiple connected nodes for testing
+`submit_proof` stores a compact seed (nonce + topology hash), not the full
+Binary Quadratic Model. Add `--dump-bqm` to also reconstruct each win's Ising
+model and write it to `<out>.bqms.jsonl`:
 
-### Shared Module (`shared/`)
-
-**Core data structures:**
-- `block.py`: Block, BlockHeader, MinerInfo, QuantumProof dataclasses with binary serialization
-- `block_requirements.py`: BlockRequirements dataclass, `compute_current_requirements()` difficulty adjustment
-- `miner_types.py`: MiningResult, IsingSample, Sampler protocol
-
-**Mining & PoW:**
-- `base_miner.py`: Abstract BaseMiner — template method pattern for `mine_block()`
-- `quantum_proof_of_work.py`: Ising model generation (`generate_ising_model_from_nonce()`), diversity calculation, `evaluate_sampleset()`
-- `miner_worker.py`: MinerHandle — 2-process mining orchestration
-- `energy_utils.py`: Expected solution energy calculations, topology parameters
-- `beta_schedule.py`: Temperature scheduling for simulated annealing
-
-**P2P network:**
-- `network_node.py`: Main NetworkNode class — P2P server with mining coordination
-- `node.py`: Node state management and miner lifecycle
-- `node_client.py` / `quic_client.py`: Async QUIC client (aioquic)
-- `quic_server.py`: QUIC server implementation
-- `quic_protocol.py`: QUIC message types and protocol definitions
-- `block_store.py`: Persistent block storage
-- `block_synchronizer.py`: Chain synchronization with peers
-
-**Cryptography & trust:**
-- `block_signer.py`: SPHINCS+ post-quantum signatures
-- `certificate_manager.py`: TLS certificate management (auto-generated self-signed for dev)
-- `trust_store.py`: Peer trust/reputation tracking
-
-**Utilities:**
-- `time_utils.py`: Network time synchronization
-- `address_utils.py`: Host:port parsing
-- `logging_config.py`: Unified logging setup
-- `version.py`: Version and protocol version management
-- `rest_api.py`: HTTP REST endpoints (legacy)
-
-### Miner Implementations
-
-```
-BaseMiner (abstract, shared/base_miner.py)
-├── SimulatedAnnealingMiner (CPU/sa_miner.py)
-├── GPUMiner (GPU/metal_miner.py, GPU/cuda_miner.py, GPU/modal_miner.py)
-└── DWaveMiner (QPU/dwave_miner.py)
+```bash
+python tools/download_and_validate_wins.py \
+  --url wss://qpu-1.nodes.quip.network/rpc \
+  --max 50 --dump-bqm --out quip_wins
 ```
 
-**CPU** (`CPU/`): `sa_miner.py` (pure Python SA), `sa_sampler.py` (dimod-compatible sampler)
+Each line is one model: `block_number`, `nonce`, `topology_hash`, plus the
+reconstructed Ising model as flat lists — `h: [[node_id, bias], ...]` and
+`j: [[u, v, coupling], ...]`. Reload into the dicts the energy functions
+expect with:
 
-**GPU** (`GPU/`):
-- Metal: `metal_miner.py`, `metal_sa.py`, `metal_gibbs_sa.py`, `metal_splash_sa.py` + `.metal` shaders
-- CUDA: `cuda_miner.py`, `cuda_sa.py`, `cuda_kernel.py`
-- Modal: `modal_miner.py`, `modal_sampler.py` (cloud GPU T4/A10G/A100)
-
-**QPU** (`QPU/`): `dwave_miner.py`, `dwave_sampler.py`, `qpu_time_manager.py` (daily budget tracking)
-
-### Topology Management (`dwave_topologies/`)
-
-- `topologies/*.json.gz`: Pregenerated hardware topology files
-- `embeddings/`: Precomputed embeddings for QPU hardware mapping
-- `embedded_topology.py`, `embedding_loader.py`, `smart_embedding.py`
-- Default topology: Zephyr Z(9,2) — 1,368 nodes, 7,692 edges
-
-### Key Architecture Concepts
-
-**Quantum Proof-of-Work:**
-1. Each block generates a unique Ising problem from: previous block hash, miner ID, block index, and salt
-2. Solutions must meet energy threshold, diversity requirement (Hamming distance), and minimum solution count
-3. First miner to find valid solutions wins the block
-
-**2-Process Mining Architecture** (`shared/miner_worker.py`):
-```
-Parent Process (Controller via MinerHandle)
-├── Spawns child process for each mining attempt
-├── Monitors stop_event every 100ms
-└── Sends SIGTERM/SIGKILL to cancel mining
-
-Child Process (Mining Worker)
-├── Runs mine_block() in isolation
-├── Handles SIGTERM for hardware cleanup
-└── Returns MiningResult via IPC
-```
-Each miner must register a SIGTERM handler in `__init__()` for hardware-specific cleanup.
-
-**P2P Network Protocol (QUIC):**
-- QUIC with datagrams for low-latency, streams for larger blocks
-- Built-in TLS 1.3 encryption (self-signed certs for dev)
-- Message types: JOIN, HEARTBEAT, GOSSIP, BLOCK, STATUS, STATS
-- Heartbeat: 15s interval, 60s timeout
-- Default port: 20049, ALPN: "quip-v1"
-
-**Difficulty Adjustment** (`block_requirements.py`):
-- `compute_current_requirements()` adjusts energy threshold based on mining time
-- Hardening (fast blocks): 35%±30%; Easing (slow blocks): 15%±14%
-
-**TOML Configuration** (`--config`):
-- `[global]`: listen, port, node_name, secret, auto_mine, peer list, heartbeat, log_level
-- `[cpu]`: num_cpus
-- `[gpu]`: backend (local/modal), devices, types
-- `[qpu]`: dwave_api_key, dwave_api_solver, dwave_region_url
-
-### Critical Parameters
-
-**Genesis block** (`genesis_block_public.json`):
 ```python
-difficulty_energy = -2500.0   # Genesis default (relaxed)
+h = {n: b for n, b in rec["h"]}
+J = {(u, v): c for u, v, c in rec["j"]}
+```
+
+The model is re-derived from the nonce + topology snapshot via
+`generate_ising_model_from_nonce` — the same function `_finalize_sample` and
+the validator use, so a green validation run proves the dumped BQMs are
+correct.
+
+### Modal Labs (cloud GPU)
+
+```bash
+pip install modal
+modal token new  # opens a browser for authentication
+```
+
+## Dependencies
+
+From `pyproject.toml`:
+
+- **Core**: `dwave-ocean-sdk`, `numpy`, `aiohttp`, `click`, `blake3`,
+  `substrate-interface`, `scalecodec`, `dilithium-py` (ML-DSA-44),
+  `python-dotenv`, `tomli` (on 3.10).
+- **CUDA** (optional): `cupy-cuda12x`, `nvidia-ml-py`.
+- **Metal** (optional): `pyobjc-framework-Metal`,
+  `pyobjc-framework-MetalPerformanceShaders`.
+- **fast** (optional): `pyzmq`, `uvloop`.
+- **dev**: `pytest`, `pytest-asyncio`.
+
+Python 3.10+ required.
+
+**Removed in v0.2**: `aioquic`, `hashsigs` (legacy SPHINCS+),
+`cryptography` (was for self-signed TLS). The QUIC P2P stack went
+with them.
+
+## Topology management (`dwave_topologies/`)
+
+- `topologies/*.json.gz` — hardware topology files (Advantage2, Chimera, Pegasus, Zephyr).
+- `embeddings/*.json.gz` — precomputed embeddings for QPU hardware mapping.
+- `embedded_topology.py`, `embedding_loader.py`, `smart_embedding.py` — loaders and embedding utilities.
+- **Default**: Zephyr Z(9,2) — 1,368 nodes, 7,692 edges.
+- For full Advantage2 hardware: `advantage2_system1.json.gz` (~4,579 qubits).
+
+**QPU solver revision updates** (when D-Wave recalibrates):
+1. Replace the topology file in `topologies/`.
+2. Verify existing `embeddings/` still match the new graph; copy over compatible ones.
+3. Delete stale topology files and incompatible embeddings.
+
+## Critical parameters
+
+**Genesis block defaults** (`genesis_block.json`):
+```python
+difficulty_energy = -2500.0
 min_diversity = 0.2
 min_solutions = 5
-h_values = [-1.0, 0.0, 1.0]  # Ternary Ising distribution
+h_values = [-1.0, 0.0, 1.0]
 ```
 
 **Production Z(9,2) targets:**
@@ -190,44 +200,139 @@ min_diversity = 0.15
 min_solutions = 5
 ```
 
-**Energy Ranges by Topology (GSE):**
-- Z(8,2): -2869 to -2677 (192 unit range)
-- Z(9,2): -4100 to -3870 (230 unit range) — DEFAULT
-- Z(10,2): -5470 to -5200 (270 unit range)
-- Z(11,4): -15170 to -14158 (1012 unit range)
+**Energy ranges by topology (GSE):**
 
-**Miner-Specific Configurations:**
-- CPU/SA: num_sweeps=64–4096, reads=64–512 (adaptive)
-- GPU/CUDA: num_sweeps=256–2048
-- GPU/Metal: num_sweeps=64–512
-- Modal: num_sweeps=128–4096
-- QPU: annealing_time=5–20μs, reads=32–64
+| Topology | Range | Size |
+|---|---|---|
+| Z(8,2) | -2869 to -2677 | 192 |
+| Z(9,2) | -4100 to -3870 | 230 (default) |
+| Z(10,2) | -5470 to -5200 | 270 |
+| Z(11,4) | -15170 to -14158 | 1012 |
+| Advantage2 (full) | similar to Z(11,4) | ~4579 qubits |
 
-## Code Style
+**QPU h/J ranges:** See [`docs/dwave-solver-ranges.md`](docs/dwave-solver-ranges.md)
+for per-solver `h_range`, `j_range`, `extended_j_range`, and
+`per_qubit_coupling_range`. Regenerate with
+`python tools/dump_solver_ranges.py`.
 
-**Imports:** All at top of file (no inline imports). Order: stdlib → third-party → local. Absolute imports only. Exception: optional dependency try/except at module level; Modal remote functions.
+**Per-miner adaptive parameters:**
 
-**Concurrency:** NEVER use threads — multiprocessing only. Async via asyncio for network operations. Mining runs in separate processes.
+| Backend | num_sweeps | num_reads |
+|---|---|---|
+| CPU/SA | 64–4096 | 64–512 |
+| GPU/CUDA | 256–2048 | (adaptive) |
+| GPU/Metal | 64–512 | (adaptive) |
+| Modal | 128–4096 | (adaptive) |
+| QPU | annealing 5–20µs | 32–64 |
 
-**Dependencies:**
-- Core: dwave-ocean-sdk, numpy, aioquic, click, blake3, hashsigs (SPHINCS+), cryptography
-- GPU: torch, cupy (Linux/Windows), pyobjc-Metal (macOS)
-- Optional: modal (cloud GPU)
-- Python 3.10+
+## Identifiers: solution number vs `dispatch_id`
 
-## CI/CD and Deployment
+Two distinct identifiers exist; **never conflate them**, and never persist
+on `dispatch_id`.
 
-**GitLab CI** (`.gitlab-ci.yml`): Builds Docker CPU and CUDA images on main/tags
+- **Solution number** — the chain-global *ordinal* of the QPoW solution
+  being mined: `count(QuantumPow.WinningSolutions) + 1`. The chain has no
+  stored solution counter — solutions are keyed in `WinningSolutions` by
+  the block number they won at (`submitted_at == key`), so the ordinal is
+  derived by counting that map's keys (cheap: one paged `state_getKeysPaged`
+  over the storage prefix, keys only). It is **determinable at round
+  start** — a round mines toward a specific upcoming solution number; the
+  round's `last_proof_block_hash` (= `block_hash(LastProofBlock)`) stays
+  constant until a proof wins and advances it. Compute the count **once per
+  round and cache it** (recount only when `last_proof_block_hash` changes);
+  it is global, monotonic, and never repeats.
+  - **Not the same as a block number.** `LastProofBlock` (e.g. 52507) is
+    the block number of the most recent winning proof — the round anchor,
+    not the solution ordinal (e.g. 196). Don't conflate them.
+  - **This is the on-disk key for the mining-attempts archive**
+    (`{base}/{solution_number}/…`). Because it tracks the logical
+    solution, a controller/worker restart mid-round correctly *resumes*
+    writing into the same solution dir — that is not stale accretion, it
+    is the same solution. Different solution number ⇒ different dir.
 
-**Docker** (`docker/`): Dockerfile.cpu, Dockerfile.cuda, docker-compose.yml, entrypoint.sh
+- **`dispatch_id`** — an **internal-only** controller↔worker coordination
+  handle: `_dispatch_contexts[(handle_id, dispatch_id)]`, cancel-ack
+  (`_await_handle_done`), and the preview channel (see `ARCHITECTURE.md`
+  §3.3). It is a process-local monotonic counter that **resets to 0 on
+  restart**, so it collides across runs and MUST NOT be used as a durable
+  or on-disk identity. Keep it in memory for pairing responses to
+  contexts; never name persisted artifacts after it.
 
-**Systemd** (`quip-network-node.service`): Production deployment, config at `/etc/quip.network/config.toml`
+The old `SubmissionLogger` `next_solution_id` local counter (persisted in
+`{base}/next_solution_id`) was a stand-in for the chain solution number
+and is misaligned with this model — replace it with the chain-derived
+solution number, do not extend it.
 
-**Cloud**: `akash/` and `aws/` directories for cloud deployment configs
+## Code style
 
-## QPU Solver Updates
+- **Imports** at top of file, in stdlib → third-party → local order. Absolute imports only. No inline imports inside functions/methods. Exception: optional-dependency `try/except` at module level.
+- **Concurrency**: NEVER use threads. Multiprocessing only. Async via `asyncio` for network operations. Mining runs in worker processes (`shared/miner_worker.py:MinerHandle`).
+- **Type hints** on public APIs. Google-style docstrings on non-trivial public functions.
+- **Logging** via `logging.getLogger(__name__)` at module level. The custom formatter and component classification live in `shared/logging_config.py`.
+- **No `Co-Authored-By: <assistant> ...` lines in commits.**
 
-When D-Wave updates a solver to a new revision:
-1. Download the new topology file and replace the old one in `topologies/`
-2. Check if existing embeddings in `embeddings/` are still compatible
-3. Delete all references to the old solver revision (stale topology files, incompatible embeddings)
+See [`ARCHITECTURE.md`](./ARCHITECTURE.md) §9 for the cleanup-candidates
+list (vestigial code flagged for removal).
+
+## Deployment
+
+- **Docker** (`docker/`): `Dockerfile.cpu`, `Dockerfile.cuda`, `docker-compose.yml`, `entrypoint.sh`, plus the example TOML configs (`quip-miner.cpu.toml`, `quip-miner.cuda.toml`).
+- **Cloud**: `akash/` and `aws/` contain deployment configs.
+- **GitLab CI** (`.gitlab-ci.yml`): builds CPU + CUDA Docker images on main/tags.
+
+## Concurrency: processes, not threads
+
+Use `multiprocessing` for concurrency. Do **not** introduce `threading.Thread`
+in our own code. Threads share the GIL; a CPU-bound thread starves its
+siblings. This stalled the QPU stream pump in v0.2 — the per-attempt consumer
+held the GIL ~1.2 s and the pump thread could not drive the sampler, so the
+QPU pipeline drained (throughput 0.6 vs ~8 subs/sec).
+
+Rules:
+- New background work → a `multiprocessing` process (use `spawn`).
+- Share scalars via `multiprocessing.Value`; share large numpy buffers via
+  `multiprocessing.shared_memory.SharedMemory` (zero-copy), never by pickling
+  per item on a hot path.
+- `threading.Lock`/`RLock` for intra-process state is fine (a lock is not a
+  thread). Cross-process correctness uses `os.replace`/PIPE_BUF atomicity or
+  `mp` primitives, not locks.
+- Exceptions we don't control: third-party internal threads (D-Wave SDK,
+  asyncio executors, stdlib `QueueListener` if ever reused). Document any such
+  exception inline with the reason.
+
+## Debugging a hung process (get a traceback)
+
+`SIGINT` (Ctrl-C) only helps when the **main thread is running Python
+bytecode** — it raises `KeyboardInterrupt` at the next bytecode boundary. A
+process wedged in a C-level call (a lock/`join`/`wait`, an `mp.Queue`
+feeder-thread join at interpreter shutdown, a blocking syscall) won't unwind,
+so `SIGINT` just kills it with **no traceback**. Don't reach for it on a hang.
+
+Use **`faulthandler`** + **`SIGABRT`** — the repo convention (CI already runs
+`timeout --signal=ABRT … python -X faulthandler -m pytest`):
+
+```bash
+# 1. Start the process with faulthandler enabled (installs handlers for the
+#    fatal signals SIGSEGV/SIGFPE/SIGABRT/SIGBUS/SIGILL).
+PYTHONFAULTHANDLER=1 python tools/whatever.py …      # or: python -X faulthandler …
+
+# 2. When it hangs, dump every thread's Python (and C) stack to stderr:
+kill -ABRT <pid>          # SIGABRT -> faulthandler dumps, then the process aborts (exit 134)
+```
+
+This prints the exact frame each thread is stuck in (e.g. `threading.py:wait`
+→ an unjoined queue feeder thread). Notes:
+
+- **Pre-arm it.** Faulthandler must be enabled *before* the hang. For tools we
+  expect to run interactively against the QPU/long pipelines, prefer enabling
+  it (env var or `faulthandler.enable()` at startup) so a hang is debuggable.
+- **Dump without killing:** `faulthandler.register(signal.SIGUSR1)` in code,
+  then `kill -USR1 <pid>` dumps and **continues** (repeatable). `SIGABRT` is
+  fatal; `SIGUSR1` (registered) is not.
+- **No instrumentation available?** `py-spy dump --pid <pid>` attaches to any
+  running CPython and prints all-thread tracebacks without a signal or restart.
+- **Inspect the tree first:** `ps -o pid,ppid,stat,command -p <pid>` and
+  `pgrep -P <pid>` reveal stuck children / orphans (`PPID 1` = reparented after
+  a parent crash). An interpreter that won't exit is usually blocked joining a
+  non-daemon child or an `mp.Queue` feeder thread (call `cancel_join_thread()`
+  on queues whose buffered data is worthless at teardown).

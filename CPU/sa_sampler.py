@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Tuple
 from dwave.samplers import SimulatedAnnealingSampler
 from dwave.system.testing import MockDWaveSampler
 from shared.quantum_proof_of_work import DEFAULT_TOPOLOGY
+from shared.stream_context import stream_from_feeder
 
 import collections.abc
 
@@ -53,4 +54,16 @@ class SimulatedAnnealingStructuredSampler(MockDWaveSampler):
         self.nodes = nodes
         self.edges = edges
 
-        
+    def sample_ising_streaming(
+        self, feeder, *, num_reads, num_sweeps, **_ignored,
+    ):
+        """Stream samplesets from a feeder, one model at a time.
+
+        Thin generator for the unified driver path; delegates to the shared
+        ``stream_from_feeder`` helper. ``**_ignored`` absorbs any
+        sampler_kwargs a generic driver may pass.
+        """
+        yield from stream_from_feeder(
+            self, feeder, num_reads=num_reads, num_sweeps=num_sweeps,
+        )
+

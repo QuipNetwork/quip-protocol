@@ -15,7 +15,7 @@ across models.
 import time
 from itertools import chain
 from typing import (
-    Dict, Iterable, Iterator, List, Optional, Tuple,
+    Any, Dict, Iterable, Iterator, List, Optional, Tuple,
 )
 
 import cupy as cp
@@ -23,10 +23,10 @@ import dimod
 import numpy as np
 
 from GPU.base_cuda_sampler import BaseCudaSampler
+from GPU.gpu_scheduler import throttled_stream
 from GPU.sampler_utils import (
     compute_beta_schedule,
     compute_color_blocks,
-    unpack_packed_results,
 )
 from shared.ising_model import IsingModel
 
@@ -518,6 +518,7 @@ class CudaGibbsSampler(BaseCudaSampler):
         seed: Optional[int] = None,
         num_kernels: Optional[int] = None,
         poll_timeout: Optional[float] = None,
+        scheduler: Any = None,
     ) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
         """Stream Ising model solutions via Gibbs kernel.
 
@@ -573,12 +574,17 @@ class CudaGibbsSampler(BaseCudaSampler):
             beta_schedule_type,
         )
 
-        yield from self._run_streaming_loop(
-            chain([first], model_iter),
-            num_k=num_k,
-            num_betas=num_betas,
-            seed=seed,
-            poll_timeout=poll_timeout,
+        # Throttle before pulling each result (yielding mode): the unified
+        # driver path bypasses the old _sample_batch back-off, so honor it here.
+        yield from throttled_stream(
+            self._run_streaming_loop(
+                chain([first], model_iter),
+                num_k=num_k,
+                num_betas=num_betas,
+                seed=seed,
+                poll_timeout=poll_timeout,
+            ),
+            scheduler,
         )
 
     # -- sample_ising --

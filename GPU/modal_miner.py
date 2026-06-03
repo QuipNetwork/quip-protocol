@@ -1,16 +1,11 @@
 """GPU miner using Modal via ModalSampler(gpu_type)."""
 from __future__ import annotations
 
-import multiprocessing
-import multiprocessing.synchronize
 import signal
-import sys
-from typing import Dict, List, Tuple
-
-import dimod
+from typing import List, Tuple
 
 from shared.base_miner import BaseMiner
-from shared.block_requirements import BlockRequirements
+from shared.miner_types import BlockRequirements
 from GPU.modal_sampler import ModalSampler
 
 
@@ -21,6 +16,8 @@ class ModalMiner(BaseMiner):
     ADAPT_MIN_READS = 64
     ADAPT_MAX_READS = 256
     ADAPT_READS_SOLUTION_FLOOR_FACTOR = 3
+
+    STREAM_FACTORY_DOTTED = "GPU.modal_stream:build_persistent_context"
 
     def __init__(self, miner_id: str, gpu_type: str = "t4", **cfg):
         sampler = ModalSampler(gpu_type)
@@ -58,8 +55,9 @@ class ModalMiner(BaseMiner):
             if hasattr(self, 'logger'):
                 self.logger.error(f"Error during Modal miner cleanup: {e}")
 
-        # Exit gracefully
-        sys.exit(0)
+        # Exit gracefully — guard against raising SystemExit during
+        # interpreter finalization (would produce "Exception ignored" noise).
+        self._graceful_exit()
 
     def _adapt_mining_params(
         self,
@@ -75,15 +73,14 @@ class ModalMiner(BaseMiner):
             num_edges=len(edges),
         )
 
-    def _sample(
-        self,
-        h: Dict[int, float],
-        J: Dict[Tuple[int, int], float],
-        *,
-        num_reads: int,
-        num_sweeps: int,
-        **kwargs,
-    ) -> dimod.SampleSet:
-        return self.sampler.sample_ising(
-            h=h, J=J, num_reads=num_reads, num_sweeps=num_sweeps,
-        )
+    def _stream_factory_kwargs(self, sample_ctx, nodes):
+        """Kwargs forwarded to GPU.modal_stream:build_persistent_context."""
+        return {
+            "miner_id": self.miner_id,
+            "nodes": nodes,
+            "edges": sample_ctx["edges"],
+            "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
+            "num_reads": sample_ctx["num_reads"],
+            "num_sweeps": sample_ctx["num_sweeps"],
+            "gpu_type": self.gpu_type,
+        }
