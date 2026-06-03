@@ -4,7 +4,6 @@ import argparse
 import json
 import logging
 import multiprocessing
-import random
 import sys
 import time
 import threading
@@ -28,9 +27,8 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from dataclasses import dataclass
 
-from shared.block import Block, BlockHeader, BlockRequirements, create_genesis_block
-from shared.block_requirements import compute_current_requirements
-from shared.energy_utils import calc_energy_range, DEFAULT_NUM_NODES, DEFAULT_NUM_EDGES
+from shared.block import BlockRequirements, create_genesis_block
+from shared.energy_utils import calc_energy_range
 from shared.time_utils import utc_timestamp
 from dwave_topologies.topologies.json_loader import load_topology
 
@@ -199,7 +197,7 @@ def sequential_adaptive_threshold(
     # Get energy range from calibration or use provided values
     if energy_min is None or energy_max is None:
         # Use miner's topology for energy calculation
-        auto_min, knee_energy, auto_max = calc_energy_range(
+        auto_min, _, auto_max = calc_energy_range(
             num_nodes=len(miner.nodes),
             num_edges=len(miner.edges)
         )
@@ -222,7 +220,6 @@ def sequential_adaptive_threshold(
     search_right = int(max_energy)  # Easiest (least negative)
     current_energy = int((search_left + search_right) / 2.0)
     previous_energy = current_energy
-    last_adjustment_direction = None  # Track if we're oscillating
 
     in_range_times = []
     below_range_count = 0
@@ -416,9 +413,6 @@ def sequential_adaptive_threshold(
         stdev_time = statistics.stdev(in_range_times) if len(in_range_times) > 1 else 0.0
         variance_time = statistics.variance(in_range_times) if len(in_range_times) > 1 else 0.0
     else:
-        # No in-range samples, use all samples that succeeded
-        all_times = []
-        # We don't have access to all times here, so we'll report as failed
         return None
 
     return {
@@ -470,7 +464,7 @@ def binary_search_threshold(
     timeout_per_attempt = target_time_seconds * timeout_multiplier
 
     # Get energy range from calibration using miner's topology
-    min_energy, knee_energy, max_energy = calc_energy_range(
+    min_energy, _, max_energy = calc_energy_range(
         num_nodes=len(miner.nodes),
         num_edges=len(miner.edges)
     )
