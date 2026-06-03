@@ -732,6 +732,20 @@ def _energy_stratified_selection(
     return selected[:target_count] if len(selected) >= target_count else None
 
 
+def _ising_from_requirements(
+    requirements,
+    nonce: Union[int, bytes],
+    nodes: List[int],
+    edges: List[Tuple[int, int]],
+) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float]]:
+    """Generate (h, J) from requirements, respecting per-block allowed value specs."""
+    allowed_h = getattr(requirements, "allowed_h_values", DEFAULT_ALLOWED_H)
+    allowed_j = getattr(requirements, "allowed_j_values", DEFAULT_ALLOWED_J)
+    return generate_ising_model_from_nonce(
+        nonce, nodes, edges, allowed_h=allowed_h, allowed_j=allowed_j,
+    )
+
+
 def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tuple[int, int]],
                       nonce: Union[int, bytes], salt: bytes, prev_timestamp: int, start_time: float,
                       miner_id: str, miner_type: str,
@@ -828,11 +842,7 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
             # regenerate. Requirements may carry `allowed_h_values` /
             # `allowed_j_values` (post-MR-!20) for non-default distributions.
             if h is None or J is None:
-                allowed_h = getattr(requirements, "allowed_h_values", DEFAULT_ALLOWED_H)
-                allowed_j = getattr(requirements, "allowed_j_values", DEFAULT_ALLOWED_J)
-                h, J = generate_ising_model_from_nonce(
-                    nonce, nodes, edges, allowed_h=allowed_h, allowed_j=allowed_j,
-                )
+                h, J = _ising_from_requirements(requirements, nonce, nodes, edges)
 
             seen: set = set()
             valid_rows: List[List[int]] = []
@@ -970,11 +980,7 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         # those silently fail chain validation. The recompute uses the
         # canonical Ising formula, matching the chain.
         if h is None or J is None:
-            allowed_h = getattr(requirements, "allowed_h_values", DEFAULT_ALLOWED_H)
-            allowed_j = getattr(requirements, "allowed_j_values", DEFAULT_ALLOWED_J)
-            h_for_floor, J_for_floor = generate_ising_model_from_nonce(
-                nonce, nodes, edges, allowed_h=allowed_h, allowed_j=allowed_j,
-            )
+            h_for_floor, J_for_floor = _ising_from_requirements(requirements, nonce, nodes, edges)
         else:
             h_for_floor, J_for_floor = h, J
         selected_energies = energies_for_solutions(
