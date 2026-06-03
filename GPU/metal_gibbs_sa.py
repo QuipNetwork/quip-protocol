@@ -180,8 +180,6 @@ class MetalGibbsSampler:
         topology_graph = topology_obj.graph
         self.nodes = list(topology_graph.nodes())
         self.edges = list(topology_graph.edges())
-        self.nodelist = self.nodes
-        self.edgelist = self.edges
         self.properties = topology_obj.properties
 
         # Extract Zephyr parameters from topology
