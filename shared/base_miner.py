@@ -1567,6 +1567,17 @@ class BaseMiner(ABC):
         except Exception as exc:  # noqa: BLE001 — best-effort
             self.logger.debug("threshold forward failed (ignored): %s", exc)
 
+    @staticmethod
+    def _worst_stashed_energy(state: _MiningLoopState) -> float:
+        """Return the worst (highest) energy in the stash, or +inf when not full.
+
+        ``+inf`` means any sample qualifies — used as the legacy-path ratchet
+        threshold when the stash hasn't reached its cap yet.
+        """
+        if len(state.top_k) >= state.top_k_cap:
+            return state.top_k[-1].result.energy
+        return float("inf")
+
     def _stash_pre_check(
         self,
         state: _MiningLoopState,
@@ -1591,11 +1602,7 @@ class BaseMiner(ABC):
         """
         decay_schedule = state.decay_schedule
         if decay_schedule is None:
-            ratchet_threshold = (
-                state.top_k[-1].result.energy
-                if len(state.top_k) >= state.top_k_cap
-                else float("inf")
-            )
+            ratchet_threshold = self._worst_stashed_energy(state)
             admit = (iter_best_milli / 1000.0) < ratchet_threshold
         elif len(state.top_k) < state.top_k_cap:
             admit = True
@@ -1665,11 +1672,7 @@ class BaseMiner(ABC):
         iter_best_milli = int(iter_best_energy * 1000)
         # ratchet_threshold (legacy energy gate the attempt log records):
         # +inf until the stash is full, then the worst stashed energy.
-        ratchet_threshold = (
-            state.top_k[-1].result.energy
-            if len(state.top_k) >= state.top_k_cap
-            else float("inf")
-        )
+        ratchet_threshold = self._worst_stashed_energy(state)
         improves_stash = self._stash_pre_check(
             state, sampleset, iter_best_energy, iter_best_milli,
         )
