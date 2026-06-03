@@ -346,10 +346,6 @@ class BaseMiner(ABC):
         # before their own ``__init__`` runs.
         self._feeder: Optional[Any] = None
 
-        # Count of QPU results dropped under result-queue backpressure.
-        # Reset per dispatch by mine_work_item; logged at dispatch end.
-        self._dropped_results: int = 0
-
         # Persistent driver handles. ``_ensure_driver`` spawns ONE stream-driver
         # process and keeps it alive across dispatches; ``_close_driver`` (miner
         # shutdown) is the only thing that reaps it and close-unlinks the ring.
@@ -1092,7 +1088,6 @@ class BaseMiner(ABC):
             "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
         }
 
-        self._dropped_results = 0
         generation = 0
         if self._ensure_driver(sample_ctx):
             # New round: bump the generation and tell the persistent driver to
@@ -1456,11 +1451,6 @@ class BaseMiner(ABC):
         delegates to subclass ``_post_mine_cleanup``.
         """
         self.mining = False
-        if self._dropped_results:
-            self.logger.info(
-                "mine_work_item: %d QPU results dropped under "
-                "result-queue backpressure", self._dropped_results,
-            )
         attempt_logger = getattr(self, "_attempt_logger", None)
         if attempt_logger is not None:
             attempt_logger.flush()
