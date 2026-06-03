@@ -405,7 +405,13 @@ class DWaveSamplerWrapper:
         h: Dict[int, float],
         J: Dict[Tuple[int, int], float],
         nonce_seed: Union[int, bytes],
-    ) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float], Dict[int, int]]:
+    ) -> Tuple[
+        Dict[int, float],
+        Dict[Tuple[int, int], float],
+        Dict[int, int],
+        float,
+        Dict[Tuple[int, int], float],
+    ]:
         """Clamp defective qubits to deterministic spins and adjust neighbors.
 
         For each offline qubit k, assigns a fixed spin s_k (deterministic from
@@ -423,10 +429,15 @@ class DWaveSamplerWrapper:
                 int seed.
 
         Returns:
-            (h_reduced, J_reduced, fixed_spins) where:
+            5-tuple (h_reduced, J_reduced, fixed_spins, energy_offset, removed_edges):
             - h_reduced: biases without defective qubits (neighbors adjusted)
             - J_reduced: couplings without edges involving defective qubits
             - fixed_spins: {qubit_id: spin_value} for solution reconstruction
+            - energy_offset: constant energy contribution from clamped qubits
+              (h-fields and mutual J among clamped pairs); add once per sample
+            - removed_edges: {(u, v): val} for live-qubit coupler pairs whose
+              hardware coupler is offline; excluded from J_reduced and offset,
+              computed per-sample in _reconstruct_full_sampleset
         """
         defective_set = set(self._defective_qubits)
         # numpy's SeedSequence rejects bytes ("expects int or sequence of
