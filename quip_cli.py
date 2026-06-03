@@ -22,7 +22,7 @@ import traceback
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import click
 
@@ -437,6 +437,33 @@ def _faucet_url_option(f):
     )(f)
 
 
+def _load_or_fail(
+    loader: Callable[..., Any],
+    config_path: Optional[str],
+    raw: Optional[dict],
+    empty: Any,
+) -> Any:
+    """Invoke ``loader`` with either ``raw=`` or a resolved path; wrap errors.
+
+    If *raw* is provided the dict is passed directly (avoids a re-read).
+    If *config_path* is ``None`` the caller-supplied *empty* default is
+    returned immediately. Both live call-sites catch :class:`MinerConfigError`
+    and re-raise as :class:`click.ClickException` so the CLI formats the
+    message as ``quip-miner: error: …``.
+    """
+    if raw is not None:
+        try:
+            return loader(raw=raw)
+        except MinerConfigError as exc:
+            raise click.ClickException(str(exc)) from exc
+    if config_path is None:
+        return empty
+    try:
+        return loader(Path(config_path).expanduser())
+    except MinerConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 def _resolve_runtime_config(
     *,
     config_path: Optional[str],
@@ -459,18 +486,7 @@ def _resolve_runtime_config(
     the TOML can't be loaded or required keys (`validators`, `signer_key`)
     are missing.
     """
-    if raw is not None:
-        try:
-            toml_data = load_miner_config(raw=raw)
-        except MinerConfigError as exc:
-            raise click.ClickException(str(exc)) from exc
-    elif config_path is not None:
-        try:
-            toml_data = load_miner_config(Path(config_path).expanduser())
-        except MinerConfigError as exc:
-            raise click.ClickException(str(exc)) from exc
-    else:
-        toml_data = {}
+    toml_data = _load_or_fail(load_miner_config, config_path, raw, {})
     merged = merge_config(toml_data, cli_kwargs)
     if defaults:
         for key, value in defaults.items():
@@ -1205,17 +1221,7 @@ def _load_backends_or_fail(
     (via `miner_main`'s wrapper). Pass `raw` (a pre-parsed config from
     :func:`load_toml`) to reuse a single parse.
     """
-    if raw is not None:
-        try:
-            return load_backend_config(raw=raw)
-        except MinerConfigError as exc:
-            raise click.ClickException(str(exc)) from exc
-    if config_path is None:
-        return {}
-    try:
-        return load_backend_config(Path(config_path).expanduser())
-    except MinerConfigError as exc:
-        raise click.ClickException(str(exc)) from exc
+    return _load_or_fail(load_backend_config, config_path, raw, {})
 
 
 def _parse_image_supports(image_supports_csv: Optional[str]) -> Optional[list]:
@@ -1238,17 +1244,7 @@ def _load_submission_config_or_default(
     CLI's standard error formatting rather than a raw traceback. Pass `raw`
     (a pre-parsed config from :func:`load_toml`) to reuse a single parse.
     """
-    if raw is not None:
-        try:
-            return load_submission_config(raw=raw)
-        except MinerConfigError as exc:
-            raise click.ClickException(str(exc)) from exc
-    if config_path is None:
-        return SubmissionConfig()
-    try:
-        return load_submission_config(Path(config_path).expanduser())
-    except MinerConfigError as exc:
-        raise click.ClickException(str(exc)) from exc
+    return _load_or_fail(load_submission_config, config_path, raw, SubmissionConfig())
 
 
 def _check_backend_conflicts(
