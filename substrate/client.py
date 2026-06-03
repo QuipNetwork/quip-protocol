@@ -1573,9 +1573,7 @@ def _build_hybrid_signed_extrinsic(
         call_params=call_params,
     )
     raw_call = call.data.data if hasattr(call.data, "data") else call.data
-    if hasattr(raw_call, "tobytes"):
-        call_bytes = bytes(raw_call)
-    elif isinstance(raw_call, str):
+    if isinstance(raw_call, str):
         call_bytes = bytes.fromhex(_strip_0x(raw_call))
     else:
         call_bytes = bytes(raw_call)
