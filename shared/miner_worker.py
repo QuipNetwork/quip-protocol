@@ -2,7 +2,6 @@
 
 This worker runs a loop handling commands from the parent process:
 - mine_work_item {context}
-- stop_mining
 - get_stats
 - shutdown
 
@@ -176,9 +175,8 @@ def miner_worker_main(
     it from ``cancel()``; the miner polls it during its inner mining loop
     and returns None as soon as it fires. Sharing the event across the
     process boundary is what makes cancellation observable while
-    ``mine_block`` is running — the command queue can't deliver a
-    ``stop_mining`` op until ``mine_block`` returns, which defeats the
-    whole point.
+    ``mine_block`` is running — the command queue cannot interrupt the
+    inner loop, so ``stop_event`` is the sole cancellation path.
 
     ``live_max_energy_milli`` is an ``mp.Value('q')`` the parent updates
     on each new head that crosses a decay-step boundary. The substrate
@@ -466,12 +464,10 @@ class MinerHandle:
 
         Signals the running mining loop directly via the shared
         ``stop_event`` so the worker observes the cancel within one
-        iteration of its inner loop. We deliberately do NOT also enqueue
-        a ``stop_mining`` op on the request queue: that op can sit in
-        the queue while the worker is busy mining, and then get consumed
-        by a *later* dispatch's clear → mine_work_item → req.get
-        sequence — cancelling the new work with a stale cancel. The
-        ``stop_event`` is the single source of truth for cancellation.
+        iteration of its inner loop. The ``stop_event`` is the single
+        source of truth for cancellation; no op is enqueued on the
+        command queue, which cannot interrupt an in-progress
+        ``mine_block`` call.
 
         Idempotent — safe to call when the worker is idle (the set is a
         no-op cleared by the next ``mine_work_item()``).
