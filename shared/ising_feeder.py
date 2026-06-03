@@ -356,8 +356,7 @@ class RandomIsingFeeder:
                 model = self._futures.pop(i).result()
                 self._fill()
                 return model
-        assert self._futures, "RandomIsingFeeder: no pending work and empty queue"
-        assert False, (
+        raise AssertionError(
             f"RandomIsingFeeder buffer underrun: "
             f"{len(self._futures)} futures pending, "
             f"none ready. Increase buffer_size."
