@@ -11,6 +11,7 @@ Generates individual PNG files:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import random
 import sys
@@ -26,12 +27,7 @@ from CPU.sa_miner import SimulatedAnnealingMiner
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
 from dwave_topologies import DEFAULT_TOPOLOGY
 from shared.energy_utils import energy_to_difficulty
-from shared.nonce_prefilter import (
-    IsingTopologyCache,
-    greedy_descent_energy,
-)
-import hashlib
-
+from shared.nonce_prefilter import IsingTopologyCache
 from shared.quantum_proof_of_work import (
     derive_nonce,
     generate_ising_model_from_nonce,
