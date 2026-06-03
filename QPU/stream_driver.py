@@ -48,7 +48,7 @@ def qpu_access_time_us(sampleset) -> int:
     — happens on non-QPU fallbacks and some embedded-future code paths.
     """
     info = getattr(sampleset, "info", None) or {}
-    t = info.get("timing", {}) if info else {}
+    t = info.get("timing", {})
     prog = t.get("qpu_programming_time") or 0
     sample = t.get("qpu_sampling_time") or 0
     return int(prog) + int(sample)
