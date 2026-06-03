@@ -593,11 +593,6 @@ def _validate_topology_consistency(
     return errors
 
 
-# `validate_quantum_proof` was the pre-substrate block-validation path. It
-# trusted nodes/edges/h_values carried inside the proof — a shape removed by
-# quip-protocol-rs MR !20. The on-chain pallet is now the only validator.
-
-
 def validate_solution(spins: List[int], h: Dict[int, float], J: Dict[Tuple[int, int], float], nodes: List[int], edges: Optional[List[Tuple[int, int]]] = None) -> Dict[str, Any]:
     """Validate an Ising model solution for correctness.
 
