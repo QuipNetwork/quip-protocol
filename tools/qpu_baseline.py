@@ -5,6 +5,7 @@ import sys
 import time
 import json
 from pathlib import Path
+from typing import cast, Mapping, Tuple, Any
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -98,7 +99,6 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, min_runtime_minute
             start_time = time.time()
 
             # Cast h and J to match protocol expectations (int is a valid Variable type)
-            from typing import cast, Mapping, Tuple, Any
             h_cast = cast(Mapping[Any, float], h)
             J_cast = cast(Mapping[Tuple[Any, Any], float], J)
 
