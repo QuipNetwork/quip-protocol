@@ -115,10 +115,17 @@ class OrderStatus(IntEnum):
 
     @classmethod
     def from_scale_variant(cls, name: str) -> "OrderStatus":
-        try:
-            return {"Opened": cls.OPENED, "Expired": cls.EXPIRED, "Closed": cls.CLOSED}[name]
-        except KeyError:
+        result = _ORDER_STATUS_MAP.get(name)
+        if result is None:
             raise ValueError(f"unknown SCALE OrderStatus variant: {name!r}")
+        return result
+
+
+_ORDER_STATUS_MAP: dict[str, OrderStatus] = {
+    "Opened": OrderStatus.OPENED,
+    "Expired": OrderStatus.EXPIRED,
+    "Closed": OrderStatus.CLOSED,
+}
 
 
 # ----------------------------------------------------------------------
