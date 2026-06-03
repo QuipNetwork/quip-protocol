@@ -111,6 +111,7 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, min_runtime_minute
             runtime = time.time() - start_time
 
             energies = list(sampleset.record.energy)
+            solutions = list(sampleset.record.sample)
             min_energy = float(min(energies))
             avg_energy = float(sum(energies) / len(energies))
             std_energy = float((sum((e - avg_energy)**2 for e in energies) / len(energies)) ** 0.5)
@@ -120,7 +121,6 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, min_runtime_minute
             print(f"    📊 avg_energy = {avg_energy:.1f} (±{std_energy:.1f})")
 
             # Verify energy calculation consistency
-            solutions = list(sampleset.record.sample)
             recalc_energies = energies_for_solutions(solutions, h, J, nodes)
             recalc_min = min(recalc_energies)
             print(f"    ✓ Energy verification: sampler={min_energy:.1f}, recalc={recalc_min:.1f}, diff={abs(min_energy - recalc_min):.1f}")
