@@ -8,6 +8,7 @@ import json
 import random
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -215,7 +216,6 @@ def metal_splash_baseline_test(
 
         except Exception as e:
             print(f"  Error: {e}")
-            import traceback
             traceback.print_exc()
             break
 

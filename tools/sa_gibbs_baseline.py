@@ -21,6 +21,7 @@ import json
 import random
 import sys
 import time
+import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -234,7 +235,7 @@ def sa_gibbs_baseline_test(
 
             energies = list(sampleset.record.energy)
             min_energy = float(min(energies))
-            avg_energy = float(sum(energies) / len(energies))
+            avg_energy = float(np.mean(energies))
             std_energy = float(np.std(energies))
 
             print(f"  Runtime: {runtime:.2f}s ({runtime/60:.1f} min)")
@@ -274,7 +275,6 @@ def sa_gibbs_baseline_test(
 
         except Exception as e:
             print(f"  Error: {e}")
-            import traceback
             traceback.print_exc()
             break
 
