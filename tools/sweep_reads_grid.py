@@ -482,6 +482,15 @@ def _get_plt():
         return None
 
 
+def _save_fig(fig, path, dpi=150, bbox_inches='tight'):
+    """Apply tight_layout, save figure to path, close it, and print path."""
+    plt = _get_plt()
+    plt.tight_layout()
+    plt.savefig(path, dpi=dpi, bbox_inches=bbox_inches)
+    plt.close(fig)
+    print(f"  {path}")
+
+
 def _best_gibbs_gap(sa_entry, gibbs_entries):
     """Mean absolute rate gap between SA and closest Gibbs.
 
@@ -645,10 +654,7 @@ def plot_blocks_vs_threshold_cmp(results, output_path):
         'Gibbs Neighbors',
         fontsize=13,
     )
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  {output_path}")
+    _save_fig(fig, output_path)
 
 
 def plot_success_probability_cmp(results, output_path):
@@ -704,10 +710,7 @@ def plot_success_probability_cmp(results, output_path):
         'Gibbs Neighbors',
         fontsize=13,
     )
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  {output_path}")
+    _save_fig(fig, output_path)
 
 
 def plot_energy_cdf_cmp(results, output_path):
@@ -788,10 +791,7 @@ def plot_energy_cdf_cmp(results, output_path):
         'Gibbs Neighbors',
         fontsize=13,
     )
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  {output_path}")
+    _save_fig(fig, output_path)
 
 
 def plot_sweep_multiplier(results, output_path):
@@ -904,20 +904,13 @@ def plot_sweep_multiplier(results, output_path):
     ax_gap.grid(True, alpha=0.3)
     ax_gap.set_xscale('log', base=2)
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  {output_path}")
+    _save_fig(fig, output_path)
 
 
 def plot_results(results: Dict, output_dir: str) -> None:
     """Generate comparison plots."""
-    try:
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib not available, skipping plots")
+    plt = _get_plt()
+    if plt is None:
         return
 
     grid = results['grid_data']
@@ -967,11 +960,8 @@ def plot_results(results: Dict, output_dir: str) -> None:
         ax.grid(True, alpha=0.3)
         ax.invert_xaxis()
 
-    plt.tight_layout()
     path = outdir / 'blocks_vs_threshold.png'
-    plt.savefig(path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  {path}")
+    _save_fig(fig, path)
 
     # --- Plot 2: Success probability vs threshold ---
     # Log-scale shows where each config transitions from
@@ -1025,11 +1015,8 @@ def plot_results(results: Dict, output_dir: str) -> None:
         ax.set_yscale('log')
         ax.set_ylim(bottom=0.5 / max(num_models, 1))
 
-    plt.tight_layout()
     path = outdir / 'success_probability.png'
-    plt.savefig(path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  {path}")
+    _save_fig(fig, path)
 
     # --- Plot 4: Energy CDF overlay ---
     fig, axes = plt.subplots(1, 2, figsize=(16, 7))
@@ -1071,11 +1058,8 @@ def plot_results(results: Dict, output_dir: str) -> None:
         ax.legend(fontsize=7, ncol=2, loc='upper left')
         ax.grid(True, alpha=0.3)
 
-    plt.tight_layout()
     path = outdir / 'energy_cdf.png'
-    plt.savefig(path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  {path}")
+    _save_fig(fig, path)
 
     # --- Sweep multiplier analysis ---
     plot_sweep_multiplier(
