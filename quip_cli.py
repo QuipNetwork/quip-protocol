@@ -643,7 +643,7 @@ async def _ensure_registered_or_fail(client: SubstrateClient, keystore) -> None:
 )
 def quip_miner(log_level: str) -> None:
     """Substrate-integrated quantum mining frontend."""
-    setup_logging(log_level=log_level.upper(), node_name="quip-miner")
+    setup_logging(log_level=log_level.upper())
 
 
 @quip_miner.command("selftest")
@@ -1659,7 +1659,6 @@ def _announce_and_load(
         setup_logging(
             log_level=logging.getLevelName(logging.getLogger().level),
             node_log_file=node_log,
-            node_name=node_name or _default_node_name(),
         )
     keystore = _load_keystore_or_fail(signer_key_path)
     click.echo(f"signer: {keystore.signer.ss58_address()} (hybrid) mode={mode}")

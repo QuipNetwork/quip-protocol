@@ -53,10 +53,9 @@ class QuipFormatter(logging.Formatter):
         # Module-level loggers (e.g. 'substrate.miner_controller', 'shared.base_miner')
         if '.' in logger_name:
             parts = logger_name.split('.')
-            if len(parts) >= 2:
-                if 'miner' in logger_name:
-                    return 'miner', parts[-1]
-                return parts[0], parts[-1]
+            if 'miner' in logger_name:
+                return 'miner', parts[-1]
+            return parts[0], parts[-1]
 
         # Fallback for other loggers
         return 'unknown', logger_name
@@ -66,7 +65,6 @@ def setup_logging(
     log_level: str = "INFO",
     node_log_file: Optional[str] = None,
     http_log_file: Optional[str] = None,
-    node_name: str = "quip-node"
 ) -> Dict[str, logging.Logger]:
     """
     Setup centralized logging configuration.
@@ -75,7 +73,6 @@ def setup_logging(
         log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
         node_log_file: Path to node log file (None for stderr)
         http_log_file: Path to HTTP log file (None to suppress aiohttp logs)
-        node_name: Node name for log file naming
 
     Returns:
         Dictionary of configured loggers
@@ -113,9 +110,6 @@ def setup_logging(
         )
         file_handler.setLevel(numeric_level)
         file_handler.setFormatter(formatter)
-
-        # Log to both file and console at the same level
-        console_handler.setLevel(numeric_level)
 
         root_logger.addHandler(file_handler)
 
@@ -184,29 +178,6 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(f'shared.{name}')
 
 
-def update_log_level(loggers: Dict[str, logging.Logger], level: str):
-    """
-    Update log level for all loggers.
-
-    Args:
-        loggers: Dictionary of loggers from setup_logging()
-        level: New log level (DEBUG, INFO, WARNING, ERROR)
-    """
-    numeric_level = getattr(logging, level.upper(), logging.INFO)
-
-    # Update root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(numeric_level)
-
-    # Update all handlers
-    for handler in root_logger.handlers:
-        handler.setLevel(numeric_level)
-
-    # Update component loggers
-    for logger in loggers.values():
-        logger.setLevel(numeric_level)
-
-
 def init_component_logger(component: str, identifier: str) -> logging.Logger:
     """
     Initialize a component logger with proper setup.
@@ -233,11 +204,6 @@ def init_component_logger(component: str, identifier: str) -> logging.Logger:
     log = logger
 
     return logger
-
-
-def shutdown_logging():
-    """Shutdown logging system and close all handlers."""
-    logging.shutdown()
 
 
 def log_writer_main(log_queue, stop_event, log_file_path, level) -> None:
