@@ -4,21 +4,25 @@
 
 """Metal Splash Sampler baseline parameter testing tool."""
 
-import argparse
+import json
+import random
 import sys
 import time
-import json
 from pathlib import Path
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evaluate_sampleset, calculate_diversity
-from shared.block_requirements import BlockRequirements
-from dwave_topologies import DEFAULT_TOPOLOGY
-from dwave_topologies.topologies.json_loader import load_topology
-from dwave_topologies.embedded_topology import create_embedded_topology
-from tools.baseline_utils import classify_energy
+from shared.quantum_proof_of_work import generate_ising_model_from_nonce
+from tools.baseline_utils import (
+    build_baseline_argparser,
+    classify_energy,
+    evaluate_baseline_sampleset,
+    filter_configs_by_label,
+    load_baseline_topology,
+    print_problem_summary,
+    print_results_summary,
+)
 
 from GPU.metal_splash_sa import MetalSplashSampler
 from GPU.metal_miner import get_gpu_core_count
@@ -73,36 +77,9 @@ def metal_splash_baseline_test(
         return None
 
     # Get topology
-    if topology:
-        # Auto-detect embedding files by .embed.json.gz extension
-        if topology.endswith('.embed.json.gz'):
-            print(f"Loading embedded topology: {topology}")
-            # Parse Z(m,t) from filename like "zephyr_z9_t2.embed.json.gz"
-            import os
-            filename = os.path.basename(topology)
-            if filename.startswith("zephyr_z"):
-                parts = filename.replace("zephyr_z", "").replace(".embed.json.gz", "").split("_t")
-                topology_name = f"Z({parts[0]},{parts[1]})"
-                embedded_topo = create_embedded_topology(topology_name)
-                nodes = embedded_topo.nodes
-                edges = embedded_topo.edges
-                topology_desc = f"{topology_name} embedded ({len(nodes)} qubits, {len(edges)} couplers)"
-            else:
-                raise ValueError(f"Cannot parse embedding filename: {filename}")
-        else:
-            print(f"Loading topology: {topology}")
-            topo_obj = load_topology(topology)
-            nodes = list(topo_obj.graph.nodes) if hasattr(topo_obj, 'graph') else topo_obj.nodes
-            edges = list(topo_obj.graph.edges) if hasattr(topo_obj, 'graph') else topo_obj.edges
-            topology_name = getattr(topo_obj, 'solver_name', 'unknown')
-            topology_desc = f"{topology_name} ({len(nodes)} nodes, {len(edges)} edges)"
-    else:
-        print(f"Using default topology (Advantage2_system1)")
-        topo_obj = DEFAULT_TOPOLOGY
-        nodes = list(topo_obj.graph.nodes) if hasattr(topo_obj, 'graph') else topo_obj.nodes
-        edges = list(topo_obj.graph.edges) if hasattr(topo_obj, 'graph') else topo_obj.edges
-        topology_desc = f"{topo_obj.solver_name} ({len(nodes)} nodes, {len(edges)} edges)"
-
+    nodes, edges, topology_desc = load_baseline_topology(
+        topology_arg=topology,
+    )
     print(f"Topology: {topology_desc}")
 
     # Generate test problem with h_values
@@ -110,11 +87,7 @@ def metal_splash_baseline_test(
     h, J = generate_ising_model_from_nonce(seed, nodes, edges, h_values=h_values)
 
     # Show h distribution
-    h_vals_set = sorted(set(h.values()))
-    h_counts = {v: list(h.values()).count(v) for v in h_vals_set}
-    h_dist_str = ", ".join([f"{v}: {h_counts[v]} ({100*h_counts[v]/len(h):.1f}%)" for v in h_vals_set])
-    print(f"Problem: {len(h)} variables, {len(J)} couplings")
-    print(f"   h distribution: {h_dist_str}")
+    print_problem_summary(h, J)
 
     # Test configurations - matching other baselines
     test_configs = [
@@ -127,13 +100,9 @@ def metal_splash_baseline_test(
     ]
 
     # Optional filter
-    if only_label:
-        available_labels = [desc for _, _, desc in test_configs]
-        filtered = [cfg for cfg in test_configs if cfg[2].lower() == only_label.lower()]
-        if not filtered:
-            print(f"No test config matched --only {only_label!r}; available: {available_labels}")
-            return None
-        test_configs = filtered
+    test_configs = filter_configs_by_label(test_configs, only_label)
+    if test_configs is None:
+        return None
 
     print(f"\nTesting Metal Splash configurations:")
 
@@ -156,7 +125,6 @@ def metal_splash_baseline_test(
     total_start_time = time.time()
 
     # Use deterministic seed sequence for reproducible comparisons
-    import random
     random.seed(42)
     test_nonces = [random.randint(0, 2**32 - 1) for _ in range(len(test_configs))]
 
@@ -214,49 +182,15 @@ def metal_splash_baseline_test(
                 print(f"  min_energy = {min_energy:.1f}")
             print(f"  Avg energy (first model): {avg_energy:.1f} (+/-{std_energy:.1f})")
 
-            # Use evaluate_sampleset to get diversity and num_solutions
-            requirements = BlockRequirements(
-                difficulty_energy=0.0,
-                min_diversity=0.1,
-                min_solutions=1,
-                timeout_to_difficulty_adjustment_decay=600
+            # Evaluate the sampleset
+            eval_fields = evaluate_baseline_sampleset(
+                sampleset, nodes, edges, nonces[0],
+                start_time, f"metal-splash-{sweeps}-{reads}", "Metal",
+                b"test_salt_metal_splash_baseline",
             )
-
-            salt = b"test_salt_metal_splash_baseline"
-            prev_timestamp = int(time.time()) - 600
-
-            mining_result = evaluate_sampleset(
-                sampleset, requirements, nodes, edges, nonces[0], salt,
-                prev_timestamp, start_time, f"metal-splash-{sweeps}-{reads}", "Metal"
-            )
-
-            diversity = 0.0
-            num_solutions = 0
-            meets_requirements = False
-
-            # Calculate diversity of top 10 solutions by energy
-            solutions = list(sampleset.record.sample)
-            energies = list(sampleset.record.energy)
-
-            solution_energy_pairs = list(zip(solutions, energies))
-            solution_energy_pairs.sort(key=lambda x: x[1])
-            top_10_solutions = [sol for sol, _ in solution_energy_pairs[:10]]
-
-            top_10_diversity = calculate_diversity(top_10_solutions)
-            print(f"  diversity (top 10) = {top_10_diversity:.3f}")
-
-            if mining_result:
-                diversity = mining_result.diversity
-                num_solutions = mining_result.num_valid
-                meets_requirements = True
-                print(f"  num_solutions = {num_solutions}")
-                print(f"  Meets mining requirements!")
-            else:
-                print(f"  Does not meet mining requirements")
 
             # Energy target analysis
             target_reached = classify_energy(min_energy)
-
             if target_reached != "none":
                 print(f"  Quality: {target_reached}")
 
@@ -270,10 +204,7 @@ def metal_splash_baseline_test(
                 'avg_energy': avg_energy,
                 'std_energy': std_energy,
                 'target_reached': target_reached,
-                'diversity': float(diversity),
-                'diversity_top_10': float(top_10_diversity),
-                'num_solutions': int(num_solutions),
-                'meets_requirements': bool(meets_requirements)
+                **eval_fields,
             }
             results['tests'].append(test_result)
 
@@ -290,20 +221,8 @@ def metal_splash_baseline_test(
 
     # Summary
     total_runtime = time.time() - total_start_time
-    print(f"\nMetal Splash Baseline Summary (total time: {total_runtime/60:.1f} min):")
-    print("=" * 50)
-
-    if results['tests']:
-        # Best energy achieved
-        best_result = min(results['tests'], key=lambda r: r['min_energy'])
-        print(f"Best energy: {best_result['min_energy']:.1f}")
-        print(f"   Required: {best_result['num_sweeps']} sweeps, {best_result['runtime_minutes']:.1f} min")
-
-        # Time vs energy analysis
-        print(f"\nTime vs Energy Performance:")
-        for result in results['tests']:
-            quality = f"({result['target_reached']})" if result['target_reached'] != 'none' else ""
-            print(f"  {result['runtime_minutes']:5.1f} min: {result['min_energy']:7.1f} energy {quality}")
+    results['_total_runtime_seconds'] = total_runtime
+    print_results_summary(results, "Metal Splash Baseline Summary")
 
     # Save results if requested
     if output_file:
@@ -316,50 +235,14 @@ def metal_splash_baseline_test(
 
 def main():
     """Main function with command line argument parsing."""
-    parser = argparse.ArgumentParser(description='Metal Splash baseline parameter testing tool')
-    parser.add_argument(
-        '--timeout', '-t',
-        type=float,
-        default=10.0,
-        help='Timeout in minutes (default: 10.0)'
-    )
-    parser.add_argument(
-        '--output', '-o',
-        type=str,
-        help='Output JSON file for results'
-    )
-    parser.add_argument(
-        '--quick',
-        action='store_true',
-        help='Quick test mode (only Light test)'
-    )
-    parser.add_argument(
-        '--extended',
-        action='store_true',
-        help='Extended test mode (30 minute timeout)'
-    )
-    parser.add_argument(
-        '--only',
-        type=str,
-        help='Run only the config with this description (e.g., "Light Splash")'
-    )
-    parser.add_argument(
-        '--h-values',
-        type=str,
-        default='-1,0,1',
-        help='Comma-separated h field values (default: -1,0,1). Use "0" for h=0 baseline.'
+    parser = build_baseline_argparser(
+        'Metal Splash baseline parameter testing tool',
     )
     parser.add_argument(
         '--num-models',
         type=int,
         default=None,
-        help='Number of models to process in parallel (default: auto-detect GPU cores)'
-    )
-    parser.add_argument(
-        '--topology',
-        type=str,
-        help='Topology: Z(9,2), Advantage2_system1, file path, or *.embed.json.gz for embedded. '
-             'Default: Advantage2_system1'
+        help='Number of models to process in parallel (default: auto-detect GPU cores)',
     )
     parser.add_argument(
         '--max-treewidth',

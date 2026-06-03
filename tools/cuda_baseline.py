@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 """CUDA GPU baseline parameter testing tool using self-feeding SA kernel."""
-import argparse
+import json
+import random
 import sys
 import time
-import json
 from pathlib import Path
-import random
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-import numpy as np
-from shared.quantum_proof_of_work import (
-    generate_ising_model_from_nonce,
-    evaluate_sampleset,
-    calculate_diversity,
-)
-from shared.block_requirements import BlockRequirements
+from shared.quantum_proof_of_work import generate_ising_model_from_nonce
 from tools.baseline_utils import (
+    build_baseline_argparser,
     classify_energy,
+    evaluate_baseline_sampleset,
+    filter_configs_by_label,
     load_baseline_topology,
+    print_problem_summary,
+    print_results_summary,
 )
 
 try:
@@ -87,20 +85,7 @@ def cuda_baseline_test(
     )
 
     # Show h distribution
-    h_vals_set = sorted(set(h.values()))
-    h_counts = {
-        v: list(h.values()).count(v) for v in h_vals_set
-    }
-    h_dist_str = ", ".join([
-        f"{v}: {h_counts[v]} "
-        f"({100 * h_counts[v] / len(h):.1f}%)"
-        for v in h_vals_set
-    ])
-    print(
-        f"📊 Problem: {len(h)} variables, "
-        f"{len(J)} couplings"
-    )
-    print(f"   h distribution: {h_dist_str}")
+    print_problem_summary(h, J)
 
     # Test configurations - matching CPU baseline exactly
     test_configs = [
@@ -113,21 +98,9 @@ def cuda_baseline_test(
     ]
 
     # Optional filter: run only the requested label
-    if only_label:
-        available_labels = [
-            desc for _, _, desc in test_configs
-        ]
-        filtered = [
-            cfg for cfg in test_configs
-            if cfg[2].lower() == only_label.lower()
-        ]
-        if not filtered:
-            print(
-                f"⚠️ No test config matched --only "
-                f"{only_label!r}; available: {available_labels}"
-            )
-            return None
-        test_configs = filtered
+    test_configs = filter_configs_by_label(test_configs, only_label)
+    if test_configs is None:
+        return None
 
     print(f"\n🧪 Testing CUDA configurations:")
 
@@ -249,58 +222,15 @@ def cuda_baseline_test(
                 f"{avg_energy:.1f} (±{std_energy:.1f})"
             )
 
-            # Use evaluate_sampleset to get diversity
-            # and num_solutions (same as CPU)
-            requirements = BlockRequirements(
-                difficulty_energy=0.0,
-                min_diversity=0.1,
-                min_solutions=1,
-                timeout_to_difficulty_adjustment_decay=600,
-            )
-
-            # Use the nonce and generate test salt
-            salt = b"test_salt_cuda_baseline"
-            prev_timestamp = int(time.time()) - 600
-
             # Evaluate the sampleset
-            mining_result = evaluate_sampleset(
-                sampleset, requirements, nodes, edges,
-                nonces[0], salt, prev_timestamp,
-                start_time,
-                f"cuda-baseline-{sweeps}-{reads}", "CUDA",
+            eval_fields = evaluate_baseline_sampleset(
+                sampleset, nodes, edges, nonces[0],
+                start_time, f"cuda-baseline-{sweeps}-{reads}", "CUDA",
+                b"test_salt_cuda_baseline",
             )
-
-            diversity = 0.0
-            num_solutions = 0
-            meets_requirements = False
-
-            # Calculate diversity of top 10 solutions
-            solutions = list(sampleset.record.sample)
-            energies_list = list(sampleset.record.energy)
-
-            # Sort solutions by energy and take top 10
-            pairs = list(zip(solutions, energies_list))
-            pairs.sort(key=lambda x: x[1])
-            top_10 = [sol for sol, _ in pairs[:10]]
-
-            top_10_diversity = calculate_diversity(top_10)
-            print(
-                f"  🌈 diversity (top 10) = "
-                f"{top_10_diversity:.3f}"
-            )
-
-            if mining_result:
-                diversity = mining_result.diversity
-                num_solutions = mining_result.num_valid
-                meets_requirements = True
-                print(f"  🔢 num_solutions = {num_solutions}")
-                print("  ✅ Meets mining requirements!")
-            else:
-                print("  ❌ Does not meet mining requirements")
 
             # Energy target analysis (same as CPU)
             target_reached = classify_energy(min_energy)
-
             if target_reached != "none":
                 print(f"  🎖️  Quality: {target_reached}")
 
@@ -314,10 +244,7 @@ def cuda_baseline_test(
                 'avg_energy': avg_energy,
                 'std_energy': std_energy,
                 'target_reached': target_reached,
-                'diversity': float(diversity),
-                'diversity_top_10': float(top_10_diversity),
-                'num_solutions': int(num_solutions),
-                'meets_requirements': bool(meets_requirements),
+                **eval_fields,
             }
             results['tests'].append(test_result)
 
@@ -337,38 +264,8 @@ def cuda_baseline_test(
 
     # Summary (same as CPU)
     total_runtime = time.time() - total_start_time
-    print(
-        f"\n📊 CUDA Baseline Summary "
-        f"(total time: {total_runtime / 60:.1f} min):"
-    )
-    print("=" * 50)
-
-    if results['tests']:
-        # Best energy achieved
-        best_result = min(
-            results['tests'], key=lambda r: r['min_energy'],
-        )
-        print(
-            f"🏆 Best energy: {best_result['min_energy']:.1f}"
-        )
-        print(
-            f"   Required: {best_result['num_sweeps']} sweeps, "
-            f"{best_result['runtime_minutes']:.1f} min"
-        )
-
-        # Time vs energy analysis
-        print(f"\n⏱️ Time vs Energy Performance:")
-        for result in results['tests']:
-            quality = (
-                f"({result['target_reached']})"
-                if result['target_reached'] != 'none'
-                else ""
-            )
-            print(
-                f"  {result['runtime_minutes']:5.1f} min: "
-                f"{result['min_energy']:7.1f} energy "
-                f"{quality}"
-            )
+    results['_total_runtime_seconds'] = total_runtime
+    print_results_summary(results, "CUDA Baseline Summary")
 
     # Save results if requested
     if output_file:
@@ -384,46 +281,13 @@ def cuda_baseline_test(
 
 def main():
     """Main function with command line argument parsing."""
-    parser = argparse.ArgumentParser(
-        description='CUDA GPU baseline parameter testing tool',
-    )
-    parser.add_argument(
-        '--timeout', '-t', type=float, default=10.0,
-        help='Timeout in minutes (default: 10.0)',
-    )
-    parser.add_argument(
-        '--output', '-o', type=str,
-        help='Output JSON file for results',
-    )
-    parser.add_argument(
-        '--quick', action='store_true',
-        help='Quick test mode (only Light test)',
-    )
-    parser.add_argument(
-        '--extended', action='store_true',
-        help='Extended test mode (30 minute timeout)',
-    )
-    parser.add_argument(
-        '--only', type=str,
-        help='Run only the config with this description '
-        '(e.g., "Light CUDA")',
-    )
-    parser.add_argument(
-        '--h-values', type=str, default='-1,0,1',
-        help='Comma-separated h field values '
-        '(default: -1,0,1). '
-        'Use "0" for h=0 baseline.',
+    parser = build_baseline_argparser(
+        'CUDA GPU baseline parameter testing tool',
     )
     parser.add_argument(
         '--embedding', type=str,
         help='Use embedded hardware topology instead of '
         'perfect topology (e.g., "Z(9,2)")',
-    )
-    parser.add_argument(
-        '--topology', type=str,
-        help='Topology to use. Can be: file path, '
-        'hardware name, or Zephyr format. '
-        'Takes precedence over --embedding.',
     )
     args = parser.parse_args()
 

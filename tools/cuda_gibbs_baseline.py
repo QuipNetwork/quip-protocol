@@ -8,7 +8,6 @@ Output format matches cuda_baseline.py exactly. Runs 12
 models in parallel (4 SMs per model × 12 = 48 SMs).
 """
 
-import argparse
 import json
 import random
 import sys
@@ -17,18 +16,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import dimod
 import numpy as np
 
-from shared.quantum_proof_of_work import (
-    generate_ising_model_from_nonce,
-    evaluate_sampleset,
-    calculate_diversity,
-)
-from shared.block_requirements import BlockRequirements
+from shared.quantum_proof_of_work import generate_ising_model_from_nonce
 from tools.baseline_utils import (
+    build_baseline_argparser,
     classify_energy,
+    evaluate_baseline_sampleset,
+    filter_configs_by_label,
     load_baseline_topology,
+    print_problem_summary,
+    print_results_summary,
 )
 
 from GPU.cuda_gibbs_sa import CudaGibbsSampler
@@ -99,20 +97,7 @@ def cuda_gibbs_baseline_test(
         seed, nodes, edges, h_values=h_values,
     )
 
-    h_vals_set = sorted(set(h.values()))
-    h_counts = {
-        v: list(h.values()).count(v) for v in h_vals_set
-    }
-    h_dist_str = ", ".join([
-        f"{v}: {h_counts[v]} "
-        f"({100 * h_counts[v] / len(h):.1f}%)"
-        for v in h_vals_set
-    ])
-    print(
-        f"📊 Problem: {len(h)} variables, "
-        f"{len(J)} couplings"
-    )
-    print(f"   h distribution: {h_dist_str}")
+    print_problem_summary(h, J)
 
     test_configs = [
         (256, 64, f"Light {mode_name}"),
@@ -123,19 +108,9 @@ def cuda_gibbs_baseline_test(
         (8192, 200, f"Max {mode_name}"),
     ]
 
-    if only_label:
-        available = [desc for _, _, desc in test_configs]
-        filtered = [
-            cfg for cfg in test_configs
-            if cfg[2].lower() == only_label.lower()
-        ]
-        if not filtered:
-            print(
-                f"⚠️ No config matched --only "
-                f"{only_label!r}; available: {available}"
-            )
-            return None
-        test_configs = filtered
+    test_configs = filter_configs_by_label(test_configs, only_label)
+    if test_configs is None:
+        return None
 
     print(f"\n🧪 Testing CUDA Block {mode_name} configs:")
     print(
@@ -235,54 +210,18 @@ def cuda_gibbs_baseline_test(
                 f"{avg_energy:.1f} (±{std_energy:.1f})"
             )
 
-            # Diversity of top 10 solutions (first model)
-            solutions = list(sampleset.record.sample)
-            pairs = sorted(
-                zip(solutions, energies),
-                key=lambda x: x[1],
-            )
-            top_10 = [sol for sol, _ in pairs[:10]]
-            top_10_diversity = calculate_diversity(top_10)
-            print(
-                f"  🌈 diversity (top 10) = "
-                f"{top_10_diversity:.3f}"
-            )
-
             # Evaluate against mining requirements
-            requirements = BlockRequirements(
-                difficulty_energy=0.0,
-                min_diversity=0.1,
-                min_solutions=1,
-                timeout_to_difficulty_adjustment_decay=600,
-            )
-            salt = b"test_salt_cuda_gibbs_baseline"
-            prev_timestamp = int(time.time()) - 600
-
-            mining_result = evaluate_sampleset(
-                sampleset, requirements,
-                nodes, edges, nonces[0], salt,
-                prev_timestamp, start_time,
+            eval_fields = evaluate_baseline_sampleset(
+                sampleset, nodes, edges, nonces[0],
+                start_time,
                 f"cuda-{update_mode}-{sweeps}-{reads}",
                 "CUDA",
+                b"test_salt_cuda_gibbs_baseline",
             )
-
-            diversity = 0.0
-            num_solutions = 0
-            meets_requirements = False
-
-            if mining_result:
-                diversity = mining_result.diversity
-                num_solutions = mining_result.num_valid
-                meets_requirements = True
-                print(f"  🔢 num_solutions = {num_solutions}")
-                print(f"  ✅ Meets mining requirements!")
-            else:
-                print(f"  ❌ Does not meet mining requirements")
 
             # Quality tier
             best_across = min(all_min_energies)
             target_reached = classify_energy(best_across)
-
             if target_reached != "none":
                 print(f"  🎖️  Quality: {target_reached}")
 
@@ -298,14 +237,7 @@ def cuda_gibbs_baseline_test(
                 'std_energy': std_energy,
                 'throughput': throughput,
                 'target_reached': target_reached,
-                'diversity': float(diversity),
-                'diversity_top_10': float(
-                    top_10_diversity,
-                ),
-                'num_solutions': int(num_solutions),
-                'meets_requirements': bool(
-                    meets_requirements,
-                ),
+                **eval_fields,
             }
             results['tests'].append(test_result)
 
@@ -323,32 +255,10 @@ def cuda_gibbs_baseline_test(
 
     # Summary
     total_runtime = time.time() - total_start_time
-    print(
-        f"\n📊 CUDA Block {mode_name} Summary "
-        f"(total time: {total_runtime / 60:.1f} min):"
+    results['_total_runtime_seconds'] = total_runtime
+    print_results_summary(
+        results, f"CUDA Block {mode_name} Summary",
     )
-    print("=" * 50)
-
-    if results['tests']:
-        best = min(
-            results['tests'], key=lambda r: r['min_energy'],
-        )
-        print(f"🏆 Best energy: {best['min_energy']:.1f}")
-        print(
-            f"   Required: {best['num_sweeps']} sweeps, "
-            f"{best['runtime_minutes']:.1f} min"
-        )
-
-        print(f"\n⏱️ Time vs Energy Performance:")
-        for r in results['tests']:
-            quality = (
-                f"({r['target_reached']})"
-                if r['target_reached'] != 'none' else ""
-            )
-            print(
-                f"  {r['runtime_minutes']:5.1f} min: "
-                f"{r['min_energy']:7.1f} energy {quality}"
-            )
 
     if output_file:
         with open(output_file, 'w') as f:
@@ -360,44 +270,8 @@ def cuda_gibbs_baseline_test(
 
 def main():
     """CLI entry point."""
-    parser = argparse.ArgumentParser(
-        description=(
-            'CUDA Block Gibbs baseline testing tool'
-        ),
-    )
-    parser.add_argument(
-        '--timeout', '-t', type=float, default=10.0,
-        help='Timeout in minutes (default: 10.0)',
-    )
-    parser.add_argument(
-        '--output', '-o', type=str,
-        help='Output JSON file for results',
-    )
-    parser.add_argument(
-        '--quick', action='store_true',
-        help='Quick test mode (only Light test)',
-    )
-    parser.add_argument(
-        '--extended', action='store_true',
-        help='Extended test mode (30 minute timeout)',
-    )
-    parser.add_argument(
-        '--only', type=str,
-        help='Run only this config (e.g., "Light Gibbs")',
-    )
-    parser.add_argument(
-        '--h-values', type=str, default='-1,0,1',
-        help=(
-            'Comma-separated h values '
-            '(default: -1,0,1)'
-        ),
-    )
-    parser.add_argument(
-        '--topology', type=str,
-        help=(
-            'Topology: Z(9,2), hardware name, '
-            'or file path'
-        ),
+    parser = build_baseline_argparser(
+        'CUDA Block Gibbs baseline testing tool',
     )
     parser.add_argument(
         '--update-mode', type=str,

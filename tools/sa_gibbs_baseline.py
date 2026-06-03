@@ -17,7 +17,6 @@ Usage:
     python tools/sa_gibbs_baseline.py --timeout 10
 """
 
-import argparse
 import json
 import random
 import sys
@@ -30,15 +29,17 @@ import numpy as np
 from dwave.samplers import SimulatedAnnealingSampler
 from dwave_networkx import zephyr_four_color, zephyr_coordinates
 
-from shared.quantum_proof_of_work import (
-    generate_ising_model_from_nonce,
-    evaluate_sampleset,
-    calculate_diversity,
-)
-from shared.block_requirements import BlockRequirements
+from shared.quantum_proof_of_work import generate_ising_model_from_nonce
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies.json_loader import load_topology
-from tools.baseline_utils import classify_energy
+from tools.baseline_utils import (
+    build_baseline_argparser,
+    classify_energy,
+    evaluate_baseline_sampleset,
+    filter_configs_by_label,
+    print_problem_summary,
+    print_results_summary,
+)
 
 
 def _extract_zephyr_params(topo_obj):
@@ -160,11 +161,7 @@ def sa_gibbs_baseline_test(
     h, J = generate_ising_model_from_nonce(seed, nodes, edges, h_values=h_values)
 
     # Show h distribution
-    h_vals_set = sorted(set(h.values()))
-    h_counts = {v: list(h.values()).count(v) for v in h_vals_set}
-    h_dist_str = ", ".join([f"{v}: {h_counts[v]} ({100*h_counts[v]/len(h):.1f}%)" for v in h_vals_set])
-    print(f"Problem: {len(h)} variables, {len(J)} couplings")
-    print(f"   h distribution: {h_dist_str}")
+    print_problem_summary(h, J)
 
     # Test configurations
     test_configs = [
@@ -177,13 +174,9 @@ def sa_gibbs_baseline_test(
     ]
 
     # Optional filter
-    if only_label:
-        available_labels = [desc for _, _, desc in test_configs]
-        filtered = [cfg for cfg in test_configs if cfg[2].lower() == only_label.lower()]
-        if not filtered:
-            print(f"No test config matched --only {only_label!r}; available: {available_labels}")
-            return None
-        test_configs = filtered
+    test_configs = filter_configs_by_label(test_configs, only_label)
+    if test_configs is None:
+        return None
 
     print(f"\nTesting CPU Block {mode_name} configurations:")
 
@@ -249,48 +242,14 @@ def sa_gibbs_baseline_test(
             print(f"  avg_energy = {avg_energy:.1f} (+/-{std_energy:.1f})")
 
             # Evaluate with mining requirements
-            requirements = BlockRequirements(
-                difficulty_energy=0.0,
-                min_diversity=0.1,
-                min_solutions=1,
-                timeout_to_difficulty_adjustment_decay=600,
+            eval_fields = evaluate_baseline_sampleset(
+                sampleset, nodes, edges, nonce,
+                start_time, f"cpu-sa-{update_mode}-{sweeps}-{reads}", "CPU",
+                b"test_salt_sa_gibbs_baseline",
             )
-
-            salt = b"test_salt_sa_gibbs_baseline"
-            prev_timestamp = int(time.time()) - 600
-
-            mining_result = evaluate_sampleset(
-                sampleset, requirements, nodes, edges, nonce, salt,
-                prev_timestamp, start_time, f"cpu-sa-{update_mode}-{sweeps}-{reads}", "CPU"
-            )
-
-            diversity = 0.0
-            num_solutions = 0
-            meets_requirements = False
-
-            # Diversity of top 10 solutions by energy
-            solutions = list(sampleset.record.sample)
-            energies_arr = list(sampleset.record.energy)
-
-            solution_energy_pairs = list(zip(solutions, energies_arr))
-            solution_energy_pairs.sort(key=lambda x: x[1])
-            top_10_solutions = [sol for sol, _ in solution_energy_pairs[:10]]
-
-            top_10_diversity = calculate_diversity(top_10_solutions)
-            print(f"  diversity (top 10) = {top_10_diversity:.3f}")
-
-            if mining_result:
-                diversity = mining_result.diversity
-                num_solutions = mining_result.num_valid
-                meets_requirements = True
-                print(f"  num_solutions = {num_solutions}")
-                print(f"  Meets mining requirements!")
-            else:
-                print(f"  Does not meet mining requirements")
 
             # Energy target analysis
             target_reached = classify_energy(min_energy)
-
             if target_reached != "none":
                 print(f"  Quality: {target_reached}")
 
@@ -304,10 +263,7 @@ def sa_gibbs_baseline_test(
                 'avg_energy': avg_energy,
                 'std_energy': std_energy,
                 'target_reached': target_reached,
-                'diversity': float(diversity),
-                'diversity_top_10': float(top_10_diversity),
-                'num_solutions': int(num_solutions),
-                'meets_requirements': bool(meets_requirements),
+                **eval_fields,
             }
             results['tests'].append(test_result)
 
@@ -324,18 +280,10 @@ def sa_gibbs_baseline_test(
 
     # Summary
     total_runtime = time.time() - total_start_time
-    print(f"\nCPU Block {mode_name} Baseline Summary (total time: {total_runtime/60:.1f} min):")
-    print("=" * 50)
-
-    if results['tests']:
-        best_result = min(results['tests'], key=lambda r: r['min_energy'])
-        print(f"Best energy: {best_result['min_energy']:.1f}")
-        print(f"   Required: {best_result['num_sweeps']} sweeps, {best_result['runtime_minutes']:.1f} min")
-
-        print(f"\nTime vs Energy Performance:")
-        for result in results['tests']:
-            quality = f"({result['target_reached']})" if result['target_reached'] != 'none' else ""
-            print(f"  {result['runtime_minutes']:5.1f} min: {result['min_energy']:7.1f} energy {quality}")
+    results['_total_runtime_seconds'] = total_runtime
+    print_results_summary(
+        results, f"CPU Block {mode_name} Baseline Summary",
+    )
 
     if output_file:
         with open(output_file, 'w') as f:
@@ -347,46 +295,8 @@ def sa_gibbs_baseline_test(
 
 def main():
     """Main function with command line argument parsing."""
-    parser = argparse.ArgumentParser(
-        description='CPU Block Gibbs baseline parameter testing tool'
-    )
-    parser.add_argument(
-        '--timeout', '-t',
-        type=float,
-        default=10.0,
-        help='Timeout in minutes (default: 10.0)',
-    )
-    parser.add_argument(
-        '--output', '-o',
-        type=str,
-        help='Output JSON file for results',
-    )
-    parser.add_argument(
-        '--quick',
-        action='store_true',
-        help='Quick test mode (only Light test)',
-    )
-    parser.add_argument(
-        '--extended',
-        action='store_true',
-        help='Extended test mode (30 minute timeout)',
-    )
-    parser.add_argument(
-        '--only',
-        type=str,
-        help='Run only the config with this description (e.g., "Light Gibbs")',
-    )
-    parser.add_argument(
-        '--h-values',
-        type=str,
-        default='-1,0,1',
-        help='Comma-separated h field values (default: -1,0,1). Use "0" for h=0 baseline.',
-    )
-    parser.add_argument(
-        '--topology',
-        type=str,
-        help='Zephyr topology: Z(9,2), Advantage2_system1, or file path. '
-             'Default: Advantage2_system1',
+    parser = build_baseline_argparser(
+        'CPU Block Gibbs baseline parameter testing tool',
     )
     parser.add_argument(
         '--update-mode',
