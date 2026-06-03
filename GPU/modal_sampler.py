@@ -1,8 +1,5 @@
 """Modal Labs GPU-accelerated sampler for cloud GPU mining."""
 
-import time
-import numpy as np
-import collections.abc
 import dimod
 from dwave.system.testing import MockDWaveSampler
 from shared.node_edge_coerce import coerce_int_nodes_edges
@@ -14,11 +11,6 @@ try:
     import modal
 except ImportError:
     modal = None
-
-try:
-    from numba import jit
-except ImportError:
-    jit = None
 
 # GPU availability check
 GPU_AVAILABLE = modal is not None
