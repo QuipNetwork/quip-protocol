@@ -847,10 +847,9 @@ def quip_miner_telemetry(
     # Hook SIGINT here so a Ctrl-C in standalone runs exits cleanly;
     # under the Docker supervisor, SIGTERM from the entrypoint's
     # `kill -TERM` does the same via telemetry_main's own handler.
-    import signal as _signal
     def _on_sigint(*_a):
         shutdown_event.set()
-    _signal.signal(_signal.SIGINT, _on_sigint)
+    signal.signal(signal.SIGINT, _on_sigint)
 
     telemetry_main(
         listen_host=rest_host,
