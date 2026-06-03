@@ -150,6 +150,9 @@ def _bare_controller() -> SubstrateMinerController:
     c._closed_work_keys = OrderedDict()
     c._highest_handled_block = 0
     c._last_pushed_threshold_milli = 0
+    # Work-item announce de-dup: on_new_head logs at INFO only when the
+    # work key changes, DEBUG otherwise. __init__ seeds this to None.
+    c._last_logged_work_key = None
     c.topology_hash = None
     c.core = None  # Phase 6: optional MinerCore for telemetry
     # Submission tuning (tip + retry bounds); defaults reproduce pre-tip
