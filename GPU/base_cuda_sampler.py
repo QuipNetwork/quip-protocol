@@ -862,6 +862,23 @@ class BaseCudaSampler(abc.ABC):
                 return m
             return _pull_blocking()
 
+        def _try_fill_free_slot(
+            nonce_id: int, ss: '_SlotState',
+        ) -> bool:
+            """Pull one model and upload it into ss.free_slot.
+
+            Returns True if a model was queued, False if none
+            was available.
+            """
+            m = _pull_nonblocking()
+            if m is None:
+                return False
+            self.upload_slot(nonce_id, ss.free_slot, m.h, m.J)
+            ss.next_slot = ss.free_slot
+            ss.next_model = m
+            ss.free_slot = -1
+            return True
+
         # Build per-kernel slot state
         # Slots: 0=active, 1=next, 2=free
         slots: list[_SlotState] = []
@@ -927,15 +944,7 @@ class BaseCudaSampler(abc.ABC):
                         and ss.next_model is None
                         and ss.free_slot >= 0
                     ):
-                        m = _pull_nonblocking()
-                        if m is not None:
-                            self.upload_slot(
-                                nonce_id, ss.free_slot,
-                                m.h, m.J,
-                            )
-                            ss.next_slot = ss.free_slot
-                            ss.next_model = m
-                            ss.free_slot = -1
+                        _try_fill_free_slot(nonce_id, ss)
 
                 # Single DMA read of ctrl array
                 ctrl = cp.asnumpy(self._d_sf_ctrl)
@@ -967,15 +976,7 @@ class BaseCudaSampler(abc.ABC):
                     ss.next_model = None
 
                     # Non-blocking fill of freed slot
-                    m = _pull_nonblocking()
-                    if m is not None:
-                        self.upload_slot(
-                            nonce_id, ss.free_slot,
-                            m.h, m.J,
-                        )
-                        ss.next_slot = ss.free_slot
-                        ss.next_model = m
-                        ss.free_slot = -1
+                    _try_fill_free_slot(nonce_id, ss)
 
                     yield (completed_model, result_ss)
 
