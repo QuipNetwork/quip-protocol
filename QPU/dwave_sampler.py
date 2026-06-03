@@ -9,11 +9,14 @@ from typing import (
 )
 import collections.abc
 import numpy as np
+import dimod
+from dwave.embedding import embed_bqm, unembed_sampleset
 from dwave.system import DWaveSampler, FixedEmbeddingComposite
+from dwave_topologies.embedding_loader import get_embedding_dict, embedding_exists
+from dwave_topologies import DEFAULT_TOPOLOGY
+from dwave_topologies.topologies.dwave_topology import DWaveTopology
 
 logger = logging.getLogger(__name__)
-from dwave.embedding import embed_bqm, unembed_sampleset
-import dimod
 
 if TYPE_CHECKING:
     from dwave.cloud.computation import Future
@@ -109,10 +112,6 @@ class DefectInfo:
         self.energy_offset = energy_offset
         self.removed_edges = removed_edges
 
-
-from dwave_topologies.embedding_loader import get_embedding_dict, embedding_exists
-from dwave_topologies import DEFAULT_TOPOLOGY
-from dwave_topologies.topologies.dwave_topology import DWaveTopology
 
 # Type definitions to match base_miner
 Variable = collections.abc.Hashable
