@@ -27,7 +27,7 @@ from shared.energy_utils import (
     DEFAULT_NUM_EDGES,
 )
 from shared.mempool_types import MempoolJobContext
-from shared.miner_types import BlockRequirements, IsingSample, MiningResult, Sampler
+from shared.miner_types import BlockRequirements, MiningResult, Sampler
 from shared.mining_attempt_log import AttemptLogger, SolutionStore
 from shared.quantum_proof_of_work import (
     compute_solution_meta,
@@ -338,7 +338,7 @@ class BaseMiner(ABC):
         }
 
         # Track top 3 mining results
-        self.top_attempts: List[IsingSample] = []
+        self.top_attempts: List = []
 
         # Worker-side feeder slot, always None: every backend mines through
         # the stream-driver process, which owns the feeder. Kept so subclass
@@ -391,17 +391,6 @@ class BaseMiner(ABC):
         # each work-tag still surfaces; repeats are suppressed until the
         # tag is evicted from the bounded cache.
         self._setup_abort_throttle = _SetupAbortThrottle()
-
-    def update_top_samples(self, sampleset: dimod.SampleSet, nonce: int, salt: bytes, requirements: BlockRequirements):
-        """Update the top 3 results list with a new mining result."""
-
-        # Add current result
-        attempt = IsingSample(nonce, salt, sampleset)
-        self.top_attempts.append(attempt)
-        self.top_attempts.sort(key=lambda r: compare_mining_samples(r, attempt, requirements))
-
-        # Keep only top 3
-        self.top_attempts = self.top_attempts[:3]
 
     def capture_partial_timing(self):
         """Capture timing for current mining attempt, including partial progress."""
@@ -2253,44 +2242,4 @@ class _BridgeNodeInfo:
             miner_account_bytes=context.miner_account_bytes,
         )
 
-
-def compare_mining_samples(sample_a: IsingSample, sample_b: IsingSample, requirements: BlockRequirements) -> int:
-    """
-    Compare two mining results to determine which is better.
-
-    Returns:
-        -1 if A is better than B
-         0 if A and B are equal
-         1 if B is better than A
-
-    Comparison logic:
-    1. Compare average of top N energies
-       where N = requirements.min_solutions
-    2. If still equal, compare overall average solution energy
-    """
-
-    # 1. Compare average of top N solution energies
-    a_energies = list(sample_a.sampleset.record.energy)
-    b_energies = list(sample_b.sampleset.record.energy)
-    n_energies = min(requirements.min_solutions, len(a_energies), len(b_energies))
-    if n_energies > 0:
-        energies_a = a_energies[:n_energies]
-        energies_b = b_energies[:n_energies]
-        avg_energy_a = np.mean(energies_a)
-        avg_energy_b = np.mean(energies_b)
-
-        if avg_energy_a < avg_energy_b:  # Lower energy is better
-            return -1
-        elif avg_energy_b < avg_energy_a:
-            return 1
-
-    # 2. If still equal, compare overall best energy (lower is better)
-    best_energy_a = min(a_energies)
-    best_energy_b = min(b_energies)
-    if best_energy_a < best_energy_b:
-        return -1
-    elif best_energy_b < best_energy_a:
-        return 1
-
-    return 0  # Equal
 
