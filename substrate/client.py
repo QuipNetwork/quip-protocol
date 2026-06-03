@@ -1291,6 +1291,16 @@ def _canonical_hex(value: Any) -> Optional[str]:
     return None
 
 
+def _as_int_or_none(x: Any) -> Optional[int]:
+    """Return ``int(x)`` or ``None`` if *x* is ``None`` or non-coercible."""
+    if x is None:
+        return None
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
 def _phase_extrinsic_idx(phase: Any) -> Optional[int]:
     """Extract the extrinsic index from a SCALE-decoded event phase.
 
@@ -1311,19 +1321,10 @@ def _phase_extrinsic_idx(phase: Any) -> Optional[int]:
             idx = applied.get("extrinsic_idx")
             if idx is None:
                 idx = applied.get("index")
-            try:
-                return int(idx) if idx is not None else None
-            except (TypeError, ValueError):
-                return None
-        try:
-            return int(applied)
-        except (TypeError, ValueError):
-            return None
+            return _as_int_or_none(idx)
+        return _as_int_or_none(applied)
     if isinstance(phase, (int, str)):
-        try:
-            return int(phase)
-        except (TypeError, ValueError):
-            return None
+        return _as_int_or_none(phase)
     return None
 
 
