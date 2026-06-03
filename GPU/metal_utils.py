@@ -112,7 +112,7 @@ def compute_beta_schedule(
             beta_range = (float(beta_schedule[0]), float(beta_schedule[-1]))
     else:
         num_betas, rem = divmod(num_sweeps, num_sweeps_per_beta)
-        if rem > 0 or num_betas < 0:
+        if rem > 0:
             raise ValueError("'num_sweeps' must be divisible by 'num_sweeps_per_beta'")
 
         if beta_range is None:

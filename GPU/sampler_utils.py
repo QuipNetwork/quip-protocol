@@ -254,7 +254,7 @@ def compute_beta_schedule(
         return beta_schedule, beta_range
 
     num_betas, rem = divmod(num_sweeps, num_sweeps_per_beta)
-    if rem > 0 or num_betas < 0:
+    if rem > 0:
         raise ValueError(
             "'num_sweeps' must be divisible by "
             "'num_sweeps_per_beta'"
