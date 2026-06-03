@@ -208,9 +208,6 @@ class MempoolMinerController:
         # Orders for which we saw OrderExpired and have not yet claimed.
         self._claimable: Set[int] = set()
         self._result_queue: asyncio.Queue[_MempoolResultEnvelope] = asyncio.Queue()
-        self._done_queues: Dict[str, asyncio.Queue[int]] = {
-            h.miner_id: asyncio.Queue() for h in miner_handles
-        }
         self._shutdown_event = asyncio.Event()
         self._drainer_tasks: List[asyncio.Task] = []
         # ChainEventManager — set in run(); polls the validator pool and
@@ -858,10 +855,6 @@ class MempoolMinerController:
                 )
             elif isinstance(msg, dict) and msg.get("op") == "work_item_done":
                 done_dispatch_id = msg.get("dispatch_id")
-                try:
-                    self._done_queues[handle.miner_id].put_nowait(done_dispatch_id)
-                except asyncio.QueueFull:
-                    pass
                 # Cancel-completion counts as terminal for the active
                 # order. Clears `_active_order` only if every handle has
                 # reported terminal without a successful submission.
