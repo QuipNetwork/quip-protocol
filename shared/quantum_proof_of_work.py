@@ -446,9 +446,6 @@ def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> L
     max_idx = np.unravel_index(np.argmax(upper_tri), upper_tri.shape)
     selected_indices = list(max_idx)
 
-    # Convert to set for O(1) lookup
-    selected_set = set(selected_indices)
-
     # Iteratively add the farthest point from the current set
     while len(selected_indices) < target_count:
         # Get distances to all selected points
@@ -461,7 +458,6 @@ def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> L
         # Find point with maximum minimum distance
         best_idx = np.argmax(min_dists)
         selected_indices.append(best_idx)
-        selected_set.add(best_idx)
 
     # Optional: Local search refinement (limited iterations for performance)
     # Try swapping elements to improve total diversity
@@ -476,8 +472,6 @@ def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> L
         current_div = _calculate_set_diversity(selected_indices, dist_matrix)
 
         for i in range(len(selected_indices)):
-            sel_idx = selected_indices[i]
-
             # Check a subset of candidates (not all) for performance
             # Sample up to 50 random candidates if n_solutions is large
             if n_solutions > 100:
@@ -486,7 +480,7 @@ def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> L
                 candidates = range(n_solutions)
 
             for cand_idx in candidates:
-                if cand_idx in selected_set:
+                if cand_idx in selected_indices:
                     continue
 
                 # Try swapping
@@ -495,8 +489,6 @@ def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> L
                 test_div = _calculate_set_diversity(test_indices, dist_matrix)
 
                 if test_div > current_div:
-                    selected_set.remove(sel_idx)
-                    selected_set.add(cand_idx)
                     selected_indices[i] = cand_idx
                     current_div = test_div
                     improved = True
