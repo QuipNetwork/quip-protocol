@@ -8,6 +8,7 @@ and argparse setup used by cuda_baseline.py and
 cuda_gibbs_baseline.py.
 """
 import argparse
+import os
 from typing import List, Optional, Tuple
 
 from dwave_topologies import DEFAULT_TOPOLOGY
@@ -35,7 +36,6 @@ def load_baseline_topology(
     """
     if topology_arg:
         if topology_arg.endswith('.embed.json.gz'):
-            import os
             filename = os.path.basename(topology_arg)
             parts = filename.replace(
                 "zephyr_z", "",
