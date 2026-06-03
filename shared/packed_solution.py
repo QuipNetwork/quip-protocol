@@ -17,7 +17,6 @@ from typing import List, Sequence
 from shared.allowed_value_spec import (
     AllowedValueContinuousRange,
     AllowedValueSpec,
-    InvalidEncodedValue,
     bits_per_value,
     decode_value,
     encode_value,
@@ -121,13 +120,8 @@ def _decode_continuous(
     out: List[int] = []
     for i in range(num_spins):
         chunk = packed[i * 4 : i * 4 + 4]
-        if len(chunk) != 4:
-            raise PackedSolutionLengthMismatch(num_spins * 4, len(packed))
         raw = int.from_bytes(chunk, "big", signed=False)
-        try:
-            out.append(decode_value(spec, raw))
-        except InvalidEncodedValue:
-            raise
+        out.append(decode_value(spec, raw))
     return out
 
 
