@@ -273,7 +273,6 @@ def _find_embedding_worker(args):
 
     worker_start = time.perf_counter()
     num_tries = 0
-    best_embedding = None
 
     while True:
         # Check if we've exceeded worker timeout
@@ -333,10 +332,6 @@ def _find_native_subgraph_seed(source_graph: nx.Graph, target_graph: nx.Graph, m
 
     print(f"  Searching for native Zephyr subgraph seed (up to Z({max_m},{max_t}))...")
 
-    # Try to find largest native subgraph
-    best_seed = None
-    best_size = 0
-
     for m in range(max_m, 1, -1):  # Start from largest
         for t in range(max_t, 0, -1):
             test_graph = dnx.zephyr_graph(m, t)
@@ -346,14 +341,11 @@ def _find_native_subgraph_seed(source_graph: nx.Graph, target_graph: nx.Graph, m
             edges_present = all(target_graph.has_edge(u, v) for u, v in test_graph.edges())
 
             if nodes_present and edges_present:
-                # Found a perfect native subgraph
+                # Found a perfect native subgraph; return immediately (loop is largest-first)
                 num_nodes = len(test_graph.nodes())
-                if num_nodes > best_size:
-                    # Create identity embedding for these nodes
-                    best_seed = {node: [node] for node in test_graph.nodes()}
-                    best_size = num_nodes
-                    print(f"    ✓ Found native Z({m},{t}) seed: {num_nodes:,} nodes")
-                    return best_seed
+                seed = {node: [node] for node in test_graph.nodes()}
+                print(f"    ✓ Found native Z({m},{t}) seed: {num_nodes:,} nodes")
+                return seed
 
     print(f"    ✗ No native subgraph found - starting from scratch")
     return None
@@ -378,7 +370,6 @@ def precompute_embedding(config: Dict[str, Any], target_solver_name: str = "Adva
     import os
     import json
     import gzip
-    import minorminer
     import multiprocessing as mp
     from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_TOPOLOGY
 
@@ -574,7 +565,6 @@ def generate_topology_file(m: int, t: int):
     edge_util = config['edge_utilization_pct']
 
     # Calculate expected GSE
-    from shared.energy_utils import expected_solution_energy
     expected_gse = expected_solution_energy(
         num_nodes=config['num_nodes'],
         num_edges=config['num_edges'],
