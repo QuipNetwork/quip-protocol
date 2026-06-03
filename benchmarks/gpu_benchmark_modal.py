@@ -9,7 +9,7 @@ import numpy as np
 import subprocess
 from typing import Tuple, Dict, Any
 import time
-from numba import cuda, jit
+from numba import jit
 
 # Define Modal app for GPU execution
 app = modal.App("quantum-blockchain-gpu-benchmark")

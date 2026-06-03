@@ -1,5 +1,4 @@
 import json
-import os
 import time
 from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional, Tuple
@@ -56,17 +55,18 @@ class QuantumPowBenchmark:
         """Initialize benchmark suite."""
         self.results: List[BenchmarkResult] = []
         
-    def generate_ising_problem(self, seed: int, sampler) -> Tuple[Dict, Dict]:
+    def generate_ising_problem(self, seed: int, sampler) -> Tuple[Dict, Dict, int]:
         """
         Generate a random Ising problem based on seed.
-        
+
         Args:
             seed: Random seed for reproducibility
             sampler: DWave sampler instance
-            
+
         Returns:
             h: Linear terms
             J: Quadratic terms
+            problem_size: Number of variables
         """
         np.random.seed(seed)
         
