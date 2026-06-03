@@ -188,9 +188,8 @@ def init_component_logger(component: str, identifier: str) -> logging.Logger:
     """
     Initialize a component logger with proper setup.
 
-    This function creates a logger with the standard naming convention,
-    ensures proper propagation, and sets up the global log variable
-    for use by static functions in the module.
+    This function creates a logger with the standard naming convention
+    and ensures proper propagation to the root logger.
 
     Args:
         component: Component type (e.g., 'miner', 'substrate')
@@ -204,10 +203,6 @@ def init_component_logger(component: str, identifier: str) -> logging.Logger:
 
     # Ensure propagation to root logger for proper formatting
     logger.propagate = True
-
-    # Set global logger for static functions in this module
-    global log
-    log = logger
 
     return logger
 

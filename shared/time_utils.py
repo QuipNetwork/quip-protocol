@@ -5,7 +5,6 @@ use consistent timestamps regardless of their local timezone.
 """
 
 import threading
-import time
 from datetime import datetime, timezone
 from typing import List, Optional
 import logging
@@ -187,19 +186,6 @@ def sync_time_with_network(peer_timestamps: list[int]) -> Optional[int]:
     adjusted_time = utc_timestamp() - offset
     logger.info(f"Using network-synchronized time with offset: {-offset} seconds")
     return adjusted_time
-
-
-# Backward compatibility functions that log warnings
-def deprecated_time_time() -> float:
-    """Deprecated: Use utc_timestamp_float() instead."""
-    logger.warning("Using deprecated time.time() - switch to utc_timestamp_float() for UTC consistency")
-    return time.time()
-
-
-def deprecated_int_time_time() -> int:
-    """Deprecated: Use utc_timestamp() instead."""
-    logger.warning("Using deprecated int(time.time()) - switch to utc_timestamp() for UTC consistency")
-    return int(time.time())
 
 
 class NetworkClock:

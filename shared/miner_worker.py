@@ -25,15 +25,11 @@ import QPU  # noqa: E402
 
 from shared.logging_config import QuipFormatter
 
-# Global logger for this module
-log = None
 logger = logging.getLogger(__name__)
 
 
 def _setup_child_process_logging(log_queue=None):
     """Set up logging for child processes to use QuipFormatter and optionally queue logging."""
-    global log
-
     root_logger = logging.getLogger()
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
@@ -47,8 +43,6 @@ def _setup_child_process_logging(log_queue=None):
         handler.setFormatter(QuipFormatter())
         root_logger.addHandler(handler)
         root_logger.setLevel(logging.INFO)
-
-    log = logging.getLogger(__name__)
 
 # NOTE: the legacy `_signal_aware_mining_worker` (a dedicated per-attempt
 # child process used by `MinerHandle.mine_with_timeout`) was removed in

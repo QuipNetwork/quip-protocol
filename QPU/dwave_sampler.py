@@ -607,10 +607,12 @@ class DWaveSamplerWrapper:
             embedding_vars = set(self.embedding.keys())
 
             if bqm_vars != embedding_vars:
-                import sys
-                print(f"\n⚠️  WARNING: BQM variables don't match embedding keys!", file=sys.stderr)
-                print(f"   BQM vars: {len(bqm_vars)}, range: {min(bqm_vars)}-{max(bqm_vars)}", file=sys.stderr)
-                print(f"   Embedding vars: {len(embedding_vars)}, range: {min(embedding_vars)}-{max(embedding_vars)}", file=sys.stderr)
+                logger.warning(
+                    "BQM variables don't match embedding keys! "
+                    "BQM vars: %d, range: %d-%d; Embedding vars: %d, range: %d-%d",
+                    len(bqm_vars), min(bqm_vars), max(bqm_vars),
+                    len(embedding_vars), min(embedding_vars), max(embedding_vars),
+                )
 
             # Calculate chain strength explicitly so we control the multiplier
             chain_strength = self._chain_strength(bqm, chain_strength_multiplier)
@@ -627,12 +629,15 @@ class DWaveSamplerWrapper:
             actual_vars = set(sampleset.variables)
 
             if actual_vars != expected_vars:
-                import sys
-                print(f"\n⚠️  WARNING: Sampleset variables don't match logical topology!", file=sys.stderr)
-                print(f"   Expected: {len(expected_vars)} vars (0-{max(expected_vars)})", file=sys.stderr)
-                print(f"   Got: {len(actual_vars)} vars ({min(actual_vars)}-{max(actual_vars)})", file=sys.stderr)
-                print(f"   Missing: {sorted(list(expected_vars - actual_vars))[:20]}", file=sys.stderr)
-                print(f"   Extra: {sorted(list(actual_vars - expected_vars))[:20]}", file=sys.stderr)
+                logger.warning(
+                    "Sampleset variables don't match logical topology! "
+                    "Expected: %d vars (0-%d); Got: %d vars (%d-%d); "
+                    "Missing: %s; Extra: %s",
+                    len(expected_vars), max(expected_vars),
+                    len(actual_vars), min(actual_vars), max(actual_vars),
+                    sorted(list(expected_vars - actual_vars))[:20],
+                    sorted(list(actual_vars - expected_vars))[:20],
+                )
 
         return sampleset
 
