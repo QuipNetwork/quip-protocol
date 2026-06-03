@@ -480,40 +480,35 @@ class IsingModelValidator:
         
         return {"format_errors": errors, "format_warnings": warnings}
     
+    def _iter_edge_energies(self, spins: List[int]):
+        """Yield per-edge spin products for all mapped edges in self.J.
+
+        Yields:
+            Tuple of (node_i, node_j, val, spin_i, spin_j, coupling_energy) for each
+            edge whose both endpoints are present in node_to_pos.
+        """
+        for (node_i, node_j), val in self.J.items():
+            pos_i = self.node_to_pos.get(int(node_i))
+            pos_j = self.node_to_pos.get(int(node_j))
+            if pos_i is not None and pos_j is not None:
+                spin_i = spins[pos_i]
+                spin_j = spins[pos_j]
+                yield node_i, node_j, val, spin_i, spin_j, val * spin_i * spin_j
+
     def _validate_energy_calculation(self, spins: List[int]) -> Dict[str, Any]:
         """Validate energy calculation matches expected Ising formula."""
-        
+
         # Calculate field energy: E_h = Σ h_i * s_i
         h_energy = 0.0
         for i in range(self.n):
             h_value = self.h.get(i, 0.0)
             h_energy += h_value * spins[i]
-        
+
         # Calculate coupling energy: E_J = Σ J_ij * s_i * s_j
-        j_energy = 0.0
-        coupling_satisfactions = []
-        
-        for (node_i, node_j), val in self.J.items():
-            pos_i = self.node_to_pos.get(int(node_i))
-            pos_j = self.node_to_pos.get(int(node_j))
-            
-            if pos_i is not None and pos_j is not None:
-                spin_i = spins[pos_i]
-                spin_j = spins[pos_j]
-                coupling_energy = val * spin_i * spin_j
-                j_energy += coupling_energy
-                
-                # Track coupling satisfaction (negative energy = satisfied)
-                coupling_satisfactions.append({
-                    "edge": (node_i, node_j),
-                    "J_value": val,
-                    "spins": (spin_i, spin_j),
-                    "energy": coupling_energy,
-                    "satisfied": coupling_energy < 0
-                })
-        
+        j_energy = sum(ce for *_, ce in self._iter_edge_energies(spins))
+
         total_energy = h_energy + j_energy
-        
+
         return {
             "energy": total_energy,
             "energy_breakdown": {
@@ -521,29 +516,22 @@ class IsingModelValidator:
                 "j_energy": j_energy,
                 "total": total_energy
             },
-            "coupling_details": coupling_satisfactions
         }
-    
+
     def _analyze_statistics(self, spins: List[int]) -> Dict[str, Any]:
         """Analyze statistical properties of the solution."""
-        
+
         positive_spins = sum(1 for s in spins if s == 1)
         negative_spins = sum(1 for s in spins if s == -1)
-        
+
         # Magnetization
         magnetization = sum(spins) / len(spins)
-        
+
         # Local correlations (simple measure)
-        correlations = []
-        for (node_i, node_j), _ in self.J.items():
-            pos_i = self.node_to_pos.get(int(node_i))
-            pos_j = self.node_to_pos.get(int(node_j))
-            if pos_i is not None and pos_j is not None:
-                correlation = spins[pos_i] * spins[pos_j]
-                correlations.append(correlation)
-        
+        correlations = [spin_i * spin_j for _, _, _, spin_i, spin_j, _ in self._iter_edge_energies(spins)]
+
         avg_correlation = np.mean(correlations) if correlations else 0.0
-        
+
         return {
             "positive_spins": positive_spins,
             "negative_spins": negative_spins,
@@ -551,35 +539,27 @@ class IsingModelValidator:
             "avg_correlation": avg_correlation,
             "total_spins": len(spins)
         }
-    
+
     def _analyze_coupling_satisfaction(self, spins: List[int]) -> Dict[str, Any]:
         """Analyze how well the solution satisfies coupling constraints."""
-        
+
         satisfied_couplings = 0
         total_couplings = len(self.J)
         frustrated_couplings = []
-        
-        for (node_i, node_j), val in self.J.items():
-            pos_i = self.node_to_pos.get(int(node_i))
-            pos_j = self.node_to_pos.get(int(node_j))
-            
-            if pos_i is not None and pos_j is not None:
-                spin_i = spins[pos_i]
-                spin_j = spins[pos_j]
-                coupling_energy = val * spin_i * spin_j
-                
-                if coupling_energy < 0:  # Satisfied (contributes negative energy)
-                    satisfied_couplings += 1
-                else:  # Frustrated (contributes positive energy)
-                    frustrated_couplings.append({
-                        "edge": (node_i, node_j),
-                        "J_value": val,
-                        "spins": (spin_i, spin_j),
-                        "energy": coupling_energy
-                    })
-        
+
+        for node_i, node_j, val, spin_i, spin_j, coupling_energy in self._iter_edge_energies(spins):
+            if coupling_energy < 0:  # Satisfied (contributes negative energy)
+                satisfied_couplings += 1
+            else:  # Frustrated (contributes positive energy)
+                frustrated_couplings.append({
+                    "edge": (node_i, node_j),
+                    "J_value": val,
+                    "spins": (spin_i, spin_j),
+                    "energy": coupling_energy
+                })
+
         satisfaction_rate = satisfied_couplings / total_couplings if total_couplings > 0 else 0
-        
+
         return {
             "satisfied_couplings": satisfied_couplings,
             "total_couplings": total_couplings,
