@@ -291,8 +291,6 @@ def mine_worker(
 
         submit_results()
 
-    submit_results()
-
 
 def build_specs(
     miner_type: str,
