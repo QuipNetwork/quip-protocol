@@ -346,6 +346,27 @@ class MempoolMinerController:
             return
         await self._process_head(ctx.block_hash, ctx.block_number)
 
+    async def _cancel_and_await(
+        self, task: Optional[asyncio.Task], label: str
+    ) -> None:
+        """Cancel *task* and await it, logging any unexpected exception.
+
+        No-ops when *task* is ``None`` or already done.
+        """
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "teardown: %s task %s raised during cancellation",
+                label,
+                task.get_name(),
+            )
+
     async def _teardown(self) -> None:
         self._shutdown_event.set()
         for handle in self.miner_handles:
@@ -366,29 +387,9 @@ class MempoolMinerController:
             self.events.request_shutdown()
 
         for task in [self._event_manager_task, self._claim_task]:
-            if task is not None and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:  # noqa: BLE001
-                    logger.exception(
-                        "teardown: task %s raised during cancellation",
-                        task.get_name(),
-                    )
+            await self._cancel_and_await(task, "task")
         for task in self._drainer_tasks:
-            if not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:  # noqa: BLE001
-                    logger.exception(
-                        "teardown: drainer task %s raised during cancellation",
-                        task.get_name(),
-                    )
+            await self._cancel_and_await(task, "drainer task")
         self._event_manager_task = None
         # Close the parent-side build client. The pool's active validator
         # handle is torn down by ``pool.close()`` from the CLI's outer
