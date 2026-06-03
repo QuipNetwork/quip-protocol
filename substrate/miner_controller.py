@@ -1251,6 +1251,16 @@ class SubstrateMinerController:
         result_diversity_milli = int(envelope.result.diversity * 1000)
         snapshot_threshold_milli = int(envelope.context.difficulty.max_energy_milli)
         last_proof_hex = "0x" + envelope.context.last_proof_block_hash.hex()
+        log_common: dict[str, Any] = {
+            "solution_number": solution_number,
+            "miner_id": envelope.handle_id,
+            "miner_type": envelope.result.miner_type,
+            "energy_milli": result_energy_milli,
+            "diversity_milli": result_diversity_milli,
+            "threshold_milli": snapshot_threshold_milli,
+            "last_proof_block_hash_hex": last_proof_hex,
+            "num_valid": envelope.result.num_valid,
+        }
 
         try:
             receipt = await submit_proof(
@@ -1306,22 +1316,10 @@ class SubstrateMinerController:
             # verified < 0   → mismatch (-1 sentinel)
             # verified is None → RPC failed, inconclusive
             if verified is not None and verified < 0:
-                self.stats.proofs_unverified += 1
-                pow_seq_mismatch = await self._query_proofs_submitted_safe()
-                self._submission_log.record(
-                    solution_number=solution_number,
-                    miner_id=envelope.handle_id,
-                    miner_type=envelope.result.miner_type,
-                    energy_milli=result_energy_milli,
-                    diversity_milli=result_diversity_milli,
-                    threshold_milli=snapshot_threshold_milli,
-                    last_proof_block_hash_hex=last_proof_hex,
-                    outcome="chain_error",
-                    num_valid=envelope.result.num_valid,
+                await self._record_verify_fail(
+                    envelope.context, None, log_common,
                     extrinsic_hash=receipt.extrinsic_hash,
-                    chain_block_hash=receipt.block_hash,
-                    pow_sequence=pow_seq_mismatch,
-                    error="receipt OK but proof not recorded by chain",
+                    receipt_block=receipt.block_hash,
                 )
                 # Re-dispatch immediately on the same context. The
                 # worker is idle (mine_result drainer already cleared
@@ -2249,25 +2247,24 @@ class SubstrateMinerController:
             )
         return accepted_block_hash, accepted_block_number
 
-    async def _record_anticipatory_verify_fail(
+    async def _record_verify_fail(
         self,
         ctx: SubstrateMiningContext,
-        key: WorkKey,
+        key: Optional[WorkKey],
         log_common: dict,
         *,
         extrinsic_hash: Optional[str],
         receipt_block: Optional[str],
     ) -> None:
-        """Handle an anticipatory fire that got receipt OK but failed verify.
+        """Record a verify-mismatch failure for both normal and anticipatory paths.
 
-        Mirrors ``_handle_result``'s verified-False path: bump
-        ``proofs_unverified``, clear the mid-fire mark (but keep the preview
-        + work key open so the next head re-fires), and write a
-        ``chain_error`` submission-log row so the failure is visible rather
-        than silently dropped.
+        Bumps ``proofs_unverified``, writes a ``chain_error`` submission-log
+        row, and — when *key* is not ``None`` (anticipatory path) — clears the
+        mid-fire mark and logs an anticipatory-specific warning.
         """
         self.stats.proofs_unverified += 1
-        self._anticipatory_fired.discard(key)
+        if key is not None:
+            self._anticipatory_fired.discard(key)
         pow_seq_mismatch = await self._query_proofs_submitted_safe()
         self._submission_log.record(
             **log_common,
@@ -2277,12 +2274,13 @@ class SubstrateMinerController:
             pow_sequence=pow_seq_mismatch,
             error="receipt OK but proof not recorded by chain",
         )
-        logger.warning(
-            "anticipatory fire receipt OK but verification failed for "
-            "work_key 0x%s... (extrinsic=%s); NOT closing key",
-            ctx.last_proof_block_hash.hex()[:16],
-            extrinsic_hash,
-        )
+        if key is not None:
+            logger.warning(
+                "anticipatory fire receipt OK but verification failed for "
+                "work_key 0x%s... (extrinsic=%s); NOT closing key",
+                ctx.last_proof_block_hash.hex()[:16],
+                extrinsic_hash,
+            )
 
     async def _record_anticipatory_success(
         self,
@@ -2330,7 +2328,7 @@ class SubstrateMinerController:
         verified = await self._verify_proof_recorded(envelope)
         # verified < 0 → chain recorded a different proof; treat as not-won.
         if verified is not None and verified < 0:
-            await self._record_anticipatory_verify_fail(
+            await self._record_verify_fail(
                 ctx, key, log_common,
                 extrinsic_hash=extrinsic_hash,
                 receipt_block=receipt_block,
