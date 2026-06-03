@@ -23,6 +23,12 @@ Two artifacts are written:
                                   the packed solution hex).
   - ``<out>.validation.jsonl`` — one verdict record per win.
 
+With ``--dump-bqm`` a third artifact is written:
+
+  - ``<out>.bqms.jsonl``       — the reconstructed Ising model (h, J) for each
+                                  win, re-derived from its nonce + topology
+                                  snapshot. One model per line.
+
 and a summary is printed to stderr.
 
 Usage::
@@ -188,6 +194,83 @@ def _validate(
     }
 
 
+def _serialize_bqm(
+    h: Dict[int, float], j: Dict[Tuple[int, int], float]
+) -> Dict[str, Any]:
+    """Serialize a reconstructed Ising model (h, J) to a JSON-safe dict.
+
+    ``h`` is keyed by node id and ``J`` by ``(u, v)`` edge tuples. JSON object
+    keys must be strings and tuples are not valid keys, so both fields are
+    emitted as flat lists that preserve the integer node ids:
+
+      - ``h``: ``[[node_id, bias], ...]``
+      - ``j``: ``[[u, v, coupling], ...]``
+
+    Reload with ``h = {n: b for n, b in rec["h"]}`` and
+    ``J = {(u, v): c for u, v, c in rec["j"]}`` — exactly the dict shapes
+    :func:`shared.quantum_proof_of_work.energy_of_solution` expects.
+
+    Returns the ``h``/``j`` fields for one line of ``<out>.bqms.jsonl``.
+    """
+    return {
+        "h": [[node, bias] for node, bias in h.items()],
+        "j": [[u, v, coupling] for (u, v), coupling in j.items()],
+    }
+
+
+async def _dump_bqms(
+    client: SubstrateClient,
+    view: List[int],
+    cache: Dict[int, Dict[str, Any]],
+    topo_cache: Dict[bytes, SubstrateMiningContext],
+    bqms_path: Path,
+    errors: List[str],
+) -> int:
+    """Reconstruct + write the Ising model for every win in ``view``.
+
+    Snapshots are stable per topology, so each unique ``topology_hash`` is
+    fetched once (at chain head) and reused. Returns the number of models
+    written; wins with no decoded proof (no ``topology_hash``) are skipped.
+    """
+    written = 0
+    with bqms_path.open("w") as f:
+        for bn in view:
+            archive = cache[bn]["archive"]
+            topo_hex = archive.get("topology_hash")
+            if topo_hex is None:
+                continue
+            topo_hash = _hx(topo_hex)
+            try:
+                snapshot = topo_cache.get(topo_hash)
+                if snapshot is None:
+                    snapshot = await client.get_mining_snapshot(
+                        miner_account_bytes=_hx(archive["miner"]),
+                        topology_hash=topo_hash,
+                    )
+                    if snapshot is None:
+                        raise RuntimeError(f"no snapshot for topology {topo_hex}")
+                    topo_cache[topo_hash] = snapshot
+                h, j = generate_ising_model_from_nonce(
+                    _hx(archive["nonce"]),
+                    snapshot.nodes,
+                    snapshot.edges,
+                    snapshot.allowed_h_values,
+                    snapshot.allowed_j_values,
+                )
+            except Exception as exc:  # noqa: BLE001 — record & skip this win
+                errors.append(f"bqm {bn}: {type(exc).__name__}: {exc}")
+                continue
+            record = {
+                "block_number": bn,
+                "nonce": archive["nonce"],
+                "topology_hash": topo_hex,
+                **_serialize_bqm(h, j),
+            }
+            f.write(json.dumps(record) + "\n")
+            written += 1
+    return written
+
+
 async def _validate_one(
     client: SubstrateClient,
     block_number: int,
@@ -320,7 +403,8 @@ async def _download_one(
 
 
 async def walk_and_validate(
-    url: str, max_wins: Optional[int], out_prefix: str, *, use_cache: bool = True
+    url: str, max_wins: Optional[int], out_prefix: str, *,
+    use_cache: bool = True, dump_bqm: bool = False,
 ) -> Dict[str, Any]:
     """Walk the proof chain backward, validating every win, reusing the cache."""
     wins_path = Path(f"{out_prefix}.wins.jsonl")
@@ -334,6 +418,8 @@ async def walk_and_validate(
     view: List[int] = []
     errors: List[str] = []
     n_new = 0
+    n_bqms = 0
+    bqms_path: Optional[Path] = None
 
     client = SubstrateClient(url=url)
     await client.connect()
@@ -354,6 +440,11 @@ async def walk_and_validate(
                 n_new += 1
             view.append(cur)
             cur = await _next_block(client, rec["archive"], errors)
+        if dump_bqm:
+            bqms_path = Path(f"{out_prefix}.bqms.jsonl")
+            n_bqms = await _dump_bqms(
+                client, view, cache, topo_cache, bqms_path, errors
+            )
     finally:
         await client.close()
 
@@ -374,6 +465,8 @@ async def walk_and_validate(
         "wins_file": str(wins_path),
         "validation_file": str(verdicts_path),
         "cache_file": str(cache_path),
+        "bqms_file": str(bqms_path) if bqms_path else None,
+        "bqms_written": n_bqms,
         "win_energies_milli": [r["archive"]["energy_milli"] for r in valid],
     }
 
@@ -543,6 +636,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="re-download every walked win instead of reusing cached records "
              "(the cache is still updated, not discarded)",
     )
+    p.add_argument(
+        "--dump-bqm", action="store_true",
+        help="also write <out>.bqms.jsonl: the reconstructed Ising model "
+             "(h, J) for each walked win, re-derived from its nonce",
+    )
     g = p.add_argument_group("time-to-solution analysis (--tts)")
     g.add_argument(
         "--tts", action="store_true",
@@ -556,7 +654,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     g.add_argument(
         "--tts-percentiles", default="50,25,10,5,1",
-        help="best-first energy percentiles to model; p1 == top 1% "
+        help="best-first energy percentiles to model; p1 == top 1%% "
              "(default: 50,25,10,5,1)",
     )
     g.add_argument("--tts-reads", type=int, default=112, help="num_reads (default 112)")
@@ -586,7 +684,10 @@ def _tts_config(args: argparse.Namespace) -> Dict[str, Any]:
 def main() -> int:
     args = _build_parser().parse_args()
     summary = asyncio.run(
-        walk_and_validate(args.url, args.max, args.out, use_cache=not args.no_cache)
+        walk_and_validate(
+            args.url, args.max, args.out,
+            use_cache=not args.no_cache, dump_bqm=args.dump_bqm,
+        )
     )
     energies = summary.pop("win_energies_milli", [])
     print(json.dumps(summary, indent=2), file=sys.stderr)
@@ -599,6 +700,11 @@ def main() -> int:
         f"cache holds {summary['cache_total']}) → {summary['validation_file']}",
         file=sys.stderr,
     )
+    if summary.get("bqms_file"):
+        print(
+            f"[bqm] {summary['bqms_written']} models → {summary['bqms_file']}",
+            file=sys.stderr,
+        )
     if args.tts:
         try:
             tts = analyze_tts(energies, Path(args.tts_model_root), _tts_config(args))

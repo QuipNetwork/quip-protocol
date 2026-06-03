@@ -108,10 +108,41 @@ python tools/analyze_topology_sizes.py --configs "9,2" \
 
 # GPU benchmarks (Modal Labs)
 modal run benchmarks/gpu_benchmark_modal.py
+
+# Download + re-validate every on-chain win (walks the proof chain)
+python tools/download_and_validate_wins.py \
+  --url wss://qpu-1.nodes.quip.network/rpc --out quip_wins
 ```
 
 **Never run QPU benchmarks in the background.** Provide the command;
 let the operator execute it.
+
+### Downloading winning-solution BQMs
+
+`submit_proof` stores a compact seed (nonce + topology hash), not the full
+Binary Quadratic Model. Add `--dump-bqm` to also reconstruct each win's Ising
+model and write it to `<out>.bqms.jsonl`:
+
+```bash
+python tools/download_and_validate_wins.py \
+  --url wss://qpu-1.nodes.quip.network/rpc \
+  --max 50 --dump-bqm --out quip_wins
+```
+
+Each line is one model: `block_number`, `nonce`, `topology_hash`, plus the
+reconstructed Ising model as flat lists — `h: [[node_id, bias], ...]` and
+`j: [[u, v, coupling], ...]`. Reload into the dicts the energy functions
+expect with:
+
+```python
+h = {n: b for n, b in rec["h"]}
+J = {(u, v): c for u, v, c in rec["j"]}
+```
+
+The model is re-derived from the nonce + topology snapshot via
+`generate_ising_model_from_nonce` — the same function `_finalize_sample` and
+the validator use, so a green validation run proves the dumped BQMs are
+correct.
 
 ### Modal Labs (cloud GPU)
 
