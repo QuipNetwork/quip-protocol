@@ -339,15 +339,12 @@ async def submit_with_retry(
                 "submit_with_retry: transient failure on attempt %d/%d: %s",
                 attempt, total_attempts, last_error,
             )
-            if attempt < total_attempts:
-                await sleep(_backoff_seconds(attempt, retry_backoff_ms))
-                continue
-            return SubmitResult(
-                action=SubmitRetryAction.RETRY,
-                receipt=None,
-                error=last_error,
-                attempts=attempt,
+            terminal = await _retry_or_exhausted(
+                attempt, total_attempts, None, last_error, retry_backoff_ms, sleep,
             )
+            if terminal is None:
+                continue
+            return terminal
 
         action = _classify_receipt(receipt)
         if action is SubmitRetryAction.RETRY:
@@ -356,15 +353,12 @@ async def submit_with_retry(
                 "submit_with_retry: retryable receipt on attempt %d/%d: %s",
                 attempt, total_attempts, receipt.error,
             )
-            if attempt < total_attempts:
-                await sleep(_backoff_seconds(attempt, retry_backoff_ms))
-                continue
-            return SubmitResult(
-                action=SubmitRetryAction.RETRY,
-                receipt=receipt,
-                error=receipt.error,
-                attempts=attempt,
+            terminal = await _retry_or_exhausted(
+                attempt, total_attempts, receipt, receipt.error, retry_backoff_ms, sleep,
             )
+            if terminal is None:
+                continue
+            return terminal
         return SubmitResult(
             action=action,
             receipt=receipt,
@@ -394,6 +388,32 @@ _TRANSIENT_SUBMIT_EXCEPTIONS = (
 def _backoff_seconds(attempt: int, retry_backoff_ms: int) -> float:
     """Linear backoff in seconds for the Nth attempt (1-indexed)."""
     return (retry_backoff_ms * attempt) / 1000.0
+
+
+async def _retry_or_exhausted(
+    attempt: int,
+    total_attempts: int,
+    receipt: Optional[ExtrinsicReceipt],
+    error: Optional[str],
+    retry_backoff_ms: int,
+    sleep: Callable[[float], Awaitable[None]],
+) -> Optional[SubmitResult]:
+    """Sleep and return None (caller should continue) or return a terminal RETRY result.
+
+    Shared by the transient-exception branch and the retryable-receipt branch of
+    :func:`submit_with_retry` — both share the same sleep+continue / else-RETRY shape.
+    Returns ``None`` when another attempt should be made (sleep has already fired);
+    returns a :class:`SubmitResult` when retries are exhausted.
+    """
+    if attempt < total_attempts:
+        await sleep(_backoff_seconds(attempt, retry_backoff_ms))
+        return None
+    return SubmitResult(
+        action=SubmitRetryAction.RETRY,
+        receipt=receipt,
+        error=error,
+        attempts=attempt,
+    )
 
 
 # ----------------------------------------------------------------------
