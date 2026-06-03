@@ -17,6 +17,7 @@ from tools.baseline_utils import (
     classify_energy,
     evaluate_baseline_sampleset,
     filter_configs_by_label,
+    get_gpu_info,
     load_baseline_topology,
     print_problem_summary,
     print_results_summary,
@@ -125,9 +126,7 @@ def cuda_baseline_test(
     total_start_time = time.time()
 
     # Query GPU capabilities
-    import cupy as cp
-    dev = cp.cuda.Device()
-    num_sms = dev.attributes['MultiProcessorCount']
+    num_sms, _ = get_gpu_info()
     print(
         f"🔧 GPU has {num_sms} streaming multiprocessors "
         f"(SMs)"
