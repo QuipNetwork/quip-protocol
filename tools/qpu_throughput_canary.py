@@ -72,6 +72,7 @@ from shared.quantum_proof_of_work import (
 from shared.miner_types import BlockRequirements
 from shared.ising_feeder import RandomIsingFeeder
 from QPU.dwave_miner import DWaveMiner
+from QPU.stream_driver import qpu_access_time_us
 
 # Validator type: (sampleset, h, J, nonce, salt) -> bool.
 # Returns True when the submission would clear the chain's three gates
@@ -131,19 +132,6 @@ def _make_energy_only_validator(threshold: float) -> Callable:
         return best < threshold
     return validate
 
-
-def _extract_timing(sampleset_info: Dict[str, Any]) -> int:
-    """Pull D-Wave's qpu_programming_time + qpu_sampling_time (µs).
-
-    Returns 0 when the timing dict is missing or partial — happens on
-    non-QPU fallbacks and on some embedded-future code paths. Callers
-    handle a zero like any other low value (it just won't contribute
-    to the access-fraction numerator).
-    """
-    timing = sampleset_info.get("timing", {}) if sampleset_info else {}
-    prog = timing.get("qpu_programming_time") or 0
-    sample = timing.get("qpu_sampling_time") or 0
-    return int(prog) + int(sample)
 
 
 def _run_batch(
@@ -234,7 +222,7 @@ def _run_batch(
             # errored and move on — the next iteration's future was
             # already submitted by sample_ising_streaming.
             try:
-                qpu_us = _extract_timing(sampleset.info)
+                qpu_us = qpu_access_time_us(sampleset)
                 best_energy = float(min(sampleset.record.energy))
             except (AttributeError, ValueError):
                 qpu_us = 0

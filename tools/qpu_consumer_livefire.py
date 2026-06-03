@@ -66,6 +66,7 @@ except Exception:  # noqa: BLE001 — .env is optional if env is already set
 import multiprocessing  # noqa: E402 — after sys.path / load_dotenv setup above
 
 from QPU.dwave_miner import DWaveMiner  # noqa: E402
+from QPU.stream_driver import qpu_access_time_us  # noqa: E402
 from dwave_topologies import DEFAULT_TOPOLOGY  # noqa: E402
 from shared.base_miner import (  # noqa: E402
     _ACQUIRE_CONTINUE,
@@ -556,11 +557,7 @@ def run_inprocess(args: argparse.Namespace) -> int:
                     )
                     t_eval.append((time.perf_counter() - t2) * 1000.0)
 
-                timing = sampleset.info.get("timing", {}) if sampleset.info else {}
-                qpu = timing.get("qpu_programming_time", 0) + timing.get(
-                    "qpu_sampling_time", 0,
-                )
-                qpu_ms.append(qpu / 1000.0)
+                qpu_ms.append(qpu_access_time_us(sampleset) / 1000.0)
             except Exception as exc:  # noqa: BLE001 — log + continue the run
                 errors += 1
                 print(f"[livefire] attempt {i} error: {type(exc).__name__}: {exc}",
