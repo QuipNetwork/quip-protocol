@@ -2425,6 +2425,17 @@ class SubstrateMinerController:
             )
             self.shutdown()
 
+    def _emit_dispatch_sentinel(self, handle: MinerHandle, dispatch_id: object) -> None:
+        """Clear the active dispatch and push the done-sentinel onto the done queue.
+
+        Called by the drain loop whenever a message signals that a dispatch is
+        terminal (mine_result, work_item_done, error).  Centralises the
+        identical three-line pattern that previously appeared in each branch.
+        """
+        if handle._active_dispatch_id == dispatch_id:
+            handle._active_dispatch_id = 0
+        self._done_queues[handle.miner_id].put_nowait(dispatch_id)
+
     async def _drain_handle_loop(
         self, handle: MinerHandle, loop: asyncio.AbstractEventLoop
     ) -> None:
@@ -2449,7 +2460,15 @@ class SubstrateMinerController:
                 )
                 self.shutdown()
                 return
-            if isinstance(msg, dict) and msg.get("op") == "mine_result":
+            if not isinstance(msg, dict):
+                logger.warning(
+                    "handle %s sent unrecognized message type=%s op=n/a; dropping",
+                    handle.miner_id,
+                    type(msg).__name__,
+                )
+                continue
+            op = msg.get("op")
+            if op == "mine_result":
                 # Use the response's dispatch_id (not the handle's
                 # current one) to look up the immutable context that was
                 # dispatched alongside this attempt. A late result from
@@ -2484,20 +2503,15 @@ class SubstrateMinerController:
                 # eat a 500ms timeout when no sentinel is forthcoming.
                 # Also emit a sentinel for any cancel-await already
                 # blocked on this dispatch_id.
-                if handle._active_dispatch_id == dispatch_id:
-                    handle._active_dispatch_id = 0
-                self._done_queues[handle.miner_id].put_nowait(dispatch_id)
-            elif isinstance(msg, dict) and msg.get("op") == "work_item_done":
+                self._emit_dispatch_sentinel(handle, dispatch_id)
+            elif op == "work_item_done":
                 # Worker finished its mine_work_item loop with no result —
                 # almost always because cancel() was observed. Surface it
                 # tagged with the dispatch_id so _await_handle_done can
                 # synchronize on cancellation of that specific dispatch,
                 # not just any sentinel.
-                done_dispatch_id = msg.get("dispatch_id")
-                if handle._active_dispatch_id == done_dispatch_id:
-                    handle._active_dispatch_id = 0
-                self._done_queues[handle.miner_id].put_nowait(done_dispatch_id)
-            elif isinstance(msg, dict) and msg.get("op") == "error":
+                self._emit_dispatch_sentinel(handle, msg.get("dispatch_id"))
+            elif op == "error":
                 self.stats.miner_errors[handle.miner_id] = (
                     self.stats.miner_errors.get(handle.miner_id, 0) + 1
                 )
@@ -2511,27 +2525,24 @@ class SubstrateMinerController:
                 # _await_handle_done can synchronize after a mining error.
                 # Without this, every mining exception causes a guaranteed
                 # timeout on the next cancel.
-                err_dispatch_id = msg.get("dispatch_id")
-                if handle._active_dispatch_id == err_dispatch_id:
-                    handle._active_dispatch_id = 0
-                self._done_queues[handle.miner_id].put_nowait(err_dispatch_id)
-            elif isinstance(msg, dict) and msg.get("op") == "preview":
+                self._emit_dispatch_sentinel(handle, msg.get("dispatch_id"))
+            elif op == "preview":
                 # Anticipatory-submission preview (Task 6a). Stash the
                 # worker's latest best-by-floor candidate keyed by the
                 # work key it was dispatched against. Do NOT build a
                 # _ResultEnvelope and do NOT submit — that's Task 6b's
                 # job; this drainer only delivers the primitive.
                 self._store_preview(handle, msg)
-            elif isinstance(msg, dict) and msg.get("op") == "budget":
+            elif op == "budget":
                 # Live QPU budget snapshot (worker-initiated push). Stash the
                 # latest per-miner stats so the telemetry snapshot can surface
                 # live usage; never blocks, never submits.
                 self._store_budget(handle, msg)
-            elif isinstance(msg, dict) and msg.get("op") == "participating":
+            elif op == "participating":
                 # Write-once participation marker for a solution #. Dedup +
                 # submit a best-effort System.remark; never blocks the drain.
                 self._mark_participating(handle.miner_id, msg)
-            elif isinstance(msg, dict) and msg.get("op") == "stats":
+            elif op == "stats":
                 # Stats responses are pulled directly by callers of
                 # handle.get_stats(); if one lands here it just means
                 # nobody was listening — drop and continue. NOTE: while
@@ -2541,10 +2552,9 @@ class SubstrateMinerController:
                 pass
             else:
                 logger.warning(
-                    "handle %s sent unrecognized message type=%s op=%s; dropping",
+                    "handle %s sent unrecognized message type=dict op=%s; dropping",
                     handle.miner_id,
-                    type(msg).__name__,
-                    msg.get("op") if isinstance(msg, dict) else "n/a",
+                    op,
                 )
 
 

@@ -831,7 +831,10 @@ class MempoolMinerController:
                 )
                 self._shutdown_event.set()
                 return
-            if isinstance(msg, dict) and msg.get("op") == "mine_result":
+            if not isinstance(msg, dict):
+                continue
+            op = msg.get("op")
+            if op == "mine_result":
                 dispatch_id = msg.get("dispatch_id")
                 result = msg.get("result")
                 context = self._dispatch_contexts.get(
@@ -854,15 +857,14 @@ class MempoolMinerController:
                         handle_id=handle.miner_id,
                     )
                 )
-            elif isinstance(msg, dict) and msg.get("op") == "work_item_done":
-                done_dispatch_id = msg.get("dispatch_id")
+            elif op == "work_item_done":
                 # Cancel-completion counts as terminal for the active
                 # order. Clears `_active_order` only if every handle has
                 # reported terminal without a successful submission.
                 self._record_handle_terminal_for_active(
-                    handle.miner_id, done_dispatch_id
+                    handle.miner_id, msg.get("dispatch_id")
                 )
-            elif isinstance(msg, dict) and msg.get("op") == "error":
+            elif op == "error":
                 err_dispatch_id = msg.get("dispatch_id")
                 logger.error(
                     "worker %s reported error (dispatch=%s): %s",
@@ -881,7 +883,7 @@ class MempoolMinerController:
                 self._record_handle_terminal_for_active(
                     handle.miner_id, err_dispatch_id
                 )
-            elif isinstance(msg, dict) and msg.get("op") == "shutdown_ack":
+            elif op == "shutdown_ack":
                 return
 
 
