@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Awaitable, Callable, List, Optional
 
-from shared.allowed_value_spec import MILLI_SCALE as _MILLI_SCALE
+from shared.allowed_value_spec import MILLI_SCALE
 from shared.logging_config import get_logger
 from shared.miner_types import MiningResult
 from substrate.validator_handle import ValidatorSwapped
@@ -106,10 +106,6 @@ class SubmitResult:
     receipt: Optional[ExtrinsicReceipt] = None
     error: Optional[str] = None
     attempts: int = 0
-
-
-# Same convention the Rust pallet uses everywhere: milli = ×1000.
-MILLI_SCALE: int = _MILLI_SCALE
 
 
 def encode_quantum_proof(
