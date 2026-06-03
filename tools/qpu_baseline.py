@@ -23,6 +23,7 @@ from shared.quantum_proof_of_work import (
 from tools.baseline_utils import (
     classify_energy,
     evaluate_baseline_sampleset,
+    print_results_summary,
 )
 
 try:
@@ -181,21 +182,10 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, min_runtime_minute
     
     # Summary and analysis
     total_runtime = time.time() - total_start_time
-    print(f"\n📊 QPU Baseline Summary (total time: {total_runtime/60:.1f} min):")
-    print("=" * 50)
-    
+    results['_total_runtime_seconds'] = total_runtime
+    print_results_summary(results, "QPU Baseline Summary")
+
     if results['tests']:
-        # Best energy achieved
-        best_result = min(results['tests'], key=lambda r: r['min_energy'])
-        print(f"🏆 Best energy: {best_result['min_energy']:.1f}")
-        print(f"   Required: {best_result['num_reads']} reads, {best_result['annealing_time_us']}µs, {best_result['runtime_minutes']:.1f} min")
-
-        # Time vs energy analysis
-        print(f"\n⏱️ Time vs Energy Performance:")
-        for result in results['tests']:
-            quality = f"({result['target_reached']})" if result['target_reached'] != 'none' else ""
-            print(f"  {result['runtime_minutes']:5.1f} min: {result['min_energy']:7.1f} energy {quality}")
-
         # Runtime analysis
         min_runtime_met = any(r['runtime_seconds'] >= min_runtime_seconds for r in results['tests'])
         print(f"\n⏰ Minimum runtime requirement ({min_runtime_minutes} min): {'✅ Met' if min_runtime_met else '❌ Not met'}")
