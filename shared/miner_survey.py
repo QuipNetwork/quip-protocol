@@ -136,7 +136,7 @@ def _kind(handle: "MinerHandle") -> str:
 
 def _device(spec: Dict[str, Any], kind: str) -> Optional[str]:
     args = spec.get("args") or {}
-    if kind == "cuda" or kind == "cuda-gibbs":
+    if kind in ("cuda", "cuda-gibbs"):
         dev = args.get("device")
         return str(dev) if dev is not None else None
     if kind == "metal":
