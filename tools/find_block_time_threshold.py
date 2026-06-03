@@ -4,6 +4,8 @@ import argparse
 import json
 import logging
 import multiprocessing
+import queue
+import statistics
 import sys
 import time
 import threading
@@ -126,7 +128,7 @@ def test_mining_time(
                 elapsed = time.time() - start_time
                 try:
                     result = result_queue.get_nowait()
-                except:
+                except queue.Empty:
                     result = None
         else:
             # No timeout - run directly
@@ -195,17 +197,12 @@ def sequential_adaptive_threshold(
     timeout_per_attempt = target_time_seconds * timeout_multiplier
 
     # Get energy range from calibration or use provided values
-    if energy_min is None or energy_max is None:
-        # Use miner's topology for energy calculation
-        auto_min, _, auto_max = calc_energy_range(
-            num_nodes=len(miner.nodes),
-            num_edges=len(miner.edges)
-        )
-        min_energy = energy_min if energy_min is not None else auto_min
-        max_energy = energy_max if energy_max is not None else auto_max
-    else:
-        min_energy = energy_min
-        max_energy = energy_max
+    auto_min, _, auto_max = calc_energy_range(
+        num_nodes=len(miner.nodes),
+        num_edges=len(miner.edges)
+    )
+    min_energy = energy_min if energy_min is not None else auto_min
+    max_energy = energy_max if energy_max is not None else auto_max
 
     print(f"\n🔍 Sequential adaptive search for {target_time_minutes:.1f} minute block time")
     print(f"   Topology: {len(miner.nodes)} nodes, {len(miner.edges)} edges")
@@ -330,7 +327,6 @@ def sequential_adaptive_threshold(
 
         # Print statistics table after each attempt
         if all_energies:
-            import statistics
             print(f"\n  📊 GSE Statistics (n={len(all_energies)}):")
             print(f"     Min: {min(all_energies):.1f}")
             print(f"     Max: {max(all_energies):.1f}")
@@ -407,7 +403,6 @@ def sequential_adaptive_threshold(
             current_energy = int(max(min_energy, min(max_energy, current_energy)))
 
     # Always return results, even if we didn't reach target
-    import statistics
     if len(in_range_times) > 0:
         avg_time = sum(in_range_times) / len(in_range_times)
         stdev_time = statistics.stdev(in_range_times) if len(in_range_times) > 1 else 0.0
