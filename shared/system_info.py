@@ -533,18 +533,36 @@ def _spec_kind(spec: Dict[str, Any]) -> str:
     return str(spec.get("kind", "")).lower()
 
 
-def _filter_args(args: Dict[str, Any], whitelist) -> Dict[str, Any]:
-    """Keep only whitelisted, non-forbidden, JSON-friendly entries."""
+def filter_telemetry_fields(
+    mapping: Dict[str, Any],
+    whitelist=None,
+) -> Dict[str, Any]:
+    """Keep only safe, JSON-friendly entries from *mapping*.
+
+    Args:
+        mapping: Source dict to filter.
+        whitelist: Optional collection of allowed keys.  When ``None`` every
+            non-secret, JSON-safe key is kept; when provided only keys in
+            the whitelist are kept.
+
+    Returns:
+        Filtered dict with no secret keys and no non-JSON-safe values.
+    """
     out: Dict[str, Any] = {}
-    for k, v in (args or {}).items():
+    for k, v in (mapping or {}).items():
         if not isinstance(k, str) or is_secret_key(k):
             continue
-        if k not in whitelist:
+        if whitelist is not None and k not in whitelist:
             continue
         if not _is_jsonable(v):
             continue
         out[k] = v
     return out
+
+
+def _filter_args(args: Dict[str, Any], whitelist) -> Dict[str, Any]:
+    """Thin wrapper kept for internal call-sites; delegates to filter_telemetry_fields."""
+    return filter_telemetry_fields(args, whitelist=whitelist)
 
 
 def _is_jsonable(value: Any) -> bool:
@@ -913,6 +931,7 @@ __all__ = [
     "SystemInfo",
     "build_descriptor",
     "collect_system_info",
+    "filter_telemetry_fields",
     "is_secret_key",
     "summarize_miners_from_handles",
     "summarize_miners_from_specs",
