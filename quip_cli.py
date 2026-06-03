@@ -115,6 +115,17 @@ async def _retry_until_verified(label: str, attempt) -> str:
     raise RuntimeError(detail)
 
 
+def _validators_unreachable(exc: NoValidatorReachable) -> click.ClickException:
+    """Build a ``ClickException`` for a ``NoValidatorReachable`` failure.
+
+    Renders the structured attempt log as ``urls=<csv> reasons=<csv>``.
+    Callers should ``raise _validators_unreachable(exc) from exc``.
+    """
+    urls = ",".join(a.url for a in exc.attempts)
+    reasons = ",".join(a.exc_type for a in exc.attempts)
+    return click.ClickException(f"validators-unreachable urls={urls} reasons={reasons}")
+
+
 def _default_node_name() -> str:
     """Return the system hostname, or 'quip-miner' if unavailable.
 
@@ -524,11 +535,7 @@ async def _connect_or_fail(urls: tuple[str, ...]) -> SubstrateClient:
     try:
         await client.connect()
     except NoValidatorReachable as exc:
-        url_csv = ",".join(a.url for a in exc.attempts)
-        reasons = ",".join(a.exc_type for a in exc.attempts)
-        raise click.ClickException(
-            f"validators-unreachable urls={url_csv} reasons={reasons}"
-        ) from exc
+        raise _validators_unreachable(exc) from exc
     return client
 
 
@@ -561,11 +568,7 @@ async def _ensure_funded_or_fail(
         # Faucet path stays connected via SubstrateClient; if the rotation
         # collapses mid-settlement, surface it as the same code the connect
         # guard uses rather than burying it in `wallet-faucet-failed`.
-        urls = ",".join(a.url for a in exc.attempts)
-        reasons = ",".join(a.exc_type for a in exc.attempts)
-        raise click.ClickException(
-            f"validators-unreachable urls={urls} reasons={reasons}"
-        ) from exc
+        raise _validators_unreachable(exc) from exc
     except Exception as exc:  # noqa: BLE001 — translated to a CLI error code
         # Surface the exception text, not just the class name: the actionable
         # detail (e.g. "faucet returned 502: transfer failed; see faucet logs"
@@ -603,11 +606,7 @@ async def _ensure_registered_or_fail(client: SubstrateClient, keystore) -> None:
     try:
         outcome = await _retry_until_verified("register-miner", _attempt)
     except NoValidatorReachable as exc:
-        urls = ",".join(a.url for a in exc.attempts)
-        reasons = ",".join(a.exc_type for a in exc.attempts)
-        raise click.ClickException(
-            f"validators-unreachable urls={urls} reasons={reasons}"
-        ) from exc
+        raise _validators_unreachable(exc) from exc
     except RuntimeError as exc:
         raise click.ClickException(
             f"miner-registration-failed ss58={ss58} error={exc}"
@@ -973,11 +972,7 @@ def quip_miner_bootstrap(
     try:
         result = asyncio.run(bootstrap(config))
     except NoValidatorReachable as exc:
-        urls = ",".join(a.url for a in exc.attempts)
-        reasons = ",".join(a.exc_type for a in exc.attempts)
-        raise click.ClickException(
-            f"validators-unreachable urls={urls} reasons={reasons}"
-        ) from exc
+        raise _validators_unreachable(exc) from exc
 
     click.echo("bootstrap complete")
     click.echo(f"  ss58 address       : {result.ss58_address}")
