@@ -119,10 +119,6 @@ class ValidatorPool:
     def active_url(self) -> Optional[str]:
         return self._active.url if self._active is not None else None
 
-    async def close(self) -> None:
-        """Shut down the active validator handle. Idempotent."""
-        await self.shutdown()
-
     async def start(self) -> None:
         """Spawn the first validator handle on the first URL."""
         url = self._failover.current()

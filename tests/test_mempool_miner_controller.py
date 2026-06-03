@@ -808,7 +808,7 @@ async def test_controller_submits_solution_end_to_end(tmp_path):
             await asyncio.wait_for(run_task, timeout=10)
         except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
             pass
-        await pool.close()
+        await pool.shutdown()
         handle.req.put({"op": "shutdown"})
         handle.proc.join(timeout=5)
         if handle.proc.is_alive():

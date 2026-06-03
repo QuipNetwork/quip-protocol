@@ -1806,7 +1806,7 @@ async def _run_concurrent_miner(
             # the standalone connection.
             await setup_client.close()
         if pool is not None:
-            await pool.close()
+            await pool.shutdown()
         if core is not None:
             core.close()
 

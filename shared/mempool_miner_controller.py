@@ -392,7 +392,7 @@ class MempoolMinerController:
             await self._cancel_and_await(task, "drainer task")
         self._event_manager_task = None
         # Close the parent-side build client. The pool's active validator
-        # handle is torn down by ``pool.close()`` from the CLI's outer
+        # handle is torn down by ``pool.shutdown()`` from the CLI's outer
         # try/finally.
         if self.build_client is not None:
             try:

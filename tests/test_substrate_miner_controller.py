@@ -779,7 +779,7 @@ async def _live_controller(
                 "controller.run() raised during _live_controller teardown"
             )
         await client.close()
-        await pool.close()
+        await pool.shutdown()
         # When `core` owns the handle, let `core.close()` tear it down; the
         # caller is responsible for that. Otherwise we built the handle
         # ourselves and own its lifecycle.

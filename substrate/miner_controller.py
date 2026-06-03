@@ -13,7 +13,7 @@ Lifecycle:
         await controller.run()  # blocks until shutdown() or fatal error
     finally:
         controller.shutdown()
-        await pool.close()
+        await pool.shutdown()
 
 The controller does not own the lifecycle of its inputs. Construction of the
 `ValidatorPool`, `Signer`, and `MinerHandle[]` is the caller's job, as is
@@ -2634,7 +2634,7 @@ class SubstrateMinerController:
             self._telemetry_proc = None
             self._telemetry_shutdown_event = None
         # Close the parent-side build client. The pool's active validator
-        # handle is torn down by ``pool.close()`` from the CLI's outer
+        # handle is torn down by ``pool.shutdown()`` from the CLI's outer
         # try/finally, not here.
         if self.build_client is not None:
             try:
