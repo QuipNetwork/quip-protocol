@@ -310,18 +310,6 @@ def _cpu_physical_cores() -> Optional[int]:
 
 
 def _windows_physical_cores() -> Optional[int]:
-    try:
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-    except (AttributeError, OSError):
-        return None
-    # GetLogicalProcessorInformation: call twice (size probe, then data).
-    needed = ctypes.c_ulong(0)
-    kernel32.GetLogicalProcessorInformation(None, ctypes.byref(needed))
-    if needed.value == 0:
-        return None
-    buf = (ctypes.c_byte * needed.value)()
-    if not kernel32.GetLogicalProcessorInformation(buf, ctypes.byref(needed)):
-        return None
     # SYSTEM_LOGICAL_PROCESSOR_INFORMATION is complex; we can't parse the
     # buffer without defining the full struct. Accept best-effort None here
     # and let logical_cores stand in on Windows.
