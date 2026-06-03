@@ -372,6 +372,20 @@ async def _get_client(request: web.Request) -> Optional[SubstrateClient]:
         return new_client
 
 
+async def _require_client(
+    request: web.Request,
+) -> Tuple[Optional[SubstrateClient], Optional[web.Response]]:
+    """Return ``(client, None)`` when a chain client is available, or
+    ``(None, 503-error-response)`` when it is not.
+
+    Matches the ``(value, error)`` convention used throughout this module.
+    """
+    client = await _get_client(request)
+    if client is None:
+        return None, _error("chain client unavailable", "CHAIN_UNAVAILABLE", status=503)
+    return client, None
+
+
 # ----------------------------------------------------------------------
 # Handlers
 # ----------------------------------------------------------------------
@@ -528,9 +542,9 @@ async def _handle_status(request: web.Request) -> web.Response:
 
 async def _handle_block_latest(request: web.Request) -> web.Response:
     """Return the chain head block (header + extrinsic count)."""
-    client = await _get_client(request)
-    if client is None:
-        return _error("chain client unavailable", "CHAIN_UNAVAILABLE", status=503)
+    client, err = await _require_client(request)
+    if err is not None:
+        return err
     try:
         head_hash = await client.get_head()
         return _success(await _block_payload(client, at=head_hash))
@@ -543,9 +557,9 @@ async def _fetch_block_payload(
 ) -> Tuple[Optional[dict], Optional[web.Response]]:
     """Resolve *block_number* to its payload, returning ``(payload, None)`` on
     success or ``(None, error_response)`` on any failure."""
-    client = await _get_client(request)
-    if client is None:
-        return None, _error("chain client unavailable", "CHAIN_UNAVAILABLE", status=503)
+    client, err = await _require_client(request)
+    if err is not None:
+        return None, err
     try:
         block_hash = await _block_hash_for_number(client, block_number)
         if block_hash is None:
