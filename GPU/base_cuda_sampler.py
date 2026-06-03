@@ -856,10 +856,7 @@ class BaseCudaSampler(abc.ABC):
             if _exhausted:
                 return None
             if _has_try_pop:
-                m = models.try_pop()
-                if m is None:
-                    return None
-                return m
+                return models.try_pop()
             return _pull_blocking()
 
         def _try_fill_free_slot(
