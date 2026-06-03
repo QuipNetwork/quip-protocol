@@ -1518,32 +1518,30 @@ class SubstrateMinerController:
         sentinel_queue = self._done_queues.get(handle.miner_id)
         if sentinel_queue is None:
             return
-        deadline = asyncio.get_event_loop().time() + timeout
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+
+        def _log_timeout() -> None:
+            logger.debug(
+                "handle %s did not ack cancel of dispatch_id=%d within "
+                "%.1fs; dispatching anyway (downstream guards handle "
+                "the stale result)",
+                handle.miner_id,
+                dispatch_id,
+                timeout,
+            )
+
         while True:
-            remaining = deadline - asyncio.get_event_loop().time()
+            remaining = deadline - loop.time()
             if remaining <= 0:
-                logger.debug(
-                    "handle %s did not ack cancel of dispatch_id=%d within "
-                    "%.1fs; dispatching anyway (downstream guards handle "
-                    "the stale result)",
-                    handle.miner_id,
-                    dispatch_id,
-                    timeout,
-                )
+                _log_timeout()
                 return
             try:
                 got = await asyncio.wait_for(
                     sentinel_queue.get(), timeout=remaining
                 )
             except asyncio.TimeoutError:
-                logger.debug(
-                    "handle %s did not ack cancel of dispatch_id=%d within "
-                    "%.1fs; dispatching anyway (downstream guards handle "
-                    "the stale result)",
-                    handle.miner_id,
-                    dispatch_id,
-                    timeout,
-                )
+                _log_timeout()
                 return
             # Match exactly — older dispatch sentinels arriving here are
             # already-resolved and can be discarded. A sentinel for a
