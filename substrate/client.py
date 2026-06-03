@@ -470,20 +470,12 @@ class SubstrateClient:
                 )
             scale_param = "0x01" + topology_hash.hex()
 
-        raw = await self._run(
-            lambda: self._iface.rpc_request(
-                "state_call",
-                ["QuantumPowApi_mining_snapshot", scale_param, block_hash],
-            )
-        )
         # Distinguish RPC-level errors (transport, bad method, bad params)
         # from `Option::None` ("no topology registered yet"). Both used to
         # look like `result is None`, which silently swallowed real failures.
-        if "error" in raw:
-            raise RuntimeError(
-                f"state_call mining_snapshot rpc error: {raw['error']}"
-            )
-        encoded = raw.get("result")
+        encoded = await self._state_call(
+            "QuantumPowApi_mining_snapshot", scale_param, block_hash
+        )
         if encoded is None:
             return None
         decoded = _decode_mining_snapshot(encoded)
@@ -627,17 +619,9 @@ class SubstrateClient:
         needs to reason about the active threshold.
         """
         block_hash = _hex(at) if at is not None else None
-        raw = await self._run(
-            lambda: self._iface.rpc_request(
-                "state_call",
-                ["QuantumPowApi_current_difficulty", "0x", block_hash],
-            )
+        encoded = await self._state_call(
+            "QuantumPowApi_current_difficulty", "0x", block_hash
         )
-        if "error" in raw:
-            raise RuntimeError(
-                f"state_call current_difficulty rpc error: {raw['error']}"
-            )
-        encoded = raw.get("result")
         if encoded is None:
             raise RuntimeError(
                 "state_call current_difficulty returned no result"
@@ -700,17 +684,9 @@ class SubstrateClient:
             )
         block_hash = _hex(at) if at is not None else None
         scale_param = "0x" + block_number.to_bytes(4, "little").hex()
-        raw = await self._run(
-            lambda: self._iface.rpc_request(
-                "state_call",
-                ["QuantumPowApi_winning_solution", scale_param, block_hash],
-            )
+        encoded = await self._state_call(
+            "QuantumPowApi_winning_solution", scale_param, block_hash
         )
-        if "error" in raw:
-            raise RuntimeError(
-                f"state_call winning_solution rpc error: {raw['error']}"
-            )
-        encoded = raw.get("result")
         if encoded is None:
             return None
         return _decode_winning_solution_with_nonce(encoded)
@@ -1191,6 +1167,33 @@ class SubstrateClient:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    async def _state_call(
+        self, method: str, scale_param: str, block_hash: Optional[str]
+    ) -> Optional[str]:
+        """Dispatch a ``state_call`` RPC and return the hex-encoded result.
+
+        Raises ``RuntimeError`` on an RPC-level error (transport, bad method,
+        bad params).  Returns ``None`` when the runtime returns
+        ``Option::None`` — callers apply their own None semantics on top.
+
+        Args:
+            method: Runtime API method name, e.g. ``QuantumPowApi_mining_snapshot``.
+            scale_param: SCALE-encoded hex parameter string (e.g. ``"0x00"``).
+            block_hash: Block hash hex string or ``None`` for the current best head.
+
+        Returns:
+            Hex-encoded result string, or ``None`` if the runtime returned no value.
+        """
+        raw = await self._run(
+            lambda: self._iface.rpc_request(
+                "state_call",
+                [method, scale_param, block_hash],
+            )
+        )
+        if "error" in raw:
+            raise RuntimeError(f"state_call {method} rpc error: {raw['error']}")
+        return raw.get("result")
 
     async def _run(self, fn, *, idempotent: bool = False):
         """Run a blocking substrate-interface call with failover-on-loss.
