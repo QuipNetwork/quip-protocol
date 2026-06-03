@@ -101,9 +101,9 @@ class QuantumPowBenchmark:
             start_time = time.time()
             
             if sampler_name == "QPU":
-                sampleset = sampler.sample_ising(h, J, num_reads=100, answer_mode='raw')
+                sampleset = sampler.sample_ising(h, J, num_reads=num_reads, answer_mode='raw')
             else:
-                sampleset = sampler.sample_ising(h, J, num_reads=100, num_sweeps=num_sweeps)
+                sampleset = sampler.sample_ising(h, J, num_reads=num_reads, num_sweeps=num_sweeps)
             
             elapsed_time = time.time() - start_time
             

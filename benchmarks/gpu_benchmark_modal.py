@@ -11,6 +11,9 @@ from typing import Tuple, Dict, Any
 import time
 from numba import jit
 
+# GPU cost per hour by instance type (Modal Labs pricing)
+GPU_COST_PER_HOUR = {"t4": 0.10, "a10g": 0.30, "a100": 1.00}
+
 # Define Modal app for GPU execution
 app = modal.App("quantum-blockchain-gpu-benchmark")
 
@@ -221,8 +224,7 @@ def benchmark_gpu_vs_qpu(
         
         # Estimate cost
         hour_fraction = result['gpu_time'] / 3600
-        gpu_costs = {"t4": 0.10, "a10g": 0.30, "a100": 1.00}
-        cost_per_hour = gpu_costs.get(gpu_type, 0.10)
+        cost_per_hour = GPU_COST_PER_HOUR.get(gpu_type, 0.10)
         cost = hour_fraction * cost_per_hour
         
         print(f"\nCost Analysis:")
@@ -249,7 +251,7 @@ def benchmark_gpu_vs_qpu(
         
         print("\nCost efficiency (energy per dollar):")
         for gpu, res in results.items():
-            cost_per_hour = {"t4": 0.10, "a10g": 0.30, "a100": 1.00}.get(gpu, 0.10)
+            cost_per_hour = GPU_COST_PER_HOUR.get(gpu, 0.10)
             samples_per_hour = 3600 / res['avg_time_per_sample']
             cost_per_sample = cost_per_hour / samples_per_hour
             energy_per_dollar = abs(np.mean(res['energies'])) / cost_per_sample
