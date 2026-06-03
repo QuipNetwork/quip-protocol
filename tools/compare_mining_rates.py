@@ -553,6 +553,23 @@ def parse_duration(duration_str: str) -> float:
         return float(duration_str)
 
 
+def _force_terminate_all(processes, drain_queue) -> None:
+    """Drain once then terminate/join/kill all alive processes.
+
+    Args:
+        processes: Iterable of multiprocessing Process objects.
+        drain_queue: Callable that drains the shared result queue.
+    """
+    drain_queue()
+    for p in processes:
+        if p.is_alive():
+            p.terminate()
+    for p in processes:
+        p.join(timeout=2.0)
+        if p.is_alive():
+            p.kill()
+
+
 @dataclass
 class NodeInfo:
     """Simple node info for testing."""
@@ -778,14 +795,7 @@ def main():
                     if time.time() - shutdown_start > 180:
                         # Force terminate if workers are stuck
                         print("   ⚠️ Timeout waiting for workers, forcing shutdown...")
-                        drain_queue()  # One more drain before terminate
-                        for p in processes:
-                            if p.is_alive():
-                                p.terminate()
-                        for p in processes:
-                            p.join(timeout=2.0)
-                            if p.is_alive():
-                                p.kill()
+                        _force_terminate_all(processes, drain_queue)
                         break
                     time.sleep(0.5)  # Check every 500ms during shutdown
                 break
@@ -802,14 +812,7 @@ def main():
             drain_queue()  # Keep draining
             if time.time() - shutdown_start > 60:
                 print("   Forcing shutdown...")
-                drain_queue()
-                for p in processes:
-                    if p.is_alive():
-                        p.terminate()
-                for p in processes:
-                    p.join(timeout=2.0)
-                    if p.is_alive():
-                        p.kill()
+                _force_terminate_all(processes, drain_queue)
                 break
             time.sleep(0.5)
         drain_queue()

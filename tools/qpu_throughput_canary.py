@@ -63,6 +63,7 @@ except ImportError:
     # dotenv is optional — if absent, env vars must already be set.
     pass
 
+from shared.proc_util import terminate_join
 from shared.quantum_proof_of_work import (
     compute_solution_meta,
     evaluate_sampleset,
@@ -1105,14 +1106,7 @@ def _force_shutdown(miner) -> None:
     children = multiprocessing.active_children()
     for child in children:
         try:
-            child.terminate()
-        except Exception:  # noqa: BLE001
-            pass
-    for child in children:
-        try:
-            child.join(timeout=2)
-            if child.is_alive():
-                child.kill()
+            terminate_join(child, 2)
         except Exception:  # noqa: BLE001
             pass
 

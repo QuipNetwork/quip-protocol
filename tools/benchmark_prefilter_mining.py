@@ -335,6 +335,23 @@ def build_specs(
     return specs
 
 
+def _force_terminate_all(processes, drain_queue) -> None:
+    """Drain once then terminate/join/kill all alive processes.
+
+    Args:
+        processes: Iterable of multiprocessing Process objects.
+        drain_queue: Callable that drains the shared result queue.
+    """
+    drain_queue()
+    for p in processes:
+        if p.is_alive():
+            p.terminate()
+    for p in processes:
+        p.join(timeout=2.0)
+        if p.is_alive():
+            p.kill()
+
+
 def run_benchmark(args) -> int:
     """Run the mining rate benchmark."""
     if args.min_blocks > 0 and args.duration == '10m':
@@ -458,14 +475,7 @@ def run_benchmark(args) -> int:
                     drain_queue()
                     if time.time() - shutdown_start > 180:
                         print("   Timeout, forcing shutdown...")
-                        drain_queue()
-                        for p in processes:
-                            if p.is_alive():
-                                p.terminate()
-                        for p in processes:
-                            p.join(timeout=2.0)
-                            if p.is_alive():
-                                p.kill()
+                        _force_terminate_all(processes, drain_queue)
                         break
                     time.sleep(0.5)
                 break
@@ -477,13 +487,7 @@ def run_benchmark(args) -> int:
         while any(p.is_alive() for p in processes):
             drain_queue()
             if time.time() - shutdown_start > 60:
-                for p in processes:
-                    if p.is_alive():
-                        p.terminate()
-                for p in processes:
-                    p.join(timeout=2.0)
-                    if p.is_alive():
-                        p.kill()
+                _force_terminate_all(processes, drain_queue)
                 break
             time.sleep(0.5)
         drain_queue()
