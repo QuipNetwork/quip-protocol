@@ -80,15 +80,6 @@ def _source_map_from_manifest(manifest):
     return source_map
 
 
-def _region_names_from_manifest(manifest):
-    """Build region name list indexed by ID."""
-    max_id = max(r["id"] for r in manifest["regions"])
-    names = [""] * (max_id + 1)
-    for r in manifest["regions"]:
-        names[r["id"]] = r["label"]
-    return names
-
-
 # ── Tree building from manifest ────────────────────────
 
 
@@ -220,8 +211,7 @@ def profile_sa(num_reads, num_sweeps):
 # ── Text profile printing ─────────────────────────────
 
 
-def print_profile(data, clock_khz, manifest,
-                  num_reads, num_sweeps):
+def print_profile(data, clock_khz, manifest):
     """Print generic profile breakdown from manifest."""
     active = data[data.any(axis=1)]
     if len(active) == 0:
@@ -311,7 +301,6 @@ def generate_flamegraph(data, clock_khz, kernel_name,
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
-        from matplotlib.patches import Rectangle
     except ImportError:
         print("matplotlib not available, skipping flamegraph.")
         return
@@ -604,7 +593,6 @@ def _build_profile_json(data, clock_khz, kernel_name,
 
     avg = active.mean(axis=0)
     source_map = _source_map_from_manifest(manifest)
-    region_names = _region_names_from_manifest(manifest)
     direct_lines = _compute_direct_lines(source_map)
 
     tree = _build_tree_from_manifest(manifest, avg)
@@ -740,8 +728,7 @@ def _render_flame_svg(bars, viewbox_w=1200,
     return "\n".join(parts)
 
 
-def _build_metrics_html(data, clock_khz, manifest,
-                        num_sweeps, gpu_name, topo):
+def _build_metrics_html(data, clock_khz, manifest, topo):
     """Build metrics table HTML for the collapsible panel."""
     active = data[data.any(axis=1)]
     avg = active.mean(axis=0)
@@ -959,18 +946,10 @@ function highlightDirectLines(lines) {
 
 function highlightBarsForRegions(regionStr) {
   if (!regionStr) return;
-  var regions = regionStr.split(",").map(Number);
   for (var i = 0; i < barEls.length; i++) {
     var bd = profile.bars[i];
-    if (!bd) continue;
-    for (var r = 0; r < regions.length; r++) {
-      var ri = regions[r];
-      if (bd.sourceLines) {
-        var sm = bd.sourceLines;
-        // Check if this bar's source range contains
-        // any of the matching region ranges
-        barEls[i].classList.add("selected");
-      }
+    if (bd && bd.sourceLines) {
+      barEls[i].classList.add("selected");
     }
   }
 }
@@ -1189,8 +1168,7 @@ def generate_flamegraph_html(data, clock_khz, kernel_name,
     )
     flame_svg = _render_flame_svg(profile["bars"])
     metrics_html = _build_metrics_html(
-        data, clock_khz, manifest, num_sweeps,
-        gpu_name, profile["topology"],
+        data, clock_khz, manifest, profile["topology"],
     )
 
     clock_mhz = clock_khz / 1000.0
@@ -1337,8 +1315,7 @@ def main():
     manifest = _load_manifest(kernel)
 
     # Print text profile
-    print_profile(data, clock_khz, manifest,
-                  args.reads, args.sweeps)
+    print_profile(data, clock_khz, manifest)
 
     # Generate outputs
     if args.plot:
