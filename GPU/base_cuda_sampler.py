@@ -90,6 +90,8 @@ class BaseCudaSampler(abc.ABC):
     """
 
     CTRL_STRIDE = 8
+    CTRL_EXIT_NOW = 6   # field index: exit_now flag
+    SLOTS_PER_NONCE = 3  # rotating buffer slots per nonce
     SLOT_EMPTY = 0
     SLOT_READY = 1
     SLOT_ACTIVE = 2
@@ -492,6 +494,47 @@ class BaseCudaSampler(abc.ABC):
         )
 
     # ----------------------------------------------------------
+    # Control / buffer layout helpers
+    # ----------------------------------------------------------
+
+    def _ctrl_index(self, nonce_id: int, field: int) -> int:
+        """Return the flat ctrl-array index for a nonce field.
+
+        Args:
+            nonce_id: Nonce group index.
+            field: Field offset within the per-nonce stride
+                (e.g., slot_id for slot-state fields,
+                CTRL_EXIT_NOW for the exit flag).
+        """
+        return nonce_id * self.CTRL_STRIDE + field
+
+    def _slot_buffer_offsets(
+        self,
+        nonce_id: int,
+        slot_id: int,
+        reads: int,
+        max_packed_size: int,
+    ) -> Tuple[int, int, int]:
+        """Return flat buffer offsets for a nonce/slot.
+
+        Args:
+            nonce_id: Nonce group index.
+            slot_id: Slot within nonce (0, 1, or 2).
+            reads: Number of reads per nonce.
+            max_packed_size: Packed words per sample.
+
+        Returns:
+            (slot_idx, sample_start, energy_start) where
+            slot_idx is the flat slot index and the *_start
+            values are the first element offsets in the
+            corresponding flat device buffers.
+        """
+        slot_idx = nonce_id * self.SLOTS_PER_NONCE + slot_id
+        sample_start = slot_idx * reads * max_packed_size
+        energy_start = slot_idx * reads
+        return slot_idx, sample_start, energy_start
+
+    # ----------------------------------------------------------
     # Slot upload / download
     # ----------------------------------------------------------
 
@@ -517,7 +560,11 @@ class BaseCudaSampler(abc.ABC):
         nnz = self._prep_nnz
         max_packed_size = self._prep_max_packed_size
         reads = self._sf_reads_per_nonce
-        slot_idx = nonce_id * 3 + slot_id
+        slot_idx, sample_start, energy_start = (
+            self._slot_buffer_offsets(
+                nonce_id, slot_id, reads, max_packed_size,
+            )
+        )
 
         # Fill host staging
         j_vals = np.fromiter(
@@ -536,10 +583,6 @@ class BaseCudaSampler(abc.ABC):
         # Async H2D on transfer stream
         j_start = slot_idx * nnz
         h_start = slot_idx * N
-        sample_start = (
-            slot_idx * reads * max_packed_size
-        )
-        energy_start = slot_idx * reads
 
         with self._sf_stream_transfer:
             self._d_sf_J[j_start:j_start + nnz].set(
@@ -558,9 +601,7 @@ class BaseCudaSampler(abc.ABC):
             ] = 0
 
         # Mark slot READY
-        ctrl_offset = (
-            nonce_id * self.CTRL_STRIDE + slot_id
-        )
+        ctrl_offset = self._ctrl_index(nonce_id, slot_id)
         ready_val = np.array(
             [self.SLOT_READY], dtype=np.int32,
         )
@@ -629,12 +670,11 @@ class BaseCudaSampler(abc.ABC):
         node_to_idx = self._prep_node_to_idx
         max_packed_size = self._prep_max_packed_size
         reads = self._sf_reads_per_nonce
-        slot_idx = nonce_id * 3 + slot_id
-
-        sample_start = (
-            slot_idx * reads * max_packed_size
+        _slot_idx, sample_start, energy_start = (
+            self._slot_buffer_offsets(
+                nonce_id, slot_id, reads, max_packed_size,
+            )
         )
-        energy_start = slot_idx * reads
 
         packed_raw = cp.asnumpy(
             self._d_sf_samples[
@@ -728,17 +768,19 @@ class BaseCudaSampler(abc.ABC):
         ctrl_host = cp.asnumpy(self._d_sf_ctrl)
         completed = []
         for n in range(self._sf_num_nonces):
-            base = n * self.CTRL_STRIDE
-            for s in range(3):
-                if ctrl_host[base + s] == self.SLOT_COMPLETE:
+            for s in range(self.SLOTS_PER_NONCE):
+                if (
+                    ctrl_host[self._ctrl_index(n, s)]
+                    == self.SLOT_COMPLETE
+                ):
                     completed.append((n, s))
         return completed
 
     def signal_nonce_exit(self, nonce_id: int) -> None:
         """Signal one nonce to exit."""
         assert self._sf_prepared
-        ctrl_offset = (
-            nonce_id * self.CTRL_STRIDE + 6
+        ctrl_offset = self._ctrl_index(
+            nonce_id, self.CTRL_EXIT_NOW,
         )
         exit_val = np.array([1], dtype=np.int32)
         self._d_sf_ctrl[
@@ -950,8 +992,11 @@ class BaseCudaSampler(abc.ABC):
                 for nonce_id, ss in enumerate(slots):
                     if ss.active_model is None:
                         continue
-                    base = nonce_id * self.CTRL_STRIDE
-                    state = ctrl[base + ss.active_slot]
+                    state = ctrl[
+                        self._ctrl_index(
+                            nonce_id, ss.active_slot,
+                        )
+                    ]
                     if state != self.SLOT_COMPLETE:
                         continue
 
