@@ -583,10 +583,18 @@ def _gpu_spec_entry(spec: Dict[str, Any], miner_id: str, kind: str) -> Dict[str,
         "backend": backend,
         "miner_id": miner_id,
     }
+    whitelist = (
+        _MODAL_HANDLE_ARGS_WHITELIST if kind == "modal"
+        else _GPU_HANDLE_ARGS_WHITELIST
+    )
+    # Apply generic whitelist fields first, then overwrite with kind-specific
+    # coercions so the explicit values always win without a pop() dance.
+    entry.update(_filter_args(args, whitelist))
     if kind in ("cuda", "cuda-gibbs"):
         device = args.get("device")
         if device is not None:
             entry["device_index"] = _coerce_int(device, default=device)
+        entry.pop("device", None)
     elif kind == "metal":
         device = args.get("device")
         if device is not None:
@@ -595,17 +603,6 @@ def _gpu_spec_entry(spec: Dict[str, Any], miner_id: str, kind: str) -> Dict[str,
         gpu_type = args.get("gpu_type")
         if gpu_type is not None:
             entry["gpu_type"] = str(gpu_type)
-    whitelist = (
-        _MODAL_HANDLE_ARGS_WHITELIST if kind == "modal"
-        else _GPU_HANDLE_ARGS_WHITELIST
-    )
-    extras = _filter_args(args, whitelist)
-    # device_index / gpu_type already set explicitly above — don't
-    # re-emit through the generic whitelist path.
-    extras.pop("device", None)
-    extras.pop("device_index", None)
-    extras.pop("gpu_type", None)
-    entry.update(extras)
     return entry
 
 
