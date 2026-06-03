@@ -566,9 +566,9 @@ class SubstrateClient:
         result = await self._run(
             lambda: self._iface.query("QuantumPow", "Miners", [account])
         )
-        if result is None or result.value is None:
+        v = _storage_value(result)
+        if v is None:
             return None
-        v = result.value
         return MinerInfo(
             registered_at=int(v["registered_at"]),
             deposit=int(v["deposit"]),
@@ -602,9 +602,9 @@ class SubstrateClient:
         currently faces.
         """
         result = await self._run(lambda: self._iface.query("QuantumPow", "Difficulty"))
-        if result is None or not _result_was_found(result) or result.value is None:
+        v = _storage_value(result, check_found=True)
+        if v is None:
             return None
-        v = result.value
         return SubstrateDifficulty(
             min_solutions=int(v["min_solutions"]),
             max_energy_milli=int(v["max_energy_milli"]),
@@ -726,9 +726,10 @@ class SubstrateClient:
         result = await self._run(
             lambda: self._iface.query("QuantumPow", "LastProofBlock")
         )
-        if result is None or not _result_was_found(result) or result.value is None:
+        v = _storage_value(result, check_found=True)
+        if v is None:
             return None
-        return int(result.value)
+        return int(v)
 
     async def query_block_timestamp_ms(self, block_hash: bytes) -> Optional[int]:
         """Return the ``Timestamp.Now`` storage value at ``block_hash``.
@@ -785,9 +786,10 @@ class SubstrateClient:
         result = await self._run(
             lambda: self._iface.query("System", "Account", [account])
         )
-        if result is None or result.value is None:
+        v = _storage_value(result)
+        if v is None:
             return 0
-        return int(result.value["data"]["free"])
+        return int(v["data"]["free"])
 
     # ------------------------------------------------------------------
     # QuantumComputeMempool storage queries
@@ -802,9 +804,9 @@ class SubstrateClient:
                 "QuantumComputeMempool", "Solvers", [account]
             )
         )
-        if result is None or result.value is None:
+        v = _storage_value(result)
+        if v is None:
             return None
-        v = result.value
         return MempoolSolverInfo(
             account=_decode_account_id(v["account"]),
             solver_type=MinerType.from_scale_variant(str(v["solver_type"])),
@@ -853,9 +855,9 @@ class SubstrateClient:
                 "QuantumComputeMempool", "JobOrders", [order_id]
             )
         )
-        if result is None or result.value is None:
+        v = _storage_value(result)
+        if v is None:
             return None
-        v = result.value
 
         # The decoded value tree mixes raw bytes (e.g. spec_id), hex strings,
         # ints, dicts (for IsingParams), and strings (for OrderStatus + the
@@ -1659,6 +1661,28 @@ def _result_was_found(result) -> bool:
     """
     meta = getattr(result, "meta_info", None) or {}
     return meta.get("result_found", True)
+
+
+def _storage_value(result, *, check_found: bool = False):
+    """Extract the decoded value from a storage query result, or return None.
+
+    Centralises the two recurring empty-result guards:
+    - ``result is None`` — the executor raised or the iface returned None.
+    - ``result.value is None`` — the entry was present but decoded to None.
+    - ``not _result_was_found(result)`` — OptionQuery default masking a
+      missing entry; only checked when ``check_found=True``.
+
+    Returns ``result.value`` when all guards pass, ``None`` otherwise.
+    Callers that need a different sentinel (e.g. ``0``) compare the return
+    value to ``None`` themselves.
+    """
+    if result is None:
+        return None
+    if check_found and not _result_was_found(result):
+        return None
+    if result.value is None:
+        return None
+    return result.value
 
 
 def _hex(b: bytes) -> str:
