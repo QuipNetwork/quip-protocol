@@ -280,25 +280,23 @@ def adjust_energy_along_curve(
 
     # Convert energy to normalized position [0, 1] for observed range
     total_range = max_energy - min_energy
-    
+    sign = -1 if direction == 'harder' else 1
+
     # Handle out-of-range values with linear adjustment
     if current_energy < min_energy or current_energy > max_energy:
         linear_adjustment = total_range * adjustment_rate
-        if direction == 'harder':
-            return current_energy - linear_adjustment
-        else:  # easier
-            return current_energy + linear_adjustment
-    
+        return current_energy + sign * linear_adjustment
+
     # Normalize current position [0, 1]
     normalized_pos = (current_energy - min_energy) / total_range
-    
+
     # Create curve using sqrt function
     # At position 0 (min_energy): curve_factor ≈ 0.1 (small adjustments)
-    # At position 0.3 (knee): curve_factor ≈ 1.0 (full adjustments)  
+    # At position 0.3 (knee): curve_factor ≈ 1.0 (full adjustments)
     # At position 1 (max_energy): curve_factor ≈ 0.1 (small adjustments)
-    
+
     knee_pos = (knee_energy - min_energy) / total_range  # ≈ 0.3
-    
+
     if normalized_pos <= knee_pos:
         # Left side: increase from 0.1 to 1.0
         progress = normalized_pos / knee_pos
@@ -307,14 +305,10 @@ def adjust_energy_along_curve(
         # Right side: decrease from 1.0 to 0.1
         progress = (normalized_pos - knee_pos) / (1.0 - knee_pos)
         curve_factor = 1.0 - 0.9 * math.sqrt(progress)
-    
+
     # Apply curved adjustment
     curved_adjustment = total_range * adjustment_rate * curve_factor
-    
-    if direction == 'harder':
-        return current_energy - curved_adjustment
-    else:  # easier
-        return current_energy + curved_adjustment
+    return current_energy + sign * curved_adjustment
 
 
 def energy_to_difficulty(
