@@ -61,6 +61,35 @@ class QuipFormatter(logging.Formatter):
         return 'unknown', logger_name
 
 
+def _make_rotating_file_handler(
+    path: str,
+    formatter: logging.Formatter,
+    level: int,
+    backup_count: int = 5,
+) -> logging.handlers.RotatingFileHandler:
+    """Create a RotatingFileHandler after ensuring the parent directory exists.
+
+    Args:
+        path: Absolute path to the log file.
+        formatter: Formatter to attach to the handler.
+        level: Numeric logging level for the handler.
+        backup_count: Number of backup files to keep (default 5).
+
+    Returns:
+        Configured RotatingFileHandler ready to be added to a logger.
+    """
+    log_path = Path(path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = logging.handlers.RotatingFileHandler(
+        path,
+        maxBytes=10 * 1024 * 1024,  # 10 MB
+        backupCount=backup_count,
+    )
+    fh.setLevel(level)
+    fh.setFormatter(formatter)
+    return fh
+
+
 def setup_logging(
     log_level: str = "INFO",
     node_log_file: Optional[str] = None,
@@ -99,31 +128,22 @@ def setup_logging(
 
     # Setup file handler for node logs if specified
     if node_log_file:
-        # Ensure directory exists
-        log_path = Path(node_log_file)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        file_handler = logging.handlers.RotatingFileHandler(
-            node_log_file,
-            maxBytes=10*1024*1024,  # 10MB
-            backupCount=5
+        root_logger.addHandler(
+            _make_rotating_file_handler(node_log_file, formatter, numeric_level)
         )
-        file_handler.setLevel(numeric_level)
-        file_handler.setFormatter(formatter)
-
-        root_logger.addHandler(file_handler)
 
     root_logger.addHandler(console_handler)
 
     # Configure aiohttp logging
-    if http_log_file:
-        # Create aiohttp logger
-        aiohttp_logger = logging.getLogger('aiohttp')
-        aiohttp_logger.setLevel(logging.DEBUG)
+    aiohttp_logger = logging.getLogger('aiohttp')
+    aiohttp_logger.propagate = False
 
-        # Remove any existing handlers
-        for handler in aiohttp_logger.handlers[:]:
-            aiohttp_logger.removeHandler(handler)
+    # Remove any existing handlers
+    for handler in aiohttp_logger.handlers[:]:
+        aiohttp_logger.removeHandler(handler)
+
+    if http_log_file:
+        aiohttp_logger.setLevel(logging.DEBUG)
 
         # Support special values 'stderr' and 'stdout' to route HTTP logs to console
         target = str(http_log_file).strip().lower()
@@ -133,29 +153,15 @@ def setup_logging(
             http_stream_handler.setLevel(logging.DEBUG)
             http_stream_handler.setFormatter(formatter)
             aiohttp_logger.addHandler(http_stream_handler)
-            # Do not propagate to root to avoid duplicate messages
-            aiohttp_logger.propagate = False
         else:
-            # Ensure directory exists for file logging
-            http_log_path = Path(http_log_file)
-            http_log_path.parent.mkdir(parents=True, exist_ok=True)
-
-            http_file_handler = logging.handlers.RotatingFileHandler(
-                http_log_file,
-                maxBytes=10*1024*1024,  # 10MB
-                backupCount=3
+            aiohttp_logger.addHandler(
+                _make_rotating_file_handler(
+                    http_log_file, formatter, logging.DEBUG, backup_count=3
+                )
             )
-            http_file_handler.setLevel(logging.DEBUG)
-            http_file_handler.setFormatter(formatter)
-            aiohttp_logger.addHandler(http_file_handler)
-
-            # Prevent aiohttp logs from propagating to root logger
-            aiohttp_logger.propagate = False
     else:
         # Suppress aiohttp logs entirely
-        aiohttp_logger = logging.getLogger('aiohttp')
         aiohttp_logger.setLevel(logging.CRITICAL)
-        aiohttp_logger.propagate = False
 
     # Configure miner parent logger so all miner.* children inherit formatting
     miner_parent_logger = logging.getLogger('miner')
@@ -230,12 +236,7 @@ def log_writer_main(log_queue, stop_event, log_file_path, level) -> None:
     console.setFormatter(fmt)
     handlers = [console]
     if log_file_path:
-        fh = logging.handlers.RotatingFileHandler(
-            log_file_path, maxBytes=10 * 1024 * 1024, backupCount=5,
-        )
-        fh.setLevel(level)
-        fh.setFormatter(fmt)
-        handlers.append(fh)
+        handlers.append(_make_rotating_file_handler(log_file_path, fmt, level))
 
     def _emit(record) -> None:
         for h in handlers:
