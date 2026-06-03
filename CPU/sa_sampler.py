@@ -3,6 +3,7 @@
 from typing import Any, Dict, List, Tuple
 from dwave.samplers import SimulatedAnnealingSampler
 from dwave.system.testing import MockDWaveSampler
+from shared.node_edge_coerce import coerce_int_nodes_edges
 from shared.quantum_proof_of_work import DEFAULT_TOPOLOGY
 from shared.stream_context import stream_from_feeder
 
@@ -39,20 +40,7 @@ class SimulatedAnnealingStructuredSampler(MockDWaveSampler):
 
         # NOTE: these are of type List[Variable], which we can't change, but AFAICT they are always ints.
         #.      it might be the case they are floats or something strange one day.
-        nodes = []
-        for node in self.nodelist:
-            if not isinstance(node, int):
-                raise ValueError(f"Expected node index to be int, got {type(node)}")
-            nodes.append(int(node))
-        edges = []
-        for edge in self.edgelist:
-            if not isinstance(edge, tuple) or len(edge) != 2:
-                raise ValueError(f"Expected edge to be tuple of length 2, got {edge}")
-            if not isinstance(edge[0], int) or not isinstance(edge[1], int):
-                raise ValueError(f"Expected edge indices to be int, got {type(edge[0])} and {type(edge[1])}")
-            edges.append((int(edge[0]), int(edge[1])))
-        self.nodes = nodes
-        self.edges = edges
+        self.nodes, self.edges = coerce_int_nodes_edges(self.nodelist, self.edgelist)
 
     def sample_ising_streaming(
         self, feeder, *, num_reads, num_sweeps, **_ignored,
