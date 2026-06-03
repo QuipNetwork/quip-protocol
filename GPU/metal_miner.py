@@ -65,11 +65,23 @@ class MetalMiner(BaseMiner):
     # neither.
     STREAM_FACTORY_DOTTED = "GPU.metal_stream:build_persistent_context"
 
-    # Metal MPS strategy: fewer sweeps, more reads
-    ADAPT_MIN_SWEEPS = 64
-    ADAPT_MAX_SWEEPS = 512
-    ADAPT_MIN_READS = 32
-    ADAPT_MAX_READS = 1024
+    # Annealing strategy: depth over breadth. At a fixed compute budget
+    # (reads x sweeps), long anneals reach far deeper Ising minima than many
+    # short restarts, and on Metal the longer-sweep profile is also faster
+    # (lower per-read dispatch overhead), measured. These bounds match the
+    # CUDA miner so the two backends mine at equivalent reads/sweeps; the
+    # old "fewer sweeps, more reads" split (512/1024) collapsed Metal's win
+    # rate ~5x vs CUDA at the same budget (see metal_vs_cuda_tts study).
+    ADAPT_MIN_SWEEPS = 256
+    ADAPT_MAX_SWEEPS = 2048
+    ADAPT_MIN_READS = 64
+    ADAPT_MAX_READS = 256
+
+    # Gibbs needs ~2x the sweeps of SA to reach the same energies (mirrors
+    # CudaMiner; measured on the Advantage2 topology). Metal production mines
+    # SA-only via metal_stream, so this is consumed by the Gibbs sweep study
+    # (tools/metal_tts_canary), not the live miner.
+    GIBBS_SWEEP_MULTIPLIER = 2
 
     def __init__(self, miner_id: str, topology=None, **cfg):
         gpu_util = cfg.pop('utilization', cfg.pop('gpu_utilization', 100))
