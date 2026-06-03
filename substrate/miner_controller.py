@@ -1041,7 +1041,7 @@ class SubstrateMinerController:
             )
             return
 
-        new_work_key = (ctx.last_proof_block_hash, ctx.topology_hash)
+        new_work_key = _work_key(ctx)
 
         # Work-key rollover: a new round started. Evict any preview +
         # anticipatory state bound to a *different* key so we never act on
