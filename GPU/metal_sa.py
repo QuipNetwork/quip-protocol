@@ -135,7 +135,7 @@ class MetalSASampler:
             raise RuntimeError("Failed to create Metal library (no error reported)")
 
         # List all functions in library for debugging
-        function_names = [lib.functionNames()[i] for i in range(len(lib.functionNames()))]
+        function_names = list(lib.functionNames())
         self.logger.debug(f"Available Metal functions: {function_names}")
 
         # Get SA kernel

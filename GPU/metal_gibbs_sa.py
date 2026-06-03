@@ -211,7 +211,7 @@ class MetalGibbsSampler:
         # Load sequential kernel
         self._kernel = lib.newFunctionWithName_("block_gibbs_sampler")
         if not self._kernel:
-            function_names = [lib.functionNames()[i] for i in range(len(lib.functionNames()))]
+            function_names = list(lib.functionNames())
             raise RuntimeError(f"Failed to find block_gibbs_sampler kernel. Available: {function_names}")
 
         self._pipeline, err = self.device.newComputePipelineStateWithFunction_error_(self._kernel, None)
@@ -221,7 +221,7 @@ class MetalGibbsSampler:
         # Load parallel kernel
         self._kernel_parallel = lib.newFunctionWithName_("block_gibbs_parallel")
         if not self._kernel_parallel:
-            function_names = [lib.functionNames()[i] for i in range(len(lib.functionNames()))]
+            function_names = list(lib.functionNames())
             raise RuntimeError(f"Failed to find block_gibbs_parallel kernel. Available: {function_names}")
 
         self._pipeline_parallel, err = self.device.newComputePipelineStateWithFunction_error_(self._kernel_parallel, None)
