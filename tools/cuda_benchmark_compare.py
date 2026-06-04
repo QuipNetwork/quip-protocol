@@ -16,7 +16,6 @@ Usage:
 Options:
     --target-energy FLOAT   Energy target (default: -14900.0)
     --num-models INT        Models for test1 CLT (default: 50)
-    --seed-start INT        Starting nonce seed (default: 0)
     --max-attempts INT      Max mining attempts for test2 (default: 500)
     --output-dir PATH       Output directory (default: benchmarks/compare)
     --gpu INT               GPU device (default: 1)
@@ -807,10 +806,6 @@ def main():
     parser.add_argument(
         "--num-models", type=int, default=50,
         help="Number of models for test1 (default: 50)",
-    )
-    parser.add_argument(
-        "--seed-start", type=int, default=0,
-        help="Starting nonce seed (default: 0)",
     )
     parser.add_argument(
         "--max-attempts", type=int, default=500,
