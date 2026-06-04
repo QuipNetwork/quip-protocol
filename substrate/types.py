@@ -197,6 +197,10 @@ class SubstrateMiningContext:
             buffer_size=buffer_size,
         )
 
+    def uses_decay_ratchet(self) -> bool:
+        """PoW work always takes the decay-ratchet loop (see ``WorkContext``)."""
+        return True
+
 
 @dataclass(frozen=True)
 class WinningSolution:

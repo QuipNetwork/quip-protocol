@@ -516,6 +516,10 @@ class MempoolJobContext:
             timeout_to_difficulty_adjustment_decay=2**31 - 1,
         )
 
+    def uses_decay_ratchet(self) -> bool:
+        """Mempool jobs use strict-energy evaluation, not the decay ratchet."""
+        return False
+
 
 # ----------------------------------------------------------------------
 # Event dataclasses (a subset — enough for the Phase 8 controller's

@@ -60,6 +60,19 @@ class WorkContext(Protocol):
         """
         ...
 
+    def uses_decay_ratchet(self) -> bool:
+        """Whether the loop ranks candidates with the decay ratchet.
+
+        PoW (substrate) work takes the "stash the best, submit when the chain
+        threshold catches up" ratchet loop — even with a flat decay schedule
+        that path falls back to strict energy ranking. Mempool jobs carry fixed
+        quality floors and use strict-energy evaluation instead. This single
+        discriminator is what ``mine_work_item`` branches on; it replaces an
+        ``isinstance`` check so the foundation need not import either concrete
+        context type.
+        """
+        ...
+
 
 def resolve_ising(
     context: WorkContext,
