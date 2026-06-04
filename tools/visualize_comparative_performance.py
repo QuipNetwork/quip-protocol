@@ -103,6 +103,16 @@ def get_normalization_units(device_counts: Dict[str, int]) -> Dict[str, float]:
     return units
 
 
+def per_unit_norm(df: pd.DataFrame) -> Dict[str, float]:
+    """Return normalization units for each miner type inferred from *df*.
+
+    Combines get_device_counts() and get_normalization_units() into a single
+    call for the common case where both the raw counts and derived units are
+    not needed separately.
+    """
+    return get_normalization_units(get_device_counts(df))
+
+
 def plot_blocks_vs_time(ax, df: pd.DataFrame):
     """Plot cumulative blocks mined vs wall-clock time, normalized per single unit."""
     ax.set_title('Blocks Mined Over Time in Isolation (Per Single Unit)', fontsize=14, fontweight='bold')
@@ -159,8 +169,7 @@ def plot_mining_efficiency(ax, df: pd.DataFrame):
     ax.grid(True, alpha=0.3, axis='y')
 
     # Get device counts for normalization
-    device_counts = get_device_counts(df)
-    norm_units = get_normalization_units(device_counts)
+    norm_units = per_unit_norm(df)
 
     miner_names = []
     rates = []
@@ -221,8 +230,7 @@ def plot_energy_distributions(ax, df: pd.DataFrame):
     ax.grid(True, alpha=0.3, axis='y')
 
     # Get device counts for normalization
-    device_counts = get_device_counts(df)
-    norm_units = get_normalization_units(device_counts)
+    norm_units = per_unit_norm(df)
 
     all_energies = df['energy'].values
     if len(all_energies) == 0:
@@ -271,8 +279,7 @@ def plot_time_to_solution(ax, df: pd.DataFrame):
     ax.grid(True, alpha=0.3, axis='y')
 
     # Get device counts for normalization
-    device_counts = get_device_counts(df)
-    norm_units = get_normalization_units(device_counts)
+    norm_units = per_unit_norm(df)
 
     # Only successful attempts
     successful_df = df[(df['valid'] > 0) & (df['time_to_solution'] > 0)]
@@ -399,8 +406,7 @@ def plot_speedup_vs_cpu(ax, df: pd.DataFrame):
     ax.grid(True, alpha=0.3, axis='y')
 
     # Get device counts for normalization
-    device_counts = get_device_counts(df)
-    norm_units = get_normalization_units(device_counts)
+    norm_units = per_unit_norm(df)
 
     # Calculate CPU baseline rate (nonces per minute per 32-core unit)
     # Find CPU miner types using normalization (handles 'cpu', 'CPU', 'Cpu', etc.)
