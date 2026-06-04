@@ -43,13 +43,14 @@ import argparse
 import json
 import logging
 import math
+import multiprocessing
 import os
 import random
 import statistics
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Make repo modules importable when run as a script.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -67,19 +68,12 @@ from shared.proc_util import terminate_join
 from shared.quantum_proof_of_work import (
     compute_solution_meta,
     evaluate_sampleset,
-    generate_ising_model_from_nonce,
     pack_spins_hex,
 )
 from shared.miner_types import BlockRequirements
 from shared.ising_feeder import RandomIsingFeeder
 from QPU.dwave_miner import DWaveMiner
 from QPU.stream_driver import qpu_access_time_us
-
-# Validator type: (sampleset, h, J, nonce, salt) -> bool.
-# Returns True when the submission would clear the chain's three gates
-# (energy < difficulty, num_solutions >= min_solutions, diversity >=
-# min_diversity). See ``_make_chain_validator``.
-from typing import Callable
 
 
 # ---------------------------------------------------------------------
@@ -181,7 +175,6 @@ def _run_batch(
     )
     # stop_event is passed into the pump so it can cancel in-flight D-Wave
     # futures when we reach n_submissions or on KeyboardInterrupt.
-    import multiprocessing
     stop_event = multiprocessing.Event()
     miner._stop_event = stop_event  # kept for legacy callers that check this attr
 
@@ -1096,8 +1089,6 @@ def _force_shutdown(miner) -> None:
     re-block; all output is already flushed to disk by this point, so a
     hard exit is safe and deterministic.
     """
-    import multiprocessing
-
     try:
         miner.sampler.close()
     except Exception:  # noqa: BLE001
