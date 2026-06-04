@@ -126,9 +126,8 @@ def plot_threshold_probabilities(
     """Plot probability of nonce meeting threshold for each miner type."""
     plt.figure(figsize=(12, 7))
 
-    for miner_type in df['miner_type'].unique():
+    for miner_type, miner_df in df.groupby('miner_type', sort=False):
         display_type = normalize_miner_type(miner_type)
-        miner_df = df[df['miner_type'] == miner_type]
         energies = miner_df['energy'].values
 
         probabilities = calculate_threshold_probabilities(energies, thresholds)
@@ -174,9 +173,8 @@ def plot_nonces_by_threshold(
     # Get device counts for normalization
     device_counts = get_device_counts(df)
 
-    for miner_type in df['miner_type'].unique():
+    for miner_type, miner_df in df.groupby('miner_type', sort=False):
         display_type = normalize_miner_type(miner_type)
-        miner_df = df[df['miner_type'] == miner_type]
         energies = miner_df['energy'].values
 
         # Calculate normalization factor
@@ -238,9 +236,8 @@ def plot_proportion_by_threshold(
     """Plot percentage of nonces that would mine at each threshold."""
     plt.figure(figsize=(12, 7))
 
-    for miner_type in df['miner_type'].unique():
+    for miner_type, miner_df in df.groupby('miner_type', sort=False):
         display_type = normalize_miner_type(miner_type)
-        miner_df = df[df['miner_type'] == miner_type]
         energies = miner_df['energy'].values
         total_attempts = len(energies)
 
@@ -625,36 +622,23 @@ def plot_win_rate_by_threshold_projection(
     # Get actual device counts for base comparison
     device_counts = get_device_counts(df)
 
-    # Generate configurations with projections
-    configurations = []
+    # Generate configurations with projections.
+    # Per-config CPU/GPU projection (label, count); extreme adds 2 extra orders.
+    projections = {
+        'extreme': {'CPU': ('CPU (2^40)', 1099511627776), 'GPU': ('GPU (2^20)', 1048576)},
+        'standard': {'CPU': ('CPU (2^20)', 1048576), 'GPU': ('GPU (2^10)', 1024)},
+    }
+    projection = projections.get(projection_config, projections['standard'])
 
-    if projection_config == 'extreme':
-        # Extreme projection: CPU 2^40 + GPU 2^20
-        if 'QPU' in device_counts:
-            configurations.append((f'QPU ({device_counts["QPU"]})', 'QPU', device_counts['QPU']))
-        if 'CPU' in device_counts:
+    configurations = []
+    if 'QPU' in device_counts:
+        configurations.append((f'QPU ({device_counts["QPU"]})', 'QPU', device_counts['QPU']))
+    for device in ('CPU', 'GPU'):
+        if device in device_counts:
+            proj_label, proj_count = projection[device]
             configurations.extend([
-                (f'CPU ({device_counts["CPU"]} CPUs)', 'CPU', device_counts['CPU']),
-                ('CPU (2^40)', 'CPU', 1099511627776)
-            ])
-        if 'GPU' in device_counts:
-            configurations.extend([
-                (f'GPU ({device_counts["GPU"]} GPUs)', 'GPU', device_counts['GPU']),
-                ('GPU (2^20)', 'GPU', 1048576)
-            ])
-    else:
-        # Standard projection: CPU 2^20 + GPU 2^15
-        if 'QPU' in device_counts:
-            configurations.append((f'QPU ({device_counts["QPU"]})', 'QPU', device_counts['QPU']))
-        if 'CPU' in device_counts:
-            configurations.extend([
-                (f'CPU ({device_counts["CPU"]} CPUs)', 'CPU', device_counts['CPU']),
-                ('CPU (2^20)', 'CPU', 1048576)
-            ])
-        if 'GPU' in device_counts:
-            configurations.extend([
-                (f'GPU ({device_counts["GPU"]} GPUs)', 'GPU', device_counts['GPU']),
-                ('GPU (2^10)', 'GPU', 1024)
+                (f'{device} ({device_counts[device]} {device}s)', device, device_counts[device]),
+                (proj_label, device, proj_count),
             ])
 
     # Calculate win rates
@@ -778,9 +762,8 @@ def plot_nonces_per_block(
     nonces_data = {}
     block_counts = {}
 
-    for miner_type in df['miner_type'].unique():
+    for miner_type, miner_df in df.groupby('miner_type', sort=False):
         display_type = normalize_miner_type(miner_type)
-        miner_df = df[df['miner_type'] == miner_type]
 
         # Group by machine, process to count attempts between successful blocks
         nonces_list = []
