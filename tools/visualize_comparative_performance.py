@@ -25,16 +25,17 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from tools.mining_viz_common import (
+    MINER_COLORS,
+    get_device_counts,
+    load_mining_csv as _load_mining_csv_base,
+    normalize_miner_type,
+)
 
 # Required columns for CSV validation
-REQUIRED_CSV_COLUMNS = {'miner_type', 'energy', 'valid', 'miner_machine', 'process',
-                        'start_time', 'end_time', 'time_to_solution'}
-
-# Standard colors for miner types
-MINER_COLORS = {
-    'CPU': '#e74c3c',
-    'GPU': '#3498db',
-    'QPU': '#2ecc71'
+_REQUIRED_CSV_COLUMNS = {
+    'miner_type', 'energy', 'valid', 'miner_machine', 'process',
+    'start_time', 'end_time', 'time_to_solution',
 }
 
 
@@ -45,47 +46,11 @@ def load_mining_csv(filepath: str) -> pd.DataFrame:
         ValueError: If required columns are missing from the CSV
     """
     # start_time/end_time are relative offsets (seconds from machine's test start)
-    df = pd.read_csv(filepath, encoding='utf-8')
-
-    # Validate required columns
-    missing = REQUIRED_CSV_COLUMNS - set(df.columns)
-    if missing:
-        raise ValueError(f"CSV missing required columns: {', '.join(sorted(missing))}")
-
-    return df
-
-
-def normalize_miner_type(miner_type: str) -> str:
-    """Normalize miner type to CPU/GPU/QPU for display."""
-    miner_type = miner_type.lower()
-    if miner_type == 'cuda':
-        return 'GPU'
-    return miner_type.upper()
-
-
-def get_device_counts(df: pd.DataFrame) -> Dict[str, int]:
-    """
-    Count actual devices per miner type from the data.
-
-    For GPU/CUDA: count unique (miner_machine, process) pairs = number of GPUs
-    For CPU: count unique (miner_machine, process) pairs = number of CPU workers
-    For QPU: count unique miner_machine = number of QPUs
-    """
-    counts = {}
-
-    for miner_type, miner_df in df.groupby('miner_type'):
-        display_type = normalize_miner_type(miner_type)
-
-        if display_type == 'QPU':
-            # QPU: count unique machines
-            count = miner_df['miner_machine'].nunique()
-        else:
-            # CPU/GPU: count unique (machine, process) pairs
-            count = miner_df.groupby(['miner_machine', 'process']).ngroups
-
-        counts[display_type] = count
-
-    return counts
+    return _load_mining_csv_base(
+        filepath,
+        required_columns=_REQUIRED_CSV_COLUMNS,
+        encoding='utf-8',
+    )
 
 
 def get_normalization_units(device_counts: Dict[str, int]) -> Dict[str, float]:

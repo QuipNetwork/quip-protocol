@@ -30,12 +30,31 @@ import numpy as np
 import pandas as pd
 from scipy import stats as scipy_stats
 
-# Standard color scheme for miner types
-MINER_COLORS = {
-    'CPU': '#e74c3c',
-    'GPU': '#3498db',
-    'QPU': '#2ecc71',
+from tools.mining_viz_common import (
+    MINER_COLORS,
+    get_device_counts,
+    load_mining_csv as _load_mining_csv_base,
+    normalize_miner_type,
+)
+
+# Required columns for this tool's CSV validation
+_REQUIRED_COLUMNS = {
+    'miner_type', 'energy', 'valid', 'miner_machine', 'process',
+    'threshold', 'start_time', 'end_time', 'time_to_solution',
 }
+
+
+def load_mining_csv(filepath: str) -> pd.DataFrame:
+    """Load mining data CSV into DataFrame.
+
+    Required columns: miner_type, energy, valid, miner_machine, process,
+                      threshold, start_time, end_time, time_to_solution
+    """
+    return _load_mining_csv_base(
+        filepath,
+        required_columns=_REQUIRED_COLUMNS,
+        parse_dates=True,
+    )
 
 
 def _add_difficulty_annotations(
@@ -65,39 +84,6 @@ def _add_difficulty_annotations(
             print("Note: Difficulty annotations disabled (shared.energy_utils not available)",
                   file=sys.stderr)
             _add_difficulty_annotations._import_warned = True
-
-
-def load_mining_csv(filepath: str) -> pd.DataFrame:
-    """Load mining data CSV into DataFrame.
-
-    Required columns: miner_type, energy, valid, miner_machine, process,
-                      threshold, start_time, end_time, time_to_solution
-    """
-    df = pd.read_csv(filepath)
-
-    # Validate required columns
-    required_columns = {
-        'miner_type', 'energy', 'valid', 'miner_machine', 'process',
-        'threshold', 'start_time', 'end_time', 'time_to_solution'
-    }
-    missing = required_columns - set(df.columns)
-    if missing:
-        raise ValueError(f"CSV missing required columns: {', '.join(sorted(missing))}")
-
-    # Parse date columns if present
-    for col in ['start_time', 'end_time']:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors='coerce')
-
-    return df
-
-
-def normalize_miner_type(miner_type: str) -> str:
-    """Normalize miner type to CPU/GPU/QPU for display."""
-    miner_type = miner_type.lower()
-    if miner_type == 'cuda':
-        return 'GPU'
-    return miner_type.upper()
 
 
 def get_miner_groups(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
@@ -294,38 +280,6 @@ def plot_proportion_by_threshold(
     plt.tight_layout()
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     print(f"Saved proportion by threshold chart to {output_file}")
-
-
-def get_device_counts(df: pd.DataFrame, miner_groups: Optional[Dict[str, pd.DataFrame]] = None) -> Dict[str, int]:
-    """
-    Count actual devices per miner type from the data.
-
-    For GPU/CUDA: count unique (miner_machine, process) pairs = number of GPUs
-    For CPU: count unique (miner_machine, process) pairs = number of CPU workers
-    For QPU: count unique miner_machine = number of QPUs
-
-    Args:
-        df: DataFrame with mining data
-        miner_groups: Optional pre-grouped dict from get_miner_groups() for efficiency
-    """
-    counts = {}
-
-    if miner_groups is None:
-        miner_groups = get_miner_groups(df)
-
-    for miner_type, miner_df in miner_groups.items():
-        display_type = normalize_miner_type(miner_type)
-
-        if display_type == 'QPU':
-            # QPU: count unique machines
-            count = miner_df['miner_machine'].nunique()
-        else:
-            # CPU/GPU: count unique (machine, process) pairs
-            count = miner_df.groupby(['miner_machine', 'process']).ngroups
-
-        counts[display_type] = count
-
-    return counts
 
 
 def get_miner_tts_stats(df: pd.DataFrame, miner_groups: Optional[Dict[str, pd.DataFrame]] = None) -> Dict[str, Dict[str, Any]]:
