@@ -11,12 +11,11 @@ time on problems where we know we won't hit the target energy.
 import argparse
 import json
 import logging
-import multiprocessing
 import random
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -40,14 +39,12 @@ sys.stderr.reconfigure(line_buffering=True)
 import numpy as np
 import dimod
 
-from shared.block import Block, BlockHeader, BlockRequirements, create_genesis_block
-from shared.miner_types import MiningResult
+from shared.block import BlockRequirements, create_genesis_block
 from shared.time_utils import utc_timestamp
 import hashlib
 
 from shared.quantum_proof_of_work import (
     derive_nonce,
-    evaluate_sampleset,
     generate_ising_model_from_nonce,
 )
 from dwave_topologies import DEFAULT_TOPOLOGY
@@ -104,7 +101,7 @@ def determine_canary_params(num_sweeps: int = 4, num_reads: int = 10) -> Dict[st
 def process_batch(
     batch_h_list, batch_J_list, batch_nonces, batch_salts, batch_canary_results,
     miner, full_params, difficulty_energy, is_gpu, qpu_time_used, qpu_calls,
-    full_passed, full_failed, full_energies, full_times, topology
+    full_passed, full_failed, full_energies, full_times
 ):
     """Process a batch of problems through the full miner.
 
@@ -505,7 +502,7 @@ def run_canary_test(
             batch_results, qpu_time_used, qpu_calls, full_passed, full_failed, full_energies, full_times = process_batch(
                 batch_h_list, batch_J_list, batch_nonces, batch_salts, batch_canary_results,
                 miner, full_params, difficulty_energy, is_gpu, qpu_time_used, qpu_calls,
-                full_passed, full_failed, full_energies, full_times, topology
+                full_passed, full_failed, full_energies, full_times
             )
 
             nonce_results.extend(batch_results)
@@ -617,7 +614,6 @@ def run_canary_test(
     # Calculate precision, recall, F1
     tp = stats['analysis']['true_positives']
     fp = stats['analysis']['false_positives']
-    tn = stats['analysis']['true_negatives']
     fn = stats['analysis']['false_negatives']
 
     if tp + fp > 0:
@@ -1054,10 +1050,6 @@ def main():
     if stats['canary']['time_stats']['mean'] and stats['full']['time_stats']['mean']:
         avg_canary = stats['canary']['time_stats']['mean']
         avg_full = stats['full']['time_stats']['mean']
-
-        # Time saved by using canary to filter
-        fn = stats['analysis']['false_negatives']
-        tn = stats['analysis']['true_negatives']
 
         # Without canary: run full on everything
         time_without_canary = stats['total_nonces'] * avg_full
