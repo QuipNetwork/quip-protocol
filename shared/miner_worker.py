@@ -19,10 +19,6 @@ import multiprocessing.synchronize as mpsync
 import traceback
 from typing import Any, Dict, Optional
 
-import CPU  # noqa: E402
-import GPU  # noqa: E402
-import QPU  # noqa: E402
-
 from shared.logging_config import QuipFormatter
 
 logger = logging.getLogger(__name__)
@@ -70,26 +66,36 @@ def build_miner_from_spec(spec: Dict[str, Any]):
         # `topology=` override in spec.args propagates to the sampler. Phase 4
         # controller relies on this to bind the miner to the chain's
         # registered topology.
+        import CPU
+
         return CPU.SimulatedAnnealingMiner(miner_id, **cfg, **args)
     elif kind == "metal":
+        import GPU
+
         if not GPU.METAL_AVAILABLE:
             raise RuntimeError(
                 "Metal miner requested but Metal is not available (requires macOS with Metal support)"
             )
         return GPU.MetalMiner(miner_id, **cfg, **args)
     elif kind == "cuda":
+        import GPU
+
         if not GPU.CUDA_AVAILABLE:
             raise RuntimeError(
                 "CUDA miner requested but CUDA is not available (requires CuPy and CUDA toolkit)"
             )
         return GPU.CudaMiner(miner_id, **cfg, **args)
     elif kind == "modal":
+        import GPU
+
         if not GPU.MODAL_AVAILABLE:
             raise RuntimeError(
                 "Modal miner requested but Modal is not available (requires modal SDK: pip install modal)"
             )
         return GPU.ModalMiner(miner_id, **cfg, **args)
     elif kind == "cuda-gibbs":
+        import GPU
+
         if not GPU.CUDA_AVAILABLE:
             raise RuntimeError(
                 "CUDA Gibbs miner requested but not available "
@@ -102,6 +108,8 @@ def build_miner_from_spec(spec: Dict[str, Any]):
             **args,
         )
     elif kind == "qpu":
+        import QPU
+
         # Build QPU time config if daily budget is specified
         time_config = None
         if cfg.get("daily_budget"):
