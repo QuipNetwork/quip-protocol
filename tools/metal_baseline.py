@@ -135,14 +135,12 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None,
 
             # Collect stats from all models; capture first sampleset's energies for reuse
             all_min_energies = []
-            all_avg_energies = []
             energies = []
             for i, ss in enumerate(samplesets):
                 e = list(ss.record.energy)
                 if i == 0:
                     energies = e
                 all_min_energies.append(float(min(e)))
-                all_avg_energies.append(float(sum(e) / len(e)))
 
             # Use first sampleset for detailed analysis
             sampleset = samplesets[0]
