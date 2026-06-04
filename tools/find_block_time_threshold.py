@@ -154,6 +154,169 @@ def test_mining_time(
     return avg_time, len(times)
 
 
+def _write_progress(output_file: str, progress_data: dict, label: str = "progress") -> None:
+    """Write in-progress JSON to ``output_file``, warning on failure.
+
+    Args:
+        output_file: Destination path for the progress JSON.
+        progress_data: Dictionary to serialize.
+        label: Noun used in the failure warning ("progress" or "progress file").
+    """
+    try:
+        with open(output_file, 'w') as f:
+            json.dump(progress_data, f, indent=2)
+    except Exception as e:
+        print(f"  ⚠️  Warning: Could not write {label}: {e}")
+
+
+def _mine_once_with_timeout(
+    miner,
+    prev_block,
+    node_info,
+    requirements,
+    prev_timestamp,
+    timeout_per_attempt: Optional[float]
+) -> Tuple[object, float]:
+    """Mine one block, optionally bounded by ``timeout_per_attempt``.
+
+    Uses a daemon thread (not a process) so the miner's stdout/stderr is
+    preserved. On timeout the stop event is signalled and any partial result
+    is returned.
+
+    Returns:
+        (result, elapsed) where result may be None on timeout/failure.
+    """
+    stop_event = multiprocessing.Event()
+    start_time = time.time()
+
+    if timeout_per_attempt:
+        # Use threading instead of multiprocessing to preserve stdout/stderr
+        result_container = [None]
+
+        def mine_thread():
+            result_container[0] = miner.mine_block(
+                prev_block=prev_block,
+                node_info=node_info,
+                requirements=requirements,
+                prev_timestamp=prev_timestamp,
+                stop_event=stop_event
+            )
+
+        thread = threading.Thread(target=mine_thread)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout=timeout_per_attempt)
+
+        elapsed = time.time() - start_time
+
+        if thread.is_alive():
+            # Timeout - signal stop
+            stop_event.set()
+            thread.join(timeout=5)
+            result = result_container[0]  # May be None or partial result
+        else:
+            # Completed
+            result = result_container[0]
+    else:
+        result = miner.mine_block(
+            prev_block=prev_block,
+            node_info=node_info,
+            requirements=requirements,
+            prev_timestamp=prev_timestamp,
+            stop_event=stop_event
+        )
+        elapsed = time.time() - start_time
+
+    return result, elapsed
+
+
+def _print_gse_stats(
+    all_energies,
+    min_energy: float,
+    max_energy: float,
+    current_energy: int,
+    previous_energy: int
+) -> None:
+    """Print the GSE statistics table for the energies seen so far."""
+    print(f"\n  📊 GSE Statistics (n={len(all_energies)}):")
+    print(f"     Min: {min(all_energies):.1f}")
+    print(f"     Max: {max(all_energies):.1f}")
+    print(f"     Mean: {statistics.mean(all_energies):.1f}")
+    print(f"     Median: {statistics.median(all_energies):.1f}")
+    if len(all_energies) > 1:
+        print(f"     Variance: {statistics.variance(all_energies):.1f}")
+        print(f"     StdDev: {statistics.stdev(all_energies):.1f}")
+    try:
+        mode_val = statistics.mode(all_energies)
+        print(f"     Mode: {mode_val:.1f}")
+    except statistics.StatisticsError:
+        print(f"     Mode: N/A (no unique mode)")
+    print(f"     Difficulty range: [{min_energy:.1f}, {max_energy:.1f}]")
+    print(f"     Current target: {current_energy:.1f}")
+    if previous_energy != current_energy:
+        delta = current_energy - previous_energy
+        print(f"     Δ from previous: {delta:+.2f}\n")
+    else:
+        print()
+
+
+def _adjust_difficulty(
+    recent_outcomes,
+    current_energy: int,
+    previous_energy: int,
+    search_left: int,
+    search_right: int,
+    min_energy: float,
+    max_energy: float,
+    below_range_count: int,
+    above_range_count: int
+) -> Tuple[int, int, int, int, int, int]:
+    """Adjust difficulty based on the last 5 outcomes.
+
+    On a consistent (≥4/5) fast or slow streak the search range is narrowed,
+    ``recent_outcomes`` is cleared, and the below/above counts are reset to 0.
+    Mixed behavior leaves the counts unchanged and stops adjusting.
+
+    Returns:
+        (current_energy, previous_energy, search_left, search_right,
+         below_range_count, above_range_count).
+    """
+    fast_count = recent_outcomes.count('fast')
+    slow_count = recent_outcomes.count('slow')
+    in_range_count = recent_outcomes.count('in_range')
+
+    if fast_count >= 4:
+        # Consistently too fast → make harder
+        previous_energy = current_energy
+        search_right = current_energy
+        current_energy = int((search_left + search_right) / 2.0)
+        print(f"  🔧 Adjusting HARDER: {current_energy} (5 recent: {fast_count} fast, {in_range_count} in-range, {slow_count} slow)")
+        recent_outcomes.clear()
+        below_range_count = 0
+        above_range_count = 0
+    elif slow_count >= 4:
+        # Consistently too slow → make easier
+        previous_energy = current_energy
+        search_left = current_energy
+        current_energy = int((search_left + search_right) / 2.0)
+        print(f"  🔧 Adjusting EASIER: {current_energy} (5 recent: {fast_count} fast, {in_range_count} in-range, {slow_count} slow)")
+        recent_outcomes.clear()
+        below_range_count = 0
+        above_range_count = 0
+    else:
+        # Mixed behavior → stop adjusting, we've found the right difficulty
+        print(f"  ✋ Behavior is mixed (5 recent: {fast_count} fast, {in_range_count} in-range, {slow_count} slow)")
+        print(f"  ✅ Converged at difficulty {current_energy} - stopping adjustments")
+        print(f"  📊 Collecting remaining samples at this difficulty...")
+        # Don't adjust anymore - just collect samples
+
+    # Ensure we stay within bounds
+    current_energy = int(max(min_energy, min(max_energy, current_energy)))
+
+    return (current_energy, previous_energy, search_left, search_right,
+            below_range_count, above_range_count)
+
+
 def sequential_adaptive_threshold(
     miner,
     target_time_minutes: float,
@@ -249,46 +412,10 @@ def sequential_adaptive_threshold(
         print(f"\n▶️  Starting attempt {total_attempts + 1} (GSE target={current_energy:.0f})")
 
         # Mine one block
-        stop_event = multiprocessing.Event()
-        start_time = time.time()
-
-        if timeout_per_attempt:
-            # Use threading instead of multiprocessing to preserve stdout/stderr
-            result_container = [None]
-
-            def mine_thread():
-                result_container[0] = miner.mine_block(
-                    prev_block=prev_block,
-                    node_info=node_info,
-                    requirements=requirements,
-                    prev_timestamp=prev_timestamp,
-                    stop_event=stop_event
-                )
-
-            thread = threading.Thread(target=mine_thread)
-            thread.daemon = True
-            thread.start()
-            thread.join(timeout=timeout_per_attempt)
-
-            elapsed = time.time() - start_time
-
-            if thread.is_alive():
-                # Timeout - signal stop
-                stop_event.set()
-                thread.join(timeout=5)
-                result = result_container[0]  # May be None or partial result
-            else:
-                # Completed
-                result = result_container[0]
-        else:
-            result = miner.mine_block(
-                prev_block=prev_block,
-                node_info=node_info,
-                requirements=requirements,
-                prev_timestamp=prev_timestamp,
-                stop_event=stop_event
-            )
-            elapsed = time.time() - start_time
+        result, elapsed = _mine_once_with_timeout(
+            miner, prev_block, node_info, requirements,
+            prev_timestamp, timeout_per_attempt
+        )
 
         total_attempts += 1
 
@@ -327,80 +454,33 @@ def sequential_adaptive_threshold(
 
         # Print statistics table after each attempt
         if all_energies:
-            print(f"\n  📊 GSE Statistics (n={len(all_energies)}):")
-            print(f"     Min: {min(all_energies):.1f}")
-            print(f"     Max: {max(all_energies):.1f}")
-            print(f"     Mean: {statistics.mean(all_energies):.1f}")
-            print(f"     Median: {statistics.median(all_energies):.1f}")
-            if len(all_energies) > 1:
-                print(f"     Variance: {statistics.variance(all_energies):.1f}")
-                print(f"     StdDev: {statistics.stdev(all_energies):.1f}")
-            try:
-                mode_val = statistics.mode(all_energies)
-                print(f"     Mode: {mode_val:.1f}")
-            except statistics.StatisticsError:
-                print(f"     Mode: N/A (no unique mode)")
-            print(f"     Difficulty range: [{min_energy:.1f}, {max_energy:.1f}]")
-            print(f"     Current target: {current_energy:.1f}")
-            if previous_energy != current_energy:
-                delta = current_energy - previous_energy
-                print(f"     Δ from previous: {delta:+.2f}\n")
-            else:
-                print()
+            _print_gse_stats(
+                all_energies, min_energy, max_energy,
+                current_energy, previous_energy
+            )
 
         # Write progress
         if output_file:
-            try:
-                progress_data = {
-                    'status': 'in_progress',
-                    'current_difficulty': current_energy,
-                    'in_range_samples': len(in_range_times),
-                    'target_samples': target_samples,
-                    'below_range': below_range_count,
-                    'above_range': above_range_count,
-                    'total_attempts': total_attempts,
-                    'timestamp': utc_timestamp()
-                }
-                with open(output_file, 'w') as f:
-                    json.dump(progress_data, f, indent=2)
-            except Exception as e:
-                print(f"  ⚠️  Warning: Could not write progress: {e}")
+            progress_data = {
+                'status': 'in_progress',
+                'current_difficulty': current_energy,
+                'in_range_samples': len(in_range_times),
+                'target_samples': target_samples,
+                'below_range': below_range_count,
+                'above_range': above_range_count,
+                'total_attempts': total_attempts,
+                'timestamp': utc_timestamp()
+            }
+            _write_progress(output_file, progress_data)
 
         # Check consistency after we have 5 outcomes
         if len(recent_outcomes) == 5 and len(in_range_times) < target_samples:
-            # Count outcomes in last 5
-            fast_count = recent_outcomes.count('fast')
-            slow_count = recent_outcomes.count('slow')
-            in_range_count = recent_outcomes.count('in_range')
-
-            # Check if behavior is consistent (all or most outcomes are the same)
-            if fast_count >= 4:
-                # Consistently too fast → make harder
-                previous_energy = current_energy
-                search_right = current_energy
-                current_energy = int((search_left + search_right) / 2.0)
-                print(f"  🔧 Adjusting HARDER: {current_energy} (5 recent: {fast_count} fast, {in_range_count} in-range, {slow_count} slow)")
-                recent_outcomes.clear()
-                below_range_count = 0
-                above_range_count = 0
-            elif slow_count >= 4:
-                # Consistently too slow → make easier
-                previous_energy = current_energy
-                search_left = current_energy
-                current_energy = int((search_left + search_right) / 2.0)
-                print(f"  🔧 Adjusting EASIER: {current_energy} (5 recent: {fast_count} fast, {in_range_count} in-range, {slow_count} slow)")
-                recent_outcomes.clear()
-                below_range_count = 0
-                above_range_count = 0
-            else:
-                # Mixed behavior → stop adjusting, we've found the right difficulty
-                print(f"  ✋ Behavior is mixed (5 recent: {fast_count} fast, {in_range_count} in-range, {slow_count} slow)")
-                print(f"  ✅ Converged at difficulty {current_energy} - stopping adjustments")
-                print(f"  📊 Collecting remaining samples at this difficulty...")
-                # Don't adjust anymore - just collect samples
-
-            # Ensure we stay within bounds
-            current_energy = int(max(min_energy, min(max_energy, current_energy)))
+            (current_energy, previous_energy, search_left, search_right,
+             below_range_count, above_range_count) = _adjust_difficulty(
+                recent_outcomes, current_energy, previous_energy,
+                search_left, search_right, min_energy, max_energy,
+                below_range_count, above_range_count
+            )
 
     # Always return results, even if we didn't reach target
     if len(in_range_times) > 0:
@@ -519,18 +599,14 @@ def binary_search_threshold(
 
             # Write progress to file after each improvement
             if output_file:
-                try:
-                    progress_data = {
-                        'status': 'in_progress',
-                        'current_best': best_result,
-                        'iteration': iteration,
-                        'max_iterations': max_iterations,
-                        'timestamp': utc_timestamp()
-                    }
-                    with open(output_file, 'w') as f:
-                        json.dump(progress_data, f, indent=2)
-                except Exception as e:
-                    print(f"  ⚠️  Warning: Could not write progress file: {e}")
+                progress_data = {
+                    'status': 'in_progress',
+                    'current_best': best_result,
+                    'iteration': iteration,
+                    'max_iterations': max_iterations,
+                    'timestamp': utc_timestamp()
+                }
+                _write_progress(output_file, progress_data, label="progress file")
 
         # Check if within tolerance
         if deviation <= tolerance:
