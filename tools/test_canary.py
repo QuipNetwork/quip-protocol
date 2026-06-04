@@ -849,7 +849,10 @@ def main():
 
     # Parse duration
     try:
-        duration_minutes = parse_duration(args.duration) / 60.0
+        # Bare numbers are legacy minutes; suffixed values use the canonical
+        # seconds-based parser.
+        _d = args.duration.strip()
+        duration_minutes = float(_d) if _d[-1:].isdigit() else parse_duration(_d) / 60.0
     except (ValueError, IndexError):
         print(f"❌ Invalid duration format: '{args.duration}'. Use formats like: 30s, 5m, 2h, 1d, 1w")
         return 1

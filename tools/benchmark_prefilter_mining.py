@@ -340,7 +340,10 @@ def run_benchmark(args) -> int:
         args.duration = '4h'
 
     try:
-        duration_minutes = parse_duration(args.duration) / 60.0
+        # Bare numbers are legacy minutes; suffixed values use the canonical
+        # seconds-based parser.
+        _d = args.duration.strip()
+        duration_minutes = float(_d) if _d[-1:].isdigit() else parse_duration(_d) / 60.0
     except (ValueError, IndexError):
         print(f"Invalid duration: '{args.duration}'")
         return 1
