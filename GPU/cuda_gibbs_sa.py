@@ -125,7 +125,6 @@ class CudaGibbsSampler(BaseCudaSampler):
 
         N = self._prep_N
         nnz = self._prep_nnz
-        max_packed_size = self._prep_max_packed_size
         node_to_idx = self._prep_node_to_idx
 
         # Build color blocks (topology-constant, computed once)
