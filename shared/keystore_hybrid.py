@@ -34,19 +34,10 @@ from pathlib import Path
 
 from shared.hybrid_signer import HybridSigner
 from shared.logging_config import get_logger
+from shared.signer import strip_0x
 
 
 logger = get_logger("keystore_hybrid")
-
-
-def strip_0x(s: str) -> str:
-    """Return *s* with a leading ``0x`` / ``0X`` prefix removed.
-
-    Uses explicit slicing rather than ``lstrip("0x")`` to avoid the footgun
-    where ``lstrip`` strips any combination of ``'0'`` and ``'x'`` characters.
-    """
-    s = s.lower()
-    return s[2:] if s.startswith("0x") else s
 
 
 KEYSTORE_VERSION = 1
