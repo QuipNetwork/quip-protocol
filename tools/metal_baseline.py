@@ -115,17 +115,13 @@ def metal_baseline_test(timeout_minutes=10.0, output_file=None, only_label=None,
         print(f"\n{desc}: {sweeps} sweeps, {reads} reads, {num_models} models")
 
         try:
-            # Generate problems with deterministic nonces
-            h_list = []
-            J_list = []
-            nonces = []
-
-            for _ in range(num_models):
-                nonce = test_nonces[idx]
-                nonces.append(nonce)
-                h, J = generate_ising_model_from_nonce(nonce, nodes, edges, h_values=h_values)
-                h_list.append(h)
-                J_list.append(J)
+            # Generate one problem from the deterministic nonce; every model
+            # in the batch shares it (the sampler reads h/J without mutating).
+            nonce = test_nonces[idx]
+            h, J = generate_ising_model_from_nonce(nonce, nodes, edges, h_values=h_values)
+            nonces = [nonce] * num_models
+            h_list = [h] * num_models
+            J_list = [J] * num_models
 
             start_time = time.time()
             # Process models in batch
