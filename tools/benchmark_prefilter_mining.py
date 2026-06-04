@@ -31,6 +31,7 @@ from dwave_topologies import DEFAULT_TOPOLOGY
 from CPU.sa_miner import SimulatedAnnealingMiner
 from shared.block import BlockRequirements, create_genesis_block
 from shared.energy_utils import energy_to_difficulty
+from shared.proc_util import drain_and_force_terminate
 from shared.time_utils import utc_timestamp
 from QPU.qpu_time_manager import parse_duration
 
@@ -317,23 +318,6 @@ def build_specs(
     return specs
 
 
-def _force_terminate_all(processes, drain_queue) -> None:
-    """Drain once then terminate/join/kill all alive processes.
-
-    Args:
-        processes: Iterable of multiprocessing Process objects.
-        drain_queue: Callable that drains the shared result queue.
-    """
-    drain_queue()
-    for p in processes:
-        if p.is_alive():
-            p.terminate()
-    for p in processes:
-        p.join(timeout=2.0)
-        if p.is_alive():
-            p.kill()
-
-
 def run_benchmark(args) -> int:
     """Run the mining rate benchmark."""
     if args.min_blocks > 0 and args.duration == '10m':
@@ -460,7 +444,7 @@ def run_benchmark(args) -> int:
                     drain_queue()
                     if time.time() - shutdown_start > 180:
                         print("   Timeout, forcing shutdown...")
-                        _force_terminate_all(processes, drain_queue)
+                        drain_and_force_terminate(processes, drain_queue)
                         break
                     time.sleep(0.5)
                 break
@@ -472,7 +456,7 @@ def run_benchmark(args) -> int:
         while any(p.is_alive() for p in processes):
             drain_queue()
             if time.time() - shutdown_start > 60:
-                _force_terminate_all(processes, drain_queue)
+                drain_and_force_terminate(processes, drain_queue)
                 break
             time.sleep(0.5)
         drain_queue()

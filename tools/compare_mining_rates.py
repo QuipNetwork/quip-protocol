@@ -40,6 +40,7 @@ sys.stderr.reconfigure(line_buffering=True)
 from dataclasses import dataclass
 
 from shared.block import BlockRequirements, create_genesis_block
+from shared.proc_util import drain_and_force_terminate
 from shared.time_utils import utc_timestamp
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies import load_topology
@@ -535,23 +536,6 @@ def mine_worker(
             print(f"   [{miner_id}] CUDA cleanup warning: {e}")
 
 
-def _force_terminate_all(processes, drain_queue) -> None:
-    """Drain once then terminate/join/kill all alive processes.
-
-    Args:
-        processes: Iterable of multiprocessing Process objects.
-        drain_queue: Callable that drains the shared result queue.
-    """
-    drain_queue()
-    for p in processes:
-        if p.is_alive():
-            p.terminate()
-    for p in processes:
-        p.join(timeout=2.0)
-        if p.is_alive():
-            p.kill()
-
-
 @dataclass
 class NodeInfo:
     """Simple node info for testing."""
@@ -664,7 +648,7 @@ def supervise_workers(processes, stop_event, drain_queue) -> None:
                     if time.time() - shutdown_start > 180:
                         # Force terminate if workers are stuck
                         print("   ⚠️ Timeout waiting for workers, forcing shutdown...")
-                        _force_terminate_all(processes, drain_queue)
+                        drain_and_force_terminate(processes, drain_queue)
                         break
                     time.sleep(0.5)  # Check every 500ms during shutdown
                 break
@@ -681,7 +665,7 @@ def supervise_workers(processes, stop_event, drain_queue) -> None:
             drain_queue()  # Keep draining
             if time.time() - shutdown_start > 60:
                 print("   Forcing shutdown...")
-                _force_terminate_all(processes, drain_queue)
+                drain_and_force_terminate(processes, drain_queue)
                 break
             time.sleep(0.5)
         drain_queue()
