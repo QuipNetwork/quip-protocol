@@ -132,16 +132,7 @@ def build_stats_snapshot_for_telemetry(controller) -> dict[str, Any]:
         "proofs_submitted": _g("proofs_submitted"),
         "stale_drops": _g("stale_drops"),
         "submission_errors": _g("submission_errors"),
-        "heads_skipped_already_won": _g("heads_skipped_already_won"),
-        "heads_dropped_stale_number": _g("heads_dropped_stale_number"),
-        "heads_refreshed_active": _g("heads_refreshed_active"),
-        "stale_post_win_heads_dropped": _g("stale_post_win_heads_dropped"),
         "zero_seed_snapshots_dropped": _g("zero_seed_snapshots_dropped"),
-        "subscription_lag_blocks": _g("subscription_lag_blocks"),
-        "heads_promoted_to_rpc": _g("heads_promoted_to_rpc"),
-        "heads_refresh_below_floor": _g("heads_refresh_below_floor"),
-        "post_win_fast_forwards": _g("post_win_fast_forwards"),
-        "post_win_fast_forward_timeouts": _g("post_win_fast_forward_timeouts"),
         "heads_same_key_skipped": _g("heads_same_key_skipped"),
         "none_snapshots_seen": _g("none_snapshots_seen"),
         "duplicate_result_drops": _g("duplicate_result_drops"),
@@ -330,68 +321,16 @@ class ControllerStats:
     # sibling submission this head. Distinct from stale_drops (head
     # changed) — this counts the storm-prevention path.
     duplicate_result_drops: int = 0
-    # Heads observed where the controller skipped dispatch because the
-    # last_proof_block_hash had already been won this round. Distinct from
-    # duplicate_result_drops (counted per *result*, after mining wasted
-    # CPU/GPU time) — this counts the cheap pre-dispatch guard.
-    heads_skipped_already_won: int = 0
-    # Heads dropped because their block_number was lower than the
-    # highest one already handled. Non-zero here means the subscription
-    # layer fed us stale historical heads — the symptom that surfaced
-    # the per-header-lookup bug in subscribe_new_heads.
-    heads_dropped_stale_number: int = 0
-    # Heads dropped because the head handler raised a non-connection
-    # exception (e.g., snapshot SCALE decode shape drift after a
-    # runtime upgrade). Non-zero here means a head was lost but the
-    # controller stayed alive. A persistently growing counter indicates
-    # a runtime API shape mismatch that needs an operator update.
-    heads_dropped_handler_error: int = 0
     # Submissions that produced an OK receipt but whose post-submit
     # winning_solution check did not match our miner+nonce. Non-zero
     # here means we accepted a receipt that the runtime did not
     # actually record (or recorded against a different submitter).
     proofs_unverified: int = 0
-    # Active best-head refreshes the controller initiated outside the
-    # subscription cadence (post-win kick, stale-post-win detect, zero-
-    # seed snapshot). Pairs with stale_post_win_heads_dropped — every
-    # detection should track to at least one refresh.
-    heads_refreshed_active: int = 0
-    # Subscription delivered a head whose number is <= the block that
-    # already accepted our proof for the still-open work key. Means the
-    # subscription path is lagging the rpc path; we refresh actively
-    # instead of idling on it.
-    stale_post_win_heads_dropped: int = 0
     # Snapshot at a non-genesis head carried last_proof_block_hash =
     # 0x00..00. Observed transiently at the exact accepted block; the
     # next block returns the receipt hash. Refusing dispatch here
     # prevents mining a degenerate seed.
     zero_seed_snapshots_dropped: int = 0
-    # Gauge — best rpc head number minus latest subscription head number
-    # at the moment a stale-post-win was detected. Non-zero means the
-    # subscription is genuinely behind; zero with stale_post_win > 0
-    # means the lag is at a finer grain than block number.
-    subscription_lag_blocks: int = 0
-    # Legacy gauge: previously counted heads where the rpc client
-    # reported a newer best than the subscription wake delivered. With
-    # the subscription chain removed, this stays at 0 — kept in the
-    # struct so telemetry consumers keep working.
-    heads_promoted_to_rpc: int = 0
-    # Active refresh responses that came back at or below the caller's
-    # `min_block_number` floor (e.g., post-win kick with the rpc client
-    # returning a head <= the block we just won at — possible when the
-    # rpc client just reconnected to a lagging peer). Counts how often
-    # the floor guard saves us.
-    heads_refresh_below_floor: int = 0
-    # Post-win fast-forwards that successfully observed the next round
-    # rolling on chain and woke the main loop with a fresh head. Pairs
-    # with `proofs_submitted` — each successful submit should produce
-    # one fast-forward in normal operation.
-    post_win_fast_forwards: int = 0
-    # Post-win fast-forwards that hit the bounded deadline without
-    # observing the round roll (e.g., the chain stalled, or someone
-    # else's proof reorganized the round). Non-zero is a warning sign
-    # but not a failure — the subscription path remains the fallback.
-    post_win_fast_forward_timeouts: int = 0
     # Heads observed whose work key matches the controller's current
     # work key. With the round-driven cancel reorder, these no longer
     # trigger cancel+re-dispatch; the in-flight mining attempt is

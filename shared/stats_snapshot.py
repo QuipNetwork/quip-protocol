@@ -158,15 +158,7 @@ _SUMMED_CONTROLLER_COUNTERS: tuple[str, ...] = (
     "proofs_submitted",
     "stale_drops",
     "submission_errors",
-    "heads_skipped_already_won",
-    "heads_dropped_stale_number",
-    "heads_refreshed_active",
-    "stale_post_win_heads_dropped",
     "zero_seed_snapshots_dropped",
-    "heads_promoted_to_rpc",
-    "heads_refresh_below_floor",
-    "post_win_fast_forwards",
-    "post_win_fast_forward_timeouts",
     "heads_same_key_skipped",
     "none_snapshots_seen",
     "duplicate_result_drops",
@@ -182,10 +174,9 @@ def merge_snapshots(snapshots: Iterable[dict[str, Any]]) -> Optional[dict[str, A
       * `controller.<counter>` (heads_observed, contexts_dispatched,
         proofs_submitted, …) — SUMMED across snapshots. Operators care
         about total work performed by the container, not per-mode.
-      * `controller.active_url` / `subscription_lag_blocks` — taken
-        from the first snapshot that supplies one (they're per-pool;
-        each child owns its own pool and the value isn't meaningful to
-        aggregate).
+      * `controller.active_url` — taken from the first snapshot that
+        supplies one (it's per-pool; each child owns its own pool and
+        the value isn't meaningful to aggregate).
       * `node_id`, `ss58_address`, `account_id_hex`, `descriptor`,
         `miner_survey`, `attempts_dir` — taken from the first snapshot
         that supplies a non-empty value. These describe the container
@@ -209,7 +200,6 @@ def merge_snapshots(snapshots: Iterable[dict[str, Any]]) -> Optional[dict[str, A
 
     summed: dict[str, int] = {k: 0 for k in _SUMMED_CONTROLLER_COUNTERS}
     first_active_url: Optional[str] = None
-    first_lag: Optional[int] = None
     for s in snaps:
         c = s.get("controller") or {}
         for k in _SUMMED_CONTROLLER_COUNTERS:
@@ -218,13 +208,9 @@ def merge_snapshots(snapshots: Iterable[dict[str, Any]]) -> Optional[dict[str, A
                 summed[k] += int(v)
         if first_active_url is None and c.get("active_url"):
             first_active_url = c.get("active_url")
-        lag = c.get("subscription_lag_blocks")
-        if first_lag is None and isinstance(lag, (int, float)):
-            first_lag = int(lag)
 
     merged_controller = dict(summed)
     merged_controller["active_url"] = first_active_url
-    merged_controller["subscription_lag_blocks"] = first_lag or 0
 
     def _first_nonempty(field: str, default: Any = None) -> Any:
         for s in snaps:
