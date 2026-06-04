@@ -38,7 +38,7 @@ from GPU.metal_sa import (
     _resolve_budget,
     reads_per_buffer_for_budget,
 )
-from GPU.metal_scheduler import DutyCycleController, MetalScheduler
+from GPU.metal_scheduler import MetalScheduler
 from GPU.metal_utils import (
     build_csr_from_ising,
     compute_beta_schedule,
@@ -255,7 +255,6 @@ class MetalGibbsSampler:
         beta_schedule_type: str = "geometric",
         beta_schedule: Optional[np.ndarray] = None,
         seed: Optional[int] = None,
-        **kwargs
     ) -> List[dimod.SampleSet]:
         """Block-Gibbs sample one batch inside an ObjC autorelease pool.
 
@@ -270,7 +269,7 @@ class MetalGibbsSampler:
                 h, J, num_reads=num_reads, num_sweeps=num_sweeps,
                 num_sweeps_per_beta=num_sweeps_per_beta, beta_range=beta_range,
                 beta_schedule_type=beta_schedule_type,
-                beta_schedule=beta_schedule, seed=seed, **kwargs,
+                beta_schedule=beta_schedule, seed=seed,
             )
 
     def _sample_ising_impl(
@@ -284,7 +283,6 @@ class MetalGibbsSampler:
         beta_schedule_type: str = "geometric",
         beta_schedule: Optional[np.ndarray] = None,
         seed: Optional[int] = None,
-        **kwargs
     ) -> List[dimod.SampleSet]:
         """
         Sample from Ising model using block Gibbs sampling.
@@ -405,11 +403,6 @@ class MetalGibbsSampler:
             "final_energies", num_threads * 4)
 
         # Execute kernel
-        _duty_cycle: Optional[DutyCycleController] = kwargs.get(
-            'duty_cycle',
-        )
-        _t0 = time.perf_counter()
-
         cmd_buf = self._command_queue.commandBuffer()
         encoder = cmd_buf.computeCommandEncoder()
 
@@ -485,11 +478,6 @@ class MetalGibbsSampler:
         encoder.endEncoding()
         cmd_buf.commit()
         cmd_buf.waitUntilCompleted()
-
-        # Duty-cycle yielding after GPU dispatch
-        if _duty_cycle and _duty_cycle.enabled:
-            _compute_s = time.perf_counter() - _t0
-            time.sleep(_duty_cycle.compute_sleep(_compute_s))
 
         # Check for errors
         if cmd_buf.status() != Metal.MTLCommandBufferStatusCompleted:
