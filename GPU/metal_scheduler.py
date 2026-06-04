@@ -42,18 +42,24 @@ __all__ = [
     "MetalScheduler", "CapConfig", "Signals",
     "HysteresisState", "decide_tier", "tier_budget", "cap_monitor_main",
     "PAUSE", "LOW", "IDLE", "ACTIVE", "LEAVE_POLLS", "UNCAPPED",
+    "ACTIVE_DISPATCH_TARGET_MS",
 ]
 
 
 # ── adaptive cap tier policy (Metal-only, pure) ──────────────────────────
 #
-# The jank lever on Apple GPUs is *occupancy* — concurrent threads in flight
-# per command buffer (problems x reads), NOT duty cycle, core count, or buffer
-# duration. Below a hardware/kernel-specific threshold the cores aren't
-# saturated so the compositor's work interleaves → smooth; above it the
-# execution units / memory bandwidth saturate → UI stalls. So the cap the
-# governor publishes is a *thread budget*: each command buffer is held under
-# it (by splitting reads), keeping the full problem batch and full sweeps.
+# Apple GPUs jank on TWO levers, and the governor bounds both:
+#  1. *Occupancy* — concurrent threads in flight per command buffer
+#     (problems x reads). Above a hardware/kernel-specific threshold the
+#     execution units / memory bandwidth saturate → the compositor can't
+#     interleave → UI stalls. Bounded by the published *thread budget* (the
+#     read-split holds each command buffer under it).
+#  2. *Duration* — wall-time of a single command buffer. macOS cannot preempt
+#     a long-running compute dispatch, so one kernel that runs all of a high
+#     ``num_sweeps`` anneal monopolizes the GPU and freezes the UI even when
+#     occupancy is capped. Bounded by ``target_dispatch_ms``: while a user is
+#     present the sweep schedule is split across short command buffers so the
+#     GPU returns to the WindowServer between chunks.
 
 PAUSE = "pause"
 LOW = "low"
@@ -62,6 +68,12 @@ ACTIVE = "active"
 
 # Sentinel budget meaning "no cap" (idle/headless → full speed).
 UNCAPPED = -1
+
+# Per-command-buffer wall-time target (ms) when a user is present (ACTIVE/LOW).
+# Kept well under a 60 Hz frame (16.6 ms) so a chunked anneal yields the GPU
+# back to the compositor between dispatches. IDLE/uncapped runs monolithically
+# (no UI to protect) for maximum throughput.
+ACTIVE_DISPATCH_TARGET_MS = 8.0
 
 # Consecutive polls required to *leave* a protective tier (PAUSE/LOW). Entry
 # into a protective tier is immediate; only relaxing one is debounced.
@@ -300,6 +312,26 @@ class MetalScheduler:
         elif now - self._last_hb_time > self._stale_timeout_s:
             return self._active_threads
         return self._budget_value.value
+
+    def target_dispatch_ms(self) -> Optional[float]:
+        """Per-command-buffer wall-time budget for sweep-chunking, or None.
+
+        Returns ``None`` when each Metal dispatch may run monolithically (full
+        sweeps in one command buffer): yielding off, or the occupancy budget is
+        ``UNCAPPED`` (IDLE/headless — no user present, so no UI to protect).
+        Returns :data:`ACTIVE_DISPATCH_TARGET_MS` when the governor is capping
+        (ACTIVE/LOW — a user is present): the sampler then splits the sweep
+        schedule across command buffers held under this wall-time so a long
+        anneal can't monopolize the GPU and freeze the compositor. A ``0``
+        (PAUSE) budget also returns ``None`` — the streaming loop handles PAUSE
+        before dispatching, so chunking never runs in that state.
+        """
+        if not self._yielding:
+            return None
+        budget = self.get_thread_budget()
+        if budget == UNCAPPED or budget <= 0:
+            return None
+        return ACTIVE_DISPATCH_TARGET_MS
 
     def get_measured_gpu(self) -> int:
         """Return the latest measured GPU residency 0-100."""

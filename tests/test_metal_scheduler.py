@@ -99,6 +99,53 @@ class TestThreadBudget:
         sched.stop()
 
 
+class TestTargetDispatchMs:
+    """The per-dispatch wall-time budget that gates Metal sweep-chunking.
+
+    None ⇒ dispatch monolithically (no UI to protect); a float ⇒ split the
+    sweep schedule. The occupancy machinery is covered by TestThreadBudget, so
+    here get_thread_budget is stubbed to isolate the four policy branches.
+    """
+
+    def _sched(self, yielding: bool):
+        from GPU.metal_scheduler import MetalScheduler
+        return MetalScheduler(
+            gpu_core_count=40,
+            gpu_utilization_pct=100,
+            yielding=yielding,
+        )
+
+    def test_none_when_yielding_off(self):
+        # Yielding disabled → never chunk (peak throughput).
+        sched = self._sched(yielding=False)
+        assert sched.target_dispatch_ms() is None
+
+    def test_none_when_uncapped(self):
+        # IDLE/headless: occupancy uncapped → no user present → monolithic.
+        from GPU.metal_scheduler import UNCAPPED
+        sched = self._sched(yielding=True)
+        sched.get_thread_budget = lambda: UNCAPPED
+        assert sched.target_dispatch_ms() is None
+        sched.stop()
+
+    def test_none_when_paused(self):
+        # PAUSE (budget 0): streaming loop handles PAUSE before dispatch, so
+        # chunking must not engage here either.
+        sched = self._sched(yielding=True)
+        sched.get_thread_budget = lambda: 0
+        assert sched.target_dispatch_ms() is None
+        sched.stop()
+
+    def test_target_ms_when_capping(self):
+        # ACTIVE/LOW: a finite positive occupancy cap means a user is present →
+        # split the schedule to the wall-time target.
+        from GPU.metal_scheduler import ACTIVE_DISPATCH_TARGET_MS
+        sched = self._sched(yielding=True)
+        sched.get_thread_budget = lambda: 512
+        assert sched.target_dispatch_ms() == ACTIVE_DISPATCH_TARGET_MS
+        sched.stop()
+
+
 class TestTierPolicy:
     """Pure adaptive-cap policy: classify → hysteresis → budget mapping."""
 

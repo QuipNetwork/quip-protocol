@@ -229,9 +229,18 @@ _CLOSED_WORK_KEYS_CAP = 16
 # losing the immutable mapping for an in-flight one.
 _DISPATCH_CONTEXT_RETENTION = 4
 
-# Upper bound on the write-once participation dedup set. Generous because
-# solution numbers are monotonic — eviction can never re-admit an active key.
+# Upper bound on the write-once participation dedup map. Generous because
+# solution numbers are monotonic and eviction is oldest-first, so a still-active
+# solution is never dropped (which would let its remark re-fire).
 _PARTICIPATION_RETENTION = 2048
+
+# Participation remark retry budget. The node submits one System.remark per
+# solution # from the same signer account the win submission uses, so a remark
+# can lose a nonce race and be rejected with ``1010 Transaction is outdated``;
+# each retry re-composes (reading a fresh nonce) before giving up. ``RETRIES``
+# is the number of *additional* attempts after the first (total ≤ RETRIES + 1).
+_PARTICIPATION_REMARK_RETRIES = 3
+_PARTICIPATION_REMARK_BACKOFF_S = 0.25
 
 
 # How far ahead (in blocks) the anticipatory predictor looks for the
@@ -521,10 +530,12 @@ class SubstrateMinerController:
         # ``{"op": "budget"}`` pushes). Surfaced in the telemetry snapshot so
         # operators can see live daily-budget usage; never drives submission.
         self._latest_budget: dict[str, Any] = {}
-        # Write-once participation dedup: (miner_id, solution_number) already
-        # marked via a System.remark. Solution numbers are monotonic, so the
-        # arbitrary-pop bound below can never re-admit a still-active key.
-        self._participated: set[tuple[str, int]] = set()
+        # Write-once participation dedup: solution #s the node has already
+        # published a System.remark for. Node-level (one remark per solution#),
+        # keyed by solution# alone — not by per-instance miner id. Insertion-
+        # ordered so the retention bound evicts the OLDEST entry, never an
+        # arbitrary still-active solution (which would re-fire its remark).
+        self._participated: "OrderedDict[int, None]" = OrderedDict()
         # Anticipatory-submission state (Task 6b).
         # ``_pow_constants`` caches the four decay constants
         # (epoch_length + curve c-triple) for the session — they only
@@ -1792,29 +1803,47 @@ class SubstrateMinerController:
             logger.debug("qpu spend sum failed (ignored): %s", exc)
             return None
 
-    def _mark_participating(self, miner_id: str, msg: dict) -> None:
-        """Submit a write-once participation remark for ``(miner_id, sol#)``.
+    def _mark_participating(self, msg: dict) -> None:
+        """Submit a write-once participation remark for this node + solution #.
 
-        Dedups on ``(miner_id, solution_number)`` so each miner publishes at
-        most one marker per solution #. Spawns a best-effort, supervised task
-        to submit the remark (never blocks the drain loop; failures are
-        swallowed — participation is observability, not consensus).
+        Node-level: dedups on ``solution_number`` alone, so the node publishes
+        at most one marker per solution # however many miner instances report
+        it. The marker identifies the node (our on-chain signer account), not
+        the per-instance worker — one remark per solution avoids N miner
+        instances racing the signer nonce (the ``1010 Transaction is outdated``
+        rejections). Spawns a best-effort, supervised task to submit the remark
+        (never blocks the drain loop; participation is observability, not
+        consensus).
         """
         try:
             solution_number = int(msg.get("solution_number", 0))
         except (TypeError, ValueError):
             return
-        key = (miner_id, solution_number)
-        if key in self._participated:
+        if solution_number in self._participated:
             return
-        self._participated.add(key)
+        # Resolve the node identity BEFORE recording dedup or spawning the task.
+        # This runs unguarded on the drain loop, so a signer failure must not
+        # propagate (the loop's broad except would shut the controller down —
+        # an observability failure crashing mining); and pre-marking the
+        # solution done before a transient failure would permanently suppress
+        # its remark. Resolve first, bail cleanly, mark done only on success.
+        try:
+            miner = self.signer.ss58_address()
+        except Exception as exc:  # noqa: BLE001 — observability path
+            logger.warning(
+                "participation remark skipped for solution %s: signer address "
+                "unavailable (%s: %s); mining continues",
+                solution_number, type(exc).__name__, exc,
+            )
+            return
+        self._participated[solution_number] = None
         while len(self._participated) > _PARTICIPATION_RETENTION:
-            self._participated.pop()
+            self._participated.popitem(last=False)  # evict oldest
 
         payload: dict[str, Any] = {
             "schema": "quip-participation",
             "solution": solution_number,
-            "miner": miner_id,
+            "miner": miner,
             "kind": msg.get("kind"),
         }
         if "budget_seconds" in msg:
@@ -1822,26 +1851,59 @@ class SubstrateMinerController:
         asyncio.create_task(
             supervise(
                 self._submit_participation_remark(payload),
-                name=f"participate-{miner_id}-{solution_number}",
+                name=f"participate-{solution_number}",
                 on_failure=lambda: None,
             ),
-            name=f"participate-{miner_id}-{solution_number}",
+            name=f"participate-{solution_number}",
         )
 
-    async def _submit_participation_remark(self, payload: dict) -> None:
-        """Submit one participation remark (best-effort, never raises).
+    async def _submit_participation_remark(
+        self,
+        payload: dict,
+        *,
+        sleeper: Optional[Callable[[float], Awaitable[None]]] = None,
+    ) -> None:
+        """Submit one participation remark (best-effort, retried, never raises).
 
         Prefers ``System.remark_with_event`` (observable in block events),
         falling back to plain ``System.remark`` — the same pattern as the
-        auto-identify flow. Logs and swallows any failure so mining continues.
+        auto-identify flow. Submission goes through the parent ``build_client``,
+        the same signer account as the win submission, so a remark can lose a
+        nonce race and be rejected with ``1010 Transaction is outdated``. Each
+        attempt re-composes via :func:`submit_remark`, reading a fresh nonce, so
+        a stale-nonce rejection clears on retry. Retries transient submit
+        exceptions up to ``_PARTICIPATION_REMARK_RETRIES`` times with linear
+        backoff, then logs and swallows the final failure so mining continues.
+        ``sleeper`` is injected so tests run with zero real delay (defaults to
+        :func:`asyncio.sleep`).
         """
         if self.build_client is None:
             return
+        sleep = sleeper if sleeper is not None else asyncio.sleep
         body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        try:
-            receipt, _call_function = await submit_remark(
-                self.build_client, self.signer, body,
-            )
+        total_attempts = _PARTICIPATION_REMARK_RETRIES + 1
+        for attempt in range(1, total_attempts + 1):
+            try:
+                receipt, _call_function = await submit_remark(
+                    self.build_client, self.signer, body,
+                )
+            except Exception as exc:  # noqa: BLE001 — observability path; retry then swallow
+                if attempt < total_attempts:
+                    logger.debug(
+                        "participation remark transient failure for %s on "
+                        "attempt %d/%d (%s: %s); retrying",
+                        payload.get("miner"), attempt, total_attempts,
+                        type(exc).__name__, exc,
+                    )
+                    await sleep(_PARTICIPATION_REMARK_BACKOFF_S * attempt)
+                    continue
+                logger.warning(
+                    "participation remark failed for %s after %d attempts "
+                    "(%s: %s); mining continues",
+                    payload.get("miner"), total_attempts,
+                    type(exc).__name__, exc,
+                )
+                return
             if receipt.error:
                 logger.warning(
                     "participation remark rejected for %s (%s); mining continues",
@@ -1853,11 +1915,7 @@ class SubstrateMinerController:
                 payload.get("miner"), payload.get("solution"),
                 payload.get("budget_seconds"),
             )
-        except Exception as exc:  # noqa: BLE001 — observability path
-            logger.warning(
-                "participation remark failed for %s (%s: %s); mining continues",
-                payload.get("miner"), type(exc).__name__, exc,
-            )
+            return
 
     def _store_preview(self, handle: MinerHandle, msg: dict) -> None:
         """Stash a worker best-candidate preview keyed by work key.
@@ -2543,9 +2601,10 @@ class SubstrateMinerController:
                 # live usage; never blocks, never submits.
                 self._store_budget(handle, msg)
             elif op == "participating":
-                # Write-once participation marker for a solution #. Dedup +
-                # submit a best-effort System.remark; never blocks the drain.
-                self._mark_participating(handle.miner_id, msg)
+                # Write-once participation marker for a solution #. Node-level
+                # (deduped per solution#, identified by our signer account, not
+                # this worker) + best-effort System.remark; never blocks drain.
+                self._mark_participating(msg)
             elif op == "stats":
                 # Stats responses are pulled directly by callers of
                 # handle.get_stats(); if one lands here it just means

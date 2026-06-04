@@ -40,6 +40,12 @@ from GPU.metal_utils import (
 # Seconds to idle between budget re-checks while paused (budget == 0).
 _PAUSE_POLL_S = 0.5
 
+# Initial sweep-chunk size (betas per command buffer) before the self-calibrating
+# controller has a wall-time measurement to size from. Small so the very first
+# capped dispatch can't lock the UI; the controller then converges on the size
+# that hits ``target_dispatch_ms``.
+_INITIAL_BETAS_PER_CHUNK = 8
+
 # pthread QoS class for the Metal sampler thread. QOS_CLASS_UTILITY (0x11, per
 # <sys/qos.h>) deprioritizes us against the foreground UI on the P-cores.
 # WARNING: 0x21 is USER_INTERACTIVE — the opposite of intended (a boost).
@@ -98,6 +104,19 @@ def _resolve_budget(scheduler) -> int:
     if scheduler is not None and hasattr(scheduler, "get_thread_budget"):
         return int(scheduler.get_thread_budget())
     return UNCAPPED
+
+
+def _resolve_target_ms(scheduler) -> Optional[float]:
+    """Resolve the per-dispatch wall-time budget for sweep-chunking, or None.
+
+    None means dispatch monolithically (full sweeps in one command buffer): no
+    scheduler, or the governor is uncapped (IDLE/headless — no UI to protect).
+    A float means split the sweep schedule so each command buffer stays under
+    it (ACTIVE/LOW — a user is present). See ``MetalScheduler.target_dispatch_ms``.
+    """
+    if scheduler is not None and hasattr(scheduler, "target_dispatch_ms"):
+        return scheduler.target_dispatch_ms()
+    return None
 
 
 def concat_read_split(
@@ -264,6 +283,15 @@ class MetalSASampler:
         # buffer/encoder but not these owned buffers) and OOMs a long stream.
         # Reusing one buffer per role keeps the footprint bounded and constant.
         self._buf_pool: Dict[str, Any] = {}
+
+        # Self-calibrating sweep-chunk size (betas per command buffer), carried
+        # across dispatches so it converges on ``target_dispatch_ms``. None
+        # until the first capped dispatch seeds it from _INITIAL_BETAS_PER_CHUNK.
+        self._betas_per_chunk: Optional[int] = None
+        # Occupancy (problems x reads) the carried chunk size was calibrated
+        # against; the size is re-seeded when this changes (per-beta GPU cost
+        # scales with occupancy). None until the first capped dispatch.
+        self._chunk_cal_threads: Optional[int] = None
 
         # Cached topology CSR structure (set by prepare_topology)
         self._topo_prepared = False
@@ -486,6 +514,50 @@ class MetalSASampler:
         ``metal_utils.pooled_input``)."""
         return pooled_input(self.device, self._buf_pool, role, data)
 
+    def _next_beta_chunk_size(self, remaining: int) -> int:
+        """Betas to run in the next command buffer (bounded by ``remaining``).
+
+        Seeds the controller with ``_INITIAL_BETAS_PER_CHUNK`` on first use so
+        the very first capped dispatch is short; thereafter returns the
+        converged size from :meth:`_record_chunk_timing`.
+        """
+        if self._betas_per_chunk is None:
+            self._betas_per_chunk = _INITIAL_BETAS_PER_CHUNK
+        return max(1, min(self._betas_per_chunk, remaining))
+
+    def _maybe_reset_chunk_calibration(self, num_threads: int) -> None:
+        """Re-seed the chunk size when occupancy (per-beta GPU cost) changes.
+
+        ``_betas_per_chunk`` is carried across dispatches on the reused sampler
+        so it converges on ``target_dispatch_ms``. Per-beta GPU cost scales with
+        occupancy (``problems x reads``), so a size converged on a *cheaper*
+        prior dispatch must not carry into a *heavier* one — it could run one
+        oversized command buffer before the controller shrinks it, reintroducing
+        the UI freeze this split exists to prevent. Drop the carried size (back
+        to the ``_INITIAL_BETAS_PER_CHUNK`` seed) whenever the thread count
+        changes; an unchanged workload keeps converging.
+        """
+        if num_threads != self._chunk_cal_threads:
+            self._chunk_cal_threads = num_threads
+            self._betas_per_chunk = None
+
+    def _record_chunk_timing(
+        self, elapsed_s: float, betas: int, target_ms: float,
+    ) -> None:
+        """Adapt the sweep-chunk size toward ``target_ms`` from a measurement.
+
+        Multiplicative control: scale the size by ``target/measured`` and
+        EMA-smooth to damp oscillation, clamped to a sane range. Bit-identity is
+        unaffected — chunk boundaries never change the annealing computation
+        (the kernel resumes exactly from the persist buffers), only where the
+        GPU yields between command buffers.
+        """
+        elapsed_ms = max(elapsed_s * 1000.0, 0.05)
+        ideal = betas * (target_ms / elapsed_ms)
+        current = self._betas_per_chunk or betas
+        smoothed = 0.6 * current + 0.4 * ideal
+        self._betas_per_chunk = int(min(1_000_000, max(1, smoothed)))
+
     def _dispatch_batch(
         self,
         models: List[IsingModel],
@@ -496,6 +568,7 @@ class MetalSASampler:
         beta_schedule_type: str,
         num_sweeps_per_beta: int,
         seed: int,
+        target_dispatch_ms: Optional[float] = None,
     ) -> List[dimod.SampleSet]:
         """Dispatch one batch inside an ObjC autorelease pool.
 
@@ -513,6 +586,7 @@ class MetalSASampler:
                 beta_schedule_arr=beta_schedule_arr, beta_range=beta_range,
                 beta_schedule_type=beta_schedule_type,
                 num_sweeps_per_beta=num_sweeps_per_beta, seed=seed,
+                target_dispatch_ms=target_dispatch_ms,
             )
 
     def _dispatch_batch_impl(
@@ -525,8 +599,15 @@ class MetalSASampler:
         beta_schedule_type: str,
         num_sweeps_per_beta: int,
         seed: int,
+        target_dispatch_ms: Optional[float] = None,
     ) -> List[dimod.SampleSet]:
-        """Batch dispatch body (run inside ``_dispatch_batch``'s pool)."""
+        """Batch dispatch body (run inside ``_dispatch_batch``'s pool).
+
+        ``target_dispatch_ms`` None ⇒ one monolithic command buffer (full
+        sweeps). A float ⇒ split the beta schedule across short, self-calibrating
+        command buffers so each stays near that wall-time, yielding the GPU to
+        the compositor between chunks. Bit-identical either way.
+        """
         num_problems = len(models)
         N = self._topo_N
         node_to_idx = self._topo_node_to_idx
@@ -573,59 +654,88 @@ class MetalSASampler:
         persist_energy_buf = self._pooled_buffer(
             "persist_energy", num_threads * 4)
 
-        # Encode and dispatch
-        cmd_buf = self._command_queue.commandBuffer()
-        encoder = cmd_buf.computeCommandEncoder()
-        encoder.setComputePipelineState_(self._pipeline)
-
-        encoder.setBuffer_offset_atIndex_(rp_buf, 0, 0)
-        encoder.setBuffer_offset_atIndex_(ci_buf, 0, 1)
-        encoder.setBuffer_offset_atIndex_(jv_buf, 0, 2)
-        encoder.setBuffer_offset_atIndex_(rpo_buf, 0, 3)
-        encoder.setBuffer_offset_atIndex_(cio_buf, 0, 4)
-
-        encoder.setBytes_length_atIndex_(N_bytes, 4, 5)
-        encoder.setBytes_length_atIndex_(num_betas_bytes, 4, 6)
-        encoder.setBytes_length_atIndex_(spb_bytes, 4, 7)
-        encoder.setBytes_length_atIndex_(seed_bytes, 4, 8)
-
-        encoder.setBuffer_offset_atIndex_(beta_buf, 0, 9)
-        encoder.setBuffer_offset_atIndex_(samples_buf, 0, 10)
-        encoder.setBuffer_offset_atIndex_(energies_buf, 0, 11)
-
-        encoder.setBytes_length_atIndex_(nt_bytes, 4, 12)
-        encoder.setBytes_length_atIndex_(np_bytes, 4, 13)
-        encoder.setBytes_length_atIndex_(nr_bytes, 4, 14)
-
-        encoder.setBuffer_offset_atIndex_(hv_buf, 0, 15)
-
-        encoder.setBytes_length_atIndex_(np.int32(0).tobytes(), 4, 16)
-        encoder.setBytes_length_atIndex_(num_betas_bytes, 4, 17)
-        encoder.setBuffer_offset_atIndex_(
-            persist_state_buf, 0, 18,
-        )
-        encoder.setBuffer_offset_atIndex_(
-            persist_de_buf, 0, 19,
-        )
-        encoder.setBuffer_offset_atIndex_(
-            persist_rng_buf, 0, 20,
-        )
-        encoder.setBuffer_offset_atIndex_(
-            persist_energy_buf, 0, 21,
-        )
-
+        total_betas = len(beta_schedule_arr)
         tg = Metal.MTLSize(width=num_problems, height=1, depth=1)
         tpt = Metal.MTLSize(width=num_reads, height=1, depth=1)
-        encoder.dispatchThreadgroups_threadsPerThreadgroup_(tg, tpt)
 
-        encoder.endEncoding()
-        cmd_buf.commit()
-        cmd_buf.waitUntilCompleted()
+        def _run_chunk(beta_start: int, beta_count: int) -> None:
+            """Encode + dispatch betas [beta_start, beta_start+beta_count).
 
-        if cmd_buf.status() != Metal.MTLCommandBufferStatusCompleted:
-            error = cmd_buf.error()
-            raise RuntimeError(
-                f"Metal command buffer failed: {error}",
+            The kernel initialises spins on ``beta_start == 0`` and otherwise
+            resumes from the persist buffers, so consecutive chunks over the
+            same (pooled) buffers continue one annealing run exactly.
+            """
+            cmd_buf = self._command_queue.commandBuffer()
+            encoder = cmd_buf.computeCommandEncoder()
+            encoder.setComputePipelineState_(self._pipeline)
+
+            encoder.setBuffer_offset_atIndex_(rp_buf, 0, 0)
+            encoder.setBuffer_offset_atIndex_(ci_buf, 0, 1)
+            encoder.setBuffer_offset_atIndex_(jv_buf, 0, 2)
+            encoder.setBuffer_offset_atIndex_(rpo_buf, 0, 3)
+            encoder.setBuffer_offset_atIndex_(cio_buf, 0, 4)
+
+            encoder.setBytes_length_atIndex_(N_bytes, 4, 5)
+            encoder.setBytes_length_atIndex_(num_betas_bytes, 4, 6)
+            encoder.setBytes_length_atIndex_(spb_bytes, 4, 7)
+            encoder.setBytes_length_atIndex_(seed_bytes, 4, 8)
+
+            encoder.setBuffer_offset_atIndex_(beta_buf, 0, 9)
+            encoder.setBuffer_offset_atIndex_(samples_buf, 0, 10)
+            encoder.setBuffer_offset_atIndex_(energies_buf, 0, 11)
+
+            encoder.setBytes_length_atIndex_(nt_bytes, 4, 12)
+            encoder.setBytes_length_atIndex_(np_bytes, 4, 13)
+            encoder.setBytes_length_atIndex_(nr_bytes, 4, 14)
+
+            encoder.setBuffer_offset_atIndex_(hv_buf, 0, 15)
+
+            encoder.setBytes_length_atIndex_(
+                np.int32(beta_start).tobytes(), 4, 16,
+            )
+            encoder.setBytes_length_atIndex_(
+                np.int32(beta_count).tobytes(), 4, 17,
+            )
+            encoder.setBuffer_offset_atIndex_(persist_state_buf, 0, 18)
+            encoder.setBuffer_offset_atIndex_(persist_de_buf, 0, 19)
+            encoder.setBuffer_offset_atIndex_(persist_rng_buf, 0, 20)
+            encoder.setBuffer_offset_atIndex_(persist_energy_buf, 0, 21)
+
+            encoder.dispatchThreadgroups_threadsPerThreadgroup_(tg, tpt)
+            encoder.endEncoding()
+            cmd_buf.commit()
+            cmd_buf.waitUntilCompleted()
+            if cmd_buf.status() != Metal.MTLCommandBufferStatusCompleted:
+                raise RuntimeError(
+                    f"Metal command buffer failed: {cmd_buf.error()}",
+                )
+
+        # Uncapped (IDLE/headless) → one monolithic command buffer for peak
+        # throughput. Capped (a user is present) → split the sweep schedule
+        # across short, self-calibrating command buffers so a long anneal can't
+        # monopolize the GPU and freeze the UI. Identical result either way: the
+        # kernel resumes from the persist buffers, so chunk boundaries change
+        # only where the GPU yields, never the annealing path.
+        if target_dispatch_ms is None:
+            _run_chunk(0, total_betas)
+        else:
+            self._maybe_reset_chunk_calibration(num_threads)
+            beta_start = 0
+            n_chunks = 0
+            while beta_start < total_betas:
+                count = self._next_beta_chunk_size(total_betas - beta_start)
+                t0 = time.perf_counter()
+                _run_chunk(beta_start, count)
+                self._record_chunk_timing(
+                    time.perf_counter() - t0, count, target_dispatch_ms,
+                )
+                beta_start += count
+                n_chunks += 1
+            self.logger.debug(
+                "metal sweep-chunked: %d betas in %d command buffers "
+                "(target %.1f ms/buf, next chunk=%d)",
+                total_betas, n_chunks, target_dispatch_ms,
+                self._betas_per_chunk,
             )
 
         # Unpack results
@@ -657,6 +767,7 @@ class MetalSASampler:
             )
 
         return samplesets
+
     def _dispatch_read_split(
         self,
         models: List[IsingModel],
@@ -668,6 +779,7 @@ class MetalSASampler:
         beta_schedule_type: str,
         num_sweeps_per_beta: int,
         seed: int,
+        target_dispatch_ms: Optional[float] = None,
     ) -> List[dimod.SampleSet]:
         """Run ``num_reads`` reads in command buffers of ``reads_per_buffer``.
 
@@ -685,6 +797,7 @@ class MetalSASampler:
                 beta_schedule_arr=beta_schedule_arr, beta_range=beta_range,
                 beta_schedule_type=beta_schedule_type,
                 num_sweeps_per_beta=num_sweeps_per_beta, seed=buf_seed,
+                target_dispatch_ms=target_dispatch_ms,
             )
 
         return concat_read_split(
@@ -755,6 +868,11 @@ class MetalSASampler:
             reads_per_buffer = reads_per_buffer_for_budget(
                 budget, len(batch_models), num_reads,
             )
+            # Per-dispatch wall-time budget: split the sweep schedule across
+            # short command buffers while a user is present (capped), run
+            # monolithically when uncapped (IDLE/headless). Re-read per batch
+            # so it tracks the same governor tier as the occupancy budget.
+            target_ms = _resolve_target_ms(scheduler)
             return self._dispatch_read_split(
                 batch_models,
                 num_reads=num_reads,
@@ -764,6 +882,7 @@ class MetalSASampler:
                 beta_schedule_type=beta_schedule_type,
                 num_sweeps_per_beta=num_sweeps_per_beta,
                 seed=batch_seed,
+                target_dispatch_ms=target_ms,
             )
 
         yield from stream_read_split_batches(
