@@ -545,6 +545,36 @@ class DWaveSamplerWrapper:
             samples, vartype=dimod.SPIN, energy=energies, info=info,
         )
 
+    def _prepare_defect_handling(
+        self,
+        h: Union[Mapping[Variable, float], Sequence[float]],
+        J: Mapping[Tuple[Variable, Variable], float],
+        kwargs: Dict[str, Any],
+    ) -> Tuple[
+        Union[Mapping[Variable, float], Sequence[float]],
+        Mapping[Tuple[Variable, Variable], float],
+        Optional[DefectInfo],
+    ]:
+        """Pop ``nonce_seed`` and clamp defective qubits if any are present.
+
+        Returns ``(h_eff, J_eff, defect_info)`` where the effective problem is
+        the defect-reduced one (and ``defect_info`` is populated) when defects
+        exist and a seed was supplied; otherwise the inputs are returned
+        unchanged with ``defect_info`` set to ``None``.
+        """
+        nonce_seed = kwargs.pop('nonce_seed', None)
+
+        has_defects = self._defective_qubits or self._defective_edges
+        if not (has_defects and nonce_seed is not None):
+            return h, J, None
+
+        h_dict = dict(h) if not isinstance(h, dict) else h
+        J_dict = dict(J) if not isinstance(J, dict) else J
+        h_reduced, J_reduced, fixed_spins, offset, removed = (
+            self._clamp_defective_qubits(h_dict, J_dict, nonce_seed)
+        )
+        return h_reduced, J_reduced, DefectInfo(fixed_spins, offset, removed)
+
     def sample_ising(
         self,
         h: Union[Mapping[Variable, float], Sequence[float]],
@@ -557,20 +587,11 @@ class DWaveSamplerWrapper:
         instead — it avoids reconstructing samples that don't meet threshold.
         This method always reconstructs for backward compatibility.
         """
-        nonce_seed = kwargs.pop('nonce_seed', None)
-
-        has_defects = self._defective_qubits or self._defective_edges
-        if has_defects and nonce_seed is not None:
-            h_dict = dict(h) if not isinstance(h, dict) else h
-            J_dict = dict(J) if not isinstance(J, dict) else J
-            h_reduced, J_reduced, fixed_spins, offset, removed = (
-                self._clamp_defective_qubits(h_dict, J_dict, nonce_seed)
-            )
-            sampleset = self._sample_ising_inner(h_reduced, J_reduced, **kwargs)
-            defect_info = DefectInfo(fixed_spins, offset, removed)
+        h_eff, J_eff, defect_info = self._prepare_defect_handling(h, J, kwargs)
+        sampleset = self._sample_ising_inner(h_eff, J_eff, **kwargs)
+        if defect_info is not None:
             return self.reconstruct_full_sampleset(sampleset, defect_info)
-
-        return self._sample_ising_inner(h, J, **kwargs)
+        return sampleset
 
     def _chain_strength(self, bqm: dimod.BinaryQuadraticModel, multiplier: float) -> float:
         """Compute chain strength as the largest absolute bias scaled by *multiplier*.
@@ -657,23 +678,9 @@ class DWaveSamplerWrapper:
         Returns:
             (future, defect_info) where defect_info is None if no defects.
         """
-        nonce_seed = kwargs.pop('nonce_seed', None)
-
-        has_defects = self._defective_qubits or self._defective_edges
-        if has_defects and nonce_seed is not None:
-            h_dict = dict(h) if not isinstance(h, dict) else h
-            J_dict = dict(J) if not isinstance(J, dict) else J
-            h_reduced, J_reduced, fixed_spins, offset, removed = (
-                self._clamp_defective_qubits(h_dict, J_dict, nonce_seed)
-            )
-            future = self._sample_ising_async_inner(
-                h_reduced, J_reduced, **kwargs
-            )
-            defect_info = DefectInfo(fixed_spins, offset, removed)
-            return future, defect_info
-
-        future = self._sample_ising_async_inner(h, J, **kwargs)
-        return future, None
+        h_eff, J_eff, defect_info = self._prepare_defect_handling(h, J, kwargs)
+        future = self._sample_ising_async_inner(h_eff, J_eff, **kwargs)
+        return future, defect_info
 
     def _sample_ising_async_inner(
         self,
