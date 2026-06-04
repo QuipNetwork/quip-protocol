@@ -3,12 +3,9 @@ from __future__ import annotations
 
 import multiprocessing
 import multiprocessing.synchronize
-import signal
 import traceback
-from typing import List, Tuple
 
 from shared.base_miner import BaseMiner
-from shared.miner_types import BlockRequirements
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
 
 
@@ -34,44 +31,17 @@ class SimulatedAnnealingMiner(BaseMiner):
         self.miner_type = "CPU"
 
         # Register SIGTERM handler for graceful cleanup
-        signal.signal(signal.SIGTERM, self._cleanup_handler)
+        self._register_sigterm_cleanup("CPU")
 
-    def _cleanup_handler(self, signum, frame):
-        """Handle SIGTERM signal for graceful cleanup of CPU resources."""
-        if hasattr(self, 'logger'):
-            self.logger.info(f"CPU miner {self.miner_id} received SIGTERM, cleaning up...")
+    def _backend_cleanup(self) -> None:
+        """Handle SIGTERM-time cleanup of CPU resources."""
+        # Reset any persistent library state
+        if hasattr(self, 'sampler') and hasattr(self.sampler, 'cleanup'):
+            self.sampler.cleanup()
 
-        # CPU-specific cleanup
-        try:
-            # Reset any persistent library state
-            if hasattr(self, 'sampler') and hasattr(self.sampler, 'cleanup'):
-                self.sampler.cleanup()
-
-            # Clear any cached data
-            if hasattr(self, 'top_attempts'):
-                self.top_attempts.clear()
-
-        except Exception as e:
-            if hasattr(self, 'logger'):
-                self.logger.error(f"Error during CPU miner cleanup: {e}")
-
-        # Exit gracefully — guard against raising SystemExit during
-        # interpreter finalization (would produce "Exception ignored" noise).
-        self._graceful_exit()
-
-    def _adapt_mining_params(
-        self,
-        current_requirements: BlockRequirements,
-        nodes: List[int],
-        edges: List[Tuple[int, int]],
-    ) -> dict:
-        return self.adapt_parameters(
-            current_requirements.difficulty_energy,
-            current_requirements.min_diversity,
-            current_requirements.min_solutions,
-            num_nodes=len(nodes),
-            num_edges=len(edges),
-        )
+        # Clear any cached data
+        if hasattr(self, 'top_attempts'):
+            self.top_attempts.clear()
 
     def _stream_factory_kwargs(self, sample_ctx, nodes):
         """Kwargs forwarded to CPU.sa_stream:build_persistent_context."""

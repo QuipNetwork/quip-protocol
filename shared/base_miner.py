@@ -4,7 +4,7 @@ Contains core mining logic and defines abstract methods for miner-specific imple
 """
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import ABC
 from collections import OrderedDict
 import logging
 import math
@@ -12,6 +12,7 @@ import multiprocessing
 import multiprocessing.synchronize
 import pickle
 import queue
+import signal
 import sys
 import time
 import traceback
@@ -2029,7 +2030,6 @@ class BaseMiner(ABC):
         """
         return True
 
-    @abstractmethod
     def _adapt_mining_params(
         self,
         current_requirements: BlockRequirements,
@@ -2041,7 +2041,18 @@ class BaseMiner(ABC):
         The returned dict must include at least 'num_sweeps' and
         'num_reads'.  Extra keys are forwarded to the stream-driver context
         factory.
+
+        Default implementation forwards to ``adapt_parameters`` using the
+        subclass-declared calibration bounds. Override only for
+        backend-specific post-processing (e.g. CUDA Gibbs sweep doubling).
         """
+        return self.adapt_parameters(
+            current_requirements.difficulty_energy,
+            current_requirements.min_diversity,
+            current_requirements.min_solutions,
+            num_nodes=len(nodes),
+            num_edges=len(edges),
+        )
 
     def _post_sample(
         self, sampleset: dimod.SampleSet,
@@ -2097,6 +2108,41 @@ class BaseMiner(ABC):
         if sys.is_finalizing():
             return
         sys.exit(0)
+
+    def _register_sigterm_cleanup(self, backend_label: str) -> None:
+        """Install the shared SIGTERM handler for graceful worker cleanup.
+
+        ``backend_label`` is interpolated into the default log lines. Subclasses
+        customize the cleanup body via ``_backend_cleanup`` and (optionally) the
+        first log line via ``_sigterm_log_message``.
+        """
+        self._sigterm_backend_label = backend_label
+        signal.signal(signal.SIGTERM, self._cleanup_handler)
+
+    def _sigterm_log_message(self) -> str:
+        """Return the first-line SIGTERM log text.
+
+        Default uses the backend label; override for backend-specific detail.
+        """
+        label = getattr(self, "_sigterm_backend_label", "")
+        return f"{label} miner {self.miner_id} received SIGTERM, cleaning up..."
+
+    def _backend_cleanup(self) -> None:
+        """Release backend-specific resources on SIGTERM. Default no-op."""
+
+    def _cleanup_handler(self, signum, frame) -> None:
+        """Shared SIGTERM handler: log, run backend cleanup, exit gracefully."""
+        label = getattr(self, "_sigterm_backend_label", "")
+        if hasattr(self, "logger"):
+            self.logger.info(self._sigterm_log_message())
+        try:
+            self._backend_cleanup()
+        except Exception as e:
+            if hasattr(self, "logger"):
+                self.logger.error(f"Error during {label} miner cleanup: {e}")
+        # Exit gracefully — guard against raising SystemExit during
+        # interpreter finalization (would produce "Exception ignored" noise).
+        self._graceful_exit()
 
     def _on_sampling_error(
         self,
