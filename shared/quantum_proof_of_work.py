@@ -392,14 +392,9 @@ def _calculate_set_diversity(indices: List[int], dist_matrix: np.ndarray) -> flo
     if len(indices) < 2:
         return 0.0
 
-    total_dist = 0
-    count = 0
-    for i in range(len(indices)):
-        for j in range(i + 1, len(indices)):
-            total_dist += dist_matrix[indices[i], indices[j]]
-            count += 1
-
-    return total_dist / count if count > 0 else 0.0
+    sub = dist_matrix[np.ix_(indices, indices)]
+    iu = np.triu_indices(sub.shape[0], k=1)
+    return float(sub[iu].mean())
 
 
 def _compute_distance_matrix_vectorized(solutions: List[List[int]]) -> np.ndarray:
