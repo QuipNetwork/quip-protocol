@@ -32,7 +32,7 @@ from shared.keystore_hybrid import generate, load
 from shared.logging_config import setup_logging
 from substrate.mempool_miner_controller import MempoolMinerController
 from substrate.mempool_types import MinerType, qpu_miner_kind
-from shared.miner_bootstrap import (
+from substrate.miner_bootstrap import (
     DEFAULT_MIN_BALANCE_PLANCKS,
     BootstrapConfig,
     Underfunded,
@@ -564,7 +564,7 @@ async def _ensure_funded_or_fail(
 ) -> int:
     """Guard C — wallet funded.
 
-    Delegates to `shared.miner_bootstrap.ensure_funded_via_faucet`: returns the
+    Delegates to `substrate.miner_bootstrap.ensure_funded_via_faucet`: returns the
     balance when it is already at/above threshold or after a successful faucet
     top-up. `Underfunded` (below threshold, no faucet) → `wallet-underfunded`;
     a dropped validator rotation mid-settlement → `validators-unreachable`;
@@ -600,7 +600,7 @@ async def _ensure_funded_or_fail(
 async def _ensure_registered_or_fail(client: SubstrateClient, keystore) -> None:
     """Guard D — miner registered, transparently and idempotently.
 
-    Reuses ``shared.miner_bootstrap._ensure_registered`` so the manual
+    Reuses ``substrate.miner_bootstrap._ensure_registered`` so the manual
     ``bootstrap`` command and the miner's own startup register through
     identical code — they cannot drift. Retries registration over several
     minutes (verifying the account lands in ``QuantumPow.Miners``); an ultimate
@@ -854,7 +854,7 @@ def quip_miner_telemetry(
     aggregator + chain-read proxy.
     """
     import multiprocessing as mp
-    from shared.telemetry_process import telemetry_main
+    from substrate.telemetry_process import telemetry_main
 
     snap_dir = Path(snapshot_dir).expanduser()
     snap_dir.mkdir(parents=True, exist_ok=True)

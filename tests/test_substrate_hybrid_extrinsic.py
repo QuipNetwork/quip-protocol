@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from shared.miner_bootstrap import _resolve_dev_signer
+from substrate.miner_bootstrap import _resolve_dev_signer
 from substrate.client import _HYBRID_TERMINAL_FAILURES
 from substrate.scale_codec import _encode_compact_u128, _encode_compact_u32
 

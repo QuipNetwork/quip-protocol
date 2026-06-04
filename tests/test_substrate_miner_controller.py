@@ -34,7 +34,7 @@ import pytest
 
 from dwave_topologies.topologies.zephyr import zephyr
 from shared.keystore_hybrid import generate
-from shared.miner_bootstrap import BootstrapConfig, _maybe_seed_chain, _resolve_dev_signer
+from substrate.miner_bootstrap import BootstrapConfig, _maybe_seed_chain, _resolve_dev_signer
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from substrate.client import SubstrateClient
@@ -686,7 +686,7 @@ async def _live_controller(
 
         # //Alice resolves to the HybridSigner derived from
         # DEV_HYBRID_SEEDS — not substrate-interface URI derivation — on
-        # hybrid chains. See shared.miner_bootstrap._resolve_dev_signer.
+        # hybrid chains. See substrate.miner_bootstrap._resolve_dev_signer.
         alice = _resolve_dev_signer("//Alice")
         balance = await setup_client.query_balance(
             keystore.signer.account_id_bytes()

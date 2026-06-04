@@ -35,14 +35,13 @@ _UPWARD_PACKAGES = frozenset({"substrate", "CPU", "GPU", "QPU"})
 # The inversions that exist today, as (filename, imported-dotted-path). The
 # layering roadmap removes these one move at a time; strike each entry here in
 # the same commit that eliminates the corresponding import. Target: empty set.
-_ALLOWED = frozenset(
-    {
-        ("miner_bootstrap.py", "substrate.client"),
-        ("miner_bootstrap.py", "substrate.types"),
-        ("telemetry_process.py", "substrate.client"),
-        ("telemetry_process.py", "substrate.url_failover"),
-    }
-)
+# Empty: shared/ is now a true foundation with zero upward imports. The
+# layering roadmap moved every orchestration module that reached up into the
+# chain/backends out of shared/ (miner_worker's backend imports deferred into
+# the factory; the controllers, bootstrap, telemetry, mempool types, and the
+# decay math relocated). Any new entry here is a regression to be moved out,
+# not allowed.
+_ALLOWED: frozenset[tuple[str, str]] = frozenset()
 
 
 def _is_upward(dotted: str) -> bool:

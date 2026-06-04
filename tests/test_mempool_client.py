@@ -28,7 +28,7 @@ from substrate.mempool_types import (
     ResultDelivery,
     RewardResolution,
 )
-from shared.miner_bootstrap import _resolve_dev_signer
+from substrate.miner_bootstrap import _resolve_dev_signer
 from substrate.client import SubstrateClient
 
 

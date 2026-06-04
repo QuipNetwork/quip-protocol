@@ -60,7 +60,7 @@ from shared.mining_attempt_log import (
 )
 from shared.signer import Signer
 from shared.stats_snapshot import StatsSnapshotWriter, snapshot_filename_for
-from shared.telemetry_process import telemetry_main
+from substrate.telemetry_process import telemetry_main
 from substrate.client import SubstrateClient
 from substrate.pool import ValidatorPool
 from substrate.pool_client import PoolClient

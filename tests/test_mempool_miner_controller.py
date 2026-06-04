@@ -620,7 +620,7 @@ async def test_controller_submits_solution_end_to_end(tmp_path):
     from shared.keystore_hybrid import generate
     from substrate.mempool_miner_controller import MempoolMinerController
     from substrate.mempool_types import MinerType
-    from shared.miner_bootstrap import _resolve_dev_signer
+    from substrate.miner_bootstrap import _resolve_dev_signer
     from shared.miner_worker import MinerHandle
     from substrate.client import SubstrateClient
 
