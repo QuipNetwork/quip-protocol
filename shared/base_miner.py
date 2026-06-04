@@ -27,7 +27,6 @@ from shared.energy_utils import (
     DEFAULT_NUM_NODES,
     DEFAULT_NUM_EDGES,
 )
-from shared.mempool_types import MempoolJobContext
 from shared.miner_types import BlockRequirements, MiningResult, Sampler
 from shared.mining_attempt_log import AttemptLogger, SolutionStore
 from shared.quantum_proof_of_work import (
@@ -36,7 +35,6 @@ from shared.quantum_proof_of_work import (
     pack_spins_hex,
 )
 from shared.decay_math import step_for_energy
-from substrate.types import SubstrateMiningContext
 from shared.work_context import (
     WorkContext,
     requirements_from_context,
@@ -995,7 +993,7 @@ class BaseMiner(ABC):
         # decay-aware "store best, submit when chain catches up" loop;
         # mempool jobs have hard quality floors that don't decay so
         # they keep the strict-energy behaviour.
-        is_substrate = isinstance(context, SubstrateMiningContext)
+        is_substrate = context.uses_decay_ratchet()
         live_threshold_var = getattr(self, '_live_max_energy_milli', None)
         # Seed the worker's live-threshold view with the snapshot value
         # in case the controller hasn't written one yet (e.g. tests, or
@@ -2096,7 +2094,7 @@ class BaseMiner(ABC):
           - Mempool: order_id / nodes / edges
         Both flavors print enough to grep logs for a specific work item.
         """
-        if isinstance(context, MempoolJobContext):
+        if not context.uses_decay_ratchet():
             msg = (
                 f"mine_work_item: order_id={context.order_id} "
                 f"nodes={len(context.nodes)} edges={len(context.edges)} "
@@ -2217,7 +2215,7 @@ class BaseMiner(ABC):
 
 def _work_tag(context: WorkContext) -> str:
     """Short identifier for a work context, used in per-iteration log lines."""
-    if isinstance(context, MempoolJobContext):
+    if not context.uses_decay_ratchet():
         return f"order={context.order_id}"
     return f"last_proof_block_hash=0x{context.last_proof_block_hash.hex()[:16]}"
 
@@ -2259,7 +2257,7 @@ class _BridgePrevBlock:
 
     @classmethod
     def from_work_context(cls, context: WorkContext) -> "_BridgePrevBlock":
-        if isinstance(context, MempoolJobContext):
+        if not context.uses_decay_ratchet():
             return cls(
                 header=_BridgePrevBlockHeader(index=context.order_id),
                 hash=b"\x00" * 32,
@@ -2292,7 +2290,7 @@ class _BridgeNodeInfo:
 
     @classmethod
     def from_work_context(cls, context: WorkContext) -> "_BridgeNodeInfo":
-        if isinstance(context, MempoolJobContext):
+        if not context.uses_decay_ratchet():
             return cls(
                 miner_id=f"mempool-order-{context.order_id}",
                 miner_account_bytes=b"\x00" * 32,
