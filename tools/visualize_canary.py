@@ -8,15 +8,103 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+
 
 def load_canary_results(filepath: str) -> Dict:
     """Load canary test results from JSON file."""
     with open(filepath, 'r') as f:
         return json.load(f)
+
+
+def _suffixed_output(output: Optional[str], suffix: str, plot_type: str) -> Optional[str]:
+    """Return a suffixed output path for ``plot_type``, or None if not applicable.
+
+    Args:
+        output: Base output path provided by the user, or None.
+        suffix: Stem suffix to insert (e.g. ``"_probability"``).
+        plot_type: The ``--type`` argument value (``"probability"``,
+            ``"scatter"``, or ``"both"``).
+    """
+    if not output:
+        return None
+    if plot_type != 'both':
+        return output
+    base = Path(output)
+    return str(base.parent / f"{base.stem}{suffix}{base.suffix}")
+
+
+def _extract_scatter_series(
+    stats: Dict,
+) -> Tuple[List[float], List[float], List[bool]]:
+    """Extract (canary_energies, full_energies, success_flags) from stats.
+
+    Args:
+        stats: The ``statistics`` sub-dict from a canary result file.
+
+    Returns:
+        Three parallel lists: canary energies, full energies, success flags.
+    """
+    canary_energies: List[float] = []
+    full_energies: List[float] = []
+    success_flags: List[bool] = []
+
+    for result in stats['nonce_results']:
+        canary_e = result['canary'].get('energy')
+        full_e = result['full'].get('energy')
+        passed = result['full'].get('passed', False)
+
+        if canary_e is not None and full_e is not None:
+            canary_energies.append(canary_e)
+            full_energies.append(full_e)
+            success_flags.append(passed)
+
+    return canary_energies, full_energies, success_flags
+
+
+def _annotate_difficulty_ticks(ax, topology_name: str) -> None:
+    """Add difficulty ratings to y-axis tick labels when dependencies are available.
+
+    Silently skips (with a stderr warning) if topology loading fails.
+
+    Args:
+        ax: Matplotlib Axes object to annotate.
+        topology_name: Name of the topology to load for difficulty calculation.
+    """
+    try:
+        from shared.energy_utils import energy_to_difficulty
+    except ImportError:
+        return
+
+    try:
+        from dwave_topologies.topologies.json_loader import load_topology
+    except ImportError:
+        return
+
+    try:
+        topology = load_topology(topology_name)
+        num_nodes = (
+            len(topology.graph.nodes) if hasattr(topology.graph, 'nodes')
+            else topology.num_nodes
+        )
+        num_edges = (
+            len(topology.graph.edges) if hasattr(topology.graph, 'edges')
+            else topology.num_edges
+        )
+
+        yticks = ax.get_yticks()
+        new_labels = [
+            f'{energy:.0f}\n({energy_to_difficulty(energy, num_nodes, num_edges):.2f})'
+            for energy in yticks
+        ]
+        ax.set_yticks(yticks)
+        ax.set_yticklabels(new_labels)
+    except Exception:
+        print("Warning: topology loading failed; skipping difficulty tick annotations",
+              file=sys.stderr)
 
 
 def plot_success_probability(
@@ -41,7 +129,6 @@ def plot_success_probability(
 
         # Extract metadata
         miner_type = data.get('miner_type', 'unknown').upper()
-        topology = data.get('topology', 'unknown')
         canary_params = stats['canary']['params']
         label = f"{miner_type} (sweeps={canary_params['num_sweeps']}, reads={canary_params['num_reads']})"
 
@@ -145,20 +232,6 @@ def plot_energy_scatter(
         output_file: Optional path to save plot
         title: Plot title
     """
-    # Try to import energy_to_difficulty for annotations
-    try:
-        from shared.energy_utils import energy_to_difficulty
-        has_difficulty_fn = True
-    except ImportError:
-        has_difficulty_fn = False
-
-    # Try to load topology loader
-    try:
-        from dwave_topologies.topologies.json_loader import load_topology
-        has_topology_loader = True
-    except ImportError:
-        has_topology_loader = False
-
     fig, axes = plt.subplots(1, len(results_files),
                             figsize=(6 * len(results_files), 5))
 
@@ -180,35 +253,27 @@ def plot_energy_scatter(
         # Get correlation info
         corr = stats['analysis'].get('correlation', {})
         pearson_r = corr.get('pearson_r', 0)
-        r_squared = corr['linear_regression']['r_squared'] if corr else 0
-        equation = corr['linear_regression']['equation'] if corr else ''
+        lr = corr.get('linear_regression', {})
+        r_squared = lr.get('r_squared', 0)
+        equation = lr.get('equation', '')
 
         # Extract data
-        canary_energies = []
-        full_energies = []
-        success_flags = []
-
-        for result in stats['nonce_results']:
-            canary_e = result['canary'].get('energy')
-            full_e = result['full'].get('energy')
-            passed = result['full'].get('passed', False)
-
-            if canary_e is not None and full_e is not None:
-                canary_energies.append(canary_e)
-                full_energies.append(full_e)
-                success_flags.append(passed)
+        canary_energies, full_energies, success_flags = _extract_scatter_series(stats)
 
         # Scatter plot colored by success
-        for i, (ce, fe, success) in enumerate(zip(canary_energies, full_energies, success_flags)):
-            color = colors[1] if success else colors[0]
-            label = 'Passed' if success and i == 0 else ('Failed' if not success and i == 0 else None)
-            ax.scatter(ce, fe, c=color, alpha=0.6, s=50, label=label)
+        failed_ce = [ce for ce, s in zip(canary_energies, success_flags) if not s]
+        failed_fe = [fe for fe, s in zip(full_energies, success_flags) if not s]
+        passed_ce = [ce for ce, s in zip(canary_energies, success_flags) if s]
+        passed_fe = [fe for fe, s in zip(full_energies, success_flags) if s]
+
+        ax.scatter(failed_ce, failed_fe, c=colors[0], alpha=0.6, s=50, label='Failed')
+        ax.scatter(passed_ce, passed_fe, c=colors[1], alpha=0.6, s=50, label='Passed')
 
         # Plot regression line if available
         if corr:
             x_range = np.array([min(canary_energies), max(canary_energies)])
-            slope = corr['linear_regression']['slope']
-            intercept = corr['linear_regression']['intercept']
+            slope = lr.get('slope', 0)
+            intercept = lr.get('intercept', 0)
             y_pred = slope * x_range + intercept
             ax.plot(x_range, y_pred, 'r--', linewidth=2, alpha=0.7, label='Linear fit')
 
@@ -234,30 +299,7 @@ def plot_energy_scatter(
         ax.legend(loc='best', fontsize=9)
 
         # Add difficulty annotations if possible
-        if has_difficulty_fn and has_topology_loader:
-            try:
-                # Load topology to get node/edge counts
-                topology = load_topology(topology_name)
-                num_nodes = len(topology.graph.nodes) if hasattr(topology.graph, 'nodes') else topology.num_nodes
-                num_edges = len(topology.graph.edges) if hasattr(topology.graph, 'edges') else topology.num_edges
-
-                # Get current y-tick locations (full energy axis)
-                yticks = ax.get_yticks()
-
-                # Create new labels with difficulty ratings
-                new_labels = []
-                for energy in yticks:
-                    # Calculate difficulty for this energy
-                    difficulty_val = energy_to_difficulty(energy, num_nodes, num_edges)
-                    # Format: energy (difficulty as 0.0-1.0)
-                    new_labels.append(f'{energy:.0f}\n({difficulty_val:.2f})')
-
-                # Set both ticks and labels
-                ax.set_yticks(yticks)
-                ax.set_yticklabels(new_labels)
-            except Exception as e:
-                # If topology loading fails, continue without annotations
-                pass
+        _annotate_difficulty_ticks(ax, topology_name)
 
         # Add equation as text
         if equation:
@@ -315,21 +357,11 @@ def main():
 
     # Generate plots
     if args.type in ['probability', 'both']:
-        output_file = args.output if args.output and args.type == 'probability' else None
-        if args.type == 'both' and args.output:
-            # Add suffix for probability plot
-            base = Path(args.output)
-            output_file = str(base.parent / f"{base.stem}_probability{base.suffix}")
-
+        output_file = _suffixed_output(args.output, '_probability', args.type)
         plot_success_probability(args.results_files, output_file, args.title)
 
     if args.type in ['scatter', 'both']:
-        output_file = args.output if args.output and args.type == 'scatter' else None
-        if args.type == 'both' and args.output:
-            # Add suffix for scatter plot
-            base = Path(args.output)
-            output_file = str(base.parent / f"{base.stem}_scatter{base.suffix}")
-
+        output_file = _suffixed_output(args.output, '_scatter', args.type)
         plot_energy_scatter(args.results_files, output_file, args.title)
 
     return 0
