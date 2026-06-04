@@ -535,6 +535,77 @@ class DWaveSamplerWrapper:
             samples, vartype=dimod.SPIN, energy=energies, info=info,
         )
 
+    @staticmethod
+    def reconstruct_full_matrix(
+        reduced_sample: np.ndarray,
+        reduced_energy: np.ndarray,
+        defect_info: DefectInfo,
+        nodes: Sequence[Variable],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Positionally reconstruct a label-less reduced sample matrix.
+
+        The streaming path is positional, not labeled: the stream driver writes
+        a raw ``int8`` matrix to shared memory and discards dimod's variable
+        labels, so the consumer holds a ``_SharedSampleSet`` whose
+        ``record.sample`` columns map to ``[n for n in nodes if n not in
+        fixed_spins]`` (``h`` is built in ``nodes`` order, so the reduced
+        sampleset preserves that order). This reinserts the clamped spins at
+        their topology positions and corrects each energy by the constant
+        offset plus the per-sample defective-coupler contributions.
+
+        Unlike :meth:`reconstruct_full_sampleset` (which reads dimod's
+        ``.data()`` and is used by the synchronous, labeled ``sample_ising``
+        path), this consumes raw arrays so it works on the connection-less
+        worker's zero-copy ring views. The energy correction MUST stay
+        consensus-identical to that method — validators recompute energy on the
+        full topology.
+
+        Args:
+            reduced_sample: ``int8`` ``(R, n_live)`` matrix; columns ordered by
+                the live (non-clamped) nodes in ``nodes`` order.
+            reduced_energy: ``float64`` ``(R,)`` reduced-problem QPU energies.
+            defect_info: :class:`DefectInfo` with ``fixed_spins``,
+                ``energy_offset``, and ``removed_edges``.
+            nodes: Full topology node order; the column order of the output.
+
+        Returns:
+            ``(full_sample, full_energy)``: ``int8`` ``(R, len(nodes))`` matrix
+            in ``nodes`` order with clamped spins reinserted, and ``float64``
+            ``(R,)`` energies corrected to the full topology.
+
+        Raises:
+            ValueError: if the reduced width does not equal
+                ``len(nodes) - len(fixed_spins)`` — a silent misalignment would
+                scatter spins into the wrong columns and corrupt every energy.
+        """
+        fixed_spins = defect_info.fixed_spins
+        reduced = np.asarray(reduced_sample, dtype=np.int8)
+        n_rows, n_live = reduced.shape
+        expected_live = len(nodes) - sum(1 for n in nodes if n in fixed_spins)
+        if n_live != expected_live:
+            raise ValueError(
+                f"reduced width {n_live} != expected live nodes {expected_live} "
+                f"({len(nodes)} topology - {len(fixed_spins)} clamped)"
+            )
+
+        full = np.empty((n_rows, len(nodes)), dtype=np.int8)
+        pos: Dict[Variable, int] = {}  # node label -> output column index
+        live_col = 0
+        for col, node in enumerate(nodes):
+            pos[node] = col
+            if node in fixed_spins:
+                full[:, col] = fixed_spins[node]
+            else:
+                full[:, col] = reduced[:, live_col]
+                live_col += 1
+
+        energy = np.asarray(reduced_energy, dtype=np.float64) + defect_info.energy_offset
+        for (u, v), j_val in defect_info.removed_edges.items():
+            energy = energy + j_val * (
+                full[:, pos[u]].astype(np.float64) * full[:, pos[v]]
+            )
+        return full, energy
+
     def sample_ising(
         self,
         h: Union[Mapping[Variable, float], Sequence[float]],

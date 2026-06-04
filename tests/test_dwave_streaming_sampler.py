@@ -437,25 +437,43 @@ def test_raw_energies_not_shifted():
 # Tests: DWaveMiner._finalize_sample
 # ---------------------------------------------------------------------------
 
+def _make_shared_ss(n_reads: int = 1, energy: float = -100.0):
+    """Build the real production input: a positional _SharedSampleSet.
+
+    Two live columns (nodes 0, 1) carry [+1, -1]; the stream driver discards
+    dimod labels, so this is a raw int8 matrix, not a labeled dimod SampleSet.
+    """
+    import numpy as np
+    from shared.base_miner import _SharedSampleSet
+
+    sample = np.tile(np.array([1, -1], dtype=np.int8), (n_reads, 1))
+    return _SharedSampleSet(sample, np.full(n_reads, energy, dtype=np.float64))
+
+
 def test_finalize_sample_reconstructs_without_live_sampler():
     """_finalize_sample reconstructs even when self.sampler is None.
 
     The worker miner has no D-Wave connection (sampler is None); reconstruction
     must not depend on one. Regression for the graph_id-change crash where a
     newly-offline qubit forced reconstruction on the connection-less worker.
+    The driver ships a label-less ``_SharedSampleSet``, so reconstruction is
+    positional against ``nodes``.
     """
     from QPU.dwave_miner import DWaveMiner
 
     miner = DWaveMiner.__new__(DWaveMiner)
     miner.sampler = None  # the production condition that crashed
 
-    # _make_ss has vars {0, 1}; the defect clamps qubit 99 to +1, offset +10.
-    full = miner._finalize_sample(_make_ss(energy=-100.0), _make_defect(offset=10.0))
+    # Live columns map to nodes [0, 1]; the defect clamps qubit 99 to +1,
+    # offset +10. Full topology order is [0, 1, 99].
+    nodes = [0, 1, 99]
+    full = miner._finalize_sample(
+        _make_shared_ss(energy=-100.0), _make_defect(offset=10.0), nodes,
+    )
 
-    sample = full.first.sample
-    assert set(sample) == {0, 1, 99}, "clamped qubit must reappear"
-    assert sample[99] == 1, "clamped qubit must carry its fixed spin"
-    assert full.first.energy == -90.0, "energy must be reduced energy + offset"
+    row = full.record.sample[0]
+    assert list(row) == [1, -1, 1], "clamped qubit must reappear with its spin"
+    assert full.record.energy[0] == -90.0, "energy must be reduced energy + offset"
 
 
 def test_finalize_sample_preserves_all_reads():
@@ -465,5 +483,7 @@ def test_finalize_sample_preserves_all_reads():
     miner = DWaveMiner.__new__(DWaveMiner)
     miner.sampler = None
 
-    result = miner._finalize_sample(_make_ss(n_reads=4), _make_defect())
-    assert len(result) == 4
+    result = miner._finalize_sample(
+        _make_shared_ss(n_reads=4), _make_defect(), [0, 1, 99],
+    )
+    assert result.record.sample.shape == (4, 3)

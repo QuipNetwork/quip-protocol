@@ -309,3 +309,99 @@ class TestClampingEnergyConsistency:
         full_ss = wrapper.reconstruct_full_sampleset(reduced_ss, defect_info)
 
         assert full_ss.first.energy == pytest.approx(direct_energy)
+
+
+class TestReconstructFromMatrix:
+    """Positional reconstruction for the live streaming (label-less) path.
+
+    Regression for the 2026-06-04 production crash: the stream driver strips
+    dimod's variable labels and writes a raw int8 matrix to shared memory, so
+    the consumer hands ``_finalize_sample`` a ``_SharedSampleSet`` (positional
+    ``record.sample`` matrix, no ``.data()``).  The original
+    ``reconstruct_full_sampleset`` consumed ``.data()`` and crashed with
+    ``AttributeError: '_SharedSampleSet' object has no attribute 'data'``.
+    """
+
+    def test_matrix_reconstruction_scatters_fixed_spins(self):
+        """Reduced columns map to ``nodes``-minus-clamped; fixed spins reinsert."""
+        from QPU.dwave_sampler import DWaveSamplerWrapper, DefectInfo
+
+        nodes = [0, 1, 2, 3, 4, 5]
+        # Qubit 4 is offline and clamped to +1. Live nodes (column order of the
+        # reduced matrix) are [0, 1, 2, 3, 5].
+        defect_info = DefectInfo(fixed_spins={4: 1}, energy_offset=2.0, removed_edges={})
+        reduced = np.array([[1, -1, 1, -1, 1]], dtype=np.int8)
+        energy = np.array([-7.0], dtype=np.float64)
+
+        full_sample, full_energy = DWaveSamplerWrapper.reconstruct_full_matrix(
+            reduced, energy, defect_info, nodes,
+        )
+
+        assert full_sample.shape == (1, 6)
+        # Column j maps to nodes[j]; column 4 carries the clamped +1.
+        assert list(full_sample[0]) == [1, -1, 1, -1, 1, 1]
+        assert full_energy[0] == pytest.approx(-5.0)  # -7.0 + offset 2.0
+
+    def test_matrix_reconstruction_corrects_removed_edge_energy(self):
+        """Defective-coupler contribution is recomputed per row, positionally."""
+        from QPU.dwave_sampler import DWaveSamplerWrapper, DefectInfo
+
+        nodes = [0, 1, 2]
+        # No clamped qubit; edge (0, 2) is a defective coupler stripped before
+        # submission, so its J contribution must be re-added per sample.
+        defect_info = DefectInfo(
+            fixed_spins={}, energy_offset=0.0, removed_edges={(0, 2): 0.5},
+        )
+        reduced = np.array([[1, 1, -1], [1, 1, 1]], dtype=np.int8)
+        energy = np.array([-3.0, -3.0], dtype=np.float64)
+
+        full_sample, full_energy = DWaveSamplerWrapper.reconstruct_full_matrix(
+            reduced, energy, defect_info, nodes,
+        )
+
+        # Row 0: s0*s2 = 1*-1 = -1 -> -3.0 + 0.5*(-1) = -3.5
+        # Row 1: s0*s2 = 1*1  =  1 -> -3.0 + 0.5*(1)  = -2.5
+        assert full_energy[0] == pytest.approx(-3.5)
+        assert full_energy[1] == pytest.approx(-2.5)
+
+    def test_matrix_reconstruction_rejects_width_mismatch(self):
+        """A reduced width that disagrees with the clamp count fails fast."""
+        from QPU.dwave_sampler import DWaveSamplerWrapper, DefectInfo
+
+        nodes = [0, 1, 2, 3]
+        defect_info = DefectInfo(fixed_spins={2: 1}, energy_offset=0.0, removed_edges={})
+        # Live nodes are [0, 1, 3] (width 3) but the matrix has 2 columns.
+        reduced = np.array([[1, -1]], dtype=np.int8)
+        energy = np.array([-1.0], dtype=np.float64)
+
+        with pytest.raises(ValueError, match="reduced width"):
+            DWaveSamplerWrapper.reconstruct_full_matrix(
+                reduced, energy, defect_info, nodes,
+            )
+
+    def test_finalize_sample_accepts_shared_sampleset(self):
+        """End-to-end: the connection-less worker reconstructs a _SharedSampleSet.
+
+        This is the exact production object and call path that crashed —
+        ``DWaveMiner._finalize_sample`` must accept the positional
+        ``_SharedSampleSet`` view, not only a labeled ``dimod.SampleSet``.
+        """
+        from QPU.dwave_miner import DWaveMiner
+        from QPU.dwave_sampler import DefectInfo
+        from shared.base_miner import _SharedSampleSet
+
+        nodes = [0, 1, 2, 3, 4, 5]
+        defect_info = DefectInfo(fixed_spins={4: 1}, energy_offset=2.0, removed_edges={})
+        shared_ss = _SharedSampleSet(
+            np.array([[1, -1, 1, -1, 1]], dtype=np.int8),
+            np.array([-7.0], dtype=np.float64),
+        )
+
+        miner = DWaveMiner(miner_id="worker-orchestrator", connect=False)
+        assert miner.sampler is None  # the precondition that triggered the crash
+
+        full = miner._finalize_sample(shared_ss, defect_info, nodes)
+
+        assert full.record.sample.shape == (1, 6)
+        assert list(full.record.sample[0]) == [1, -1, 1, -1, 1, 1]
+        assert full.record.energy[0] == pytest.approx(-5.0)
