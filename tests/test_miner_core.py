@@ -334,6 +334,38 @@ def test_toml_dwave_throughput_overrides_round_trip(tmp_path):
     assert "annealing_time_us" not in cfg2
 
 
+def test_toml_dwave_budget_overrides_round_trip(tmp_path):
+    """``[dwave].min_block_budget`` and ``budget_cap`` flow into the spec cfg
+    so the QPU time config (reservoir buffer + pool cap) picks them up. Absent
+    keys do not appear, so miner_worker's ``cfg.get("min_block_budget", "90s")``
+    default drives the buffer."""
+    from shared.miner_config import load_backend_config
+    from shared.miner_core import _build_qpu_specs
+
+    p = tmp_path / "budget.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[dwave]\n'
+        'daily_budget = "15m"\n'
+        'min_block_budget = "20m"\n'
+        'budget_cap = "30m"\n'
+    )
+    backends = load_backend_config(p)
+    cfg = _build_qpu_specs("rig", backends)[0]["cfg"]
+    assert cfg["min_block_budget"] == "20m"
+    assert cfg["budget_cap"] == "30m"
+
+    p2 = tmp_path / "no_budget_overrides.toml"
+    p2.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[dwave]\ndaily_budget = "15m"\n'
+    )
+    backends2 = load_backend_config(p2)
+    cfg2 = _build_qpu_specs("rig", backends2)[0]["cfg"]
+    assert "min_block_budget" not in cfg2
+    assert "budget_cap" not in cfg2
+
+
 def test_toml_dwave_token_does_not_leak_to_descriptor(tmp_path):
     """Defense-in-depth regression: even though the dwave cfg now
     carries `token`, the descriptor pipeline's whitelist

@@ -545,6 +545,14 @@ def _build_qpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
                 cfg_block["num_reads"] = dev["num_reads"]
             if dev.get("annealing_time_us") is not None:
                 cfg_block["annealing_time_us"] = dev["annealing_time_us"]
+            # QPU-budget reservoir tuning (consumed by miner_worker into the
+            # QPUTimeConfig, then stripped before constructing DWaveMiner).
+            # Conditional so an absent key keeps miner_worker's "90s" /
+            # daily-budget defaults rather than threading a None through.
+            if dev.get("min_block_budget") is not None:
+                cfg_block["min_block_budget"] = dev["min_block_budget"]
+            if dev.get("budget_cap") is not None:
+                cfg_block["budget_cap"] = dev["budget_cap"]
             specs.append(
                 {
                     "id": f"{node_id}-QPU-{tag}-{i}",
