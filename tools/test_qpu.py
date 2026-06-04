@@ -312,17 +312,19 @@ def build_output_data(seeds, topology, num_reads_list, annealing_time_list,
     return data
 
 
-def run_streaming(qpu_miner, nonces_and_models, num_reads_list,
-                  annealing_time_list, interval_seconds, qpu_results,
-                  queue_depth, total_tests, test_counter, output_file,
-                  output_data_builder, solver_props=None,
-                  completed_keys=None):
-    """Run QPU tests with async streaming for maximum throughput.
+def _build_work_items(
+    nonces_and_models: List,
+    num_reads_list: List,
+    annealing_time_list: List,
+    interval_seconds: float,
+    solver_props: Optional[Dict],
+    completed_keys: Optional[Any],
+) -> List:
+    """Build the ordered work-item list, skipping over-limit and resumed combos.
 
-    Maintains up to queue_depth jobs in-flight simultaneously.
-    Saves results incrementally after each completed job.
+    Prints skip summaries to stdout and returns a list of
+    (seed, nonce, model, num_reads, annealing_time) tuples.
     """
-    # Build work queue, skipping combos that exceed QPU time limit or are resumed
     work_items = []
     skipped_combos = 0
     skipped_resume = 0
@@ -332,7 +334,9 @@ def run_streaming(qpu_miner, nonces_and_models, num_reads_list,
                 skipped_combos += 1
                 continue
             for seed, nonce, model in nonces_and_models:
-                if completed_keys and (seed, interval_seconds, num_reads, annealing_time) in completed_keys:
+                if completed_keys and (
+                    seed, interval_seconds, num_reads, annealing_time
+                ) in completed_keys:
                     skipped_resume += 1
                     continue
                 work_items.append((seed, nonce, model, num_reads, annealing_time))
@@ -343,6 +347,24 @@ def run_streaming(qpu_miner, nonces_and_models, num_reads_list,
               f"QPU time limit ({skipped_jobs} jobs)")
     if skipped_resume:
         print(f"  Skipped {skipped_resume} already-completed job(s) (resume)")
+
+    return work_items
+
+
+def run_streaming(qpu_miner, nonces_and_models, num_reads_list,
+                  annealing_time_list, interval_seconds, qpu_results,
+                  queue_depth, total_tests, test_counter, output_file,
+                  output_data_builder, solver_props=None,
+                  completed_keys=None):
+    """Run QPU tests with async streaming for maximum throughput.
+
+    Maintains up to queue_depth jobs in-flight simultaneously.
+    Saves results incrementally after each completed job.
+    """
+    work_items = _build_work_items(
+        nonces_and_models, num_reads_list, annealing_time_list,
+        interval_seconds, solver_props, completed_keys,
+    )
 
     topology_label = qpu_miner.sampler.job_label
     pending: Dict[Any, PendingJob] = {}
@@ -371,15 +393,19 @@ def run_streaming(qpu_miner, nonces_and_models, num_reads_list,
             test_index=test_counter[0] + idx + 1
         )
 
+    def fill_queue() -> None:
+        nonlocal work_index
+        while len(pending) < queue_depth and work_index < total_work:
+            try:
+                job = submit_job(work_index)
+                pending[id(job.future)] = job
+                work_index += 1
+            except Exception as e:
+                print(f"\n  ⚠️  Submit error (work_index={work_index}): {e}")
+                work_index += 1
+
     # Fill initial queue
-    while len(pending) < queue_depth and work_index < total_work:
-        try:
-            job = submit_job(work_index)
-            pending[id(job.future)] = job
-            work_index += 1
-        except Exception as e:
-            print(f"\n  ⚠️  Submit error (work_index={work_index}): {e}")
-            work_index += 1
+    fill_queue()
 
     # Process completed jobs and refill
     while pending:
@@ -429,14 +455,7 @@ def run_streaming(qpu_miner, nonces_and_models, num_reads_list,
                   flush=True)
 
         # Refill queue
-        while len(pending) < queue_depth and work_index < total_work:
-            try:
-                job = submit_job(work_index)
-                pending[id(job.future)] = job
-                work_index += 1
-            except Exception as e:
-                print(f"\n  ⚠️  Submit error (work_index={work_index}): {e}")
-                work_index += 1
+        fill_queue()
 
     test_counter[0] += total_work
 
@@ -446,26 +465,10 @@ def run_sync(qpu_miner, nonces_and_models, num_reads_list,
              total_tests, test_counter, output_file, output_data_builder,
              solver_props=None, completed_keys=None):
     """Run QPU tests synchronously with sleep intervals between queries."""
-    work_items = []
-    skipped_combos = 0
-    skipped_resume = 0
-    for num_reads in num_reads_list:
-        for annealing_time in annealing_time_list:
-            if exceeds_qpu_time_limit(num_reads, annealing_time, solver_props):
-                skipped_combos += 1
-                continue
-            for seed, nonce, model in nonces_and_models:
-                if completed_keys and (seed, interval_seconds, num_reads, annealing_time) in completed_keys:
-                    skipped_resume += 1
-                    continue
-                work_items.append((seed, nonce, model, num_reads, annealing_time))
-
-    if skipped_combos:
-        skipped_jobs = skipped_combos * len(nonces_and_models)
-        print(f"  Skipped {skipped_combos} param combo(s) exceeding "
-              f"QPU time limit ({skipped_jobs} jobs)")
-    if skipped_resume:
-        print(f"  Skipped {skipped_resume} already-completed job(s) (resume)")
+    work_items = _build_work_items(
+        nonces_and_models, num_reads_list, annealing_time_list,
+        interval_seconds, solver_props, completed_keys,
+    )
 
     for i, (seed, nonce, model, num_reads, annealing_time) in enumerate(work_items):
         test_counter[0] += 1
