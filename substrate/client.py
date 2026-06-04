@@ -230,9 +230,8 @@ class SubstrateClient:
         else:
             url_list = [url]  # type: ignore[list-item]
         self._urls: tuple[str, ...] = tuple(url_list)
-        # `url` retained for back-compat reads — points at whichever URL is
-        # currently connected (or the first one before connect()).
-        self.url: str = self._urls[0]
+        # Points at whichever URL is currently connected (or the first one
+        # before connect()).
         self.current_url: str = self._urls[0]
         # Public read-only view of the validator rotation. Controllers
         # propagate this to their separate subscription clients so both
@@ -309,7 +308,6 @@ class SubstrateClient:
                     exc,
                 )
                 continue
-            self.url = candidate
             self.current_url = candidate
             self._current_index = idx
             logger.info("substrate client connected: url=%s", candidate)
