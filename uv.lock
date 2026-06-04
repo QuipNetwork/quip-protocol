@@ -12,7 +12,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-05-17T18:33:39.771671Z"
+exclude-newer = "2026-05-28T04:41:58.96399Z"
 exclude-newer-span = "P1W"
 
 [[package]]
@@ -3822,7 +3822,7 @@ wheels = [
 
 [[package]]
 name = "quip-protocol"
-version = "0.2.0.dev0"
+version = "0.2.1rc1"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },

@@ -12,7 +12,9 @@ init_logger = logging.getLogger(__name__)
 
 from QPU.dwave_sampler import DWaveSamplerWrapper
 from QPU.qpu_time_manager import QPUTimeManager, QPUTimeConfig
-from shared.base_miner import BaseMiner, MidstreamBudget, _energy_to_milli
+from shared.base_miner import (
+    BaseMiner, MidstreamBudget, _SharedSampleSet, _energy_to_milli,
+)
 from shared.miner_types import BlockRequirements
 from shared.stream_context import StreamContext
 from dwave_topologies import DEFAULT_TOPOLOGY
@@ -476,26 +478,37 @@ class DWaveMiner(BaseMiner):
             "topology": getattr(self, "topology", None),
         }
 
-    def _finalize_sample(self, sampleset: Any, defect_info: Any) -> Any:
-        """Reconstruct a reduced D-Wave sampleset to full topology (survivor-only).
+    def _finalize_sample(
+        self, sampleset: Any, defect_info: Any, nodes: List[int],
+    ) -> Any:
+        """Reconstruct a reduced D-Wave sample to full topology (survivor-only).
 
         Called by ``BaseMiner._run_substrate_ratchet`` when a promising sample
         has fewer variables than the topology — i.e. the QPU driver stripped
         offline qubits before writing to the ring.  ``defect_info`` carries the
         fixed-spin assignments and energy offset needed for reconstruction.
 
+        The driver discards dimod's variable labels (it writes a raw ``int8``
+        matrix to shared memory), so the input here is a positional
+        ``_SharedSampleSet`` view — NOT a labeled ``dimod.SampleSet``.
+        Reconstruct positionally against ``nodes`` and return a
+        ``_SharedSampleSet`` so the downstream ``evaluate_sampleset`` (which
+        reads ``record.sample`` positionally) sees a full-width matrix.
+
         Args:
-            sampleset: The reduced sampleset from the QPU driver.
+            sampleset: The reduced ``_SharedSampleSet`` from the QPU driver.
             defect_info: :class:`~QPU.dwave_sampler.DefectInfo` with
                 ``fixed_spins``, ``energy_offset``, and ``removed_edges``.
+            nodes: Full topology node order; the column order of the output.
 
         Returns:
-            Full-topology sampleset with all variables present and energies
-            corrected.
+            Full-topology ``_SharedSampleSet`` with clamped spins reinserted
+            and energies corrected.
         """
-        # Reconstruction is a pure transform of (sampleset, defect_info) and
-        # runs in the connection-less worker, where self.sampler is None. Call
-        # the staticmethod on the class so it does not require a live sampler.
-        return DWaveSamplerWrapper.reconstruct_full_sampleset(
-            sampleset, defect_info,
+        # Reconstruction is a pure transform of (sample matrix, defect_info,
+        # nodes) and runs in the connection-less worker, where self.sampler is
+        # None. Call the staticmethod on the class so it needs no live sampler.
+        full_sample, full_energy = DWaveSamplerWrapper.reconstruct_full_matrix(
+            sampleset.record.sample, sampleset.record.energy, defect_info, nodes,
         )
+        return _SharedSampleSet(full_sample, full_energy)
