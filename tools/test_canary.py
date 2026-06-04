@@ -51,6 +51,15 @@ from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies import load_topology
 
 
+_DURATION_SUFFIX_MULTIPLIERS = {
+    's': 1 / 60.0,
+    'm': 1.0,
+    'h': 60.0,
+    'd': 1440.0,
+    'w': 10080.0,
+}
+
+
 def parse_duration(duration_str: str) -> float:
     """
     Parse duration string to minutes.
@@ -64,20 +73,12 @@ def parse_duration(duration_str: str) -> float:
         "1w" -> 10080.0
     """
     duration_str = duration_str.strip().lower()
-
-    if duration_str.endswith('s'):
-        return int(duration_str[:-1]) / 60.0
-    elif duration_str.endswith('m'):
-        return float(duration_str[:-1])
-    elif duration_str.endswith('h'):
-        return int(duration_str[:-1]) * 60.0
-    elif duration_str.endswith('d'):
-        return int(duration_str[:-1]) * 1440.0
-    elif duration_str.endswith('w'):
-        return int(duration_str[:-1]) * 10080.0
-    else:
-        # Try parsing as raw minutes
-        return float(duration_str)
+    suffix = duration_str[-1]
+    multiplier = _DURATION_SUFFIX_MULTIPLIERS.get(suffix)
+    if multiplier is not None:
+        return float(duration_str[:-1]) * multiplier
+    # Try parsing as raw minutes
+    return float(duration_str)
 
 
 def determine_canary_params(num_sweeps: int = 4, num_reads: int = 10) -> Dict[str, int]:
@@ -755,32 +756,50 @@ def run_canary_test(
                 'min': min_diff,
                 'max': max_diff,
                 'coefficient_of_variation': diff_cv,
-                'interpretation': (
-                    'roughly constant offset' if diff_cv < 0.1 else
-                    'moderately variable offset' if diff_cv < 0.3 else
-                    'highly variable (non-linear)'
-                )
+                'interpretation': _classify_offset(diff_cv),
             },
             'interpretation': {
-                'correlation_strength': (
-                    'very strong positive' if correlation > 0.9 else
-                    'strong positive' if correlation > 0.7 else
-                    'moderate positive' if correlation > 0.5 else
-                    'weak positive' if correlation > 0.3 else
-                    'weak or no correlation'
-                ),
-                'relationship_type': (
-                    'nearly perfect linear (constant offset)' if r_squared > 0.95 and diff_cv < 0.1 else
-                    'strong linear relationship' if r_squared > 0.8 else
-                    'moderate linear relationship' if r_squared > 0.5 else
-                    'weak linear relationship (non-linear)'
-                )
+                'correlation_strength': _classify_correlation(correlation),
+                'relationship_type': _classify_relationship(r_squared, diff_cv),
             }
         }
     else:
         stats['analysis']['correlation'] = None
 
     return stats
+
+
+def _classify_offset(diff_cv: float) -> str:
+    """Classify energy-difference coefficient of variation as an offset description."""
+    if diff_cv < 0.1:
+        return 'roughly constant offset'
+    if diff_cv < 0.3:
+        return 'moderately variable offset'
+    return 'highly variable (non-linear)'
+
+
+def _classify_correlation(correlation: float) -> str:
+    """Classify Pearson correlation strength."""
+    if correlation > 0.9:
+        return 'very strong positive'
+    if correlation > 0.7:
+        return 'strong positive'
+    if correlation > 0.5:
+        return 'moderate positive'
+    if correlation > 0.3:
+        return 'weak positive'
+    return 'weak or no correlation'
+
+
+def _classify_relationship(r_squared: float, diff_cv: float) -> str:
+    """Classify regression relationship type."""
+    if r_squared > 0.95 and diff_cv < 0.1:
+        return 'nearly perfect linear (constant offset)'
+    if r_squared > 0.8:
+        return 'strong linear relationship'
+    if r_squared > 0.5:
+        return 'moderate linear relationship'
+    return 'weak linear relationship (non-linear)'
 
 
 def main():
