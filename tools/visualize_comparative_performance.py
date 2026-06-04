@@ -103,14 +103,6 @@ def get_normalization_units(device_counts: Dict[str, int]) -> Dict[str, float]:
     return units
 
 
-def get_normalization_single_unit(device_counts: Dict[str, int]) -> Dict[str, int]:
-    """
-    Get normalization units for single device comparison.
-    All types normalized per device/worker for fair comparison.
-    """
-    return device_counts.copy()
-
-
 def plot_blocks_vs_time(ax, df: pd.DataFrame):
     """Plot cumulative blocks mined vs wall-clock time, normalized per single unit."""
     ax.set_title('Blocks Mined Over Time in Isolation (Per Single Unit)', fontsize=14, fontweight='bold')
@@ -120,7 +112,7 @@ def plot_blocks_vs_time(ax, df: pd.DataFrame):
 
     # Get device counts for normalization (per single worker/GPU/QPU)
     device_counts = get_device_counts(df)
-    norm_units = get_normalization_single_unit(device_counts)
+    norm_units = device_counts
 
     # Get successful blocks only - first valid block per attempt
     # (same machine, process, start_time = same mining attempt/SA run)
@@ -132,9 +124,6 @@ def plot_blocks_vs_time(ax, df: pd.DataFrame):
     for miner_type, miner_df in successful_df.groupby('miner_type'):
         display_type = normalize_miner_type(miner_type)
         miner_df = miner_df.sort_values('end_time')
-
-        if len(miner_df) == 0:
-            continue
 
         # Get normalization factor
         units = norm_units.get(display_type, 1)
@@ -149,20 +138,12 @@ def plot_blocks_vs_time(ax, df: pd.DataFrame):
         times_minutes = np.concatenate([[0], times_minutes])
         cumulative_blocks = np.concatenate([[0], cumulative_blocks])
 
-        # Create label
-        if display_type == 'CPU':
-            display_name = "CPU"
-        elif display_type == 'GPU':
-            display_name = "GPU"
-        else:
-            display_name = "QPU"
-
         ax.plot(
             times_minutes,
             cumulative_blocks,
             marker='o',
             markersize=2,
-            label=f"{display_name} ({cumulative_blocks[-1]:.2f} blocks)",
+            label=f"{display_type} ({cumulative_blocks[-1]:.2f} blocks)",
             color=MINER_COLORS.get(display_type, 'gray'),
             linewidth=2,
             alpha=0.8
@@ -190,9 +171,6 @@ def plot_mining_efficiency(ax, df: pd.DataFrame):
         miner_df = groups[miner_type]
         display_type = normalize_miner_type(miner_type)
 
-        if len(miner_df) == 0:
-            continue
-
         # Get normalization factor
         units = norm_units.get(display_type, 1)
         if units <= 0:
@@ -208,14 +186,7 @@ def plot_mining_efficiency(ax, df: pd.DataFrame):
         else:
             nonces_per_min = 0
 
-        # Create label with unit info
-        if display_type == 'CPU':
-            display_name = "CPU (32c)"
-        elif display_type == 'GPU':
-            display_name = "GPU"
-        else:
-            display_name = "QPU"
-
+        display_name = 'CPU (32c)' if display_type == 'CPU' else display_type
         miner_names.append(display_name)
         rates.append(nonces_per_min)
         rate_colors.append(MINER_COLORS.get(display_type, 'gray'))
@@ -273,13 +244,7 @@ def plot_energy_distributions(ax, df: pd.DataFrame):
             units = 1
 
         if len(energies) > 0:
-            # Create label with unit info
-            if display_type == 'CPU':
-                display_name = "CPU (32c)"
-            elif display_type == 'GPU':
-                display_name = "GPU"
-            else:
-                display_name = "QPU"
+            display_name = 'CPU (32c)' if display_type == 'CPU' else display_type
 
             # Use weights to normalize the histogram
             weights = np.ones(len(energies)) / units
@@ -337,13 +302,7 @@ def plot_time_to_solution(ax, df: pd.DataFrame):
             # Clip TTS values at max for histogram (values > max go in last bin)
             tts_clipped = np.clip(tts, 0, max_tts)
 
-            # Create label with unit info
-            if display_type == 'CPU':
-                display_name = "CPU (32c)"
-            elif display_type == 'GPU':
-                display_name = "GPU"
-            else:
-                display_name = "QPU"
+            display_name = 'CPU (32c)' if display_type == 'CPU' else display_type
 
             # Use weights to normalize the histogram
             weights = np.ones(len(tts_clipped)) / units
@@ -488,13 +447,7 @@ def plot_speedup_vs_cpu(ax, df: pd.DataFrame):
         if miner_rate > 0:
             speedup = miner_rate / cpu_rate
 
-            # Create label with unit info
-            if display_type == 'GPU':
-                display_name = "GPU"
-            else:
-                display_name = "QPU"
-
-            miner_names.append(display_name)
+            miner_names.append(display_type)
             speedups.append(speedup)
             speedup_colors.append(MINER_COLORS.get(display_type, 'gray'))
 
