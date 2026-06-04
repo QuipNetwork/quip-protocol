@@ -28,10 +28,7 @@ def normalize_miner_type(miner_type: str) -> str:
     return miner_type.upper()
 
 
-def get_device_counts(
-    df: pd.DataFrame,
-    miner_groups: Optional[Dict[str, pd.DataFrame]] = None,
-) -> Dict[str, int]:
+def get_device_counts(df: pd.DataFrame) -> Dict[str, int]:
     """Count actual devices per miner type from the data.
 
     For GPU/CUDA: count unique (miner_machine, process) pairs = number of GPUs.
@@ -40,18 +37,13 @@ def get_device_counts(
 
     Args:
         df: DataFrame with mining data.
-        miner_groups: Optional pre-grouped dict for efficiency.  When provided
-            the ``df`` argument is not used for grouping.
 
     Returns:
         Dict mapping display type (CPU/GPU/QPU) to device count.
     """
     counts: Dict[str, int] = {}
 
-    if miner_groups is None:
-        miner_groups = {mt: g for mt, g in df.groupby('miner_type')}
-
-    for miner_type, miner_df in miner_groups.items():
+    for miner_type, miner_df in df.groupby('miner_type'):
         display_type = normalize_miner_type(miner_type)
 
         if display_type == 'QPU':
