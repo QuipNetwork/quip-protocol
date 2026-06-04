@@ -141,6 +141,17 @@ def generate_nonce(seed: int, topology) -> Tuple[str, Dict]:
     return nonce, {'h': h, 'J': J, 'salt': salt.hex()}
 
 
+def _energy_stats(energies) -> Dict:
+    """Return energy summary dict for a sampleset record."""
+    return {
+        'energy_min': float(np.min(energies)),
+        'energy_max': float(np.max(energies)),
+        'energy_mean': float(np.mean(energies)),
+        'energy_std': float(np.std(energies)),
+        'all_energies': [float(e) for e in energies],
+    }
+
+
 def run_cpu_baseline(cpu_miner, h, J, num_sweeps: int, num_reads: int) -> Dict:
     """Run CPU baseline test."""
     start_time = time.time()
@@ -151,35 +162,20 @@ def run_cpu_baseline(cpu_miner, h, J, num_sweeps: int, num_reads: int) -> Dict:
     )
     elapsed = time.time() - start_time
 
-    energies = sampleset.record.energy
-
-    return {
-        'energy_min': float(np.min(energies)),
-        'energy_max': float(np.max(energies)),
-        'energy_mean': float(np.mean(energies)),
-        'energy_std': float(np.std(energies)),
-        'time': elapsed,
-        'num_sweeps': num_sweeps,
-        'num_reads': num_reads,
-        'all_energies': [float(e) for e in energies]
-    }
+    result = _energy_stats(sampleset.record.energy)
+    result['time'] = elapsed
+    result['num_sweeps'] = num_sweeps
+    result['num_reads'] = num_reads
+    return result
 
 
 def extract_result(sampleset, num_reads: int, annealing_time: float,
                    elapsed: float) -> Dict:
     """Extract result dict from a resolved sampleset."""
-    energies = sampleset.record.energy
-
-    result = {
-        'energy_min': float(np.min(energies)),
-        'energy_max': float(np.max(energies)),
-        'energy_mean': float(np.mean(energies)),
-        'energy_std': float(np.std(energies)),
-        'time': elapsed,
-        'num_reads': num_reads,
-        'annealing_time': annealing_time,
-        'all_energies': [float(e) for e in energies]
-    }
+    result = _energy_stats(sampleset.record.energy)
+    result['time'] = elapsed
+    result['num_reads'] = num_reads
+    result['annealing_time'] = annealing_time
 
     if hasattr(sampleset, 'info') and sampleset.info:
         timing = sampleset.info.get('timing', {})
@@ -618,9 +614,6 @@ def main():
 
     queue_depth = args.queue_depth
 
-    # Extract solver properties for dynamic time limits
-    solver_props = None
-
     print("🔬 QPU Parameter Testing Tool")
     print("=" * 60)
     if args.solver:
@@ -719,10 +712,9 @@ def main():
         if exceeds_qpu_time_limit(nr, at, solver_props)
     )
     valid_combos = len(num_reads_list) * len(annealing_time_list) - skipped_combos
-    total_tests_full = valid_combos * len(nonces_and_models) * len(interval_list)
-    remaining_tests = total_tests_full - len(completed_keys)
-    total_tests = total_tests_full
-    print(f"Running {total_tests_full} QPU tests...")
+    total_tests = valid_combos * len(nonces_and_models) * len(interval_list)
+    remaining_tests = total_tests - len(completed_keys)
+    print(f"Running {total_tests} QPU tests...")
     print(f"  {len(num_reads_list)} num_reads x {len(annealing_time_list)} annealing_time x {len(interval_list)} interval x {len(seeds)} seed(s)")
     if skipped_combos:
         skipped_jobs = skipped_combos * len(nonces_and_models) * len(interval_list)
