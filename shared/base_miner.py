@@ -1579,6 +1579,25 @@ class BaseMiner(ABC):
             return state.top_k[-1].result.energy
         return float("inf")
 
+    def _reconstruct_or_skip(
+        self, sampleset: Any, defect_info: Any, state: _MiningLoopState,
+    ) -> Optional[Any]:
+        """Reconstruct a reduced sampleset to full topology, or signal a skip.
+
+        ``evaluate_sampleset`` indexes topology positions, so a sample narrower
+        than the topology must be reconstructed first. A full-width sample is
+        returned unchanged. A reduced sample carrying ``defect_info`` is
+        reconstructed via ``_finalize_sample`` and returned. A reduced sample
+        without ``defect_info`` is unexpectedly narrow — return ``None`` so the
+        caller can translate the skip into its own control outcome and emit its
+        own log line.
+        """
+        if sampleset.record.sample.shape[1] == len(state.nodes):
+            return sampleset
+        if defect_info is not None:
+            return self._finalize_sample(sampleset, defect_info)
+        return None
+
     def _stash_pre_check(
         self,
         state: _MiningLoopState,
@@ -1681,10 +1700,11 @@ class BaseMiner(ABC):
         # must be reconstructed before evaluate_sampleset indexes topology
         # positions. With defect_info, reconstruct here; without it, the
         # sample is unexpectedly narrow — skip evaluation and log a warning.
-        if improves_stash and sampleset.record.sample.shape[1] != len(state.nodes):
-            if defect_info is not None:
-                sampleset = self._finalize_sample(sampleset, defect_info)
-            else:
+        if improves_stash:
+            reconstructed = self._reconstruct_or_skip(
+                sampleset, defect_info, state,
+            )
+            if reconstructed is None:
                 self.logger.info(
                     "[%s] Mining attempt - Energy: %.0f (under-reconstructed: "
                     "sample width %d != topology %d; skipping evaluation)",
@@ -1692,6 +1712,8 @@ class BaseMiner(ABC):
                     sampleset.record.sample.shape[1], len(state.nodes),
                 )
                 improves_stash = False
+            else:
+                sampleset = reconstructed
 
         result = None
         stored_replaced = False
@@ -1832,17 +1854,16 @@ class BaseMiner(ABC):
         before evaluation.  Metal/CUDA mempool samples are full-width with
         ``defect_info=None`` and are unaffected.
         """
-        if sampleset.record.sample.shape[1] != len(state.nodes):
-            if defect_info is not None:
-                sampleset = self._finalize_sample(sampleset, defect_info)
-            else:
-                self.logger.info(
-                    "[%s] mempool attempt skipped (under-reconstructed: "
-                    "width %d != topology %d)",
-                    self.miner_id, sampleset.record.sample.shape[1],
-                    len(state.nodes),
-                )
-                return None
+        reconstructed = self._reconstruct_or_skip(sampleset, defect_info, state)
+        if reconstructed is None:
+            self.logger.info(
+                "[%s] mempool attempt skipped (under-reconstructed: "
+                "width %d != topology %d)",
+                self.miner_id, sampleset.record.sample.shape[1],
+                len(state.nodes),
+            )
+            return None
+        sampleset = reconstructed
 
         result = self.evaluate_sampleset(
             sampleset, state.requirements, state.nodes, state.edges,
