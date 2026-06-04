@@ -86,14 +86,6 @@ def _add_difficulty_annotations(
             _add_difficulty_annotations._import_warned = True
 
 
-def get_miner_groups(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """Pre-group DataFrame by miner_type for efficiency.
-
-    Returns a dict mapping raw miner_type strings to their DataFrames.
-    """
-    return {miner_type: group for miner_type, group in df.groupby('miner_type')}
-
-
 def calculate_threshold_probabilities(
     energies: np.ndarray,
     thresholds: List[float]
@@ -282,7 +274,7 @@ def plot_proportion_by_threshold(
     print(f"Saved proportion by threshold chart to {output_file}")
 
 
-def get_miner_tts_stats(df: pd.DataFrame, miner_groups: Optional[Dict[str, pd.DataFrame]] = None) -> Dict[str, Dict[str, Any]]:
+def get_miner_tts_stats(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
     """
     Calculate TTS (time-to-solution) statistics for each miner type.
 
@@ -300,15 +292,11 @@ def get_miner_tts_stats(df: pd.DataFrame, miner_groups: Optional[Dict[str, pd.Da
 
     Args:
         df: DataFrame with mining data
-        miner_groups: Optional pre-grouped dict from get_miner_groups() for efficiency
     """
-    if miner_groups is None:
-        miner_groups = get_miner_groups(df)
-
-    device_counts = get_device_counts(df, miner_groups)
+    device_counts = get_device_counts(df)
     stats = {}
 
-    for miner_type, miner_df in miner_groups.items():
+    for miner_type, miner_df in df.groupby('miner_type'):
         display_type = normalize_miner_type(miner_type)
         energies = miner_df['energy'].values
 
@@ -351,7 +339,6 @@ def get_miner_tts_stats(df: pd.DataFrame, miner_groups: Optional[Dict[str, pd.Da
 
         stats[display_type] = {
             'energies': energies,
-            'num_attempts': len(energies),
             'observed_tts': observed_tts,
             'observed_tts_std': observed_tts_std,
             'tts_samples': tts_samples,
@@ -676,7 +663,6 @@ def plot_win_rate_by_threshold_projection(
     # Plot styles for projections
     style_map = {
         1024: {'linestyle': '--', 'marker': 's', 'linewidth': 2.5, 'alpha': 0.7},        # 2^10
-        65536: {'linestyle': ':', 'marker': '^', 'linewidth': 2.5, 'alpha': 0.7},        # 2^16
         1048576: {'linestyle': '--', 'marker': 'D', 'linewidth': 2.5, 'alpha': 0.7},     # 2^20
         1099511627776: {'linestyle': ':', 'marker': 'X', 'linewidth': 2.5, 'alpha': 0.7} # 2^40
     }
