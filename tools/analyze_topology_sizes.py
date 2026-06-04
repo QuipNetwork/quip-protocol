@@ -26,40 +26,13 @@ from dwave.samplers import SimulatedAnnealingSampler
 
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce
 from shared.energy_utils import expected_solution_energy
+from QPU.qpu_time_manager import parse_duration
 
 
 # Advantage2-System1.6 capacity (target QPU)
 ADVANTAGE2_NODES = 4593
 ADVANTAGE2_EDGES = 41796
 
-
-def parse_timeout(timeout_str: str) -> int:
-    """
-    Parse timeout string to seconds.
-
-    Supports: 30s, 5m, 2h, 1d, 1w
-    Examples:
-        "30s" -> 30
-        "5m" -> 300
-        "2h" -> 7200
-        "1d" -> 86400
-        "1w" -> 604800
-    """
-    timeout_str = timeout_str.strip().lower()
-
-    if timeout_str.endswith('s'):
-        return int(timeout_str[:-1])
-    elif timeout_str.endswith('m'):
-        return int(timeout_str[:-1]) * 60
-    elif timeout_str.endswith('h'):
-        return int(timeout_str[:-1]) * 3600
-    elif timeout_str.endswith('d'):
-        return int(timeout_str[:-1]) * 86400
-    elif timeout_str.endswith('w'):
-        return int(timeout_str[:-1]) * 604800
-    else:
-        # Try parsing as raw seconds
-        return int(timeout_str)
 
 
 def analyze_zephyr_config(m: int, t: int) -> Dict[str, Any]:
@@ -815,8 +788,8 @@ def main():
         embedding_result = {'embedding_tested': False}
         if args.precompute_embedding:
             # Parse timeouts and precompute embedding
-            timeout_seconds = parse_timeout(args.embedding_timeout)
-            try_timeout_seconds = parse_timeout(args.try_timeout)
+            timeout_seconds = int(parse_duration(args.embedding_timeout))
+            try_timeout_seconds = int(parse_duration(args.try_timeout))
             precompute_embedding(
                 config_info,
                 target_solver_name="Advantage2_system1",
