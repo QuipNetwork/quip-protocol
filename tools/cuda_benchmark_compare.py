@@ -43,15 +43,12 @@ import numpy as np
 from dwave_topologies import DEFAULT_TOPOLOGY
 from GPU.cuda_gibbs_sa import CudaGibbsSampler
 from GPU.cuda_sa import CudaSASampler
-from shared.beta_schedule import _default_ising_beta_range
 from shared.energy_utils import energy_to_difficulty
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce
 from tools.cuda_profile_regions import (
     _load_manifest,
     generate_flamegraph_html,
     get_gpu_info,
-    get_topology_stats,
-    print_profile,
 )
 
 

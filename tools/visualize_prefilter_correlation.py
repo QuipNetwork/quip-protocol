@@ -25,7 +25,6 @@ sys.path.insert(
 
 from CPU.sa_miner import SimulatedAnnealingMiner
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
-from dwave_topologies import DEFAULT_TOPOLOGY
 from shared.energy_utils import energy_to_difficulty
 from shared.nonce_prefilter import IsingTopologyCache
 from shared.quantum_proof_of_work import (

@@ -43,7 +43,7 @@ sys.stderr.reconfigure(line_buffering=True)
 
 import numpy as np
 
-from shared.block import create_genesis_block, BlockRequirements
+from shared.block import create_genesis_block
 import hashlib
 
 from shared.quantum_proof_of_work import (

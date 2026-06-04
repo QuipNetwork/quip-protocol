@@ -19,7 +19,7 @@ Usage:
 import argparse
 import sys
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
 sys.path.append(str(Path(__file__).parent.parent))
 

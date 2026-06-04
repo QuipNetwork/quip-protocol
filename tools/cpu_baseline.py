@@ -39,7 +39,6 @@ from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies.json_loader import load_topology
-from dwave_topologies.embedded_topology import create_embedded_topology
 from dwave_topologies.embedding_loader import load_embedding
 from tools.baseline_utils import (
     build_baseline_argparser,

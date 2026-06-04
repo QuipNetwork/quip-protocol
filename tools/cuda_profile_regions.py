@@ -25,7 +25,6 @@ import re
 from pathlib import Path
 
 import cupy as cp
-import numpy as np
 
 
 # Color by region type

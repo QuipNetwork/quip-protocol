@@ -16,12 +16,11 @@ Usage:
 import argparse
 import gzip
 import json
-import os
 import re
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
