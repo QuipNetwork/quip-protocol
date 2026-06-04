@@ -19,7 +19,7 @@ try:
 except ImportError:  # Apple Metal framework is macOS-only; absent on Linux/CI.
     Metal = None  # type: ignore[assignment]
 
-from shared.beta_schedule import _default_ising_beta_range
+from GPU.gpu_csr_beta import build_csr_single, compute_beta_schedule_core
 
 
 def _create_buffer(device, data: np.ndarray, label: str = ""):
@@ -100,39 +100,11 @@ def compute_beta_schedule(
     Returns:
         Tuple of (beta_schedule array, beta_range tuple)
     """
-    if beta_schedule_type == "custom":
-        if beta_schedule is None:
-            raise ValueError("'beta_schedule' must be provided for beta_schedule_type = 'custom'")
-        beta_schedule = np.array(beta_schedule, dtype=np.float32)
-        num_betas = len(beta_schedule)
-        if num_sweeps != num_betas * num_sweeps_per_beta:
-            raise ValueError(f"num_sweeps ({num_sweeps}) must equal len(beta_schedule) * num_sweeps_per_beta")
-        # For custom schedule, beta_range is informational only
-        if beta_range is None:
-            beta_range = (float(beta_schedule[0]), float(beta_schedule[-1]))
-    else:
-        num_betas, rem = divmod(num_sweeps, num_sweeps_per_beta)
-        if rem > 0:
-            raise ValueError("'num_sweeps' must be divisible by 'num_sweeps_per_beta'")
-
-        if beta_range is None:
-            beta_range = _default_ising_beta_range(h, J)
-        elif len(beta_range) != 2 or min(beta_range) < 0:
-            raise ValueError("'beta_range' should be a 2-tuple of positive numbers")
-
-        if num_betas == 1:
-            beta_schedule = np.array([beta_range[-1]], dtype=np.float32)
-        else:
-            if beta_schedule_type == "linear":
-                beta_schedule = np.linspace(beta_range[0], beta_range[1], num=num_betas, dtype=np.float32)
-            elif beta_schedule_type == "geometric":
-                if min(beta_range) <= 0:
-                    raise ValueError("'beta_range' must contain non-zero values for geometric schedule")
-                beta_schedule = np.geomspace(beta_range[0], beta_range[1], num=num_betas, dtype=np.float32)
-            else:
-                raise ValueError(f"Beta schedule type {beta_schedule_type} not implemented")
-
-    return beta_schedule, beta_range
+    return compute_beta_schedule_core(
+        h, J, num_sweeps, num_sweeps_per_beta, beta_range,
+        beta_schedule_type, beta_schedule,
+        custom_fills_beta_range=True,
+    )
 
 
 def build_csr_from_ising(
@@ -156,53 +128,7 @@ def build_csr_from_ising(
         - node_to_idx: Mapping from node IDs to dense indices
         - N: Number of nodes
     """
-    # Get all nodes for this problem
-    all_nodes = set(h.keys()) | set(n for edge in J.keys() for n in edge)
-    N = len(all_nodes)
-    node_list = sorted(all_nodes)
-    node_to_idx = {node: idx for idx, node in enumerate(node_list)}
-
-    # Build CSR representation
-    csr_row_ptr = np.zeros(N + 1, dtype=np.int32)
-    csr_col_ind = []
-    csr_J_vals = []
-
-    # Extract h values in node order
-    h_dtype = np.float32 if use_float else np.int8
-    h_vals_array = np.zeros(N, dtype=h_dtype)
-    for node, h_val in h.items():
-        if node in node_to_idx:
-            h_vals_array[node_to_idx[node]] = float(h_val) if use_float else int(h_val)
-
-    # Count degrees
-    degree = np.zeros(N, dtype=np.int32)
-    for (i, j) in J.keys():
-        if i in node_to_idx and j in node_to_idx:
-            degree[node_to_idx[i]] += 1
-            degree[node_to_idx[j]] += 1
-
-    # Build CSR
-    csr_row_ptr[1:] = np.cumsum(degree)
-
-    adjacency = [[] for _ in range(N)]
-    for (i, j), Jij in J.items():
-        if i in node_to_idx and j in node_to_idx:
-            idx_i = node_to_idx[i]
-            idx_j = node_to_idx[j]
-            adjacency[idx_i].append((idx_j, Jij))
-            adjacency[idx_j].append((idx_i, Jij))
-
-    for i in range(N):
-        adjacency[i].sort()  # Ensure deterministic ordering
-        for j, Jij in adjacency[i]:
-            csr_col_ind.append(j)
-            csr_J_vals.append(float(Jij) if use_float else int(Jij))
-
-    csr_col_ind = np.array(csr_col_ind, dtype=np.int32)
-    j_dtype = np.float32 if use_float else np.int8
-    csr_J_vals = np.array(csr_J_vals, dtype=j_dtype)
-
-    return csr_row_ptr, csr_col_ind, csr_J_vals, h_vals_array, node_to_idx, N
+    return build_csr_single(h, J, use_float=use_float)
 
 
 def unpack_metal_results(
@@ -230,14 +156,11 @@ def unpack_metal_results(
     Returns:
         dimod.SampleSet with unpacked samples
     """
-    # Unpack bit-packed samples
-    samples_data = np.zeros((num_reads, N), dtype=np.int8)
-    for read_idx in range(num_reads):
-        for var in range(N):
-            byte_idx = var >> 3  # var / 8
-            bit_idx = var & 7    # var % 8
-            bit = (packed_data[read_idx, byte_idx] >> bit_idx) & 1
-            samples_data[read_idx, var] = -1 if bit else 1
+    # Unpack bit-packed samples (kernel stores LSB-first)
+    bits = np.unpackbits(
+        packed_data.view(np.uint8), axis=1, bitorder='little',
+    )[:, :N]
+    samples_data = np.where(bits, np.int8(-1), np.int8(1))
 
     # Build SampleSet using node_to_idx mapping
     samples_dict = []
