@@ -1593,7 +1593,7 @@ class BaseMiner(ABC):
         if sampleset.record.sample.shape[1] == len(state.nodes):
             return sampleset
         if defect_info is not None:
-            return self._finalize_sample(sampleset, defect_info)
+            return self._finalize_sample(sampleset, defect_info, state.nodes)
         return None
 
     def _stash_pre_check(
@@ -2019,18 +2019,21 @@ class BaseMiner(ABC):
     # Hook methods (override in subclasses as needed)
     # ------------------------------------------------------------------
 
-    def _finalize_sample(self, sampleset: Any, defect_info: Any) -> Any:
+    def _finalize_sample(
+        self, sampleset: Any, defect_info: Any, nodes: List[int],
+    ) -> Any:
         """Reconstruct a reduced sampleset to full topology (survivor-only).
 
         Called in ``_run_substrate_ratchet`` only when a sample passes the
         energy pre-check but its width is narrower than the topology (i.e. the
         QPU stream driver clamped offline qubits out before writing to the
         ring). ``defect_info`` carries the fixed-spin assignments and energy
-        offset needed for reconstruction.
+        offset needed for reconstruction; ``nodes`` is the full topology order
+        the reduced columns must be scattered back into.
 
         The base implementation is the identity (CPU/GPU/Metal samples are
         always full width; the ratchet's width guard never triggers for them).
-        ``DWaveMiner`` overrides this to call ``reconstruct_full_sampleset``.
+        ``DWaveMiner`` overrides this to reconstruct the full-topology matrix.
         """
         return sampleset
 
