@@ -33,6 +33,7 @@ from shared.block import BlockRequirements, create_genesis_block
 from shared.energy_utils import calc_energy_range
 from shared.time_utils import utc_timestamp
 from dwave_topologies.topologies.json_loader import load_topology
+from QPU.qpu_time_manager import parse_duration
 
 
 @dataclass
@@ -636,36 +637,6 @@ def binary_search_threshold(
     return best_result
 
 
-def parse_time(time_str: str) -> float:
-    """Parse human-readable time string to minutes.
-
-    Supports formats like:
-    - "10" or "10m" -> 10 minutes
-    - "30s" -> 0.5 minutes
-    - "2h" -> 120 minutes
-    - "1.5h" -> 90 minutes
-
-    Args:
-        time_str: Time string to parse
-
-    Returns:
-        Time in minutes
-    """
-    time_str = time_str.strip().lower()
-
-    # Parse value and unit
-    if time_str.endswith('s'):
-        value = float(time_str[:-1])
-        return value / 60.0  # Convert seconds to minutes
-    elif time_str.endswith('m'):
-        return float(time_str[:-1])
-    elif time_str.endswith('h'):
-        value = float(time_str[:-1])
-        return value * 60.0  # Convert hours to minutes
-    else:
-        # Assume minutes if no unit specified
-        return float(time_str)
-
 
 def main():
     """Main entry point."""
@@ -760,8 +731,9 @@ def main():
 
     args = parser.parse_args()
 
-    # Parse target time
-    target_time_minutes = parse_time(args.target_time)
+    # Parse target time (bare numbers are minutes; suffixed via canonical parser)
+    _tt = args.target_time.strip()
+    target_time_minutes = float(_tt) if _tt[-1:].isdigit() else parse_duration(_tt) / 60.0
 
     # Load topology if specified
     topology = None
