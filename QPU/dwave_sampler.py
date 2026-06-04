@@ -270,7 +270,7 @@ class DWaveSamplerWrapper:
 
         else:
             # Native hardware topology - no embedding needed
-            logger.info(f"[QPU] Using native hardware topology (no embedding needed)")
+            logger.info("[QPU] Using native hardware topology (no embedding needed)")
             self.sampler = base_sampler
             self.embedding = None
             if topology is not None:
