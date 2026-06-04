@@ -1970,7 +1970,7 @@ def test_evict_resets_fire_status_key():
 
 
 # ----------------------------------------------------------------------
-# Participation marker (write-once System.remark per (miner, solution#))
+# Participation marker (write-once System.remark per solution#, node-level)
 # ----------------------------------------------------------------------
 
 
@@ -2013,46 +2013,87 @@ async def test_participation_remark_falls_back_to_plain_remark():
     assert second_call.args[1] == "remark"
 
 
-async def test_participation_remark_swallows_failure():
+async def test_participation_remark_retries_transient_then_succeeds():
+    controller = _bare_controller()
+    controller.build_client.has_call = AsyncMock(return_value=False)
+    # First attempt fails with a stale-nonce "outdated" error (the reported
+    # 1010 Invalid Transaction); the retry re-composes a fresh nonce and lands.
+    controller.build_client.submit_extrinsic = AsyncMock(
+        side_effect=[
+            RuntimeError("1010 Invalid Transaction: Transaction is outdated"),
+            MagicMock(error=None),
+        ]
+    )
+    slept: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    await controller._submit_participation_remark(
+        {"schema": "quip-participation", "solution": 3, "miner": "5Test",
+         "kind": "cpu"},
+        sleeper=_record_sleep,
+    )
+    assert controller.build_client.submit_extrinsic.await_count == 2
+    assert len(slept) == 1  # one backoff between the two attempts
+
+
+async def test_participation_remark_swallows_persistent_failure():
+    from substrate.miner_controller import _PARTICIPATION_REMARK_RETRIES
+
     controller = _bare_controller()
     controller.build_client.has_call = AsyncMock(return_value=False)
     controller.build_client.submit_extrinsic = AsyncMock(
         side_effect=RuntimeError("rpc down")
     )
-    # Must not raise — observability path.
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    # Must not raise — retries the bounded number of times, then gives up.
     await controller._submit_participation_remark(
-        {"schema": "quip-participation", "solution": 2, "miner": "qpu-0",
-         "kind": "qpu"}
+        {"schema": "quip-participation", "solution": 2, "miner": "5Test",
+         "kind": "qpu"},
+        sleeper=_no_sleep,
+    )
+    assert (
+        controller.build_client.submit_extrinsic.await_count
+        == _PARTICIPATION_REMARK_RETRIES + 1
     )
 
 
-async def test_mark_participating_dedups_per_solution():
+async def test_mark_participating_dedups_per_solution_across_instances():
     controller = _bare_controller()
     controller._submit_participation_remark = AsyncMock(return_value=None)
-    msg = {"solution_number": 5, "kind": "qpu", "budget_seconds": 90.0}
-    controller._mark_participating("qpu-0", msg)
-    controller._mark_participating("qpu-0", dict(msg))  # duplicate
+    # Two different miner instances report the SAME solution # → exactly one
+    # node-level remark (deduped on solution#, not on the per-instance worker).
+    controller._mark_participating(
+        {"solution_number": 5, "kind": "qpu", "budget_seconds": 90.0}
+    )
+    controller._mark_participating({"solution_number": 5, "kind": "cpu"})
     await asyncio.sleep(0)  # let the spawned task run
     controller._submit_participation_remark.assert_awaited_once()
     payload = controller._submit_participation_remark.call_args.args[0]
     assert payload == {
-        "schema": "quip-participation", "solution": 5, "miner": "qpu-0",
+        "schema": "quip-participation", "solution": 5, "miner": "5Test",
         "kind": "qpu", "budget_seconds": 90.0,
     }
-    # A different solution # for the same miner fires again.
-    controller._mark_participating("qpu-0", {"solution_number": 6, "kind": "qpu"})
+    # A different solution # fires again.
+    controller._mark_participating({"solution_number": 6, "kind": "qpu"})
     await asyncio.sleep(0)
     assert controller._submit_participation_remark.await_count == 2
 
 
-async def test_mark_participating_cpu_omits_budget():
+async def test_mark_participating_uses_node_id_and_omits_budget():
     controller = _bare_controller()
     controller._submit_participation_remark = AsyncMock(return_value=None)
-    controller._mark_participating("cpu-0", {"solution_number": 9, "kind": "cpu"})
+    controller._mark_participating({"solution_number": 9, "kind": "cpu"})
     await asyncio.sleep(0)
     payload = controller._submit_participation_remark.call_args.args[0]
     assert "budget_seconds" not in payload
     assert payload["kind"] == "cpu"
+    # Node identity (signer ss58), not the per-instance worker id.
+    assert payload["miner"] == "5Test"
 
 
 
