@@ -115,10 +115,17 @@ class OrderStatus(IntEnum):
 
     @classmethod
     def from_scale_variant(cls, name: str) -> "OrderStatus":
-        try:
-            return {"Opened": cls.OPENED, "Expired": cls.EXPIRED, "Closed": cls.CLOSED}[name]
-        except KeyError:
+        result = _ORDER_STATUS_MAP.get(name)
+        if result is None:
             raise ValueError(f"unknown SCALE OrderStatus variant: {name!r}")
+        return result
+
+
+_ORDER_STATUS_MAP: dict[str, OrderStatus] = {
+    "Opened": OrderStatus.OPENED,
+    "Expired": OrderStatus.EXPIRED,
+    "Closed": OrderStatus.CLOSED,
+}
 
 
 # ----------------------------------------------------------------------
@@ -508,6 +515,10 @@ class MempoolJobContext:
             min_solutions=min_solutions,
             timeout_to_difficulty_adjustment_decay=2**31 - 1,
         )
+
+    def uses_decay_ratchet(self) -> bool:
+        """Mempool jobs use strict-energy evaluation, not the decay ratchet."""
+        return False
 
 
 # ----------------------------------------------------------------------

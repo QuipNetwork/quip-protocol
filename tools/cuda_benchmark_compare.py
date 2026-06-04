@@ -16,7 +16,6 @@ Usage:
 Options:
     --target-energy FLOAT   Energy target (default: -14900.0)
     --num-models INT        Models for test1 CLT (default: 50)
-    --seed-start INT        Starting nonce seed (default: 0)
     --max-attempts INT      Max mining attempts for test2 (default: 500)
     --output-dir PATH       Output directory (default: benchmarks/compare)
     --gpu INT               GPU device (default: 1)
@@ -44,15 +43,12 @@ import numpy as np
 from dwave_topologies import DEFAULT_TOPOLOGY
 from GPU.cuda_gibbs_sa import CudaGibbsSampler
 from GPU.cuda_sa import CudaSASampler
-from shared.beta_schedule import _default_ising_beta_range
 from shared.energy_utils import energy_to_difficulty
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce
 from tools.cuda_profile_regions import (
     _load_manifest,
     generate_flamegraph_html,
     get_gpu_info,
-    get_topology_stats,
-    print_profile,
 )
 
 
@@ -65,6 +61,31 @@ ADAPT_MIN_SWEEPS = 256
 ADAPT_MAX_SWEEPS = 2048
 ADAPT_MIN_READS = 64
 ADAPT_MAX_READS = 256
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as _plt_module
+    _MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    _plt_module = None
+    _MATPLOTLIB_AVAILABLE = False
+
+
+def _get_plt():
+    """Return matplotlib.pyplot with Agg backend, or None if unavailable."""
+    return _plt_module if _MATPLOTLIB_AVAILABLE else None
+
+
+def _save_fig(fig, path, dpi=150, bbox_inches=None):
+    """Apply tight_layout, save figure to path, then close it."""
+    plt = _plt_module
+    plt.tight_layout()
+    if bbox_inches is not None:
+        plt.savefig(path, dpi=dpi, bbox_inches=bbox_inches)
+    else:
+        plt.savefig(path, dpi=dpi)
+    plt.close()
 
 
 def compute_adaptive_params(target_energy):
@@ -231,9 +252,9 @@ def build_aggregate_profile(all_profiles, kernel_name):
 
 def plot_comparison_table(rows, output_path):
     """Render per-model energy comparison as a table image."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    plt = _get_plt()
+    if plt is None:
+        return
 
     headers = [
         "Model", "Gibbs E", "SA E", "Delta",
@@ -262,17 +283,15 @@ def plot_comparison_table(rows, output_path):
         table[0, col].set_facecolor("#2c3e50")
         table[0, col].set_text_props(color="white", weight="bold")
     plt.title("Gibbs vs SA Per-Model Comparison", fontsize=14)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close()
+    _save_fig(fig, output_path, bbox_inches="tight")
     print(f"  Table saved to {output_path}")
 
 
 def plot_energy_comparison(rows, output_path):
     """Bar chart comparing best energies per model per kernel."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    plt = _get_plt()
+    if plt is None:
+        return
 
     models = [r["model_id"] for r in rows]
     gibbs = [r["gibbs_energy"] for r in rows]
@@ -290,17 +309,15 @@ def plot_energy_comparison(rows, output_path):
     ax.set_xticks(x)
     ax.set_xticklabels(models, rotation=45, fontsize=7)
     ax.legend()
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150)
-    plt.close()
+    _save_fig(fig, output_path)
     print(f"  Energy chart saved to {output_path}")
 
 
 def plot_energy_timeline(gibbs_attempts, sa_attempts, target, output_path):
     """Plot attempt # vs best_energy for both kernels."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    plt = _get_plt()
+    if plt is None:
+        return
 
     fig, ax = plt.subplots(figsize=(14, 6))
     if gibbs_attempts:
@@ -323,9 +340,7 @@ def plot_energy_timeline(gibbs_attempts, sa_attempts, target, output_path):
     ax.set_ylabel("Best Energy")
     ax.set_title("Mining Energy Timeline")
     ax.legend()
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150)
-    plt.close()
+    _save_fig(fig, output_path)
     print(f"  Timeline saved to {output_path}")
 
 
@@ -333,9 +348,9 @@ def plot_overhead_comparison(
     gibbs_inst, gibbs_uninst, sa_inst, sa_uninst, output_path
 ):
     """Bar chart comparing instrumented vs uninstrumented wall times."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    plt = _get_plt()
+    if plt is None:
+        return
 
     labels = ["Gibbs", "SA"]
     inst = [gibbs_inst, sa_inst]
@@ -371,17 +386,15 @@ def plot_overhead_comparison(
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.legend()
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150)
-    plt.close()
+    _save_fig(fig, output_path)
     print(f"  Overhead chart saved to {output_path}")
 
 
 def plot_mining_summary(gibbs_summary, sa_summary, output_path):
     """Table image summarizing mining test results."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    plt = _get_plt()
+    if plt is None:
+        return
 
     headers = [
         "Kernel", "Attempts", "Total Time (s)",
@@ -411,9 +424,7 @@ def plot_mining_summary(gibbs_summary, sa_summary, output_path):
         table[0, col].set_facecolor("#2c3e50")
         table[0, col].set_text_props(color="white", weight="bold")
     plt.title("Mining Test Summary", fontsize=14)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close()
+    _save_fig(fig, output_path, bbox_inches="tight")
     print(f"  Summary saved to {output_path}")
 
 
@@ -792,10 +803,6 @@ def main():
     parser.add_argument(
         "--num-models", type=int, default=50,
         help="Number of models for test1 (default: 50)",
-    )
-    parser.add_argument(
-        "--seed-start", type=int, default=0,
-        help="Starting nonce seed (default: 0)",
     )
     parser.add_argument(
         "--max-attempts", type=int, default=500,

@@ -392,14 +392,9 @@ def _calculate_set_diversity(indices: List[int], dist_matrix: np.ndarray) -> flo
     if len(indices) < 2:
         return 0.0
 
-    total_dist = 0
-    count = 0
-    for i in range(len(indices)):
-        for j in range(i + 1, len(indices)):
-            total_dist += dist_matrix[indices[i], indices[j]]
-            count += 1
-
-    return total_dist / count if count > 0 else 0.0
+    sub = dist_matrix[np.ix_(indices, indices)]
+    iu = np.triu_indices(sub.shape[0], k=1)
+    return float(sub[iu].mean())
 
 
 def _compute_distance_matrix_vectorized(solutions: List[List[int]]) -> np.ndarray:
@@ -446,9 +441,6 @@ def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> L
     max_idx = np.unravel_index(np.argmax(upper_tri), upper_tri.shape)
     selected_indices = list(max_idx)
 
-    # Convert to set for O(1) lookup
-    selected_set = set(selected_indices)
-
     # Iteratively add the farthest point from the current set
     while len(selected_indices) < target_count:
         # Get distances to all selected points
@@ -461,7 +453,6 @@ def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> L
         # Find point with maximum minimum distance
         best_idx = np.argmax(min_dists)
         selected_indices.append(best_idx)
-        selected_set.add(best_idx)
 
     # Optional: Local search refinement (limited iterations for performance)
     # Try swapping elements to improve total diversity
@@ -476,8 +467,6 @@ def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> L
         current_div = _calculate_set_diversity(selected_indices, dist_matrix)
 
         for i in range(len(selected_indices)):
-            sel_idx = selected_indices[i]
-
             # Check a subset of candidates (not all) for performance
             # Sample up to 50 random candidates if n_solutions is large
             if n_solutions > 100:
@@ -486,7 +475,7 @@ def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> L
                 candidates = range(n_solutions)
 
             for cand_idx in candidates:
-                if cand_idx in selected_set:
+                if cand_idx in selected_indices:
                     continue
 
                 # Try swapping
@@ -495,8 +484,6 @@ def select_diverse_solutions(solutions: List[List[int]], target_count: int) -> L
                 test_div = _calculate_set_diversity(test_indices, dist_matrix)
 
                 if test_div > current_div:
-                    selected_set.remove(sel_idx)
-                    selected_set.add(cand_idx)
                     selected_indices[i] = cand_idx
                     current_div = test_div
                     improved = True
@@ -591,11 +578,6 @@ def _validate_topology_consistency(
         errors.append(f"Missing J parameters for edges: {sorted(missing_j)}")
     
     return errors
-
-
-# `validate_quantum_proof` was the pre-substrate block-validation path. It
-# trusted nodes/edges/h_values carried inside the proof — a shape removed by
-# quip-protocol-rs MR !20. The on-chain pallet is now the only validator.
 
 
 def validate_solution(spins: List[int], h: Dict[int, float], J: Dict[Tuple[int, int], float], nodes: List[int], edges: Optional[List[Tuple[int, int]]] = None) -> Dict[str, Any]:
@@ -737,6 +719,181 @@ def _energy_stratified_selection(
     return selected[:target_count] if len(selected) >= target_count else None
 
 
+def _ising_from_requirements(
+    requirements,
+    nonce: Union[int, bytes],
+    nodes: List[int],
+    edges: List[Tuple[int, int]],
+) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float]]:
+    """Generate (h, J) from requirements, respecting per-block allowed value specs."""
+    allowed_h = getattr(requirements, "allowed_h_values", DEFAULT_ALLOWED_H)
+    allowed_j = getattr(requirements, "allowed_j_values", DEFAULT_ALLOWED_J)
+    return generate_ising_model_from_nonce(
+        nonce, nodes, edges, allowed_h=allowed_h, allowed_j=allowed_j,
+    )
+
+
+def _dedup_and_validate(
+    sample_arr: np.ndarray,
+    energy_arr: np.ndarray,
+    skip_validation: bool,
+    requirements,
+    nonce: Union[int, bytes],
+    nodes: List[int],
+    edges: List[Tuple[int, int]],
+    h: Optional[Dict[int, float]],
+    J: Optional[Dict[Tuple[int, int], float]],
+) -> Tuple[np.ndarray, np.ndarray, Optional[Dict[int, float]],
+           Optional[Dict[Tuple[int, int], float]]]:
+    """Dedup the full batch into the constraint-valid set of unique rows.
+
+    Returns the unique solutions (int8 ndarray), their first-occurrence
+    energies, and the (possibly regenerated) ``h``/``J`` Ising model so the
+    slow path's regeneration propagates back to the caller.
+    """
+    if skip_validation:
+        # FAST PATH: Trust sampler output, skip per-solution validation
+        # (safe during mining — we control the sampler). _unique_rows
+        # dedups rows at C speed; first_index + a stable argsort reproduce
+        # the legacy dict loop exactly: unique rows in first-seen order,
+        # each carrying its first occurrence's energy.
+        uniq, first_idx, _ = _unique_rows(sample_arr)
+        first_seen = np.argsort(first_idx, kind="stable")
+        return uniq[first_seen], energy_arr[first_idx[first_seen]], h, J
+
+    # SLOW PATH: Full validation for untrusted sources (block
+    # validation). Per-solution validate_solution needs Python lists;
+    # this path is not the mining hot loop, so it stays list-based
+    # and is converted to an ndarray pool at the end for the shared
+    # downstream. Use pre-computed Ising model if provided, otherwise
+    # regenerate. Requirements may carry `allowed_h_values` /
+    # `allowed_j_values` (post-MR-!20) for non-default distributions.
+    if h is None or J is None:
+        h, J = _ising_from_requirements(requirements, nonce, nodes, edges)
+
+    seen: set = set()
+    valid_rows: List[List[int]] = []
+    valid_row_energies: List[float] = []
+    invalid_solutions = []
+    for idx in range(len(energy_arr)):
+        solution = tuple(sample_arr[idx])
+        if solution not in seen:
+            seen.add(solution)
+            solution_list = list(solution)
+
+            # Validate solution format and correctness
+            validation_result = validate_solution(solution_list, h, J, nodes, edges)
+            if validation_result["valid"]:
+                valid_rows.append(solution_list)
+                valid_row_energies.append(float(energy_arr[idx]))
+            else:
+                invalid_solutions.append({
+                    "solution": solution_list,
+                    "errors": validation_result["errors"]
+                })
+
+    # Log any invalid solutions found
+    if invalid_solutions:
+        local_logger = logging.getLogger(__name__)
+        local_logger.warning(f"Found {len(invalid_solutions)} invalid solutions with errors: {[s['errors'] for s in invalid_solutions[:3]]}")
+
+    full_unique_solutions = (
+        np.asarray(valid_rows, dtype=sample_arr.dtype)
+        if valid_rows
+        else np.empty((0, sample_arr.shape[1]), dtype=sample_arr.dtype)
+    )
+    full_unique_energies = np.asarray(valid_row_energies, dtype=np.float64)
+    return full_unique_solutions, full_unique_energies, h, J
+
+
+def _select_pool_indices(
+    full_unique_solutions: np.ndarray,
+    full_unique_energies: np.ndarray,
+    difficulty_energy: float,
+    min_solutions: int,
+    strict_energy: bool,
+    live_threshold_energy: Optional[float],
+) -> np.ndarray:
+    """Select the diverse-K candidate pool indices. Three modes:
+
+    1. Strict (legacy / mempool): pool = below snapshot target.
+       (best-vs-difficulty already enforced by the caller.)
+
+    2. Lenient + live threshold (substrate ratchet, common case):
+       tighten pool to below-target *when* it has enough samples
+       to satisfy min_solutions, so the diverse-K's recomputed
+       floor stays under the live target and the submit gate
+       fires. When the subset is too thin (e.g. right after a
+       chain re-snapshot), fall back to the full constraint-valid
+       set — the iter can't submit now but it lands in the top-K
+       stash for visibility and future submission once
+       ``BlockDecayInterval`` raises the live target past its
+       floor.
+
+    3. Lenient + no live (tests / legacy): use full pool.
+    """
+    if strict_energy:
+        return np.flatnonzero(full_unique_energies < difficulty_energy)
+    if live_threshold_energy is not None:
+        below_target = np.flatnonzero(
+            full_unique_energies < live_threshold_energy
+        )
+        if len(below_target) >= min_solutions:
+            return below_target
+        return np.arange(len(full_unique_solutions))
+    return np.arange(len(full_unique_solutions))
+
+
+def _select_diverse_with_fallback(
+    valid_solutions: np.ndarray,
+    valid_energies: np.ndarray,
+    min_solutions: int,
+    min_diversity: float,
+    best_energy: float,
+) -> Tuple[np.ndarray, float, float]:
+    """Select diverse solutions, falling back to energy-stratified selection.
+
+    Tries farthest-point selection first; if its diversity is below
+    ``min_diversity`` (and there's slack), retries with energy-stratified
+    selection. Returns the filtered solutions, their diversity, and the
+    best (minimum) energy among the selection. ``best_energy`` carries the
+    caller's current value so the (unreachable in the success path) no-op
+    branches preserve it unchanged.
+    """
+    filtered_solutions = valid_solutions
+    diversity = 0.0
+    if len(valid_solutions) >= min_solutions:
+        selected_indices = select_diverse_solutions(
+            valid_solutions, min_solutions,
+        )
+        filtered_solutions = valid_solutions[selected_indices]
+        diversity = calculate_diversity(filtered_solutions)
+        best_energy = float(valid_energies[selected_indices].min())
+
+        # Fallback: if farthest-point selection doesn't meet diversity,
+        # try energy-stratified selection. Solutions at different energy
+        # levels are more likely to be in different spin basins.
+        if diversity < min_diversity and len(valid_solutions) > min_solutions:
+            stratified = _energy_stratified_selection(
+                valid_solutions, valid_energies, min_solutions,
+            )
+            if stratified is not None:
+                strat_div = calculate_diversity(
+                    valid_solutions[stratified]
+                )
+                if strat_div >= min_diversity:
+                    selected_indices = stratified
+                    filtered_solutions = valid_solutions[selected_indices]
+                    diversity = strat_div
+                    best_energy = float(
+                        valid_energies[selected_indices].min()
+                    )
+    elif len(valid_energies):
+        best_energy = float(valid_energies.min())
+
+    return filtered_solutions, diversity, best_energy
+
+
 def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tuple[int, int]],
                       nonce: Union[int, bytes], salt: bytes, prev_timestamp: int, start_time: float,
                       miner_id: str, miner_type: str,
@@ -814,63 +971,13 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         sample_arr = np.asarray(sampleset.record.sample)
         energy_arr = np.asarray(all_energies, dtype=np.float64)
 
-        if skip_validation:
-            # FAST PATH: Trust sampler output, skip per-solution validation
-            # (safe during mining — we control the sampler). _unique_rows
-            # dedups rows at C speed; first_index + a stable argsort reproduce
-            # the legacy dict loop exactly: unique rows in first-seen order,
-            # each carrying its first occurrence's energy.
-            uniq, first_idx, _ = _unique_rows(sample_arr)
-            first_seen = np.argsort(first_idx, kind="stable")
-            full_unique_solutions = uniq[first_seen]
-            full_unique_energies = energy_arr[first_idx[first_seen]]
-        else:
-            # SLOW PATH: Full validation for untrusted sources (block
-            # validation). Per-solution validate_solution needs Python lists;
-            # this path is not the mining hot loop, so it stays list-based
-            # and is converted to an ndarray pool at the end for the shared
-            # downstream. Use pre-computed Ising model if provided, otherwise
-            # regenerate. Requirements may carry `allowed_h_values` /
-            # `allowed_j_values` (post-MR-!20) for non-default distributions.
-            if h is None or J is None:
-                allowed_h = getattr(requirements, "allowed_h_values", DEFAULT_ALLOWED_H)
-                allowed_j = getattr(requirements, "allowed_j_values", DEFAULT_ALLOWED_J)
-                h, J = generate_ising_model_from_nonce(
-                    nonce, nodes, edges, allowed_h=allowed_h, allowed_j=allowed_j,
-                )
-
-            seen: set = set()
-            valid_rows: List[List[int]] = []
-            valid_row_energies: List[float] = []
-            invalid_solutions = []
-            for idx in range(len(energy_arr)):
-                solution = tuple(sample_arr[idx])
-                if solution not in seen:
-                    seen.add(solution)
-                    solution_list = list(solution)
-
-                    # Validate solution format and correctness
-                    validation_result = validate_solution(solution_list, h, J, nodes, edges)
-                    if validation_result["valid"]:
-                        valid_rows.append(solution_list)
-                        valid_row_energies.append(float(energy_arr[idx]))
-                    else:
-                        invalid_solutions.append({
-                            "solution": solution_list,
-                            "errors": validation_result["errors"]
-                        })
-
-            # Log any invalid solutions found
-            if invalid_solutions:
-                local_logger = logging.getLogger(__name__)
-                local_logger.warning(f"Found {len(invalid_solutions)} invalid solutions with errors: {[s['errors'] for s in invalid_solutions[:3]]}")
-
-            full_unique_solutions = (
-                np.asarray(valid_rows, dtype=sample_arr.dtype)
-                if valid_rows
-                else np.empty((0, sample_arr.shape[1]), dtype=sample_arr.dtype)
-            )
-            full_unique_energies = np.asarray(valid_row_energies, dtype=np.float64)
+        # Dedup (fast path) or dedup+validate (slow path) into the
+        # constraint-valid pool. The slow path may regenerate ``h``/``J``;
+        # capture them back so the submit-floor recompute below reuses them.
+        full_unique_solutions, full_unique_energies, h, J = _dedup_and_validate(
+            sample_arr, energy_arr, skip_validation,
+            requirements, nonce, nodes, edges, h, J,
+        )
 
         # Set num_valid here so it reflects actual sampleset shape even
         # when later validation raises. Without this, the finally-block
@@ -882,35 +989,13 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         # the post-success-path block below.
         num_valid = int(np.count_nonzero(full_unique_energies < difficulty_energy))
 
-        # Pool selection for diverse-K. Three modes:
-        #
-        # 1. Strict (legacy / mempool): pool = below snapshot target.
-        #    (best-vs-difficulty already enforced above.)
-        #
-        # 2. Lenient + live threshold (substrate ratchet, common case):
-        #    tighten pool to below-target *when* it has enough samples
-        #    to satisfy min_solutions, so the diverse-K's recomputed
-        #    floor stays under the live target and the submit gate
-        #    fires. When the subset is too thin (e.g. right after a
-        #    chain re-snapshot), fall back to the full constraint-valid
-        #    set — the iter can't submit now but it lands in the top-K
-        #    stash for visibility and future submission once
-        #    ``BlockDecayInterval`` raises the live target past its
-        #    floor.
-        #
-        # 3. Lenient + no live (tests / legacy): use full pool.
-        if strict_energy:
-            pool_indices = np.flatnonzero(full_unique_energies < difficulty_energy)
-        elif live_threshold_energy is not None:
-            below_target = np.flatnonzero(
-                full_unique_energies < live_threshold_energy
-            )
-            if len(below_target) >= min_solutions:
-                pool_indices = below_target
-            else:
-                pool_indices = np.arange(len(full_unique_solutions))
-        else:
-            pool_indices = np.arange(len(full_unique_solutions))
+        # Pool selection for diverse-K (see _select_pool_indices for the
+        # three strict/ratchet/lenient modes).
+        pool_indices = _select_pool_indices(
+            full_unique_solutions, full_unique_energies,
+            difficulty_energy, min_solutions, strict_energy,
+            live_threshold_energy,
+        )
 
         valid_solutions = full_unique_solutions[pool_indices]
         valid_energies = full_unique_energies[pool_indices]
@@ -928,35 +1013,10 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
 
         # Select diverse solutions — try farthest-point first, then
         # fall back to energy-stratified selection if diversity is too low.
-        filtered_solutions = valid_solutions
-        if len(valid_solutions) >= min_solutions:
-            selected_indices = select_diverse_solutions(
-                valid_solutions, min_solutions,
-            )
-            filtered_solutions = valid_solutions[selected_indices]
-            diversity = calculate_diversity(filtered_solutions)
-            best_energy = float(valid_energies[selected_indices].min())
-
-            # Fallback: if farthest-point selection doesn't meet diversity,
-            # try energy-stratified selection. Solutions at different energy
-            # levels are more likely to be in different spin basins.
-            if diversity < min_diversity and len(valid_solutions) > min_solutions:
-                stratified = _energy_stratified_selection(
-                    valid_solutions, valid_energies, min_solutions,
-                )
-                if stratified is not None:
-                    strat_div = calculate_diversity(
-                        valid_solutions[stratified]
-                    )
-                    if strat_div >= min_diversity:
-                        selected_indices = stratified
-                        filtered_solutions = valid_solutions[selected_indices]
-                        diversity = strat_div
-                        best_energy = float(
-                            valid_energies[selected_indices].min()
-                        )
-        elif len(valid_energies):
-            best_energy = float(valid_energies.min())
+        filtered_solutions, diversity, best_energy = _select_diverse_with_fallback(
+            valid_solutions, valid_energies, min_solutions,
+            min_diversity, best_energy,
+        )
 
         if diversity < min_diversity:
             raise ValueError(f"Insufficient diversity: {diversity} < {min_diversity}")
@@ -975,11 +1035,7 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         # those silently fail chain validation. The recompute uses the
         # canonical Ising formula, matching the chain.
         if h is None or J is None:
-            allowed_h = getattr(requirements, "allowed_h_values", DEFAULT_ALLOWED_H)
-            allowed_j = getattr(requirements, "allowed_j_values", DEFAULT_ALLOWED_J)
-            h_for_floor, J_for_floor = generate_ising_model_from_nonce(
-                nonce, nodes, edges, allowed_h=allowed_h, allowed_j=allowed_j,
-            )
+            h_for_floor, J_for_floor = _ising_from_requirements(requirements, nonce, nodes, edges)
         else:
             h_for_floor, J_for_floor = h, J
         selected_energies = energies_for_solutions(

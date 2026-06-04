@@ -1,4 +1,4 @@
-"""Tests for shared.telemetry_process.telemetry_main.
+"""Tests for substrate.telemetry_process.telemetry_main.
 
 The telemetry sibling process owns its own aiohttp app, a SubstrateClient
 with URL failover, and serves /api/v1/stats from the file the controller
@@ -24,7 +24,7 @@ def _free_port() -> int:
 
 def test_telemetry_process_starts_and_serves_stats(tmp_path: Path):
     """Spawn telemetry process; verify /api/v1/stats returns the file contents."""
-    from shared.telemetry_process import telemetry_main
+    from substrate.telemetry_process import telemetry_main
 
     stats_path = tmp_path / "telemetry-stats.json"
     stats_path.write_text(json.dumps(
@@ -73,7 +73,7 @@ def test_telemetry_process_starts_and_serves_stats(tmp_path: Path):
 
 def test_telemetry_process_returns_503_when_snapshot_missing(tmp_path: Path):
     """If the snapshot file doesn't exist yet, /api/v1/stats returns 503."""
-    from shared.telemetry_process import telemetry_main
+    from substrate.telemetry_process import telemetry_main
 
     port = _free_port()
     shutdown_event = mp.Event()
@@ -116,7 +116,7 @@ def test_telemetry_process_returns_503_when_snapshot_missing(tmp_path: Path):
 
 def test_telemetry_process_responds_to_shutdown_event(tmp_path: Path):
     """Setting shutdown_event causes the process to exit cleanly."""
-    from shared.telemetry_process import telemetry_main
+    from substrate.telemetry_process import telemetry_main
 
     stats_path = tmp_path / "telemetry-stats.json"
     stats_path.write_text("{}")
@@ -150,7 +150,7 @@ def test_telemetry_process_aggregator_mode_merges_per_kind_snapshots(tmp_path: P
     per-kind snapshot files; verify /api/v1/stats returns the merged
     view (summed counters, unioned miners, per-mode breakdown)."""
     from shared.stats_snapshot import snapshot_filename_for
-    from shared.telemetry_process import telemetry_main
+    from substrate.telemetry_process import telemetry_main
 
     snap_dir = tmp_path / "runtime"
     snap_dir.mkdir()

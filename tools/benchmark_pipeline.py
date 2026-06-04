@@ -16,9 +16,11 @@ Usage:
     CUDA_VISIBLE_DEVICES=0 python tools/benchmark_pipeline.py
 """
 
+import json
 import logging
 import multiprocessing
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +38,12 @@ logging.basicConfig(
 sys.path.append(str(Path(__file__).parent.parent))
 
 from shared.block import BlockRequirements, create_genesis_block
+from GPU.cuda_miner import CudaMiner
+
+
+def make_gibbs_miner(*a, **kw):
+    """Construct a CudaMiner configured for Gibbs updates."""
+    return CudaMiner(*a, update_mode="gibbs", **kw)
 
 
 @dataclass
@@ -143,16 +151,7 @@ def _coexist_worker(miner_cls_name, label, device, result_file):
 
     Writes results to a JSON file instead of using Queue/pickle.
     """
-    import json
-
-    # Import miner class by name to avoid pickling issues
-    from GPU.cuda_miner import CudaMiner
-
-    if miner_cls_name == "CudaGibbsMiner":
-        def cls(*a, **kw):
-            return CudaMiner(*a, update_mode="gibbs", **kw)
-    else:
-        cls = CudaMiner
+    cls = make_gibbs_miner if miner_cls_name == "CudaGibbsMiner" else CudaMiner
 
     try:
         trial = run_trial(
@@ -183,9 +182,6 @@ def run_coexistence_test(device):
     Uses 'spawn' context so each child gets a fresh CUDA runtime
     instead of inheriting the parent's (already-initialized) context.
     """
-    import json
-    import tempfile
-
     print(f"\n{'#' * 60}")
     print("  CO-EXISTENCE: SA + Gibbs @ 50% yielding=True")
     print(f"{'#' * 60}")
@@ -221,12 +217,10 @@ def run_coexistence_test(device):
             p.join(timeout=5)
 
     results = []
-    for fpath in [sa_file, gibbs_file]:
-        path = Path(fpath)
+    for path, label in [(Path(sa_file), "SA"), (Path(gibbs_file), "Gibbs")]:
         if path.exists():
             results.append(json.loads(path.read_text()))
         else:
-            label = "SA" if "sa_" in fpath else "Gibbs"
             results.append({'label': f"coexist-{label}", 'error': "no output"})
 
     # Cleanup temp files
@@ -240,18 +234,12 @@ def run_coexistence_test(device):
 def main():
     device = "0"
 
-    from functools import partial
-    from GPU.cuda_miner import CudaMiner
-
-    def GibbsMiner(*a, **kw):
-        return CudaMiner(*a, update_mode="gibbs", **kw)
-
     all_results = []
 
     # --- Single-miner trials ---
     for miner_cls, name in [
         (CudaMiner, "SA"),
-        (GibbsMiner, "Gibbs"),
+        (make_gibbs_miner, "Gibbs"),
     ]:
         for util in [25, 50, 75, 100]:
             label = f"{name}-{util}pct"

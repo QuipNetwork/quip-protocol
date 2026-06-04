@@ -27,7 +27,6 @@ Usage:
 
 import argparse
 import json
-import os
 import random
 import sys
 import time
@@ -60,12 +59,13 @@ QUICK_SWEEPS = [256, 512, 1024]
 QUICK_READS = [64, 128, 256]
 QUICK_NUM_MODELS = 50
 
+SAMPLER_NAMES = {'sa': 'SA', 'gibbs': 'Gibbs'}
+
 
 def generate_models(
     nodes: List[int],
     edges: list,
     num_models: int,
-    h_values: List[float],
     seed: int = 42,
 ) -> List[IsingModel]:
     """Pre-generate deterministic IsingModels.
@@ -235,7 +235,7 @@ def run_grid(
     # Pre-generate models
     print("Generating models...", end=" ", flush=True)
     models = generate_models(
-        nodes, edges, num_models, h_values,
+        nodes, edges, num_models,
     )
     print(f"{len(models)} models ready")
     print()
@@ -340,6 +340,14 @@ def run_grid(
     }
 
 
+def _hdr(reads_range: List, width: int) -> str:
+    """Build the 'sw\\rd  <reads...>' header string for a table."""
+    header = f"  {'sw\\rd':>8}"
+    for rd in reads_range:
+        header += f" {rd:>{width}}"
+    return header
+
+
 def print_tables(results: Dict) -> None:
     """Print blocks-mined grids for SA and Gibbs."""
     grid = results['grid_data']
@@ -348,8 +356,13 @@ def print_tables(results: Dict) -> None:
     reads_range = results['reads_range']
     num_models = results['num_models']
 
+    lookup = {
+        (e['sampler_type'], e['sweeps'], e['reads']): e
+        for e in grid
+    }
+
     for sampler_type in ('sa', 'gibbs'):
-        name = 'SA' if sampler_type == 'sa' else 'Gibbs'
+        name = SAMPLER_NAMES[sampler_type]
         print(f"\n{'=' * 60}")
         print(f"  {name} — blocks mined / {num_models} models")
         print(f"{'=' * 60}")
@@ -357,23 +370,14 @@ def print_tables(results: Dict) -> None:
         for threshold in thresholds:
             t_str = str(threshold)
             print(f"\n  E <= {threshold:.0f}:")
-            sw_rd = 'sw\\rd'
-            header = f"  {sw_rd:>8}"
-            for rd in reads_range:
-                header += f" {rd:>6}"
+            header = _hdr(reads_range, 6)
             print(header)
             print("  " + "-" * (len(header) - 2))
 
             for sw in sweeps_range:
                 row = f"  {sw:>8}"
                 for rd in reads_range:
-                    entry = next(
-                        (e for e in grid
-                         if e['sampler_type'] == sampler_type
-                         and e['sweeps'] == sw
-                         and e['reads'] == rd),
-                        None,
-                    )
+                    entry = lookup.get((sampler_type, sw, rd))
                     if entry is None:
                         row += f" {'—':>6}"
                     else:
@@ -387,25 +391,16 @@ def print_tables(results: Dict) -> None:
     print("  Throughput (models/sec)")
     print(f"{'=' * 60}")
     for sampler_type in ('sa', 'gibbs'):
-        name = 'SA' if sampler_type == 'sa' else 'Gibbs'
+        name = SAMPLER_NAMES[sampler_type]
         print(f"\n  {name}:")
-        sw_rd = 'sw\\rd'
-        header = f"  {sw_rd:>8}"
-        for rd in reads_range:
-            header += f" {rd:>6}"
+        header = _hdr(reads_range, 6)
         print(header)
         print("  " + "-" * (len(header) - 2))
 
         for sw in sweeps_range:
             row = f"  {sw:>8}"
             for rd in reads_range:
-                entry = next(
-                    (e for e in grid
-                     if e['sampler_type'] == sampler_type
-                     and e['sweeps'] == sw
-                     and e['reads'] == rd),
-                    None,
-                )
+                entry = lookup.get((sampler_type, sw, rd))
                 if entry is None:
                     row += f" {'—':>6}"
                 else:
@@ -419,25 +414,16 @@ def print_tables(results: Dict) -> None:
     t_mid = str(thresholds[len(thresholds) // 2])
     print(f"  At threshold E <= {t_mid}:")
     for sampler_type in ('sa', 'gibbs'):
-        name = 'SA' if sampler_type == 'sa' else 'Gibbs'
+        name = SAMPLER_NAMES[sampler_type]
         print(f"\n  {name}:")
-        sw_rd = 'sw\\rd'
-        header = f"  {sw_rd:>8}"
-        for rd in reads_range:
-            header += f" {rd:>8}"
+        header = _hdr(reads_range, 8)
         print(header)
         print("  " + "-" * (len(header) - 2))
 
         for sw in sweeps_range:
             row = f"  {sw:>8}"
             for rd in reads_range:
-                entry = next(
-                    (e for e in grid
-                     if e['sampler_type'] == sampler_type
-                     and e['sweeps'] == sw
-                     and e['reads'] == rd),
-                    None,
-                )
+                entry = lookup.get((sampler_type, sw, rd))
                 if entry is None:
                     row += f" {'—':>8}"
                 else:
@@ -480,6 +466,15 @@ def _get_plt():
     except ImportError:
         print("matplotlib not available, skipping plots")
         return None
+
+
+def _save_fig(fig, path, dpi=150, bbox_inches='tight'):
+    """Apply tight_layout, save figure to path, close it, and print path."""
+    plt = _get_plt()
+    plt.tight_layout()
+    plt.savefig(path, dpi=dpi, bbox_inches=bbox_inches)
+    plt.close(fig)
+    print(f"  {path}")
 
 
 def _best_gibbs_gap(sa_entry, gibbs_entries):
@@ -645,10 +640,7 @@ def plot_blocks_vs_threshold_cmp(results, output_path):
         'Gibbs Neighbors',
         fontsize=13,
     )
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  {output_path}")
+    _save_fig(fig, output_path)
 
 
 def plot_success_probability_cmp(results, output_path):
@@ -704,10 +696,7 @@ def plot_success_probability_cmp(results, output_path):
         'Gibbs Neighbors',
         fontsize=13,
     )
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  {output_path}")
+    _save_fig(fig, output_path)
 
 
 def plot_energy_cdf_cmp(results, output_path):
@@ -788,10 +777,7 @@ def plot_energy_cdf_cmp(results, output_path):
         'Gibbs Neighbors',
         fontsize=13,
     )
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  {output_path}")
+    _save_fig(fig, output_path)
 
 
 def plot_sweep_multiplier(results, output_path):
@@ -808,8 +794,6 @@ def plot_sweep_multiplier(results, output_path):
     thresholds = results['thresholds']
     sweeps_range = results['sweeps_range']
     reads_range = results['reads_range']
-    sa_max_reads = 256
-
     sa = {
         (e['sweeps'], e['reads']): e
         for e in grid if e['sampler_type'] == 'sa'
@@ -818,7 +802,7 @@ def plot_sweep_multiplier(results, output_path):
         (e['sweeps'], e['reads']): e
         for e in grid if e['sampler_type'] == 'gibbs'
     }
-    shared_reads = [r for r in reads_range if r <= sa_max_reads]
+    shared_reads = [r for r in reads_range if r <= SA_MAX_READS]
 
     def _rates(entry):
         return np.array([
@@ -904,20 +888,13 @@ def plot_sweep_multiplier(results, output_path):
     ax_gap.grid(True, alpha=0.3)
     ax_gap.set_xscale('log', base=2)
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  {output_path}")
+    _save_fig(fig, output_path)
 
 
 def plot_results(results: Dict, output_dir: str) -> None:
     """Generate comparison plots."""
-    try:
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib not available, skipping plots")
+    plt = _get_plt()
+    if plt is None:
         return
 
     grid = results['grid_data']
@@ -931,7 +908,7 @@ def plot_results(results: Dict, output_dir: str) -> None:
 
     for ax_idx, sampler_type in enumerate(('sa', 'gibbs')):
         ax = axes[ax_idx]
-        name = 'SA' if sampler_type == 'sa' else 'Gibbs'
+        name = SAMPLER_NAMES[sampler_type]
 
         entries = [
             e for e in grid
@@ -967,11 +944,8 @@ def plot_results(results: Dict, output_dir: str) -> None:
         ax.grid(True, alpha=0.3)
         ax.invert_xaxis()
 
-    plt.tight_layout()
     path = outdir / 'blocks_vs_threshold.png'
-    plt.savefig(path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  {path}")
+    _save_fig(fig, path)
 
     # --- Plot 2: Success probability vs threshold ---
     # Log-scale shows where each config transitions from
@@ -982,7 +956,7 @@ def plot_results(results: Dict, output_dir: str) -> None:
 
     for ax_idx, sampler_type in enumerate(('sa', 'gibbs')):
         ax = axes[ax_idx]
-        name = 'SA' if sampler_type == 'sa' else 'Gibbs'
+        name = SAMPLER_NAMES[sampler_type]
 
         entries = [
             e for e in grid
@@ -1025,18 +999,15 @@ def plot_results(results: Dict, output_dir: str) -> None:
         ax.set_yscale('log')
         ax.set_ylim(bottom=0.5 / max(num_models, 1))
 
-    plt.tight_layout()
     path = outdir / 'success_probability.png'
-    plt.savefig(path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  {path}")
+    _save_fig(fig, path)
 
     # --- Plot 4: Energy CDF overlay ---
     fig, axes = plt.subplots(1, 2, figsize=(16, 7))
 
     for ax_idx, sampler_type in enumerate(('sa', 'gibbs')):
         ax = axes[ax_idx]
-        name = 'SA' if sampler_type == 'sa' else 'Gibbs'
+        name = SAMPLER_NAMES[sampler_type]
 
         entries = [
             e for e in grid
@@ -1071,11 +1042,8 @@ def plot_results(results: Dict, output_dir: str) -> None:
         ax.legend(fontsize=7, ncol=2, loc='upper left')
         ax.grid(True, alpha=0.3)
 
-    plt.tight_layout()
     path = outdir / 'energy_cdf.png'
-    plt.savefig(path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  {path}")
+    _save_fig(fig, path)
 
     # --- Sweep multiplier analysis ---
     plot_sweep_multiplier(

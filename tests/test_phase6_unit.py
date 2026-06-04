@@ -14,7 +14,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock
 
 
-from shared.miner_bootstrap import (
+from substrate.miner_bootstrap import (
     BootstrapConfig,
     DEFAULT_SEED_DIFFICULTY,
     _maybe_seed_chain,
@@ -80,16 +80,16 @@ async def test_force_reseed_difficulty_overrides_idempotency(monkeypatch):
         sudo_calls.append((module, function))
 
     monkeypatch.setattr(
-        "shared.miner_bootstrap._sudo_call", fake_sudo_call
+        "substrate.miner_bootstrap._sudo_call", fake_sudo_call
     )
     # `_assert_dev_chain` calls into substrate-interface; replace with a no-op.
     monkeypatch.setattr(
-        "shared.miner_bootstrap._assert_dev_chain", AsyncMock()
+        "substrate.miner_bootstrap._assert_dev_chain", AsyncMock()
     )
     # `_resolve_dev_signer` is fine but builds a real signer; stub it
     # so the test doesn't depend on DEV_HYBRID_SEEDS layout.
     monkeypatch.setattr(
-        "shared.miner_bootstrap._resolve_dev_signer", lambda uri: MagicMock()
+        "substrate.miner_bootstrap._resolve_dev_signer", lambda uri: MagicMock()
     )
 
     config = BootstrapConfig(
@@ -120,10 +120,10 @@ async def test_force_reseed_difficulty_default_is_idempotent(monkeypatch):
     async def fake_sudo_call(client, signer, module, function, params):
         sudo_calls.append((module, function))
 
-    monkeypatch.setattr("shared.miner_bootstrap._sudo_call", fake_sudo_call)
-    monkeypatch.setattr("shared.miner_bootstrap._assert_dev_chain", AsyncMock())
+    monkeypatch.setattr("substrate.miner_bootstrap._sudo_call", fake_sudo_call)
+    monkeypatch.setattr("substrate.miner_bootstrap._assert_dev_chain", AsyncMock())
     monkeypatch.setattr(
-        "shared.miner_bootstrap._resolve_dev_signer", lambda uri: MagicMock()
+        "substrate.miner_bootstrap._resolve_dev_signer", lambda uri: MagicMock()
     )
 
     config = BootstrapConfig(

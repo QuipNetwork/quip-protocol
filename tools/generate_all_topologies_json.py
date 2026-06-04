@@ -12,6 +12,10 @@ This script generates static JSON files for:
 import json
 import os
 import dwave_networkx as dnx
+from dwave_topologies.topologies.advantage2_system1 import (
+    ADVANTAGE2_SYSTEM1_TOPOLOGY,
+)
+from shared.energy_utils import expected_solution_energy
 
 
 def generate_generic_topology_json(topology_type: str, params: dict, output_dir: str):
@@ -49,7 +53,6 @@ def generate_generic_topology_json(topology_type: str, params: dict, output_dir:
     avg_degree = 2 * num_edges / num_nodes if num_nodes > 0 else 0
 
     # Calculate expected GSE
-    from shared.energy_utils import expected_solution_energy
     expected_gse = expected_solution_energy(
         num_nodes=num_nodes,
         num_edges=num_edges,
@@ -110,13 +113,9 @@ def generate_generic_topology_json(topology_type: str, params: dict, output_dir:
 def generate_advantage2_system_json(output_dir: str):
     """Generate JSON for real Advantage2-System1 topology."""
 
-    # Import the existing topology data
-    from dwave_topologies.topologies.advantage2_system1 import ADVANTAGE2_SYSTEM1_TOPOLOGY
-
     topo = ADVANTAGE2_SYSTEM1_TOPOLOGY
 
     # Calculate expected GSE
-    from shared.energy_utils import expected_solution_energy
     expected_gse = expected_solution_energy(
         num_nodes=topo.num_nodes,
         num_edges=topo.num_edges,

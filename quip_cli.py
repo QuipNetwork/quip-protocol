@@ -22,7 +22,7 @@ import traceback
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import click
 
@@ -30,9 +30,9 @@ from dwave_topologies.topologies.json_loader import load_topology
 from dwave_topologies.topologies.zephyr import zephyr
 from shared.keystore_hybrid import generate, load
 from shared.logging_config import setup_logging
-from shared.mempool_miner_controller import MempoolMinerController
-from shared.mempool_types import MinerType, qpu_miner_kind
-from shared.miner_bootstrap import (
+from substrate.mempool_miner_controller import MempoolMinerController
+from substrate.mempool_types import MinerType, qpu_miner_kind
+from substrate.miner_bootstrap import (
     DEFAULT_MIN_BALANCE_PLANCKS,
     BootstrapConfig,
     Underfunded,
@@ -113,6 +113,17 @@ async def _retry_until_verified(label: str, attempt) -> str:
             await asyncio.sleep(delay)
             delay = min(delay * 2.0, _STARTUP_RETRY_MAX_DELAY_SECONDS)
     raise RuntimeError(detail)
+
+
+def _validators_unreachable(exc: NoValidatorReachable) -> click.ClickException:
+    """Build a ``ClickException`` for a ``NoValidatorReachable`` failure.
+
+    Renders the structured attempt log as ``urls=<csv> reasons=<csv>``.
+    Callers should ``raise _validators_unreachable(exc) from exc``.
+    """
+    urls = ",".join(a.url for a in exc.attempts)
+    reasons = ",".join(a.exc_type for a in exc.attempts)
+    return click.ClickException(f"validators-unreachable urls={urls} reasons={reasons}")
 
 
 def _default_node_name() -> str:
@@ -426,6 +437,33 @@ def _faucet_url_option(f):
     )(f)
 
 
+def _load_or_fail(
+    loader: Callable[..., Any],
+    config_path: Optional[str],
+    raw: Optional[dict],
+    empty: Any,
+) -> Any:
+    """Invoke ``loader`` with either ``raw=`` or a resolved path; wrap errors.
+
+    If *raw* is provided the dict is passed directly (avoids a re-read).
+    If *config_path* is ``None`` the caller-supplied *empty* default is
+    returned immediately. Both live call-sites catch :class:`MinerConfigError`
+    and re-raise as :class:`click.ClickException` so the CLI formats the
+    message as ``quip-miner: error: …``.
+    """
+    if raw is not None:
+        try:
+            return loader(raw=raw)
+        except MinerConfigError as exc:
+            raise click.ClickException(str(exc)) from exc
+    if config_path is None:
+        return empty
+    try:
+        return loader(Path(config_path).expanduser())
+    except MinerConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 def _resolve_runtime_config(
     *,
     config_path: Optional[str],
@@ -448,18 +486,7 @@ def _resolve_runtime_config(
     the TOML can't be loaded or required keys (`validators`, `signer_key`)
     are missing.
     """
-    if raw is not None:
-        try:
-            toml_data = load_miner_config(raw=raw)
-        except MinerConfigError as exc:
-            raise click.ClickException(str(exc)) from exc
-    elif config_path is not None:
-        try:
-            toml_data = load_miner_config(Path(config_path).expanduser())
-        except MinerConfigError as exc:
-            raise click.ClickException(str(exc)) from exc
-    else:
-        toml_data = {}
+    toml_data = _load_or_fail(load_miner_config, config_path, raw, {})
     merged = merge_config(toml_data, cli_kwargs)
     if defaults:
         for key, value in defaults.items():
@@ -524,11 +551,7 @@ async def _connect_or_fail(urls: tuple[str, ...]) -> SubstrateClient:
     try:
         await client.connect()
     except NoValidatorReachable as exc:
-        url_csv = ",".join(a.url for a in exc.attempts)
-        reasons = ",".join(a.exc_type for a in exc.attempts)
-        raise click.ClickException(
-            f"validators-unreachable urls={url_csv} reasons={reasons}"
-        ) from exc
+        raise _validators_unreachable(exc) from exc
     return client
 
 
@@ -541,7 +564,7 @@ async def _ensure_funded_or_fail(
 ) -> int:
     """Guard C — wallet funded.
 
-    Delegates to `shared.miner_bootstrap.ensure_funded_via_faucet`: returns the
+    Delegates to `substrate.miner_bootstrap.ensure_funded_via_faucet`: returns the
     balance when it is already at/above threshold or after a successful faucet
     top-up. `Underfunded` (below threshold, no faucet) → `wallet-underfunded`;
     a dropped validator rotation mid-settlement → `validators-unreachable`;
@@ -561,11 +584,7 @@ async def _ensure_funded_or_fail(
         # Faucet path stays connected via SubstrateClient; if the rotation
         # collapses mid-settlement, surface it as the same code the connect
         # guard uses rather than burying it in `wallet-faucet-failed`.
-        urls = ",".join(a.url for a in exc.attempts)
-        reasons = ",".join(a.exc_type for a in exc.attempts)
-        raise click.ClickException(
-            f"validators-unreachable urls={urls} reasons={reasons}"
-        ) from exc
+        raise _validators_unreachable(exc) from exc
     except Exception as exc:  # noqa: BLE001 — translated to a CLI error code
         # Surface the exception text, not just the class name: the actionable
         # detail (e.g. "faucet returned 502: transfer failed; see faucet logs"
@@ -581,7 +600,7 @@ async def _ensure_funded_or_fail(
 async def _ensure_registered_or_fail(client: SubstrateClient, keystore) -> None:
     """Guard D — miner registered, transparently and idempotently.
 
-    Reuses ``shared.miner_bootstrap._ensure_registered`` so the manual
+    Reuses ``substrate.miner_bootstrap._ensure_registered`` so the manual
     ``bootstrap`` command and the miner's own startup register through
     identical code — they cannot drift. Retries registration over several
     minutes (verifying the account lands in ``QuantumPow.Miners``); an ultimate
@@ -603,11 +622,7 @@ async def _ensure_registered_or_fail(client: SubstrateClient, keystore) -> None:
     try:
         outcome = await _retry_until_verified("register-miner", _attempt)
     except NoValidatorReachable as exc:
-        urls = ",".join(a.url for a in exc.attempts)
-        reasons = ",".join(a.exc_type for a in exc.attempts)
-        raise click.ClickException(
-            f"validators-unreachable urls={urls} reasons={reasons}"
-        ) from exc
+        raise _validators_unreachable(exc) from exc
     except RuntimeError as exc:
         raise click.ClickException(
             f"miner-registration-failed ss58={ss58} error={exc}"
@@ -628,7 +643,7 @@ async def _ensure_registered_or_fail(client: SubstrateClient, keystore) -> None:
 )
 def quip_miner(log_level: str) -> None:
     """Substrate-integrated quantum mining frontend."""
-    setup_logging(log_level=log_level.upper(), node_name="quip-miner")
+    setup_logging(log_level=log_level.upper())
 
 
 @quip_miner.command("selftest")
@@ -839,7 +854,7 @@ def quip_miner_telemetry(
     aggregator + chain-read proxy.
     """
     import multiprocessing as mp
-    from shared.telemetry_process import telemetry_main
+    from substrate.telemetry_process import telemetry_main
 
     snap_dir = Path(snapshot_dir).expanduser()
     snap_dir.mkdir(parents=True, exist_ok=True)
@@ -848,10 +863,9 @@ def quip_miner_telemetry(
     # Hook SIGINT here so a Ctrl-C in standalone runs exits cleanly;
     # under the Docker supervisor, SIGTERM from the entrypoint's
     # `kill -TERM` does the same via telemetry_main's own handler.
-    import signal as _signal
     def _on_sigint(*_a):
         shutdown_event.set()
-    _signal.signal(_signal.SIGINT, _on_sigint)
+    signal.signal(signal.SIGINT, _on_sigint)
 
     telemetry_main(
         listen_host=rest_host,
@@ -973,11 +987,7 @@ def quip_miner_bootstrap(
     try:
         result = asyncio.run(bootstrap(config))
     except NoValidatorReachable as exc:
-        urls = ",".join(a.url for a in exc.attempts)
-        reasons = ",".join(a.exc_type for a in exc.attempts)
-        raise click.ClickException(
-            f"validators-unreachable urls={urls} reasons={reasons}"
-        ) from exc
+        raise _validators_unreachable(exc) from exc
 
     click.echo("bootstrap complete")
     click.echo(f"  ss58 address       : {result.ss58_address}")
@@ -1211,17 +1221,7 @@ def _load_backends_or_fail(
     (via `miner_main`'s wrapper). Pass `raw` (a pre-parsed config from
     :func:`load_toml`) to reuse a single parse.
     """
-    if raw is not None:
-        try:
-            return load_backend_config(raw=raw)
-        except MinerConfigError as exc:
-            raise click.ClickException(str(exc)) from exc
-    if config_path is None:
-        return {}
-    try:
-        return load_backend_config(Path(config_path).expanduser())
-    except MinerConfigError as exc:
-        raise click.ClickException(str(exc)) from exc
+    return _load_or_fail(load_backend_config, config_path, raw, {})
 
 
 def _parse_image_supports(image_supports_csv: Optional[str]) -> Optional[list]:
@@ -1244,17 +1244,7 @@ def _load_submission_config_or_default(
     CLI's standard error formatting rather than a raw traceback. Pass `raw`
     (a pre-parsed config from :func:`load_toml`) to reuse a single parse.
     """
-    if raw is not None:
-        try:
-            return load_submission_config(raw=raw)
-        except MinerConfigError as exc:
-            raise click.ClickException(str(exc)) from exc
-    if config_path is None:
-        return SubmissionConfig()
-    try:
-        return load_submission_config(Path(config_path).expanduser())
-    except MinerConfigError as exc:
-        raise click.ClickException(str(exc)) from exc
+    return _load_or_fail(load_submission_config, config_path, raw, SubmissionConfig())
 
 
 def _check_backend_conflicts(
@@ -1669,7 +1659,6 @@ def _announce_and_load(
         setup_logging(
             log_level=logging.getLevelName(logging.getLogger().level),
             node_log_file=node_log,
-            node_name=node_name or _default_node_name(),
         )
     keystore = _load_keystore_or_fail(signer_key_path)
     click.echo(f"signer: {keystore.signer.ss58_address()} (hybrid) mode={mode}")
@@ -1817,7 +1806,7 @@ async def _run_concurrent_miner(
             # the standalone connection.
             await setup_client.close()
         if pool is not None:
-            await pool.close()
+            await pool.shutdown()
         if core is not None:
             core.close()
 
@@ -1854,6 +1843,13 @@ _MODE_HELP = (
     "≥2 handles). Phase 9 will introduce a shared scheduler so one "
     "mode can use the other's idle worker."
 )
+
+# Default miner_config for each --gpu-backend choice (no TOML inventory).
+_GPU_BACKEND_DEFAULTS: dict[str, dict] = {
+    "local": {"cuda": [{"device": "0"}]},
+    "metal": {"metal": [{}]},
+    "modal": {"modal": [{"gpu_type": "t4"}]},
+}
 
 # Shared default fallbacks for the cpu/gpu/qpu commands (applied after the
 # TOML+CLI merge, so an explicit TOML/CLI value always wins).
@@ -2081,14 +2077,9 @@ def quip_miner_gpu(
         }
     else:
         backend = gpu_backend.lower()
-        if backend == "local":
-            miner_config = {"cuda": [{"device": "0"}]}
-        elif backend == "metal":
-            miner_config = {"metal": [{}]}
-        elif backend == "modal":
-            miner_config = {"modal": [{"gpu_type": "t4"}]}
-        else:
+        if backend not in _GPU_BACKEND_DEFAULTS:
             raise click.BadParameter(f"unknown --gpu-backend: {backend}")
+        miner_config = _GPU_BACKEND_DEFAULTS[backend]
 
     _dispatch_mining_command(
         raw=raw,

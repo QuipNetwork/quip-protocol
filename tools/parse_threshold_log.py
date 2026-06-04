@@ -105,6 +105,11 @@ def parse_log(log_file: str) -> dict[str, Any]:
         'required_samples': required_samples,
     }
 
+def _fmt(x: float) -> str:
+    """Format a number as int if whole, else one decimal place."""
+    return f"{int(x)}" if x == int(x) else f"{x:.1f}"
+
+
 def print_summary(stats: dict[str, Any]) -> None:
     """Print formatted summary."""
     print("=" * 60)
@@ -114,19 +119,11 @@ def print_summary(stats: dict[str, Any]) -> None:
     cfg = stats['config']
     print(f"\n📋 Configuration:")
     if cfg['target_time_min'] is not None and cfg['tolerance_pct'] is not None:
-        # Format tolerance as int if whole number, else as float
-        tol = cfg['tolerance_pct']
-        tol_str = f"{int(tol)}" if tol == int(tol) else f"{tol:.1f}"
-        print(f"   Target: {cfg['target_time_min']:.1f} minutes (±{tol_str}%)")
+        print(f"   Target: {cfg['target_time_min']:.1f} minutes (±{_fmt(cfg['tolerance_pct'])}%)")
     else:
         print("   Target: Not found in log")
     if cfg['lower_bound_s'] is not None and cfg['upper_bound_s'] is not None:
-        # Format bounds as int if whole numbers
-        lb = cfg['lower_bound_s']
-        ub = cfg['upper_bound_s']
-        lb_str = f"{int(lb)}" if lb == int(lb) else f"{lb:.1f}"
-        ub_str = f"{int(ub)}" if ub == int(ub) else f"{ub:.1f}"
-        print(f"   Range: [{lb_str}s, {ub_str}s]")
+        print(f"   Range: [{_fmt(cfg['lower_bound_s'])}s, {_fmt(cfg['upper_bound_s'])}s]")
     else:
         print("   Range: Not found in log")
 

@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Metal SA performance tester with known optimal energies."""
 
-import sys
 import time
 import argparse
-from pathlib import Path
 
 from basic_ising_problems import BASIC_ISING_PROBLEMS
 
@@ -161,7 +159,7 @@ def main():
         # Display results
         if sa_times:
             avg_time = sum(sa_times) / len(sa_times)
-            last_time = sa_times[-1] if sa_times else 0
+            last_time = sa_times[-1]
             last_success = all_results[last_problem_idx]['sa']['success']
 
             print(f"SA: {last_time:.1f}s, Success: {last_success}")

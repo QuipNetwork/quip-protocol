@@ -65,6 +65,37 @@ class RpcResponse:
     exception: Optional[BaseException] = None
 
 
+def _put_response(
+    resp_q: mp.Queue,
+    request_id: int,
+    *,
+    result: Any = None,
+    exception: Optional[BaseException] = None,
+) -> None:
+    """Build and enqueue an `RpcResponse`, guarding against unpicklable payloads.
+
+    If `exception` is set but not picklable it is replaced with a plain
+    `RuntimeError`.  If `result` is set but not picklable the response is
+    flipped to an exception instead.
+
+    Args:
+        resp_q: The multiprocessing queue the child writes responses onto.
+        request_id: Monotonic id echoed from the originating `RpcRequest`.
+        result: Successful call result (mutually exclusive with `exception`).
+        exception: Exception from the child (mutually exclusive with `result`).
+    """
+    if exception is not None:
+        exc_to_send: BaseException = exception
+        if not _is_picklable(exception):
+            exc_to_send = RuntimeError(f"{type(exception).__name__}: {exception}")
+        resp_q.put(RpcResponse(request_id=request_id, exception=exc_to_send))
+    elif not _is_picklable(result):
+        safe = RuntimeError(f"result is not picklable (request_id={request_id})")
+        resp_q.put(RpcResponse(request_id=request_id, exception=safe))
+    else:
+        resp_q.put(RpcResponse(request_id=request_id, result=result))
+
+
 def validator_main(
     url: str,
     req_q: mp.Queue,
@@ -139,19 +170,9 @@ def validator_main(
             except BaseException as exc:  # noqa: BLE001
                 # Eagerly test picklability: mp.Queue serialises in a background
                 # thread, so a try/except around put() won't catch the error.
-                exc_to_send: BaseException = exc
-                if not _is_picklable(exc):
-                    exc_to_send = RuntimeError(f"{type(exc).__name__}: {exc}")
-                resp_q.put(RpcResponse(request_id=req.request_id, exception=exc_to_send))
+                _put_response(resp_q, req.request_id, exception=exc)
                 continue
-            # Guard against unpicklable results too.
-            if not _is_picklable(result):
-                safe = RuntimeError(
-                    f"result for op={req.op!r} is not picklable"
-                )
-                resp_q.put(RpcResponse(request_id=req.request_id, exception=safe))
-            else:
-                resp_q.put(RpcResponse(request_id=req.request_id, result=result))
+            _put_response(resp_q, req.request_id, result=result)
     finally:
         try:
             close = getattr(client, "close", None)

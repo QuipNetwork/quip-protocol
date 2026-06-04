@@ -15,7 +15,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 # Set spawn method before any other multiprocessing code
 try:
@@ -31,7 +31,9 @@ from dwave_topologies import DEFAULT_TOPOLOGY
 from CPU.sa_miner import SimulatedAnnealingMiner
 from shared.block import BlockRequirements, create_genesis_block
 from shared.energy_utils import energy_to_difficulty
+from shared.proc_util import drain_and_force_terminate
 from shared.time_utils import utc_timestamp
+from QPU.qpu_time_manager import parse_duration
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,25 +63,6 @@ class NodeInfo:
     """Simple node info for testing."""
 
     miner_id: str
-
-
-def parse_duration(duration_str: str) -> float:
-    """Parse duration string to minutes.
-
-    Supports: 30s, 5m, 2h, 1d, 1w, or raw minute values.
-    """
-    duration_str = duration_str.strip().lower()
-    if duration_str.endswith('s'):
-        return int(duration_str[:-1]) / 60.0
-    elif duration_str.endswith('m'):
-        return float(duration_str[:-1])
-    elif duration_str.endswith('h'):
-        return int(duration_str[:-1]) * 60.0
-    elif duration_str.endswith('d'):
-        return int(duration_str[:-1]) * 1440.0
-    elif duration_str.endswith('w'):
-        return int(duration_str[:-1]) * 10080.0
-    return float(duration_str)
 
 
 def aggregate_results(
@@ -291,8 +274,6 @@ def mine_worker(
 
         submit_results()
 
-    submit_results()
-
 
 def build_specs(
     miner_type: str,
@@ -343,7 +324,10 @@ def run_benchmark(args) -> int:
         args.duration = '4h'
 
     try:
-        duration_minutes = parse_duration(args.duration)
+        # Bare numbers are legacy minutes; suffixed values use the canonical
+        # seconds-based parser.
+        _d = args.duration.strip()
+        duration_minutes = float(_d) if _d[-1:].isdigit() else parse_duration(_d) / 60.0
     except (ValueError, IndexError):
         print(f"Invalid duration: '{args.duration}'")
         return 1
@@ -460,14 +444,7 @@ def run_benchmark(args) -> int:
                     drain_queue()
                     if time.time() - shutdown_start > 180:
                         print("   Timeout, forcing shutdown...")
-                        drain_queue()
-                        for p in processes:
-                            if p.is_alive():
-                                p.terminate()
-                        for p in processes:
-                            p.join(timeout=2.0)
-                            if p.is_alive():
-                                p.kill()
+                        drain_and_force_terminate(processes, drain_queue)
                         break
                     time.sleep(0.5)
                 break
@@ -479,13 +456,7 @@ def run_benchmark(args) -> int:
         while any(p.is_alive() for p in processes):
             drain_queue()
             if time.time() - shutdown_start > 60:
-                for p in processes:
-                    if p.is_alive():
-                        p.terminate()
-                for p in processes:
-                    p.join(timeout=2.0)
-                    if p.is_alive():
-                        p.kill()
+                drain_and_force_terminate(processes, drain_queue)
                 break
             time.sleep(0.5)
         drain_queue()

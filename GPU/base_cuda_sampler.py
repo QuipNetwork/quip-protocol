@@ -19,8 +19,9 @@ import dataclasses
 import logging
 import os
 import time
+from itertools import chain
 from typing import (
-    Dict, Iterable, Iterator, List, Optional, Tuple,
+    Any, Dict, Iterable, Iterator, List, Optional, Tuple,
 )
 
 import cupy as cp
@@ -29,6 +30,7 @@ import numpy as np
 
 from shared.ising_model import IsingModel
 
+from GPU.gpu_scheduler import throttled_stream
 from GPU.sampler_utils import (
     build_csr_structure_from_edges,
     build_edge_position_index,
@@ -87,9 +89,12 @@ class BaseCudaSampler(abc.ABC):
         _allocate_kernel_buffers()
         _kernel_launch_args()
         _extra_download_info()
+        _self_feeding_kwargs()
     """
 
     CTRL_STRIDE = 8
+    CTRL_EXIT_NOW = 6   # field index: exit_now flag
+    SLOTS_PER_NONCE = 3  # rotating buffer slots per nonce
     SLOT_EMPTY = 0
     SLOT_READY = 1
     SLOT_ACTIVE = 2
@@ -318,6 +323,14 @@ class BaseCudaSampler(abc.ABC):
         """
         return {}
 
+    def _self_feeding_kwargs(self) -> dict:
+        """Extra kwargs forwarded to prepare_self_feeding().
+
+        Override to pass sampler-specific allocation params
+        (e.g., sms_per_nonce) into _allocate_kernel_buffers().
+        """
+        return {}
+
     # ----------------------------------------------------------
     # Shared prepare (topology CSR)
     # ----------------------------------------------------------
@@ -492,6 +505,47 @@ class BaseCudaSampler(abc.ABC):
         )
 
     # ----------------------------------------------------------
+    # Control / buffer layout helpers
+    # ----------------------------------------------------------
+
+    def _ctrl_index(self, nonce_id: int, field: int) -> int:
+        """Return the flat ctrl-array index for a nonce field.
+
+        Args:
+            nonce_id: Nonce group index.
+            field: Field offset within the per-nonce stride
+                (e.g., slot_id for slot-state fields,
+                CTRL_EXIT_NOW for the exit flag).
+        """
+        return nonce_id * self.CTRL_STRIDE + field
+
+    def _slot_buffer_offsets(
+        self,
+        nonce_id: int,
+        slot_id: int,
+        reads: int,
+        max_packed_size: int,
+    ) -> Tuple[int, int, int]:
+        """Return flat buffer offsets for a nonce/slot.
+
+        Args:
+            nonce_id: Nonce group index.
+            slot_id: Slot within nonce (0, 1, or 2).
+            reads: Number of reads per nonce.
+            max_packed_size: Packed words per sample.
+
+        Returns:
+            (slot_idx, sample_start, energy_start) where
+            slot_idx is the flat slot index and the *_start
+            values are the first element offsets in the
+            corresponding flat device buffers.
+        """
+        slot_idx = nonce_id * self.SLOTS_PER_NONCE + slot_id
+        sample_start = slot_idx * reads * max_packed_size
+        energy_start = slot_idx * reads
+        return slot_idx, sample_start, energy_start
+
+    # ----------------------------------------------------------
     # Slot upload / download
     # ----------------------------------------------------------
 
@@ -517,7 +571,11 @@ class BaseCudaSampler(abc.ABC):
         nnz = self._prep_nnz
         max_packed_size = self._prep_max_packed_size
         reads = self._sf_reads_per_nonce
-        slot_idx = nonce_id * 3 + slot_id
+        slot_idx, sample_start, energy_start = (
+            self._slot_buffer_offsets(
+                nonce_id, slot_id, reads, max_packed_size,
+            )
+        )
 
         # Fill host staging
         j_vals = np.fromiter(
@@ -536,10 +594,6 @@ class BaseCudaSampler(abc.ABC):
         # Async H2D on transfer stream
         j_start = slot_idx * nnz
         h_start = slot_idx * N
-        sample_start = (
-            slot_idx * reads * max_packed_size
-        )
-        energy_start = slot_idx * reads
 
         with self._sf_stream_transfer:
             self._d_sf_J[j_start:j_start + nnz].set(
@@ -558,9 +612,7 @@ class BaseCudaSampler(abc.ABC):
             ] = 0
 
         # Mark slot READY
-        ctrl_offset = (
-            nonce_id * self.CTRL_STRIDE + slot_id
-        )
+        ctrl_offset = self._ctrl_index(nonce_id, slot_id)
         ready_val = np.array(
             [self.SLOT_READY], dtype=np.int32,
         )
@@ -629,12 +681,11 @@ class BaseCudaSampler(abc.ABC):
         node_to_idx = self._prep_node_to_idx
         max_packed_size = self._prep_max_packed_size
         reads = self._sf_reads_per_nonce
-        slot_idx = nonce_id * 3 + slot_id
-
-        sample_start = (
-            slot_idx * reads * max_packed_size
+        _slot_idx, sample_start, energy_start = (
+            self._slot_buffer_offsets(
+                nonce_id, slot_id, reads, max_packed_size,
+            )
         )
-        energy_start = slot_idx * reads
 
         packed_raw = cp.asnumpy(
             self._d_sf_samples[
@@ -666,20 +717,6 @@ class BaseCudaSampler(abc.ABC):
             info=info,
         )
         return results[0]
-
-    def mark_slot_empty(
-        self, nonce_id: int, slot_id: int,
-    ) -> None:
-        """Mark a slot as EMPTY."""
-        ctrl_offset = (
-            nonce_id * self.CTRL_STRIDE + slot_id
-        )
-        empty_val = np.array(
-            [self.SLOT_EMPTY], dtype=np.int32,
-        )
-        self._d_sf_ctrl[
-            ctrl_offset:ctrl_offset + 1
-        ].set(empty_val)
 
     # ----------------------------------------------------------
     # Kernel launch / control
@@ -742,17 +779,19 @@ class BaseCudaSampler(abc.ABC):
         ctrl_host = cp.asnumpy(self._d_sf_ctrl)
         completed = []
         for n in range(self._sf_num_nonces):
-            base = n * self.CTRL_STRIDE
-            for s in range(3):
-                if ctrl_host[base + s] == self.SLOT_COMPLETE:
+            for s in range(self.SLOTS_PER_NONCE):
+                if (
+                    ctrl_host[self._ctrl_index(n, s)]
+                    == self.SLOT_COMPLETE
+                ):
                     completed.append((n, s))
         return completed
 
     def signal_nonce_exit(self, nonce_id: int) -> None:
         """Signal one nonce to exit."""
         assert self._sf_prepared
-        ctrl_offset = (
-            nonce_id * self.CTRL_STRIDE + 6
+        ctrl_offset = self._ctrl_index(
+            nonce_id, self.CTRL_EXIT_NOW,
         )
         exit_val = np.array([1], dtype=np.int32)
         self._d_sf_ctrl[
@@ -775,42 +814,6 @@ class BaseCudaSampler(abc.ABC):
         if wait:
             self._sf_stream_compute.synchronize()
         self._sf_kernel_running = False
-
-    def relaunch_self_feeding(
-        self,
-        active_nonce_count: int,
-        num_betas: int,
-        seed: Optional[int] = None,
-    ) -> None:
-        """Stop kernel, reset ctrl, relaunch.
-
-        Args:
-            active_nonce_count: Number of active nonces.
-            num_betas: Beta schedule length.
-            seed: RNG base seed.
-        """
-        assert self._sf_prepared
-
-        self._sf_stream_compute.synchronize()
-        self._sf_kernel_running = False
-
-        # Zero the entire ctrl array
-        self._d_sf_ctrl[:] = 0
-
-        self.launch_self_feeding(
-            num_betas=num_betas,
-            seed=seed,
-            active_nonce_count=active_nonce_count,
-        )
-
-    def is_kernel_running(self) -> bool:
-        """Check if the self-feeding kernel is still running."""
-        if not self._sf_kernel_running:
-            return False
-        done = self._sf_stream_compute.done
-        if done:
-            self._sf_kernel_running = False
-        return self._sf_kernel_running
 
     def get_profile_data(self) -> np.ndarray:
         """Copy profile counters from GPU and reshape.
@@ -906,11 +909,25 @@ class BaseCudaSampler(abc.ABC):
             if _exhausted:
                 return None
             if _has_try_pop:
-                m = models.try_pop()
-                if m is None:
-                    return None
-                return m
+                return models.try_pop()
             return _pull_blocking()
+
+        def _try_fill_free_slot(
+            nonce_id: int, ss: '_SlotState',
+        ) -> bool:
+            """Pull one model and upload it into ss.free_slot.
+
+            Returns True if a model was queued, False if none
+            was available.
+            """
+            m = _pull_nonblocking()
+            if m is None:
+                return False
+            self.upload_slot(nonce_id, ss.free_slot, m.h, m.J)
+            ss.next_slot = ss.free_slot
+            ss.next_model = m
+            ss.free_slot = -1
+            return True
 
         # Build per-kernel slot state
         # Slots: 0=active, 1=next, 2=free
@@ -977,15 +994,7 @@ class BaseCudaSampler(abc.ABC):
                         and ss.next_model is None
                         and ss.free_slot >= 0
                     ):
-                        m = _pull_nonblocking()
-                        if m is not None:
-                            self.upload_slot(
-                                nonce_id, ss.free_slot,
-                                m.h, m.J,
-                            )
-                            ss.next_slot = ss.free_slot
-                            ss.next_model = m
-                            ss.free_slot = -1
+                        _try_fill_free_slot(nonce_id, ss)
 
                 # Single DMA read of ctrl array
                 ctrl = cp.asnumpy(self._d_sf_ctrl)
@@ -994,8 +1003,11 @@ class BaseCudaSampler(abc.ABC):
                 for nonce_id, ss in enumerate(slots):
                     if ss.active_model is None:
                         continue
-                    base = nonce_id * self.CTRL_STRIDE
-                    state = ctrl[base + ss.active_slot]
+                    state = ctrl[
+                        self._ctrl_index(
+                            nonce_id, ss.active_slot,
+                        )
+                    ]
                     if state != self.SLOT_COMPLETE:
                         continue
 
@@ -1017,15 +1029,7 @@ class BaseCudaSampler(abc.ABC):
                     ss.next_model = None
 
                     # Non-blocking fill of freed slot
-                    m = _pull_nonblocking()
-                    if m is not None:
-                        self.upload_slot(
-                            nonce_id, ss.free_slot,
-                            m.h, m.J,
-                        )
-                        ss.next_slot = ss.free_slot
-                        ss.next_model = m
-                        ss.free_slot = -1
+                    _try_fill_free_slot(nonce_id, ss)
 
                     yield (completed_model, result_ss)
 
@@ -1044,6 +1048,186 @@ class BaseCudaSampler(abc.ABC):
 
         finally:
             self.signal_exit(wait=False)
+
+    # ----------------------------------------------------------
+    # Public sampling API (shared SA/Gibbs bodies)
+    # ----------------------------------------------------------
+
+    def sample_ising_streaming(
+        self,
+        models: Iterable[IsingModel],
+        *,
+        num_reads: int = 200,
+        num_sweeps: int = 1000,
+        num_sweeps_per_beta: int = 1,
+        beta_range: Optional[Tuple[float, float]] = None,
+        beta_schedule_type: str = "geometric",
+        seed: Optional[int] = None,
+        num_kernels: Optional[int] = None,
+        poll_timeout: Optional[float] = None,
+        scheduler: Any = None,
+    ) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
+        """Stream Ising model solutions via the kernel.
+
+        Prepare topology/self-feeding buffers if needed, peek
+        the first model to build the beta schedule, then run
+        the base rotation loop under the scheduler throttle.
+
+        Args:
+            models: Iterable of IsingModel.
+            num_reads: Samples per model.
+            num_sweeps: Total sweeps per model.
+            num_sweeps_per_beta: Sweeps per beta value.
+            beta_range: (hot, cold) or None for auto.
+            beta_schedule_type: Schedule type.
+            seed: RNG seed.
+            num_kernels: Concurrent nonces (default: auto).
+            poll_timeout: Seconds before TimeoutError.
+            scheduler: Optional throttling scheduler.
+
+        Yields:
+            (model, SampleSet) in completion order.
+        """
+        num_k = num_kernels or max(
+            1,
+            self.max_sms // self._sms_per_nonce,
+        )
+
+        if not self._prepared:
+            self.prepare(
+                num_reads=num_reads,
+                num_sweeps=num_sweeps,
+                num_sweeps_per_beta=num_sweeps_per_beta,
+            )
+
+        if not self._sf_prepared:
+            self.prepare_self_feeding(
+                num_nonces=num_k,
+                reads_per_nonce=num_reads,
+                num_sweeps=num_sweeps,
+                num_sweeps_per_beta=num_sweeps_per_beta,
+                **self._self_feeding_kwargs(),
+            )
+
+        # Peek first model for beta schedule
+        model_iter = iter(models)
+        try:
+            first = next(model_iter)
+        except StopIteration:
+            return
+
+        num_betas, _ = self.upload_beta_schedule(
+            first.h, first.J, num_sweeps,
+            num_sweeps_per_beta, beta_range,
+            beta_schedule_type,
+        )
+
+        # Throttle before pulling each result (yielding mode): the unified
+        # driver path bypasses the old _sample_batch back-off, so honor it here.
+        yield from throttled_stream(
+            self._run_streaming_loop(
+                chain([first], model_iter),
+                num_k=num_k,
+                num_betas=num_betas,
+                seed=seed,
+                poll_timeout=poll_timeout,
+            ),
+            scheduler,
+        )
+
+    def sample_ising(
+        self,
+        h: List[Dict[int, float]],
+        J: List[Dict[Tuple[int, int], float]],
+        num_reads: int = 200,
+        num_sweeps: int = 1000,
+        num_sweeps_per_beta: int = 1,
+        beta_range: Optional[Tuple[float, float]] = None,
+        beta_schedule_type: str = "geometric",
+        seed: Optional[int] = None,
+        **kwargs,
+    ) -> List[dimod.SampleSet]:
+        """Sample from Ising models using the self-feeding kernel.
+
+        Args:
+            h: List of linear biases per problem.
+            J: List of quadratic biases per problem.
+            num_reads: Number of independent samples per
+                problem.
+            num_sweeps: Total number of sweeps.
+            num_sweeps_per_beta: Sweeps per beta value.
+            beta_range: (hot_beta, cold_beta) or None for
+                auto.
+            beta_schedule_type: Schedule type.
+            seed: RNG seed.
+
+        Returns:
+            List of dimod.SampleSet, one per problem.
+        """
+        num_problems = len(h)
+        assert len(J) == num_problems, (
+            f"h and J must have same length: "
+            f"{num_problems} vs {len(J)}"
+        )
+
+        if not self._prepared:
+            self.prepare(
+                num_reads=num_reads,
+                num_sweeps=num_sweeps,
+                num_sweeps_per_beta=num_sweeps_per_beta,
+            )
+
+        if not self._sf_prepared:
+            self.prepare_self_feeding(
+                num_nonces=num_problems,
+                reads_per_nonce=num_reads,
+                num_sweeps=num_sweeps,
+                num_sweeps_per_beta=num_sweeps_per_beta,
+                **self._self_feeding_kwargs(),
+            )
+
+        # Reset ctrl array (clears stale EXIT_NOW from
+        # previous sample_ising call)
+        self._d_sf_ctrl[:] = 0
+
+        # Upload beta schedule
+        num_betas, beta_range = self.upload_beta_schedule(
+            h[0], J[0], num_sweeps,
+            num_sweeps_per_beta, beta_range,
+            beta_schedule_type,
+        )
+
+        # Upload one model per nonce to slot 0
+        for i in range(num_problems):
+            self.upload_slot(i, 0, h[i], J[i])
+
+        # Launch kernel
+        self._sf_kernel_running = False  # allow re-launch
+        self.launch_self_feeding(
+            num_betas=num_betas,
+            seed=seed,
+            active_nonce_count=num_problems,
+        )
+
+        # Poll until all nonces complete
+        completed = set()
+        while len(completed) < num_problems:
+            for nonce_id, slot_id in self.poll_completions():
+                if nonce_id not in completed:
+                    completed.add(nonce_id)
+            if len(completed) < num_problems:
+                time.sleep(0.001)
+
+        # Download results
+        results = []
+        for i in range(num_problems):
+            ss = self.download_slot(i, 0)
+            results.append(ss)
+
+        # Signal exit and wait
+        self.signal_exit()
+
+        return results
 
     def close(self) -> None:
         """Synchronize streams and free GPU buffers.

@@ -14,7 +14,7 @@ import.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple, Union
+from typing import NoReturn, Tuple, Union
 
 
 # Milli-precision scale factor. Mirrors quantum_validation::fixed::MILLI_SCALE.
@@ -157,12 +157,16 @@ def bits_per_value(spec: AllowedValueSpec) -> int:
         if spec.max < spec.min:
             raise EmptyAllowedValues("allowed value spec is empty or inverted")
         return 32
-    raise TypeError(f"unknown AllowedValueSpec variant: {type(spec).__name__}")
+    _unknown_variant(spec)
 
 
 def _check_indexed_bits(bits: int) -> None:
     if bits > MAX_INDEXED_BITS:
         raise EncodingTooWide(bits)
+
+
+def _unknown_variant(spec: AllowedValueSpec) -> NoReturn:
+    raise TypeError(f"unknown AllowedValueSpec variant: {type(spec).__name__}")
 
 
 def sample(spec: AllowedValueSpec, rng) -> int:
@@ -188,7 +192,7 @@ def sample(spec: AllowedValueSpec, rng) -> int:
         span = spec.max - spec.min + 1
         offset = rng.next_u32() % span
         return int(spec.min + offset)
-    raise TypeError(f"unknown AllowedValueSpec variant: {type(spec).__name__}")
+    _unknown_variant(spec)
 
 
 def decode_value(spec: AllowedValueSpec, raw: int) -> int:
@@ -218,7 +222,7 @@ def decode_value(spec: AllowedValueSpec, raw: int) -> int:
         if value < spec.min or value > spec.max:
             raise InvalidEncodedValue(raw)
         return int(value)
-    raise TypeError(f"unknown AllowedValueSpec variant: {type(spec).__name__}")
+    _unknown_variant(spec)
 
 
 def encode_value(spec: AllowedValueSpec, value: int) -> int:
@@ -243,7 +247,7 @@ def encode_value(spec: AllowedValueSpec, value: int) -> int:
             raise InvalidEncodedValue(value)
         # Encode i32 as u32 two's-complement (matches `value as u32` in Rust).
         return int(value) & _U32_MASK
-    raise TypeError(f"unknown AllowedValueSpec variant: {type(spec).__name__}")
+    _unknown_variant(spec)
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +279,7 @@ def canonical_bytes(spec: AllowedValueSpec) -> bytes:
             + int(spec.min).to_bytes(4, "big", signed=True)
             + int(spec.max).to_bytes(4, "big", signed=True)
         )
-    raise TypeError(f"unknown AllowedValueSpec variant: {type(spec).__name__}")
+    _unknown_variant(spec)
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +302,7 @@ def scale_dict(spec: AllowedValueSpec) -> dict:
         return {"IntegerRange": {"min": int(spec.min), "max": int(spec.max)}}
     if isinstance(spec, AllowedValueContinuousRange):
         return {"ContinuousRange": {"min": int(spec.min), "max": int(spec.max)}}
-    raise TypeError(f"unknown AllowedValueSpec variant: {type(spec).__name__}")
+    _unknown_variant(spec)
 
 
 __all__ = [

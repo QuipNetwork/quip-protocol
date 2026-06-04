@@ -217,7 +217,7 @@ def test_bridge_prev_block_handles_mempool_context():
     """Phase 8b: mempool work uses order_id as the prev-block index and a
     zero-hash placeholder. Subclass hooks that log the index get a
     meaningful value; the hash is never fed back into the chain."""
-    from shared.mempool_types import MempoolJobContext
+    from substrate.mempool_types import MempoolJobContext
     ctx = MempoolJobContext(
         order_id=42,
         nodes=(0, 1, 2),
@@ -231,7 +231,7 @@ def test_bridge_prev_block_handles_mempool_context():
 
 
 def test_bridge_node_info_handles_mempool_context():
-    from shared.mempool_types import MempoolJobContext
+    from substrate.mempool_types import MempoolJobContext
     ctx = MempoolJobContext(
         order_id=7,
         nodes=(0, 1),
@@ -279,7 +279,7 @@ def test_requirements_from_context_mempool_unset_floors():
       - difficulty_energy = +inf (no upper bound)
       - min_diversity    = 0.0
       - min_solutions    = 1 (chain requires ≥1 valid submission)"""
-    from shared.mempool_types import MempoolJobContext
+    from substrate.mempool_types import MempoolJobContext
     ctx = MempoolJobContext(
         order_id=1,
         nodes=(0, 1),
@@ -294,7 +294,7 @@ def test_requirements_from_context_mempool_unset_floors():
 
 
 def test_requirements_from_context_mempool_with_floors():
-    from shared.mempool_types import MempoolJobContext
+    from substrate.mempool_types import MempoolJobContext
     ctx = MempoolJobContext(
         order_id=2,
         nodes=(0, 1),
@@ -315,7 +315,7 @@ def test_resolve_ising_mempool_returns_stored_h_j():
     """Mempool's resolve_ising surfaces the stored (h, J) dicts directly;
     nonce is 0 (telemetry placeholder). nodes/edges params are unused on
     this path since the chain doesn't re-derive the model."""
-    from shared.mempool_types import MempoolJobContext
+    from substrate.mempool_types import MempoolJobContext
     ctx = MempoolJobContext(
         order_id=99,
         nodes=(10, 20, 30),
@@ -360,7 +360,7 @@ def test_make_feeder_mempool_returns_fixed_feeder():
     cycles the order's stored (h, J) — placeholder nonce / salt are
     zero bytes (chain doesn't re-derive)."""
     from shared.ising_feeder import FixedIsingFeeder
-    from shared.mempool_types import MempoolJobContext
+    from substrate.mempool_types import MempoolJobContext
 
     ctx = MempoolJobContext(
         order_id=99,
@@ -449,7 +449,7 @@ def test_mine_work_item_handles_mempool_context(cpu_miner):
     other floors passes the requirements check.
     """
     from shared.base_miner import _MiningLoopState
-    from shared.mempool_types import MempoolJobContext
+    from substrate.mempool_types import MempoolJobContext
     from shared.work_context import requirements_from_context, resolve_ising
 
     nodes = tuple(int(n) for n in cpu_miner.sampler.nodes)
@@ -614,7 +614,7 @@ def test_requirements_from_context_mempool_zero_energy_floor():
     """min_energy_milli=0 is a valid (very relaxed) floor — must NOT map to
     +inf the way None does. Zero divides to 0.0 which allows any non-positive
     energy sample."""
-    from shared.mempool_types import MempoolJobContext
+    from substrate.mempool_types import MempoolJobContext
     ctx = MempoolJobContext(
         order_id=3,
         nodes=(0, 1),

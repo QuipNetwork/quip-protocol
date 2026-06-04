@@ -9,7 +9,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 sys.path.append(str(Path(__file__).parent.parent))
 
@@ -205,8 +205,6 @@ def plot_greedy_mined_vs_random(
     fig.savefig(output_dir / 'greedy_mined_vs_random.png', dpi=150)
     plt.close(fig)
 
-    return ks_stat, ks_p
-
 
 def plot_energy_distributions(
     by_type: Dict[str, List[Dict]],
@@ -269,16 +267,15 @@ def plot_mining_timeline(
             continue
         # Cumulative: times are absolute timestamps; convert to minutes
         # from first block
-        if times:
-            cumulative = list(range(1, len(times) + 1))
-            # Normalize to minutes from start
-            t0 = times[0]
-            minutes = [(t - t0) / 60 for t in times]
-            ax.plot(
-                minutes, cumulative,
-                label=mtype, color=colors.get(mtype, '#999'),
-                marker='.', markersize=4,
-            )
+        cumulative = list(range(1, len(times) + 1))
+        # Normalize to minutes from start
+        t0 = times[0]
+        minutes = [(t - t0) / 60 for t in times]
+        ax.plot(
+            minutes, cumulative,
+            label=mtype, color=colors.get(mtype, '#999'),
+            marker='.', markersize=4,
+        )
 
     ax.set_xlabel('Time (minutes from first block)')
     ax.set_ylabel('Cumulative Blocks')

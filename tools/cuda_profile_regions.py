@@ -25,7 +25,6 @@ import re
 from pathlib import Path
 
 import cupy as cp
-import numpy as np
 
 
 # Color by region type
@@ -53,10 +52,9 @@ def _load_manifest(kernel_name):
         Manifest dict with kernel, source_file,
         num_regions, profiling_mode, regions.
     """
-    cu_stem = f"cuda_{kernel_name}"
     manifest_path = (
         _PROJECT_ROOT / "GPU"
-        / f"{cu_stem}_profile_manifest.json"
+        / f"cuda_{kernel_name}_profile_manifest.json"
     )
     assert manifest_path.exists(), (
         f"Manifest not found: {manifest_path}. "
@@ -78,15 +76,6 @@ def _source_map_from_manifest(manifest):
             r["line_start"], r["line_end"],
         )
     return source_map
-
-
-def _region_names_from_manifest(manifest):
-    """Build region name list indexed by ID."""
-    max_id = max(r["id"] for r in manifest["regions"])
-    names = [""] * (max_id + 1)
-    for r in manifest["regions"]:
-        names[r["id"]] = r["label"]
-    return names
 
 
 # ── Tree building from manifest ────────────────────────
@@ -220,8 +209,16 @@ def profile_sa(num_reads, num_sweeps):
 # ── Text profile printing ─────────────────────────────
 
 
-def print_profile(data, clock_khz, manifest,
-                  num_reads, num_sweeps):
+def _root_total(manifest, avg):
+    """Sum avg cycles over root (parent_id=None) regions."""
+    return sum(
+        avg[r["id"]]
+        for r in manifest["regions"]
+        if r["parent_id"] is None
+    )
+
+
+def print_profile(data, clock_khz, manifest):
     """Print generic profile breakdown from manifest."""
     active = data[data.any(axis=1)]
     if len(active) == 0:
@@ -234,11 +231,7 @@ def print_profile(data, clock_khz, manifest,
     mn = active.min(axis=0)
     mx = active.max(axis=0)
 
-    total = sum(
-        avg[r["id"]]
-        for r in manifest["regions"]
-        if r["parent_id"] is None
-    )
+    total = _root_total(manifest, avg)
 
     kernel_name = manifest["kernel"]
     print(f"\n{'=' * 60}")
@@ -247,7 +240,7 @@ def print_profile(data, clock_khz, manifest,
 
     # Sort regions by ID for display
     regions_sorted = sorted(
-        manifest["regions"], key=lambda r: r["id"],
+        manifest["regions"], key=lambda region: region["id"],
     )
 
     print(f"\n{'Region':<50} {'Avg Cycles':>14} "
@@ -272,7 +265,7 @@ def print_profile(data, clock_khz, manifest,
     ]
     if root_ids:
         main_id = root_ids[0]
-        print(f"\n{'Load Imbalance (region 0)':}")
+        print("\nLoad Imbalance (region 0)")
         print(f"  Min: {fmt_cycles(mn[main_id]):>14}  "
               f"({fmt_time(cycles_to_time(mn[main_id], clock_khz))})")
         print(f"  Max: {fmt_cycles(mx[main_id]):>14}  "
@@ -311,7 +304,6 @@ def generate_flamegraph(data, clock_khz, kernel_name,
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
-        from matplotlib.patches import Rectangle
     except ImportError:
         print("matplotlib not available, skipping flamegraph.")
         return
@@ -604,7 +596,6 @@ def _build_profile_json(data, clock_khz, kernel_name,
 
     avg = active.mean(axis=0)
     source_map = _source_map_from_manifest(manifest)
-    region_names = _region_names_from_manifest(manifest)
     direct_lines = _compute_direct_lines(source_map)
 
     tree = _build_tree_from_manifest(manifest, avg)
@@ -740,20 +731,15 @@ def _render_flame_svg(bars, viewbox_w=1200,
     return "\n".join(parts)
 
 
-def _build_metrics_html(data, clock_khz, manifest,
-                        num_sweeps, gpu_name, topo):
+def _build_metrics_html(data, clock_khz, manifest, topo):
     """Build metrics table HTML for the collapsible panel."""
     active = data[data.any(axis=1)]
     avg = active.mean(axis=0)
-    total = sum(
-        avg[r["id"]]
-        for r in manifest["regions"]
-        if r["parent_id"] is None
-    )
+    total = _root_total(manifest, avg)
 
     rows = []
     for r in sorted(manifest["regions"],
-                    key=lambda r: r["id"]):
+                    key=lambda region: region["id"]):
         rid = r["id"]
         if rid >= len(avg):
             continue
@@ -959,18 +945,10 @@ function highlightDirectLines(lines) {
 
 function highlightBarsForRegions(regionStr) {
   if (!regionStr) return;
-  var regions = regionStr.split(",").map(Number);
   for (var i = 0; i < barEls.length; i++) {
     var bd = profile.bars[i];
-    if (!bd) continue;
-    for (var r = 0; r < regions.length; r++) {
-      var ri = regions[r];
-      if (bd.sourceLines) {
-        var sm = bd.sourceLines;
-        // Check if this bar's source range contains
-        // any of the matching region ranges
-        barEls[i].classList.add("selected");
-      }
+    if (bd && bd.sourceLines) {
+      barEls[i].classList.add("selected");
     }
   }
 }
@@ -1189,8 +1167,7 @@ def generate_flamegraph_html(data, clock_khz, kernel_name,
     )
     flame_svg = _render_flame_svg(profile["bars"])
     metrics_html = _build_metrics_html(
-        data, clock_khz, manifest, num_sweeps,
-        gpu_name, profile["topology"],
+        data, clock_khz, manifest, profile["topology"],
     )
 
     clock_mhz = clock_khz / 1000.0
@@ -1337,8 +1314,7 @@ def main():
     manifest = _load_manifest(kernel)
 
     # Print text profile
-    print_profile(data, clock_khz, manifest,
-                  args.reads, args.sweeps)
+    print_profile(data, clock_khz, manifest)
 
     # Generate outputs
     if args.plot:

@@ -41,10 +41,21 @@ def _maybe_with_stop(fn, kwargs: Dict[str, Any], stop_event) -> Dict[str, Any]:
     return kwargs
 
 
-def _extract_qpu_us(sampleset) -> int:
+def qpu_access_time_us(sampleset) -> int:
+    """Sum D-Wave qpu_programming_time + qpu_sampling_time from a sampleset (µs).
+
+    Returns 0 when the timing dict is missing, partial, or contains None values
+    — happens on non-QPU fallbacks and some embedded-future code paths.
+    """
     info = getattr(sampleset, "info", None) or {}
-    t = info.get("timing", {}) if info else {}
-    return int(t.get("qpu_programming_time", 0) + t.get("qpu_sampling_time", 0))
+    t = info.get("timing", {})
+    prog = t.get("qpu_programming_time") or 0
+    sample = t.get("qpu_sampling_time") or 0
+    return int(prog) + int(sample)
+
+
+def _extract_qpu_us(sampleset) -> int:
+    return qpu_access_time_us(sampleset)
 
 
 def _coalesce_ctl_q(ctx, ctl_q) -> str:

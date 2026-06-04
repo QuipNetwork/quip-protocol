@@ -38,11 +38,14 @@ Query primitives:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
 from pathlib import Path
 from typing import Iterator, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def _default_log_dir() -> Path:
@@ -265,10 +268,7 @@ class AttemptLogger:
         try:
             self._appender(solution_number).write(record)
         except OSError as exc:
-            import logging
-            logging.getLogger(__name__).warning(
-                "AttemptLogger.record: write failed: %s", exc,
-            )
+            logger.warning("AttemptLogger.record: write failed: %s", exc)
             return
 
         # Update aggregate metadata. Failures here also don't block.
@@ -280,10 +280,7 @@ class AttemptLogger:
                 mining_time_us=mining_time_us,
             )
         except OSError as exc:
-            import logging
-            logging.getLogger(__name__).warning(
-                "AttemptLogger.metadata update failed: %s", exc,
-            )
+            logger.warning("AttemptLogger.metadata update failed: %s", exc)
 
     def flush(self) -> None:
         """Flush all per-solution metadata loggers owned by this worker."""
@@ -291,10 +288,7 @@ class AttemptLogger:
             try:
                 ml.flush()
             except OSError as exc:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "AttemptLogger.flush: %s", exc,
-                )
+                logger.warning("AttemptLogger.flush: %s", exc)
 
 
 # ----------------------------------------------------------------------
@@ -499,10 +493,7 @@ class SolutionStore:
             with path.open("w", encoding="utf-8") as fh:
                 json.dump(record, fh, separators=(",", ":"), default=str)
         except OSError as exc:
-            import logging
-            logging.getLogger(__name__).warning(
-                "SolutionStore.record: write failed: %s", exc,
-            )
+            logger.warning("SolutionStore.record: write failed: %s", exc)
 
 
 # ----------------------------------------------------------------------
@@ -588,10 +579,8 @@ class SubmissionLogger:
             with sub_path.open("w", encoding="utf-8") as fh:
                 json.dump(record, fh, separators=(",", ":"), default=str)
         except OSError as exc:
-            import logging
-            logging.getLogger(__name__).warning(
-                "SubmissionLogger.record: write %s failed: %s",
-                sub_path, exc,
+            logger.warning(
+                "SubmissionLogger.record: write %s failed: %s", sub_path, exc,
             )
 
         # Attach to winning miner's metadata.json (best effort).
@@ -601,8 +590,7 @@ class SubmissionLogger:
                 miner_type=miner_type,
             ).attach_submission(record)
         except OSError as exc:
-            import logging
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "SubmissionLogger.record: metadata attach failed: %s", exc,
             )
 

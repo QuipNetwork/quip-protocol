@@ -16,7 +16,7 @@ import logging
 import os
 import sys
 import time
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import dimod
 import numpy as np
@@ -100,6 +100,117 @@ def _resolve_budget(scheduler) -> int:
     return UNCAPPED
 
 
+def concat_read_split(
+    models: List[IsingModel],
+    num_reads: int,
+    reads_per_buffer: int,
+    seed: int,
+    dispatch_fn: Callable[[int, int], List[dimod.SampleSet]],
+) -> List[dimod.SampleSet]:
+    """Run ``num_reads`` in command buffers of ``reads_per_buffer``.
+
+    Caps occupancy (``problems x reads`` per command buffer) while preserving
+    the full read count. ``reads_per_buffer >= num_reads`` is a single
+    dispatch; otherwise each read-buffer is an independent run with a distinct
+    seed and the per-problem samplesets are concatenated. ``dispatch_fn`` is
+    called as ``dispatch_fn(read_count, buf_seed)`` and returns one sampleset
+    per model.
+    """
+    if reads_per_buffer >= num_reads:
+        return dispatch_fn(num_reads, seed)
+
+    parts: List[List[dimod.SampleSet]] = [[] for _ in models]
+    done = 0
+    buf_idx = 0
+    while done < num_reads:
+        rc = min(reads_per_buffer, num_reads - done)
+        buf_seed = (seed + buf_idx * 0x9E3779B1) & 0x7FFFFFFF
+        ss_list = dispatch_fn(rc, buf_seed)
+        for prob_idx, ss in enumerate(ss_list):
+            parts[prob_idx].append(ss)
+        done += rc
+        buf_idx += 1
+
+    return [dimod.concatenate(p) for p in parts]
+
+
+def stream_read_split_batches(
+    models: Iterable[IsingModel],
+    *,
+    max_threadgroups: int,
+    seed: Optional[int],
+    scheduler: Optional['MetalScheduler'],
+    stop_event,
+    setup_fn: Callable[
+        [Iterator[IsingModel]],
+        Optional[Tuple[List[IsingModel], Any]],
+    ],
+    dispatch_batch_fn: Callable[
+        [List[IsingModel], int, int, Any], List[dimod.SampleSet],
+    ],
+) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
+    """Shared bounded read-split streaming skeleton for the Metal samplers.
+
+    Lowers the producer thread's QoS, then loops: re-read the occupancy budget
+    before consuming the feeder (``0`` ⇒ PAUSE and re-check, stop-aware;
+    ``UNCAPPED`` ⇒ full speed; else split reads across command buffers), fill a
+    full problem batch, dispatch, and yield ``(model, sampleset)`` pairs.
+
+    ``setup_fn(model_iter)`` runs once before the loop (SA primes its beta
+    schedule from the first model). It returns ``(pending, ctx)`` where
+    ``pending`` are pre-pulled models that lead the first batch and ``ctx`` is
+    the opaque context passed to every ``dispatch_batch_fn`` call; returning
+    ``None`` aborts the stream (empty feeder). ``dispatch_batch_fn`` is called
+    as ``dispatch_batch_fn(batch_models, budget, batch_seed, ctx)`` and owns
+    the read-split (it knows ``num_reads``).
+    """
+    # CPU-side politeness: lower this (producer) thread's QoS so we yield
+    # P-cores to the foreground UI. Metal-only; once per process.
+    apply_qos_utility()
+
+    model_iter = iter(models)
+    batch_seed = (
+        seed if seed is not None else int(np.random.randint(0, 2**31))
+    )
+
+    setup = setup_fn(model_iter)
+    if setup is None:
+        return
+    pending, ctx = setup
+
+    while True:
+        # Re-read the occupancy budget before consuming the feeder so a PAUSE
+        # does not burn queued models.
+        budget = _resolve_budget(scheduler)
+        # PAUSE (budget == 0): idle and re-check without dispatching or pulling
+        # models. Stop-aware so teardown never blocks.
+        while budget == 0:
+            if stop_event is not None and stop_event.is_set():
+                return
+            time.sleep(_PAUSE_POLL_S)
+            budget = _resolve_budget(scheduler)
+
+        # Fill the full problem batch (all cores). Occupancy is bounded by
+        # splitting reads, not by shrinking the batch.
+        batch_models: List[IsingModel] = list(pending)
+        pending = []
+        while len(batch_models) < max_threadgroups:
+            try:
+                batch_models.append(next(model_iter))
+            except StopIteration:
+                break
+        if not batch_models:
+            return
+
+        samplesets = dispatch_batch_fn(
+            batch_models, budget, batch_seed, ctx,
+        )
+        batch_seed = (batch_seed + 1) & 0x7FFFFFFF
+
+        for model, ss in zip(batch_models, samplesets):
+            yield (model, ss)
+
+
 class MetalSASampler:
     """
     Simulated Annealing sampler using Metal GPU.
@@ -119,8 +230,6 @@ class MetalSASampler:
         topology_graph = topology_obj.graph
         self.nodes = list(topology_graph.nodes())
         self.edges = list(topology_graph.edges())
-        self.nodelist = self.nodes
-        self.edgelist = self.edges
         self.properties = topology_obj.properties
 
         # Load Metal library
@@ -135,7 +244,7 @@ class MetalSASampler:
             raise RuntimeError("Failed to create Metal library (no error reported)")
 
         # List all functions in library for debugging
-        function_names = [lib.functionNames()[i] for i in range(len(lib.functionNames()))]
+        function_names = list(lib.functionNames())
         self.logger.debug(f"Available Metal functions: {function_names}")
 
         # Get SA kernel
@@ -464,10 +573,6 @@ class MetalSASampler:
         persist_energy_buf = self._pooled_buffer(
             "persist_energy", num_threads * 4)
 
-        total_betas = len(beta_schedule_arr)
-        beta_start_bytes = np.int32(0).tobytes()
-        beta_count_bytes = np.int32(total_betas).tobytes()
-
         # Encode and dispatch
         cmd_buf = self._command_queue.commandBuffer()
         encoder = cmd_buf.computeCommandEncoder()
@@ -494,8 +599,8 @@ class MetalSASampler:
 
         encoder.setBuffer_offset_atIndex_(hv_buf, 0, 15)
 
-        encoder.setBytes_length_atIndex_(beta_start_bytes, 4, 16)
-        encoder.setBytes_length_atIndex_(beta_count_bytes, 4, 17)
+        encoder.setBytes_length_atIndex_(np.int32(0).tobytes(), 4, 16)
+        encoder.setBytes_length_atIndex_(num_betas_bytes, 4, 17)
         encoder.setBuffer_offset_atIndex_(
             persist_state_buf, 0, 18,
         )
@@ -574,32 +679,17 @@ class MetalSASampler:
         samplesets are concatenated. ``reads_per_buffer >= num_reads`` is a
         single monolithic dispatch.
         """
-        if reads_per_buffer >= num_reads:
+        def dispatch(read_count: int, buf_seed: int) -> List[dimod.SampleSet]:
             return self._dispatch_batch(
-                models, num_reads=num_reads,
-                beta_schedule_arr=beta_schedule_arr, beta_range=beta_range,
-                beta_schedule_type=beta_schedule_type,
-                num_sweeps_per_beta=num_sweeps_per_beta, seed=seed,
-            )
-
-        parts: List[List[dimod.SampleSet]] = [[] for _ in models]
-        done = 0
-        buf_idx = 0
-        while done < num_reads:
-            rc = min(reads_per_buffer, num_reads - done)
-            buf_seed = (seed + buf_idx * 0x9E3779B1) & 0x7FFFFFFF
-            ss_list = self._dispatch_batch(
-                models, num_reads=rc,
+                models, num_reads=read_count,
                 beta_schedule_arr=beta_schedule_arr, beta_range=beta_range,
                 beta_schedule_type=beta_schedule_type,
                 num_sweeps_per_beta=num_sweeps_per_beta, seed=buf_seed,
             )
-            for prob_idx, ss in enumerate(ss_list):
-                parts[prob_idx].append(ss)
-            done += rc
-            buf_idx += 1
 
-        return [dimod.concatenate(p) for p in parts]
+        return concat_read_split(
+            models, num_reads, reads_per_buffer, seed, dispatch,
+        )
 
     def sample_ising_streaming(
         self,
@@ -644,62 +734,28 @@ class MetalSASampler:
         Yields:
             (IsingModel, dimod.SampleSet) for each completed problem.
         """
-        # CPU-side politeness: lower this (stream-driver child) thread's QoS so
-        # we yield P-cores to the foreground UI. Metal-only; once per process.
-        apply_qos_utility()
-        self.prepare_topology()
+        def setup(model_iter):
+            # Prepare the cached topology CSR structure once, then prime the
+            # beta schedule from the first model (all problems share the same
+            # topology, so auto-range is topology- not nonce-dependent). The
+            # first model leads the first batch.
+            self.prepare_topology()
+            first_model = next(model_iter, None)
+            if first_model is None:
+                return None
+            beta_arr, beta_range_out = compute_beta_schedule(
+                first_model.h, first_model.J,
+                num_sweeps, num_sweeps_per_beta,
+                beta_range, beta_schedule_type, None,
+            )
+            return [first_model], (beta_arr, beta_range_out)
 
-        model_iter = iter(models)
-        batch_seed = (
-            seed if seed is not None
-            else np.random.randint(0, 2**31)
-        )
-
-        # Compute beta schedule once (all problems share the
-        # same topology so auto-range is topology-dependent,
-        # not nonce-dependent). Use first model for auto range.
-        first_model = next(model_iter, None)
-        if first_model is None:
-            return
-
-        beta_arr, beta_range_out = compute_beta_schedule(
-            first_model.h, first_model.J,
-            num_sweeps, num_sweeps_per_beta,
-            beta_range, beta_schedule_type, None,
-        )
-
-        # Put the first model back into the batch
-        pending = [first_model]
-
-        while True:
-            # Re-read the occupancy budget before consuming the feeder so a
-            # PAUSE does not burn queued models.
-            budget = _resolve_budget(scheduler)
-            # PAUSE (budget == 0, e.g. on battery / critical thermal): idle and
-            # re-check without dispatching or pulling models. Stop-aware so
-            # teardown never blocks; returns promptly when stop_event is set.
-            while budget == 0:
-                if stop_event is not None and stop_event.is_set():
-                    return
-                time.sleep(_PAUSE_POLL_S)
-                budget = _resolve_budget(scheduler)
-
-            # Fill the full problem batch (all cores). Occupancy is bounded by
-            # splitting reads, not by shrinking the batch.
-            batch_models: List[IsingModel] = list(pending)
-            pending.clear()
-            while len(batch_models) < max_threadgroups:
-                try:
-                    batch_models.append(next(model_iter))
-                except StopIteration:
-                    break
-            if not batch_models:
-                return
-
+        def dispatch_batch(batch_models, budget, batch_seed, ctx):
+            beta_arr, beta_range_out = ctx
             reads_per_buffer = reads_per_buffer_for_budget(
                 budget, len(batch_models), num_reads,
             )
-            samplesets = self._dispatch_read_split(
+            return self._dispatch_read_split(
                 batch_models,
                 num_reads=num_reads,
                 reads_per_buffer=reads_per_buffer,
@@ -710,8 +766,13 @@ class MetalSASampler:
                 seed=batch_seed,
             )
 
-            batch_seed = (batch_seed + 1) & 0x7FFFFFFF
-
-            for model, ss in zip(batch_models, samplesets):
-                yield (model, ss)
+        yield from stream_read_split_batches(
+            models,
+            max_threadgroups=max_threadgroups,
+            seed=seed,
+            scheduler=scheduler,
+            stop_event=stop_event,
+            setup_fn=setup,
+            dispatch_batch_fn=dispatch_batch,
+        )
 

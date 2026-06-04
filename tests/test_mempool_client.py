@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from shared.keystore_hybrid import generate
-from shared.mempool_types import (
+from substrate.mempool_types import (
     IsingParams,
     JobMode,
     MinerType,
@@ -28,7 +28,7 @@ from shared.mempool_types import (
     ResultDelivery,
     RewardResolution,
 )
-from shared.miner_bootstrap import _resolve_dev_signer
+from substrate.miner_bootstrap import _resolve_dev_signer
 from substrate.client import SubstrateClient
 
 

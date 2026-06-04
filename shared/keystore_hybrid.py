@@ -34,6 +34,7 @@ from pathlib import Path
 
 from shared.hybrid_signer import HybridSigner
 from shared.logging_config import get_logger
+from shared.signer import strip_0x
 
 
 logger = get_logger("keystore_hybrid")
@@ -92,19 +93,10 @@ def load(path: Path) -> HybridKeystoreFile:
             "passphrase-encrypted hybrid keystores not supported yet; the "
             "encrypted-on-disk format is a follow-on once the dev flow stabilises"
         )
-    seed_hex = raw["master_seed_hex"]
-    if seed_hex.startswith("0x"):
-        seed_hex = seed_hex[2:]
-    master_seed = bytes.fromhex(seed_hex)
+    master_seed = bytes.fromhex(strip_0x(raw["master_seed_hex"]))
     signer = HybridSigner.from_master_seed(master_seed)
 
     # Tamper check: cached pubkey hex must match what we derive from the seed.
-    # `str.lstrip("0x")` is a footgun — it strips any combo of "0"/"x"
-    # characters, not just the prefix. Use slicing.
-    def _strip_0x(s: str) -> str:
-        s = s.lower()
-        return s[2:] if s.startswith("0x") else s
-
     expected_sr = signer.sr25519_public_bytes.hex()
     expected_ml = signer.ml_dsa_public_bytes.hex()
     raw_sr = raw.get("sr25519_public_hex")
@@ -120,12 +112,12 @@ def load(path: Path) -> HybridKeystoreFile:
         raise ValueError(
             "keystore tampered: ml_dsa_public_hex field is missing or empty"
         )
-    if _strip_0x(raw_sr) != expected_sr:
+    if strip_0x(raw_sr) != expected_sr:
         raise ValueError(
             "keystore tampered: sr25519_public_hex does not match the key "
             "derived from master_seed_hex"
         )
-    if _strip_0x(raw_ml) != expected_ml:
+    if strip_0x(raw_ml) != expected_ml:
         raise ValueError(
             "keystore tampered: ml_dsa_public_hex does not match the key "
             "derived from master_seed_hex"

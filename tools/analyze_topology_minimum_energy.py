@@ -62,14 +62,10 @@ def analyze_topology(topology_name: str, topology_obj) -> Dict:
     
     return {
         'topology_name': topology_name,
-        'topology_obj': topology_obj,
-        'graph': graph,
         'nodes': nodes,
         'edges': edges,
         'num_nodes': len(nodes),
         'num_edges': len(edges),
-        'avg_degree': 2 * len(edges) / len(nodes),
-        'edge_density': len(edges) / (len(nodes) * (len(nodes) - 1) // 2)
     }
 
 def calculate_theoretical_minimum_energy(
@@ -116,7 +112,6 @@ def calculate_theoretical_minimum_energy(
     sa_sampler = SimulatedAnnealingSampler()
 
     random_min_energies = []
-    random_max_energies = []
     sa_min_energies = []
     sa_avg_energies = []
     theoretical_bounds = []
@@ -158,7 +153,6 @@ def calculate_theoretical_minimum_energy(
             random_energies.append(energy)
 
         random_min_energies.append(min(random_energies))
-        random_max_energies.append(max(random_energies))
 
         # 2. Simulated Annealing (what miners actually use)
         sampleset = sa_sampler.sample_ising(h, J, num_reads=num_reads, num_sweeps=num_sweeps)
@@ -169,7 +163,6 @@ def calculate_theoretical_minimum_energy(
     # Statistical analysis
     avg_theoretical = statistics.mean(theoretical_bounds)
     avg_random_min = statistics.mean(random_min_energies)
-    avg_random_max = statistics.mean(random_max_energies)
     avg_sa_min = statistics.mean(sa_min_energies)
     avg_sa_avg = statistics.mean(sa_avg_energies)
 
@@ -208,13 +201,11 @@ def calculate_theoretical_minimum_energy(
     return {
         'theoretical_bounds': theoretical_bounds,
         'random_min_energies': random_min_energies,
-        'random_max_energies': random_max_energies,
         'sa_min_energies': sa_min_energies,
         'sa_avg_energies': sa_avg_energies,
         'coupling_stats': coupling_stats,
         'avg_theoretical': avg_theoretical,
         'avg_random_min': avg_random_min,
-        'avg_random_max': avg_random_max,
         'avg_sa_min': avg_sa_min,
         'avg_sa_avg': avg_sa_avg,
         'best_observed': min(sa_min_energies),
@@ -323,26 +314,18 @@ def calculate_sa_theoretical_bounds(topology_data: Dict, energy_data: Dict) -> D
 def print_summary_table(results: List[Dict]):
     """Print a summary table comparing all analyzed topologies."""
     print(f"\n=== SUMMARY TABLE: All Analyzed Topologies ===")
-    print(f"{'Topology':<8} {'Nodes':<8} {'Edges':<8} {'Perfect Min':<12} {'SA O(√n)':<12} {'SA O(n^2/3)':<12} {'Best Observed':<14}")
-    print("-" * 94)
-    
+    print(f"{'Topology':<8} {'Nodes':<8} {'Edges':<8} {'Perfect Min':<12} {'SA Avg Min':<12} {'Best Observed':<14}")
+    print("-" * 70)
+
     for result in results:
         topology_data = result['topology_data']
         energy_data = result['energy_data']
-        sa_data = result.get('sa_bounds', {})
-        
-        sa_conservative = sa_data.get('practical_conservative', 'N/A')
-        sa_optimistic = sa_data.get('practical_optimistic', 'N/A')
-        
-        sa_cons_str = f"{sa_conservative:.0f}" if isinstance(sa_conservative, (int, float)) else str(sa_conservative)
-        sa_opt_str = f"{sa_optimistic:.0f}" if isinstance(sa_optimistic, (int, float)) else str(sa_optimistic)
-        
+
         print(f"{topology_data['topology_name'].upper():<8} "
               f"{topology_data['num_nodes']:<8,} "
               f"{topology_data['num_edges']:<8,} "
               f"{energy_data['perfect_theoretical_min']:<12.0f} "
-              f"{sa_cons_str:<12} "
-              f"{sa_opt_str:<12} "
+              f"{energy_data['avg_sa_min']:<12.1f} "
               f"{energy_data['best_observed']:<14.1f}")
 
 def main():

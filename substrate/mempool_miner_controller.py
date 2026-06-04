@@ -54,7 +54,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from shared.allowed_value_spec import AllowedValueSpec
 from shared.asyncio_supervise import supervise
 from shared.logging_config import get_logger
-from shared.mempool_types import (
+from substrate.mempool_types import (
     JobOrder,
     MempoolJobContext,
     MempoolSolverInfo,
@@ -208,9 +208,6 @@ class MempoolMinerController:
         # Orders for which we saw OrderExpired and have not yet claimed.
         self._claimable: Set[int] = set()
         self._result_queue: asyncio.Queue[_MempoolResultEnvelope] = asyncio.Queue()
-        self._done_queues: Dict[str, asyncio.Queue[int]] = {
-            h.miner_id: asyncio.Queue() for h in miner_handles
-        }
         self._shutdown_event = asyncio.Event()
         self._drainer_tasks: List[asyncio.Task] = []
         # ChainEventManager — set in run(); polls the validator pool and
@@ -349,6 +346,27 @@ class MempoolMinerController:
             return
         await self._process_head(ctx.block_hash, ctx.block_number)
 
+    async def _cancel_and_await(
+        self, task: Optional[asyncio.Task], label: str
+    ) -> None:
+        """Cancel *task* and await it, logging any unexpected exception.
+
+        No-ops when *task* is ``None`` or already done.
+        """
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "teardown: %s task %s raised during cancellation",
+                label,
+                task.get_name(),
+            )
+
     async def _teardown(self) -> None:
         self._shutdown_event.set()
         for handle in self.miner_handles:
@@ -369,32 +387,12 @@ class MempoolMinerController:
             self.events.request_shutdown()
 
         for task in [self._event_manager_task, self._claim_task]:
-            if task is not None and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:  # noqa: BLE001
-                    logger.exception(
-                        "teardown: task %s raised during cancellation",
-                        task.get_name(),
-                    )
+            await self._cancel_and_await(task, "task")
         for task in self._drainer_tasks:
-            if not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:  # noqa: BLE001
-                    logger.exception(
-                        "teardown: drainer task %s raised during cancellation",
-                        task.get_name(),
-                    )
+            await self._cancel_and_await(task, "drainer task")
         self._event_manager_task = None
         # Close the parent-side build client. The pool's active validator
-        # handle is torn down by ``pool.close()`` from the CLI's outer
+        # handle is torn down by ``pool.shutdown()`` from the CLI's outer
         # try/finally.
         if self.build_client is not None:
             try:
@@ -833,7 +831,10 @@ class MempoolMinerController:
                 )
                 self._shutdown_event.set()
                 return
-            if isinstance(msg, dict) and msg.get("op") == "mine_result":
+            if not isinstance(msg, dict):
+                continue
+            op = msg.get("op")
+            if op == "mine_result":
                 dispatch_id = msg.get("dispatch_id")
                 result = msg.get("result")
                 context = self._dispatch_contexts.get(
@@ -856,19 +857,14 @@ class MempoolMinerController:
                         handle_id=handle.miner_id,
                     )
                 )
-            elif isinstance(msg, dict) and msg.get("op") == "work_item_done":
-                done_dispatch_id = msg.get("dispatch_id")
-                try:
-                    self._done_queues[handle.miner_id].put_nowait(done_dispatch_id)
-                except asyncio.QueueFull:
-                    pass
+            elif op == "work_item_done":
                 # Cancel-completion counts as terminal for the active
                 # order. Clears `_active_order` only if every handle has
                 # reported terminal without a successful submission.
                 self._record_handle_terminal_for_active(
-                    handle.miner_id, done_dispatch_id
+                    handle.miner_id, msg.get("dispatch_id")
                 )
-            elif isinstance(msg, dict) and msg.get("op") == "error":
+            elif op == "error":
                 err_dispatch_id = msg.get("dispatch_id")
                 logger.error(
                     "worker %s reported error (dispatch=%s): %s",
@@ -887,13 +883,8 @@ class MempoolMinerController:
                 self._record_handle_terminal_for_active(
                     handle.miner_id, err_dispatch_id
                 )
-            elif isinstance(msg, dict) and msg.get("op") == "shutdown_ack":
+            elif op == "shutdown_ack":
                 return
-
-    # ------------------------------------------------------------------
-    # Subscription cleanup (the substrate-interface subscription thread
-    # holds the receive loop; if it dies before shutdown we surface it.)
-    # ------------------------------------------------------------------
 
 
 def _classify_solution(error: Optional[str]) -> str:
