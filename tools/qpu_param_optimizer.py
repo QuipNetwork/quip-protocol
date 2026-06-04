@@ -468,6 +468,55 @@ def process_completed_job(job: PendingJob) -> Dict[str, Any]:
     }
 
 
+def _raise_quota_exhausted(pending_jobs: Dict[Any, PendingJob], error: Exception) -> None:
+    """Print the quota warning, cancel all pending jobs, and raise.
+
+    Used by the queue refill / result-processing paths where in-flight jobs
+    must be cancelled before propagating ``QuotaExhaustedError``.
+    """
+    print(f"\n    ⚠️  QUOTA EXHAUSTED: {error}")
+    for future in pending_jobs.keys():
+        try:
+            future.cancel()
+        except Exception:
+            pass
+    raise QuotaExhaustedError(str(error))
+
+
+def _fill_queue(
+    pending_jobs: Dict[Any, PendingJob],
+    seeds_to_run: List[int],
+    seed_index: int,
+    submit_kwargs: Dict[str, Any],
+    *,
+    queue_depth: int,
+    total_to_run: int,
+    cancel_on_quota: bool,
+) -> int:
+    """Submit jobs until the queue is full or seeds are exhausted.
+
+    ``submit_kwargs`` holds the static ``submit_async_job`` arguments shared by
+    every seed. Returns the advanced ``seed_index``. On quota exhaustion this
+    raises ``QuotaExhaustedError`` (cancelling pending jobs first when
+    ``cancel_on_quota`` is set, matching the original refill behaviour).
+    """
+    while len(pending_jobs) < queue_depth and seed_index < total_to_run:
+        seed = seeds_to_run[seed_index]
+        try:
+            job = submit_async_job(ising_seed=seed, **submit_kwargs)
+            pending_jobs[job.future] = job
+            seed_index += 1
+        except Exception as e:
+            if is_quota_exhausted_error(e):
+                if cancel_on_quota:
+                    _raise_quota_exhausted(pending_jobs, e)
+                print(f"\n    ⚠️  QUOTA EXHAUSTED: {e}")
+                raise QuotaExhaustedError(str(e))
+            print(f"    Error submitting seed {seed}: {e}")
+            seed_index += 1
+    return seed_index
+
+
 def run_configuration(
     sampler: DWaveSamplerWrapper,
     nodes: List[int],
@@ -526,25 +575,26 @@ def run_configuration(
     completed_count = 0
     total_to_run = len(seeds_to_run)
 
+    # Static arguments shared by every submit_async_job call for this config.
+    submit_kwargs: Dict[str, Any] = {
+        'sampler': sampler,
+        'nodes': nodes,
+        'edges': edges,
+        'num_reads': num_reads,
+        'annealing_time': annealing_time,
+        'test_id': test_id,
+        'solver_name': solver_name,
+        'chain_strength_multiplier': chain_strength_multiplier,
+        'reduce_intersample_correlation': reduce_intersample_correlation,
+        'reinitialize_state': reinitialize_state,
+    }
+
     # Initial queue fill
-    while len(pending_jobs) < queue_depth and seed_index < total_to_run:
-        seed = seeds_to_run[seed_index]
-        try:
-            job = submit_async_job(
-                sampler, nodes, edges, seed, num_reads, annealing_time, test_id,
-                solver_name=solver_name,
-                chain_strength_multiplier=chain_strength_multiplier,
-                reduce_intersample_correlation=reduce_intersample_correlation,
-                reinitialize_state=reinitialize_state,
-            )
-            pending_jobs[job.future] = job
-            seed_index += 1
-        except Exception as e:
-            if is_quota_exhausted_error(e):
-                print(f"\n    ⚠️  QUOTA EXHAUSTED: {e}")
-                raise QuotaExhaustedError(str(e))
-            print(f"    Error submitting seed {seed}: {e}")
-            seed_index += 1
+    seed_index = _fill_queue(
+        pending_jobs, seeds_to_run, seed_index, submit_kwargs,
+        queue_depth=queue_depth, total_to_run=total_to_run,
+        cancel_on_quota=False,
+    )
 
     # Streaming result loop
     while pending_jobs:
@@ -583,41 +633,15 @@ def run_configuration(
 
         except Exception as e:
             if is_quota_exhausted_error(e):
-                print(f"\n    ⚠️  QUOTA EXHAUSTED: {e}")
-                # Cancel remaining pending jobs
-                for future in pending_jobs.keys():
-                    try:
-                        future.cancel()
-                    except Exception:
-                        pass
-                raise QuotaExhaustedError(str(e))
+                _raise_quota_exhausted(pending_jobs, e)
             print(f"    Error processing seed {job.ising_seed}: {e}")
 
         # Refill queue
-        while len(pending_jobs) < queue_depth and seed_index < total_to_run:
-            seed = seeds_to_run[seed_index]
-            try:
-                new_job = submit_async_job(
-                    sampler, nodes, edges, seed, num_reads, annealing_time, test_id,
-                    solver_name=solver_name,
-                    chain_strength_multiplier=chain_strength_multiplier,
-                    reduce_intersample_correlation=reduce_intersample_correlation,
-                    reinitialize_state=reinitialize_state,
-                )
-                pending_jobs[new_job.future] = new_job
-                seed_index += 1
-            except Exception as e:
-                if is_quota_exhausted_error(e):
-                    print(f"\n    ⚠️  QUOTA EXHAUSTED: {e}")
-                    # Cancel remaining pending jobs
-                    for future in pending_jobs.keys():
-                        try:
-                            future.cancel()
-                        except Exception:
-                            pass
-                    raise QuotaExhaustedError(str(e))
-                print(f"    Error submitting seed {seed}: {e}")
-                seed_index += 1
+        seed_index = _fill_queue(
+            pending_jobs, seeds_to_run, seed_index, submit_kwargs,
+            queue_depth=queue_depth, total_to_run=total_to_run,
+            cancel_on_quota=True,
+        )
 
     if min_energies:
         avg = statistics.mean(min_energies)
