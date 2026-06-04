@@ -23,6 +23,7 @@ spawns the stream driver).
 from __future__ import annotations
 
 import ast
+import textwrap
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -110,3 +111,56 @@ def test_shared_has_no_unapproved_upward_imports() -> None:
         "ratchet only tightens, so strike them from _ALLOWED:\n  "
         + "\n  ".join(f"{f} -> import {m}" for f, m in sorted(stale_allowances))
     )
+
+
+# ---------------------------------------------------------------------------
+# Detector self-tests. With _ALLOWED empty and shared/ clean, the test above
+# only asserts empty == empty — so a regressed AST visitor would silently pass
+# (no real upward import exists to catch it). These pin the detector itself.
+# ---------------------------------------------------------------------------
+
+
+def _collect_from_source(source: str) -> set[tuple[str, str]]:
+    """Run the module-level import collector over an in-memory source string."""
+    collector = _ModuleLevelImportCollector("sample.py")
+    collector.visit(ast.parse(textwrap.dedent(source)))
+    return collector.offenders
+
+
+def test_detector_flags_module_level_from_import() -> None:
+    """A module-level `from substrate... import` is flagged (the dominant case)."""
+    found = _collect_from_source(
+        "from substrate.types import SubstrateMiningContext\n"
+    )
+    assert ("sample.py", "substrate.types") in found
+
+
+def test_detector_flags_bare_backend_import() -> None:
+    """A module-level `import GPU` is flagged."""
+    assert ("sample.py", "GPU") in _collect_from_source("import GPU\n")
+
+
+def test_detector_ignores_deferred_in_function_import() -> None:
+    """An upward import inside a function body is NOT flagged — this is the
+    sanctioned lazy-coupling escape hatch (e.g. _ensure_driver importing
+    QPU.stream_driver only when it spawns the stream driver)."""
+    found = _collect_from_source(
+        """
+        def f():
+            from substrate.client import SubstrateClient
+            return SubstrateClient
+        """
+    )
+    assert found == set()
+
+
+def test_detector_ignores_relative_and_downward_imports() -> None:
+    """Relative (intra-shared) and non-upward imports are never flagged."""
+    found = _collect_from_source(
+        """
+        from shared.miner_types import MiningResult
+        from . import sibling
+        import os
+        """
+    )
+    assert found == set()

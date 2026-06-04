@@ -963,6 +963,48 @@ async def test_handle_result_cancels_siblings_on_ok(monkeypatch):
     assert sibling_b.cancel_calls == 1
 
 
+async def test_handle_result_redispatches_idle_handle_on_verify_mismatch(monkeypatch):
+    """OK receipt but the runtime recorded someone else's proof
+    (_verify_proof_recorded returns -1): the controller must NOT close the
+    work key, and must re-dispatch the SAME context to IDLE handles only —
+    skipping a busy handle — while bumping contexts_dispatched. This is the
+    anti-deadlock guarantee that keeps an idle worker from sitting forever
+    after a silent rejection. It exercises _finalize_accepted_proof's
+    mismatch branch and _redispatch_after_verify_fail (gate_idle=True), which
+    are reachable only through _handle_result's OK path."""
+    from substrate.miner_controller import _work_key
+
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+
+    idle = _FakeHandle("idle")            # _active_dispatch_id == 0 → eligible
+    busy = _FakeHandle("busy")
+    busy._active_dispatch_id = 7          # active → must be skipped
+    controller.miner_handles = [idle, busy]
+
+    async def fake_submit_proof(*args, **kwargs):
+        return ExtrinsicReceipt(extrinsic_hash="0xabc")  # classifies OK
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+    controller._verify_proof_recorded = AsyncMock(return_value=-1)  # type: ignore[assignment]
+
+    await controller._handle_result(
+        _ResultEnvelope(result=_mining_result(), context=ctx, handle_id="idle")
+    )
+
+    # Anti-deadlock invariant: the work key stays open (not won by us).
+    assert _work_key(ctx) not in controller._closed_work_keys
+    assert controller.stats.proofs_submitted == 0
+    # Only the idle handle was re-dispatched; the busy one was skipped.
+    assert len(idle.mine_calls) == 1
+    assert idle.mine_calls[0][1] is ctx
+    assert len(busy.mine_calls) == 0
+    assert controller.stats.contexts_dispatched == 1
+
+
 async def test_handle_result_drops_duplicate_after_ok(monkeypatch):
     """Second result for the same work key — landing after the first was
     accepted — must be dropped without another submit_proof call. This

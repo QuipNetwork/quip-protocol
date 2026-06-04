@@ -1163,10 +1163,17 @@ class SubstrateMinerController:
         """
         self._submission_log.record(**log_common, outcome=outcome, **extra)
 
-    async def _handle_result(self, envelope: _ResultEnvelope) -> None:
-        self.stats.results_received += 1
-        envelope_key = _work_key(envelope.context)
+    def _should_drop_result(
+        self, envelope: _ResultEnvelope, envelope_key: WorkKey
+    ) -> bool:
+        """Whether to drop *envelope* before submitting, logging the reason.
 
+        Three guards, in order: (1) the work key was already won this head
+        (storm prevention); (2) the anticipatory fire loop already handled the
+        key; (3) the result was produced against a now-stale context. Each
+        increments its drop counter and logs before returning ``True``;
+        returns ``False`` when the result should proceed to submission.
+        """
         # Storm prevention: if we already submitted an accepted proof
         # for this work key this head, drop sibling/duplicate results
         # without re-submitting. Distinct from the stale check below —
@@ -1182,7 +1189,7 @@ class SubstrateMinerController:
                 envelope.handle_id,
                 envelope.context.last_proof_block_hash.hex()[:16],
             )
-            return
+            return True
 
         # De-dup with the anticipatory path: if the controller has already
         # SUCCESS-submitted (or is mid-fire on) this work key via the
@@ -1199,7 +1206,7 @@ class SubstrateMinerController:
                 envelope.handle_id,
                 envelope.context.last_proof_block_hash.hex()[:16],
             )
-            return
+            return True
 
         # Drop results produced against a stale context. The controller
         # already moved on to a new round; the chain would reject this
@@ -1223,6 +1230,15 @@ class SubstrateMinerController:
                 envelope.context.last_proof_block_hash.hex()[:16],
                 current_seed_hex,
             )
+            return True
+
+        return False
+
+    async def _handle_result(self, envelope: _ResultEnvelope) -> None:
+        self.stats.results_received += 1
+        envelope_key = _work_key(envelope.context)
+
+        if self._should_drop_result(envelope, envelope_key):
             return
 
         # Encoder errors (ValueError on no-solutions / wrong-salt-length)
