@@ -14,12 +14,10 @@ import os
 import statistics
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple, cast
-from typing import Any as AnyType
-from typing import Tuple as TupleType
 
 import numpy as np
 
@@ -180,10 +178,6 @@ def normalize_test_id(test_id: str) -> str:
                 suffix += base[idx:]
                 base = base[:idx]
                 break  # suffixes are contiguous after the base
-        # Re-extract suffix from remaining if multiple
-        if suffix:
-            # All suffixes are in the suffix string already
-            pass
 
         num_reads, annealing_time = parse_test_id(base)
         normalized_base = f"quip_{num_reads}sweep_{int(round(annealing_time))}time"
@@ -373,8 +367,8 @@ def submit_async_job(
     # Generate Ising model from seed
     h, J = generate_ising_model_from_nonce(ising_seed, nodes, edges)
 
-    h_cast = cast(Mapping[AnyType, float], h)
-    J_cast = cast(Mapping[TupleType[AnyType, AnyType], float], J)
+    h_cast = cast(Mapping[Any, float], h)
+    J_cast = cast(Mapping[Tuple[Any, Any], float], J)
 
     # Build sample kwargs
     sample_kwargs: Dict[str, Any] = {
@@ -1034,10 +1028,6 @@ def phase7_intersample_correlation(
     print("="*60)
 
     # Check solver support
-    supported_params = solver_props.get('parameters', {})
-    if not isinstance(supported_params, dict):
-        supported_params = {}
-    # Also check raw properties for parameter support
     raw_params = sampler.properties.get('parameters', {})
     if 'reduce_intersample_correlation' not in raw_params:
         print("  SKIPPED: Solver does not support reduce_intersample_correlation")
