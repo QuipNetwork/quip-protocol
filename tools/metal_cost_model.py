@@ -158,6 +158,89 @@ def _grid_cells(
     return deduped
 
 
+def _chunk_sweep(
+    sampler: MetalSASampler,
+    model: IsingModel,
+    *,
+    num_reads: int,
+    num_sweeps: int,
+    targets: List[float],
+    repeats: int,
+    residency_secs: float,
+    seed: int,
+) -> List[Dict[str, object]]:
+    """Total wall-time + GPU residency for one point across target_dispatch_ms.
+
+    Drives the REAL chunked path (``_dispatch_batch`` with the self-calibrating
+    controller) at each target (0 ⇒ monolithic). Captures the two things the
+    monolithic grid can't: per-command-buffer overhead (total time vs target)
+    and whether chunking lets the compositor breathe (GPU residency vs target).
+    """
+    beta_arr, beta_range = compute_beta_schedule(
+        model.h, model.J, num_sweeps, 1, None, "geometric", None,
+    )
+    base = dict(
+        num_reads=num_reads, beta_schedule_arr=beta_arr, beta_range=beta_range,
+        beta_schedule_type="geometric", num_sweeps_per_beta=1, seed=seed,
+    )
+
+    def _one(target_ms: Optional[float]) -> None:
+        sampler._betas_per_chunk = None  # fresh controller each run
+        sampler._dispatch_batch([model], target_dispatch_ms=target_ms, **base)
+
+    rows: List[Dict[str, object]] = []
+    for tgt in targets:
+        target_ms = None if tgt <= 0 else float(tgt)
+        _one(target_ms)  # warmup
+        samples_ms: List[float] = []
+        for _ in range(repeats):
+            t0 = time.perf_counter()
+            _one(target_ms)
+            samples_ms.append((time.perf_counter() - t0) * 1000.0)
+        wall_ms = statistics.median(samples_ms)
+        chunk = "mono" if target_ms is None else sampler._betas_per_chunk
+        residency: Optional[int] = None
+        if residency_secs > 0:
+            res: List[int] = []
+            deadline = time.perf_counter() + residency_secs
+            while time.perf_counter() < deadline:
+                _one(target_ms)
+                res.append(macos_sensors.gpu_active_residency())
+            residency = int(statistics.median(res)) if res else None
+        rows.append({
+            "target_ms": "mono" if target_ms is None else tgt,
+            "chunk_betas": chunk,
+            "wall_ms": round(wall_ms, 1),
+            "gpu_residency_pct": "" if residency is None else residency,
+        })
+    return rows
+
+
+def _print_chunk_sweep(
+    rows: List[Dict[str, object]], num_reads: int, num_sweeps: int,
+) -> None:
+    mono = next((r for r in rows if r["target_ms"] == "mono"), None)
+    base_ms = float(mono["wall_ms"]) if mono else 0.0
+    print(
+        f"\n=== chunk-overhead + residency sweep "
+        f"(reads={num_reads}, sweeps={num_sweeps}) ===",
+    )
+    for r in rows:
+        wall = float(r["wall_ms"])
+        overhead = (wall - base_ms) / base_ms * 100 if base_ms else 0.0
+        res = r["gpu_residency_pct"]
+        print(
+            f"  target={str(r['target_ms']):>4} ms  chunk={str(r['chunk_betas']):>4} "
+            f"betas  wall={wall:8.1f} ms  (+{overhead:5.1f}% vs mono)  "
+            f"GPU={res if res != '' else '-':>3}%",
+        )
+    print(
+        "Read: low overhead% ⇒ chunking is cheap (fixed cost is per-dispatch, "
+        "not per-buffer); GPU-residency dropping below 100 as the target shrinks "
+        "⇒ the compositor is getting windows (smaller/no sleep needed).",
+    )
+
+
 def _row(
     kind: str, energy: float, reads: int, sweeps: int,
     wall_ms: float, residency: Optional[int],
@@ -251,6 +334,20 @@ def main() -> int:
     parser.add_argument(
         "--target-ms", type=float, default=DEFAULT_TARGET_DISPATCH_MS,
     )
+    parser.add_argument(
+        "--chunk-sweep", action="store_true",
+        help="measure total wall-time + GPU residency on the real chunked path "
+             "across --chunk-targets (instead of the monolithic cost grid)",
+    )
+    parser.add_argument(
+        "--chunk-targets", default="0,33,16,8,4,2",
+        help="target_dispatch_ms values for --chunk-sweep (0 = monolithic)",
+    )
+    parser.add_argument(
+        "--chunk-energy", type=float, default=None,
+        help="target energy whose (reads,sweeps) the chunk-sweep uses "
+             "(default: the first --energies entry)",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", default="metal_cost_model.csv")
     parser.add_argument(
@@ -278,6 +375,27 @@ def main() -> int:
     realistic = _realistic_points(
         energies, args.min_diversity, args.min_solutions, num_nodes, num_edges,
     )
+
+    if args.chunk_sweep:
+        energy = args.chunk_energy if args.chunk_energy is not None else energies[0]
+        params = MetalMiner.adapt_parameters(
+            energy, args.min_diversity, args.min_solutions,
+            num_nodes=num_nodes, num_edges=num_edges,
+        )
+        reads, sweeps = int(params["num_reads"]), int(params["num_sweeps"])
+        print(
+            f"topology: {num_nodes} nodes, {num_edges} edges | chunk-sweep at "
+            f"E={energy:.0f} -> reads={reads}, sweeps={sweeps}",
+        )
+        sweep_rows = _chunk_sweep(
+            sampler, model, num_reads=reads, num_sweeps=sweeps,
+            targets=_parse_float_list(args.chunk_targets), repeats=args.repeats,
+            residency_secs=args.residency_secs if args.residency else 0.0,
+            seed=args.seed,
+        )
+        _print_chunk_sweep(sweep_rows, reads, sweeps)
+        return 0
+
     cells = _grid_cells(realistic, reads_grid, sweeps_grid)
 
     print(
