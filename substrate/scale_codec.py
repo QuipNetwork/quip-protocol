@@ -16,7 +16,7 @@ from typing import Any, Callable, Optional
 from scalecodec.base import ScaleBytes
 from scalecodec.utils.ss58 import ss58_decode
 
-from shared.mempool_types import JobMode, MinerType, ResultDelivery
+from substrate.mempool_types import JobMode, MinerType, ResultDelivery
 from shared.signer import strip_0x
 from substrate.types import (
     SubstrateDifficulty,

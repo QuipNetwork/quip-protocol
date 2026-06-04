@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from shared.keystore_hybrid import generate
-from shared.mempool_types import (
+from substrate.mempool_types import (
     IsingParams,
     JobMode,
     MinerType,

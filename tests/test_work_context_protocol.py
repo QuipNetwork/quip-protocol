@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from shared.work_context import WorkContext
-from shared.mempool_types import MempoolJobContext
+from substrate.mempool_types import MempoolJobContext
 from substrate.types import SubstrateMiningContext
 
 

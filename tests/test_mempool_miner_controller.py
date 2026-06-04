@@ -29,7 +29,7 @@ from substrate.mempool_miner_controller import (
     _classify_claim,
     _classify_solution,
 )
-from shared.mempool_types import (
+from substrate.mempool_types import (
     IsingParams,
     JobMode,
     JobOrder,
@@ -619,7 +619,7 @@ async def test_controller_submits_solution_end_to_end(tmp_path):
     from CPU.sa_miner import SimulatedAnnealingMiner  # noqa: F401 — ensures sampler module loads
     from shared.keystore_hybrid import generate
     from substrate.mempool_miner_controller import MempoolMinerController
-    from shared.mempool_types import MinerType
+    from substrate.mempool_types import MinerType
     from shared.miner_bootstrap import _resolve_dev_signer
     from shared.miner_worker import MinerHandle
     from substrate.client import SubstrateClient
@@ -720,7 +720,7 @@ async def test_controller_submits_solution_end_to_end(tmp_path):
         # IsingParams.to_scale_dict() so we go through the same encoding
         # path the test_mempool_client.py::test_propose_job_and_query_back
         # test exercises.
-        from shared.mempool_types import IsingParams
+        from substrate.mempool_types import IsingParams
         ising = IsingParams(
             nodes=sampler_nodes,
             edges=sampler_edges,

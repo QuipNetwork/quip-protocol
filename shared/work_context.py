@@ -2,7 +2,7 @@
 
 `WorkContext` is a structural Protocol describing the shape both
 PoW (`substrate.types.SubstrateMiningContext`) and mempool
-(`shared.mempool_types.MempoolJobContext`) contexts satisfy. Each
+(`substrate.mempool_types.MempoolJobContext`) contexts satisfy. Each
 context implements `resolve_ising(salt, nodes, edges)` and
 `requirements()` itself — `shared/` no longer needs to import either
 concrete type.

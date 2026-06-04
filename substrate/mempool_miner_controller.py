@@ -54,7 +54,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from shared.allowed_value_spec import AllowedValueSpec
 from shared.asyncio_supervise import supervise
 from shared.logging_config import get_logger
-from shared.mempool_types import (
+from substrate.mempool_types import (
     JobOrder,
     MempoolJobContext,
     MempoolSolverInfo,

@@ -65,7 +65,7 @@ from shared.logging_config import get_logger
 # Aliased: `topology_hash` is also a local param/field name throughout this
 # module, so import the canonical-hash function under a distinct name.
 from shared.topology_hash import topology_hash as compute_topology_hash
-from shared.mempool_types import (
+from substrate.mempool_types import (
     IsingParams,
     JobOrder,
     MempoolSolverInfo,

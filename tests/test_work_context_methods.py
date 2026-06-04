@@ -1,7 +1,7 @@
 """Verify context types implement their own resolve_ising and requirements()."""
 from __future__ import annotations
 
-from shared.mempool_types import MempoolJobContext
+from substrate.mempool_types import MempoolJobContext
 from substrate.types import SubstrateMiningContext
 
 
