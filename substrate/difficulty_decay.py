@@ -26,12 +26,12 @@ helper, still used by the legacy tests).
 """
 from __future__ import annotations
 
-import bisect
 import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
+from shared.decay_math import step_for_energy
 from substrate.types import SubstrateDifficulty
 
 
@@ -233,18 +233,9 @@ def build_decay_schedule(
     return sched
 
 
-def step_for_energy(
-    decay_schedule: list[int], floor_energy_milli: int
-) -> Optional[int]:
-    """First decay step ``s`` where ``schedule[s] > floor_energy_milli``.
-
-    Mirrors the chain's strict ``best_energy_milli < max_energy_milli`` gate:
-    the candidate clears at the first step whose threshold is *strictly* above
-    its floor. ``None`` when it never clears within the schedule's horizon.
-    The schedule is monotonic non-decreasing, so this is a binary search.
-    """
-    i = bisect.bisect_right(decay_schedule, floor_energy_milli)
-    return i if i < len(decay_schedule) else None
+# ``step_for_energy`` is re-exported from ``shared.decay_math`` (imported above):
+# it is pure decay-step math with no substrate dependency, so it lives in the
+# foundation layer and chain-side callers keep importing it from here.
 
 
 # ----------------------------------------------------------------------

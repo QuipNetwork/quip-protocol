@@ -37,7 +37,6 @@ _UPWARD_PACKAGES = frozenset({"substrate", "CPU", "GPU", "QPU"})
 # the same commit that eliminates the corresponding import. Target: empty set.
 _ALLOWED = frozenset(
     {
-        ("base_miner.py", "substrate.difficulty_decay"),
         ("base_miner.py", "substrate.types"),
         ("miner_bootstrap.py", "substrate.client"),
         ("miner_bootstrap.py", "substrate.types"),

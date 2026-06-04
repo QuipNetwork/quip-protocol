@@ -35,7 +35,7 @@ from shared.quantum_proof_of_work import (
     evaluate_sampleset,
     pack_spins_hex,
 )
-from substrate.difficulty_decay import step_for_energy
+from shared.decay_math import step_for_energy
 from substrate.types import SubstrateMiningContext
 from shared.work_context import (
     WorkContext,
