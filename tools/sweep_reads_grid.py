@@ -59,6 +59,8 @@ QUICK_SWEEPS = [256, 512, 1024]
 QUICK_READS = [64, 128, 256]
 QUICK_NUM_MODELS = 50
 
+SAMPLER_NAMES = {'sa': 'SA', 'gibbs': 'Gibbs'}
+
 
 def generate_models(
     nodes: List[int],
@@ -338,6 +340,14 @@ def run_grid(
     }
 
 
+def _hdr(reads_range: List, width: int) -> str:
+    """Build the 'sw\\rd  <reads...>' header string for a table."""
+    header = f"  {'sw\\rd':>8}"
+    for rd in reads_range:
+        header += f" {rd:>{width}}"
+    return header
+
+
 def print_tables(results: Dict) -> None:
     """Print blocks-mined grids for SA and Gibbs."""
     grid = results['grid_data']
@@ -346,8 +356,13 @@ def print_tables(results: Dict) -> None:
     reads_range = results['reads_range']
     num_models = results['num_models']
 
+    lookup = {
+        (e['sampler_type'], e['sweeps'], e['reads']): e
+        for e in grid
+    }
+
     for sampler_type in ('sa', 'gibbs'):
-        name = 'SA' if sampler_type == 'sa' else 'Gibbs'
+        name = SAMPLER_NAMES[sampler_type]
         print(f"\n{'=' * 60}")
         print(f"  {name} — blocks mined / {num_models} models")
         print(f"{'=' * 60}")
@@ -355,23 +370,14 @@ def print_tables(results: Dict) -> None:
         for threshold in thresholds:
             t_str = str(threshold)
             print(f"\n  E <= {threshold:.0f}:")
-            sw_rd = 'sw\\rd'
-            header = f"  {sw_rd:>8}"
-            for rd in reads_range:
-                header += f" {rd:>6}"
+            header = _hdr(reads_range, 6)
             print(header)
             print("  " + "-" * (len(header) - 2))
 
             for sw in sweeps_range:
                 row = f"  {sw:>8}"
                 for rd in reads_range:
-                    entry = next(
-                        (e for e in grid
-                         if e['sampler_type'] == sampler_type
-                         and e['sweeps'] == sw
-                         and e['reads'] == rd),
-                        None,
-                    )
+                    entry = lookup.get((sampler_type, sw, rd))
                     if entry is None:
                         row += f" {'—':>6}"
                     else:
@@ -385,25 +391,16 @@ def print_tables(results: Dict) -> None:
     print("  Throughput (models/sec)")
     print(f"{'=' * 60}")
     for sampler_type in ('sa', 'gibbs'):
-        name = 'SA' if sampler_type == 'sa' else 'Gibbs'
+        name = SAMPLER_NAMES[sampler_type]
         print(f"\n  {name}:")
-        sw_rd = 'sw\\rd'
-        header = f"  {sw_rd:>8}"
-        for rd in reads_range:
-            header += f" {rd:>6}"
+        header = _hdr(reads_range, 6)
         print(header)
         print("  " + "-" * (len(header) - 2))
 
         for sw in sweeps_range:
             row = f"  {sw:>8}"
             for rd in reads_range:
-                entry = next(
-                    (e for e in grid
-                     if e['sampler_type'] == sampler_type
-                     and e['sweeps'] == sw
-                     and e['reads'] == rd),
-                    None,
-                )
+                entry = lookup.get((sampler_type, sw, rd))
                 if entry is None:
                     row += f" {'—':>6}"
                 else:
@@ -417,25 +414,16 @@ def print_tables(results: Dict) -> None:
     t_mid = str(thresholds[len(thresholds) // 2])
     print(f"  At threshold E <= {t_mid}:")
     for sampler_type in ('sa', 'gibbs'):
-        name = 'SA' if sampler_type == 'sa' else 'Gibbs'
+        name = SAMPLER_NAMES[sampler_type]
         print(f"\n  {name}:")
-        sw_rd = 'sw\\rd'
-        header = f"  {sw_rd:>8}"
-        for rd in reads_range:
-            header += f" {rd:>8}"
+        header = _hdr(reads_range, 8)
         print(header)
         print("  " + "-" * (len(header) - 2))
 
         for sw in sweeps_range:
             row = f"  {sw:>8}"
             for rd in reads_range:
-                entry = next(
-                    (e for e in grid
-                     if e['sampler_type'] == sampler_type
-                     and e['sweeps'] == sw
-                     and e['reads'] == rd),
-                    None,
-                )
+                entry = lookup.get((sampler_type, sw, rd))
                 if entry is None:
                     row += f" {'—':>8}"
                 else:
@@ -920,7 +908,7 @@ def plot_results(results: Dict, output_dir: str) -> None:
 
     for ax_idx, sampler_type in enumerate(('sa', 'gibbs')):
         ax = axes[ax_idx]
-        name = 'SA' if sampler_type == 'sa' else 'Gibbs'
+        name = SAMPLER_NAMES[sampler_type]
 
         entries = [
             e for e in grid
@@ -968,7 +956,7 @@ def plot_results(results: Dict, output_dir: str) -> None:
 
     for ax_idx, sampler_type in enumerate(('sa', 'gibbs')):
         ax = axes[ax_idx]
-        name = 'SA' if sampler_type == 'sa' else 'Gibbs'
+        name = SAMPLER_NAMES[sampler_type]
 
         entries = [
             e for e in grid
@@ -1019,7 +1007,7 @@ def plot_results(results: Dict, output_dir: str) -> None:
 
     for ax_idx, sampler_type in enumerate(('sa', 'gibbs')):
         ax = axes[ax_idx]
-        name = 'SA' if sampler_type == 'sa' else 'Gibbs'
+        name = SAMPLER_NAMES[sampler_type]
 
         entries = [
             e for e in grid
