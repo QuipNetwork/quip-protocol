@@ -232,6 +232,14 @@ def get_solver_properties(sampler: DWaveSamplerWrapper) -> Dict[str, Any]:
     }
 
 
+def _timing_params(solver_props: Dict[str, Any]) -> Tuple[float, float, float]:
+    """Return (programming_time, readout_per_sample, readout_therm) from solver_props."""
+    programming_time = solver_props.get('default_programming_thermalization', 1000.0)
+    readout_per_sample = solver_props.get('readout_time_per_sample', 123.0)
+    readout_therm = solver_props.get('default_readout_thermalization', 0.0)
+    return programming_time, readout_per_sample, readout_therm
+
+
 def estimate_qpu_time(
     annealing_time: float,
     num_reads: int,
@@ -243,9 +251,7 @@ def estimate_qpu_time(
 
     Returns estimated time in microseconds.
     """
-    programming_time = solver_props.get('default_programming_thermalization', 1000.0)
-    readout_per_sample = solver_props.get('readout_time_per_sample', 123.0)
-    readout_therm = solver_props.get('default_readout_thermalization', 0.0)
+    programming_time, readout_per_sample, readout_therm = _timing_params(solver_props)
 
     # Per-read time includes annealing + readout + thermalization overhead
     per_read_time = annealing_time + readout_per_sample + readout_therm
@@ -301,9 +307,7 @@ def max_annealing_time_for_reads(
     hw_max_duration = solver_props['problem_run_duration_range'][1]
     max_duration = min(qpu_budget, hw_max_duration)
 
-    programming_time = solver_props.get('default_programming_thermalization', 1000.0)
-    readout_per_sample = solver_props.get('readout_time_per_sample', 123.0)
-    readout_therm = solver_props.get('default_readout_thermalization', 0.0)
+    programming_time, readout_per_sample, readout_therm = _timing_params(solver_props)
 
     overhead_per_read = readout_per_sample + readout_therm
 
@@ -331,9 +335,7 @@ def max_num_reads_for_annealing_time(
     hw_max_duration = solver_props['problem_run_duration_range'][1]
     max_duration = min(qpu_budget, hw_max_duration)
 
-    programming_time = solver_props.get('default_programming_thermalization', 1000.0)
-    readout_per_sample = solver_props.get('readout_time_per_sample', 123.0)
-    readout_therm = solver_props.get('default_readout_thermalization', 0.0)
+    programming_time, readout_per_sample, readout_therm = _timing_params(solver_props)
 
     per_read_time = annealing_time + readout_per_sample + readout_therm
 
