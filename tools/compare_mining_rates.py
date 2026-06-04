@@ -558,8 +558,8 @@ class NodeInfo:
     miner_id: str
 
 
-def main():
-    """Main entry point."""
+def parse_and_validate_args():
+    """Build the argument parser and return the parsed CLI arguments."""
     parser = argparse.ArgumentParser(
         description='Compare mining rates at fixed difficulty'
     )
@@ -637,7 +637,151 @@ def main():
         help='CUDA sampling algorithm: "sa" for simulated annealing, "gibbs" for chromatic block Gibbs (default: sa)'
     )
 
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def supervise_workers(processes, stop_event, drain_queue) -> None:
+    """Monitor workers until exit, draining results and forcing shutdown.
+
+    Args:
+        processes: Iterable of multiprocessing Process objects.
+        stop_event: multiprocessing.Event signalling workers to stop.
+        drain_queue: Callable that drains the shared result queue.
+    """
+    try:
+        # Wait for workers to exit gracefully
+        # Workers check stop_event in their loop and will exit after current iteration
+        while any(p.is_alive() for p in processes):
+            time.sleep(0.1)  # Check every 100ms
+            drain_queue()  # Periodically drain to get incremental results
+
+            # If stop_event is set, give workers time to finish current iteration
+            if stop_event.is_set():
+                # Wait up to 180 seconds for graceful shutdown (mining iteration can take 2+ min)
+                shutdown_start = time.time()
+                while any(p.is_alive() for p in processes):
+                    drain_queue()  # Keep draining to capture incremental results
+                    if time.time() - shutdown_start > 180:
+                        # Force terminate if workers are stuck
+                        print("   ⚠️ Timeout waiting for workers, forcing shutdown...")
+                        _force_terminate_all(processes, drain_queue)
+                        break
+                    time.sleep(0.5)  # Check every 500ms during shutdown
+                break
+
+        # Drain any results after processes exit
+        drain_queue()
+
+    except KeyboardInterrupt:
+        print("\n⚠️  Interrupted, waiting for workers to finish current iteration...")
+        stop_event.set()
+        # Give workers up to 60 seconds to finish gracefully
+        shutdown_start = time.time()
+        while any(p.is_alive() for p in processes):
+            drain_queue()  # Keep draining
+            if time.time() - shutdown_start > 60:
+                print("   Forcing shutdown...")
+                _force_terminate_all(processes, drain_queue)
+                break
+            time.sleep(0.5)
+        drain_queue()
+
+
+def print_results(stats, valid_results, errors) -> None:
+    """Print the aggregated results summary and per-miner breakdown.
+
+    Args:
+        stats: Aggregated statistics dict from aggregate_results (or empty stub).
+        valid_results: List of non-error miner result dicts.
+        errors: List of error result dicts.
+    """
+    print("\n" + "=" * 50)
+    print("📊 RESULTS")
+    print("=" * 50)
+
+    if not valid_results:
+        print("⚠️  No miner results collected (workers may have been terminated)")
+        print(f"   Total time: {stats['total_time_minutes']:.1f} min")
+        if errors:
+            print(f"   Errors: {len(errors)}")
+    else:
+        print(f"✅ Mining completed:")
+        print(f"   Miners used: {stats['num_miners']}")
+        print(f"   Total time: {stats['total_time_minutes']:.1f} min")
+        print(f"   Blocks found: {stats['total_blocks_found']}")
+        print(f"   Total attempts: {stats['total_attempts']}")
+        print(f"   Success rate: {stats['success_rate'] * 100:.1f}%")
+        print(f"   Mining rate: {stats['blocks_per_minute']:.3f} blocks/min")
+
+        # Per-miner breakdown
+        print(f"\n📋 Per-miner breakdown:")
+        for r in stats['per_miner_stats']:
+            rate = r['blocks_found'] / (r['total_time'] / 60) if r['total_time'] > 0 else 0
+            print(f"   {r['miner_id']}: {r['blocks_found']} blocks, {r['attempts']} attempts, {rate:.2f} blocks/min")
+
+        if stats['total_blocks_found'] > 0:
+            print(f"\n📈 Energy distribution:")
+            print(f"   Min: {stats['energy_stats']['min']:.1f}")
+            print(f"   Max: {stats['energy_stats']['max']:.1f}")
+            print(f"   Mean: {stats['energy_stats']['mean']:.1f}")
+
+            print(f"\n🌈 Diversity distribution:")
+            print(f"   Min: {stats['diversity_stats']['min']:.3f}")
+            print(f"   Max: {stats['diversity_stats']['max']:.3f}")
+            print(f"   Mean: {stats['diversity_stats']['mean']:.3f}")
+
+            if stats['mining_time_stats']['mean']:
+                print(f"\n⏱️  Mining time per block:")
+                print(f"   Min: {stats['mining_time_stats']['min']:.1f}s")
+                print(f"   Max: {stats['mining_time_stats']['max']:.1f}s")
+                print(f"   Mean: {stats['mining_time_stats']['mean']:.1f}s")
+
+
+def write_output(args, stats, errors, duration_minutes, valid_results) -> int:
+    """Write the results JSON file and return the process exit code.
+
+    Args:
+        args: Parsed CLI arguments.
+        stats: Aggregated statistics dict.
+        errors: List of error result dicts.
+        duration_minutes: Mining duration in minutes.
+        valid_results: List of non-error miner result dicts.
+
+    Returns:
+        0 if any valid results were collected, otherwise 1.
+    """
+    output_data = {
+        'miner_type': args.miner_type,
+        'update_mode': args.update_mode,
+        'num_miners': stats['num_miners'],
+        'difficulty_energy': args.difficulty_energy,
+        'duration_spec': args.duration,
+        'duration_minutes': duration_minutes,
+        'min_diversity': args.min_diversity,
+        'min_solutions': args.min_solutions,
+        'statistics': stats,
+        'errors': [e.get('error', 'unknown') for e in errors] if errors else [],
+        'timestamp': utc_timestamp()
+    }
+
+    output_file = args.output
+    if not output_file:
+        timestamp = int(time.time())
+        mode_suffix = f"_{args.update_mode}" if args.miner_type == 'cuda' else ""
+        output_file = f"mining_rate_{args.miner_type}{mode_suffix}_{args.duration}min_{timestamp}.json"
+
+    with open(output_file, 'w') as f:
+        json.dump(output_data, f, indent=2, cls=NumpyEncoder)
+
+    print(f"\n💾 Results saved to {output_file}")
+
+    # Return 0 if we got any results, 1 if completely empty
+    return 0 if valid_results else 1
+
+
+def main():
+    """Main entry point."""
+    args = parse_and_validate_args()
 
     # Parse duration
     try:
@@ -760,43 +904,7 @@ def main():
             except Exception:
                 break
 
-    try:
-        # Wait for workers to exit gracefully
-        # Workers check stop_event in their loop and will exit after current iteration
-        while any(p.is_alive() for p in processes):
-            time.sleep(0.1)  # Check every 100ms
-            drain_queue()  # Periodically drain to get incremental results
-
-            # If stop_event is set, give workers time to finish current iteration
-            if stop_event.is_set():
-                # Wait up to 180 seconds for graceful shutdown (mining iteration can take 2+ min)
-                shutdown_start = time.time()
-                while any(p.is_alive() for p in processes):
-                    drain_queue()  # Keep draining to capture incremental results
-                    if time.time() - shutdown_start > 180:
-                        # Force terminate if workers are stuck
-                        print("   ⚠️ Timeout waiting for workers, forcing shutdown...")
-                        _force_terminate_all(processes, drain_queue)
-                        break
-                    time.sleep(0.5)  # Check every 500ms during shutdown
-                break
-
-        # Drain any results after processes exit
-        drain_queue()
-
-    except KeyboardInterrupt:
-        print("\n⚠️  Interrupted, waiting for workers to finish current iteration...")
-        stop_event.set()
-        # Give workers up to 60 seconds to finish gracefully
-        shutdown_start = time.time()
-        while any(p.is_alive() for p in processes):
-            drain_queue()  # Keep draining
-            if time.time() - shutdown_start > 60:
-                print("   Forcing shutdown...")
-                _force_terminate_all(processes, drain_queue)
-                break
-            time.sleep(0.5)
-        drain_queue()
+    supervise_workers(processes, stop_event, drain_queue)
 
     total_time = time.time() - start_time
 
@@ -832,76 +940,9 @@ def main():
             'mining_time_stats': {'min': None, 'max': None, 'mean': None, 'all_times': []}
         }
 
-    # Print results
-    print("\n" + "=" * 50)
-    print("📊 RESULTS")
-    print("=" * 50)
+    print_results(stats, valid_results, errors)
 
-    if not valid_results:
-        print("⚠️  No miner results collected (workers may have been terminated)")
-        print(f"   Total time: {stats['total_time_minutes']:.1f} min")
-        if errors:
-            print(f"   Errors: {len(errors)}")
-    else:
-        print(f"✅ Mining completed:")
-        print(f"   Miners used: {stats['num_miners']}")
-        print(f"   Total time: {stats['total_time_minutes']:.1f} min")
-        print(f"   Blocks found: {stats['total_blocks_found']}")
-        print(f"   Total attempts: {stats['total_attempts']}")
-        print(f"   Success rate: {stats['success_rate'] * 100:.1f}%")
-        print(f"   Mining rate: {stats['blocks_per_minute']:.3f} blocks/min")
-
-        # Per-miner breakdown
-        print(f"\n📋 Per-miner breakdown:")
-        for r in stats['per_miner_stats']:
-            rate = r['blocks_found'] / (r['total_time'] / 60) if r['total_time'] > 0 else 0
-            print(f"   {r['miner_id']}: {r['blocks_found']} blocks, {r['attempts']} attempts, {rate:.2f} blocks/min")
-
-        if stats['total_blocks_found'] > 0:
-            print(f"\n📈 Energy distribution:")
-            print(f"   Min: {stats['energy_stats']['min']:.1f}")
-            print(f"   Max: {stats['energy_stats']['max']:.1f}")
-            print(f"   Mean: {stats['energy_stats']['mean']:.1f}")
-
-            print(f"\n🌈 Diversity distribution:")
-            print(f"   Min: {stats['diversity_stats']['min']:.3f}")
-            print(f"   Max: {stats['diversity_stats']['max']:.3f}")
-            print(f"   Mean: {stats['diversity_stats']['mean']:.3f}")
-
-            if stats['mining_time_stats']['mean']:
-                print(f"\n⏱️  Mining time per block:")
-                print(f"   Min: {stats['mining_time_stats']['min']:.1f}s")
-                print(f"   Max: {stats['mining_time_stats']['max']:.1f}s")
-                print(f"   Mean: {stats['mining_time_stats']['mean']:.1f}s")
-
-    # Always save results (even if empty)
-    output_data = {
-        'miner_type': args.miner_type,
-        'update_mode': args.update_mode,
-        'num_miners': stats['num_miners'],
-        'difficulty_energy': args.difficulty_energy,
-        'duration_spec': args.duration,
-        'duration_minutes': duration_minutes,
-        'min_diversity': args.min_diversity,
-        'min_solutions': args.min_solutions,
-        'statistics': stats,
-        'errors': [e.get('error', 'unknown') for e in errors] if errors else [],
-        'timestamp': utc_timestamp()
-    }
-
-    output_file = args.output
-    if not output_file:
-        timestamp = int(time.time())
-        mode_suffix = f"_{args.update_mode}" if args.miner_type == 'cuda' else ""
-        output_file = f"mining_rate_{args.miner_type}{mode_suffix}_{args.duration}min_{timestamp}.json"
-
-    with open(output_file, 'w') as f:
-        json.dump(output_data, f, indent=2, cls=NumpyEncoder)
-
-    print(f"\n💾 Results saved to {output_file}")
-
-    # Return 0 if we got any results, 1 if completely empty
-    return 0 if valid_results else 1
+    return write_output(args, stats, errors, duration_minutes, valid_results)
 
 
 if __name__ == "__main__":
