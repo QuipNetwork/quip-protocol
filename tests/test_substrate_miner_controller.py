@@ -170,7 +170,7 @@ def _bare_controller() -> SubstrateMinerController:
     # Anticipatory-submission state (Task 6b).
     c._latest_preview = {}
     c._latest_budget = {}
-    c._participated = set()
+    c._participated = OrderedDict()
     c._pow_constants = None
     c._base_difficulty_by_key = {}
     c._decay_schedule_by_key = {}  # WorkKey -> (schedule, last_proof_block, epoch_length)
@@ -2094,6 +2094,83 @@ async def test_mark_participating_uses_node_id_and_omits_budget():
     assert payload["kind"] == "cpu"
     # Node identity (signer ss58), not the per-instance worker id.
     assert payload["miner"] == "5Test"
+
+
+async def test_mark_participating_skips_when_signer_address_unavailable():
+    controller = _bare_controller()
+    controller._submit_participation_remark = AsyncMock(return_value=None)
+    # _mark_participating runs unguarded on the drain loop; a signer failure
+    # must NOT propagate (the drain loop's broad except would shut the
+    # controller down — an observability failure crashing mining).
+    controller.signer.ss58_address.side_effect = RuntimeError("keystore locked")
+    controller._mark_participating({"solution_number": 11, "kind": "cpu"})
+    await asyncio.sleep(0)
+    controller._submit_participation_remark.assert_not_awaited()
+    # The solution must NOT be pre-marked done, so a recovered later report
+    # still fires (no permanent suppression from a transient signer failure).
+    controller.signer.ss58_address.side_effect = None
+    controller.signer.ss58_address.return_value = "5Test"
+    controller._mark_participating({"solution_number": 11, "kind": "cpu"})
+    await asyncio.sleep(0)
+    controller._submit_participation_remark.assert_awaited_once()
+
+
+async def test_mark_participating_evicts_oldest_deterministically(monkeypatch):
+    import substrate.miner_controller as mc
+    monkeypatch.setattr(mc, "_PARTICIPATION_RETENTION", 3)
+    controller = _bare_controller()
+    controller._submit_participation_remark = AsyncMock(return_value=None)
+    # Add 4 with retention 3 → the OLDEST (1) is evicted, never an arbitrary
+    # (possibly still-active) entry that would re-fire its remark.
+    for sol in (1, 2, 3, 4):
+        controller._mark_participating({"solution_number": sol, "kind": "cpu"})
+    await asyncio.sleep(0)
+    assert list(controller._participated.keys()) == [2, 3, 4]
+
+
+async def test_participation_remark_receipt_error_is_terminal():
+    controller = _bare_controller()
+    controller.build_client.has_call = AsyncMock(return_value=False)
+    controller.build_client.submit_extrinsic = AsyncMock(
+        return_value=MagicMock(error="System.ExtrinsicFailed")
+    )
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    # An included-but-rejected remark won't be fixed by resubmitting the same
+    # body — it's terminal, not retried (no pointless resubmission storm).
+    await controller._submit_participation_remark(
+        {"schema": "quip-participation", "solution": 4, "miner": "5Test",
+         "kind": "cpu"},
+        sleeper=_no_sleep,
+    )
+    assert controller.build_client.submit_extrinsic.await_count == 1
+
+
+async def test_participation_remark_retries_when_fallback_path_also_fails():
+    controller = _bare_controller()
+    controller.build_client.has_call = AsyncMock(return_value=True)
+    # Attempt 1: remark_with_event raises (caught inside submit_remark →
+    # fallback), then plain remark ALSO raises and ESCAPES submit_remark — this
+    # is the literal 1010-outdated nonce race the retry loop exists for. Attempt
+    # 2: the recomposed (fresh-nonce) plain remark lands.
+    controller.build_client.submit_extrinsic = AsyncMock(side_effect=[
+        RuntimeError("no event variant"),              # a1 remark_with_event
+        RuntimeError("1010 Transaction is outdated"),  # a1 plain (escapes)
+        RuntimeError("no event variant"),              # a2 remark_with_event
+        MagicMock(error=None),                         # a2 plain — lands
+    ])
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    await controller._submit_participation_remark(
+        {"schema": "quip-participation", "solution": 8, "miner": "5Test",
+         "kind": "qpu"},
+        sleeper=_no_sleep,
+    )
+    assert controller.build_client.submit_extrinsic.await_count == 4
 
 
 

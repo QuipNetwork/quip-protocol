@@ -229,8 +229,9 @@ _CLOSED_WORK_KEYS_CAP = 16
 # losing the immutable mapping for an in-flight one.
 _DISPATCH_CONTEXT_RETENTION = 4
 
-# Upper bound on the write-once participation dedup set. Generous because
-# solution numbers are monotonic — eviction can never re-admit an active key.
+# Upper bound on the write-once participation dedup map. Generous because
+# solution numbers are monotonic and eviction is oldest-first, so a still-active
+# solution is never dropped (which would let its remark re-fire).
 _PARTICIPATION_RETENTION = 2048
 
 # Participation remark retry budget. The node submits one System.remark per
@@ -529,13 +530,12 @@ class SubstrateMinerController:
         # ``{"op": "budget"}`` pushes). Surfaced in the telemetry snapshot so
         # operators can see live daily-budget usage; never drives submission.
         self._latest_budget: dict[str, Any] = {}
-        # Write-once participation dedup: (miner_id, solution_number) already
-        # marked via a System.remark. Solution numbers are monotonic, so the
-        # arbitrary-pop bound below can never re-admit a still-active key.
-        # Solution #s the node has already published a participation remark
-        # for. Node-level (one remark per solution#), so keyed by solution#
-        # alone — not by per-instance miner id.
-        self._participated: set[int] = set()
+        # Write-once participation dedup: solution #s the node has already
+        # published a System.remark for. Node-level (one remark per solution#),
+        # keyed by solution# alone — not by per-instance miner id. Insertion-
+        # ordered so the retention bound evicts the OLDEST entry, never an
+        # arbitrary still-active solution (which would re-fire its remark).
+        self._participated: "OrderedDict[int, None]" = OrderedDict()
         # Anticipatory-submission state (Task 6b).
         # ``_pow_constants`` caches the four decay constants
         # (epoch_length + curve c-triple) for the session — they only
@@ -1821,14 +1821,29 @@ class SubstrateMinerController:
             return
         if solution_number in self._participated:
             return
-        self._participated.add(solution_number)
+        # Resolve the node identity BEFORE recording dedup or spawning the task.
+        # This runs unguarded on the drain loop, so a signer failure must not
+        # propagate (the loop's broad except would shut the controller down —
+        # an observability failure crashing mining); and pre-marking the
+        # solution done before a transient failure would permanently suppress
+        # its remark. Resolve first, bail cleanly, mark done only on success.
+        try:
+            miner = self.signer.ss58_address()
+        except Exception as exc:  # noqa: BLE001 — observability path
+            logger.warning(
+                "participation remark skipped for solution %s: signer address "
+                "unavailable (%s: %s); mining continues",
+                solution_number, type(exc).__name__, exc,
+            )
+            return
+        self._participated[solution_number] = None
         while len(self._participated) > _PARTICIPATION_RETENTION:
-            self._participated.pop()
+            self._participated.popitem(last=False)  # evict oldest
 
         payload: dict[str, Any] = {
             "schema": "quip-participation",
             "solution": solution_number,
-            "miner": self.signer.ss58_address(),
+            "miner": miner,
             "kind": msg.get("kind"),
         }
         if "budget_seconds" in msg:

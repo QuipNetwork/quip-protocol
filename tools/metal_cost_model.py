@@ -143,7 +143,9 @@ def _grid_cells(
     (vary sweeps at a fixed reads, vary reads at a fixed sweeps) let a linear
     fit separate per-beta cost from fixed overhead and the reads/occupancy term.
     """
-    ref_reads = max(MetalMiner.ADAPT_MAX_READS, *(r for _, _, r, _ in realistic))
+    # List form so an empty ``realistic`` (e.g. ``--energies ""``) still has the
+    # ADAPT_MAX_READS element rather than ``max(int)`` raising TypeError.
+    ref_reads = max([MetalMiner.ADAPT_MAX_READS, *(r for _, _, r, _ in realistic)])
     ref_sweeps = sweeps_grid[len(sweeps_grid) // 2]
     cells = list(realistic)
     cells += [("sweeps-axis", 0.0, ref_reads, s) for s in sweeps_grid]
@@ -185,12 +187,15 @@ def _chunk_sweep(
     )
 
     def _one(target_ms: Optional[float]) -> None:
-        sampler._betas_per_chunk = None  # fresh controller each run
         sampler._dispatch_batch([model], target_dispatch_ms=target_ms, **base)
 
     rows: List[Dict[str, object]] = []
     for tgt in targets:
         target_ms = None if tgt <= 0 else float(tgt)
+        # Reset calibration ONCE per target so the warmup converges the chunk
+        # size for this target; the timed repeats then measure steady-state
+        # chunked throughput, not the cold-start re-calibration cost.
+        sampler._betas_per_chunk = None
         _one(target_ms)  # warmup
         samples_ms: List[float] = []
         for _ in range(repeats):
@@ -394,6 +399,11 @@ def main() -> int:
             seed=args.seed,
         )
         _print_chunk_sweep(sweep_rows, reads, sweeps)
+        if args.out != parser.get_default("out"):
+            print(
+                "note: --chunk-sweep is print-only; --out is not written",
+                file=sys.stderr,
+            )
         return 0
 
     cells = _grid_cells(realistic, reads_grid, sweeps_grid)

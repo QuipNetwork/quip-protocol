@@ -288,6 +288,10 @@ class MetalSASampler:
         # across dispatches so it converges on ``target_dispatch_ms``. None
         # until the first capped dispatch seeds it from _INITIAL_BETAS_PER_CHUNK.
         self._betas_per_chunk: Optional[int] = None
+        # Occupancy (problems x reads) the carried chunk size was calibrated
+        # against; the size is re-seeded when this changes (per-beta GPU cost
+        # scales with occupancy). None until the first capped dispatch.
+        self._chunk_cal_threads: Optional[int] = None
 
         # Cached topology CSR structure (set by prepare_topology)
         self._topo_prepared = False
@@ -521,6 +525,22 @@ class MetalSASampler:
             self._betas_per_chunk = _INITIAL_BETAS_PER_CHUNK
         return max(1, min(self._betas_per_chunk, remaining))
 
+    def _maybe_reset_chunk_calibration(self, num_threads: int) -> None:
+        """Re-seed the chunk size when occupancy (per-beta GPU cost) changes.
+
+        ``_betas_per_chunk`` is carried across dispatches on the reused sampler
+        so it converges on ``target_dispatch_ms``. Per-beta GPU cost scales with
+        occupancy (``problems x reads``), so a size converged on a *cheaper*
+        prior dispatch must not carry into a *heavier* one — it could run one
+        oversized command buffer before the controller shrinks it, reintroducing
+        the UI freeze this split exists to prevent. Drop the carried size (back
+        to the ``_INITIAL_BETAS_PER_CHUNK`` seed) whenever the thread count
+        changes; an unchanged workload keeps converging.
+        """
+        if num_threads != self._chunk_cal_threads:
+            self._chunk_cal_threads = num_threads
+            self._betas_per_chunk = None
+
     def _record_chunk_timing(
         self, elapsed_s: float, betas: int, target_ms: float,
     ) -> None:
@@ -699,6 +719,7 @@ class MetalSASampler:
         if target_dispatch_ms is None:
             _run_chunk(0, total_betas)
         else:
+            self._maybe_reset_chunk_calibration(num_threads)
             beta_start = 0
             n_chunks = 0
             while beta_start < total_betas:
@@ -746,6 +767,7 @@ class MetalSASampler:
             )
 
         return samplesets
+
     def _dispatch_read_split(
         self,
         models: List[IsingModel],

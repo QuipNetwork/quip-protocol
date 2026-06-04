@@ -198,3 +198,43 @@ class TestStreamingBudget:
                 np.asarray(mono[i].record.energy),
                 np.asarray(chunked[i].record.energy),
             ), f"energies differ from monolithic for problem {i}"
+
+    def test_sweep_chunked_multibeta_is_bit_identical_to_monolithic(
+        self, monkeypatch,
+    ):
+        """Multi-beta chunks (with a partial final chunk) must also match.
+
+        The 1-beta case proves persist-buffer resume at every boundary, but a
+        ``beta_count > 1`` chunk drives a different ``(beta_start, beta_count)``
+        pair at encoder indices 16/17 — an off-by-one there would survive the
+        1-beta test. Force fixed 5-beta chunks over 128 betas (25 full chunks +
+        a 3-beta tail), independent of the self-calibrating controller, and
+        require element-wise identical spins and energies for every read."""
+        import numpy as np
+
+        from GPU.metal_utils import compute_beta_schedule
+        s, models = self._sampler_and_models(2)
+        s.prepare_topology()
+        beta_arr, br = compute_beta_schedule(
+            models[0].h, models[0].J, 128, 1, None, "geometric", None,
+        )
+        common = dict(
+            num_reads=16, beta_schedule_arr=beta_arr, beta_range=br,
+            beta_schedule_type="geometric", num_sweeps_per_beta=1, seed=7,
+        )
+        mono = s._dispatch_batch(models, target_dispatch_ms=None, **common)
+        # Deterministic 5-beta chunks (with a 3-beta partial tail), bypassing
+        # the adaptive sizing so the boundaries are fixed and reproducible.
+        monkeypatch.setattr(
+            s, "_next_beta_chunk_size", lambda remaining: min(5, remaining),
+        )
+        chunked = s._dispatch_batch(models, target_dispatch_ms=8.0, **common)
+        for i in range(len(models)):
+            assert np.array_equal(
+                np.asarray(mono[i].record.sample),
+                np.asarray(chunked[i].record.sample),
+            ), f"spins differ from monolithic for problem {i}"
+            assert np.array_equal(
+                np.asarray(mono[i].record.energy),
+                np.asarray(chunked[i].record.energy),
+            ), f"energies differ from monolithic for problem {i}"
