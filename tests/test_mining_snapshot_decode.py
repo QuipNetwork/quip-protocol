@@ -14,7 +14,8 @@ from shared.allowed_value_spec import (
     AllowedValueIntegerRange,
     AllowedValueSet,
 )
-from substrate.client import SubstrateClient, _decode_mining_snapshot
+from substrate.client import SubstrateClient
+from substrate.scale_codec import _decode_mining_snapshot
 from substrate.types import SubstrateDifficulty
 
 
