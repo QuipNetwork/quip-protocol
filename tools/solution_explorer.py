@@ -67,7 +67,6 @@ def extract_quantum_proof_from_block(block_data: Dict[str, Any]) -> Dict[str, An
         'block_index': block_data.get('index', 0),
         'solutions': proof.get('solutions', []),
         'nonce': proof.get('nonce', 0),
-        'salt': proof.get('salt', b''),
         'nodes': proof.get('nodes', proof.get('node_list', [])),
         'edges': proof.get('edges', proof.get('edge_list', [])),
         'miner_id': proof.get('miner_id', 'unknown'),
@@ -98,10 +97,10 @@ def explore_solutions_interactive(h: Dict[int, float], J: Dict, nodes: List[int]
             if cmd == 'exit':
                 break
             elif cmd == 'all':
-                results = validate_sampler_solutions("Block Solutions", 
-                                                   {'samples': solutions, 'energies': [0]*len(solutions)}, 
-                                                   h, J, nodes)
-                
+                validate_sampler_solutions("Block Solutions",
+                                           {'samples': solutions, 'energies': [0]*len(solutions)},
+                                           h, J, nodes)
+
             elif cmd == 'stats':
                 print(f"\n📊 Solution Statistics:")
                 print(f"  Total solutions: {len(solutions)}")
