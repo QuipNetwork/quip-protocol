@@ -77,7 +77,7 @@ from shared.mempool_types import (
     ResultDelivery,
     RewardResolution,
 )
-from shared.signer import Signer
+from shared.signer import Signer, strip_0x
 from substrate.types import (
     ExtrinsicReceipt,
     MinerInfo,
@@ -372,7 +372,7 @@ class SubstrateClient:
     async def get_head(self) -> bytes:
         """Best block hash as raw bytes."""
         return bytes.fromhex(
-            _strip_0x(await self._run(lambda: self._iface.get_chain_head()))
+            strip_0x(await self._run(lambda: self._iface.get_chain_head()))
         )
 
     async def has_call(self, module: str, function: str) -> bool:
@@ -395,7 +395,7 @@ class SubstrateClient:
 
     async def get_finalized_head(self) -> bytes:
         return bytes.fromhex(
-            _strip_0x(await self._run(lambda: self._iface.get_chain_finalised_head()))
+            strip_0x(await self._run(lambda: self._iface.get_chain_finalised_head()))
         )
 
     async def get_block_number(self, at: Optional[bytes] = None) -> int:
@@ -451,7 +451,7 @@ class SubstrateClient:
         # to "let the RPC pick"; we have to read the head ourselves.
         if at is None:
             resolved_block_hash = bytes.fromhex(
-                _strip_0x(await self._run(lambda: self._iface.get_chain_head()))
+                strip_0x(await self._run(lambda: self._iface.get_chain_head()))
             )
         else:
             if len(at) != 32:
@@ -1285,7 +1285,7 @@ def _canonical_hex(value: Any) -> Optional[str]:
     if isinstance(value, (bytes, bytearray)):
         return bytes(value).hex()
     if isinstance(value, str):
-        return _strip_0x(value).lower()
+        return strip_0x(value).lower()
     return None
 
 
@@ -1386,7 +1386,7 @@ def _fetch_extrinsic_dispatch_error(
         # this block, so callers must NOT close the work key.
         return (
             f"unclassified: extrinsic {target_hash[:16]}… not found in "
-            f"block {_strip_0x(block_hash)[:16]}… "
+            f"block {strip_0x(block_hash)[:16]}… "
             f"({len(extrinsics)} extrinsics)"
         )
     events = iface.get_events(block_hash=block_hash) or []
@@ -1418,16 +1418,13 @@ def _fetch_extrinsic_dispatch_error(
     return None
 
 
-def _strip_0x(s: str) -> str:
-    return s[2:] if s.startswith("0x") else s
-
 
 def _decode_hash(value) -> bytes:
     """Decode a substrate Hash storage field to 32 raw bytes."""
     if isinstance(value, bytes):
         return value
     if isinstance(value, str):
-        return bytes.fromhex(_strip_0x(value))
+        return bytes.fromhex(strip_0x(value))
     raise ValueError(f"unrecognized Hash shape: {value!r}")
 
 
@@ -1488,7 +1485,7 @@ def _decode_result_delivery(value) -> ResultDelivery:
             return ResultDelivery.on_chain_only()
         endpoint = inner.get("endpoint") if isinstance(inner, dict) else inner
         if isinstance(endpoint, str):
-            endpoint = bytes.fromhex(_strip_0x(endpoint))
+            endpoint = bytes.fromhex(strip_0x(endpoint))
         elif isinstance(endpoint, list):
             endpoint = bytes(endpoint)
         if endpoint is None:
@@ -1578,7 +1575,7 @@ def _build_hybrid_signed_extrinsic(
     )
     raw_call = call.data.data if hasattr(call.data, "data") else call.data
     if isinstance(raw_call, str):
-        call_bytes = bytes.fromhex(_strip_0x(raw_call))
+        call_bytes = bytes.fromhex(strip_0x(raw_call))
     else:
         call_bytes = bytes(raw_call)
 
@@ -1589,7 +1586,7 @@ def _build_hybrid_signed_extrinsic(
     rv = iface.rpc_request("state_getRuntimeVersion", [])["result"]
     spec_version = int(rv["specVersion"])
     tx_version = int(rv["transactionVersion"])
-    genesis_bytes = bytes.fromhex(_strip_0x(genesis_hex))
+    genesis_bytes = bytes.fromhex(strip_0x(genesis_hex))
 
     # 3. Signed-extension extras, in metadata order. Empty composites
     #    (AuthorizeCall / CheckNonZeroSender / CheckSpecVersion / CheckTxVersion /
