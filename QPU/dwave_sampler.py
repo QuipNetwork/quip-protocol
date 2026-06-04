@@ -546,12 +546,18 @@ class DWaveSamplerWrapper:
 
         The streaming path is positional, not labeled: the stream driver writes
         a raw ``int8`` matrix to shared memory and discards dimod's variable
-        labels, so the consumer holds a ``_SharedSampleSet`` whose
-        ``record.sample`` columns map to ``[n for n in nodes if n not in
-        fixed_spins]`` (``h`` is built in ``nodes`` order, so the reduced
-        sampleset preserves that order). This reinserts the clamped spins at
-        their topology positions and corrects each energy by the constant
-        offset plus the per-sample defective-coupler contributions.
+        labels. dimod orders a ``SampleSet``'s columns by **sorted variable
+        label**, so the reduced matrix's columns are the live (non-clamped)
+        node labels in ascending order — NOT in ``nodes`` order. The output, by
+        contrast, must be in ``nodes`` order because the consensus energy
+        recompute (``energies_for_solutions``) reads column ``pos`` as
+        ``nodes[pos]``. This maps the sorted live columns back to their
+        ``nodes`` positions explicitly, so correctness holds for any node
+        ordering rather than only when ``nodes`` happens to be sorted.
+
+        Clamped spins are reinserted at their topology positions and each
+        energy is corrected by the constant offset plus the per-sample
+        defective-coupler contributions.
 
         Unlike :meth:`reconstruct_full_sampleset` (which reads dimod's
         ``.data()`` and is used by the synchronous, labeled ``sample_ising``
@@ -561,8 +567,9 @@ class DWaveSamplerWrapper:
         full topology.
 
         Args:
-            reduced_sample: ``int8`` ``(R, n_live)`` matrix; columns ordered by
-                the live (non-clamped) nodes in ``nodes`` order.
+            reduced_sample: ``int8`` ``(R, n_live)`` matrix; columns are the
+                live (non-clamped) node labels in ascending (dimod-sorted)
+                order.
             reduced_energy: ``float64`` ``(R,)`` reduced-problem QPU energies.
             defect_info: :class:`DefectInfo` with ``fixed_spins``,
                 ``energy_offset``, and ``removed_edges``.
@@ -574,33 +581,48 @@ class DWaveSamplerWrapper:
             ``(R,)`` energies corrected to the full topology.
 
         Raises:
-            ValueError: if the reduced width does not equal
-                ``len(nodes) - len(fixed_spins)`` — a silent misalignment would
-                scatter spins into the wrong columns and corrupt every energy.
+            ValueError: if the reduced width disagrees with the live-node count,
+                or if a ``fixed_spins`` / ``removed_edges`` label is absent from
+                ``nodes`` — each is a topology mismatch that would otherwise
+                silently scatter spins or drop a clamp and corrupt the
+                consensus energy.
         """
         fixed_spins = defect_info.fixed_spins
         reduced = np.asarray(reduced_sample, dtype=np.int8)
         n_rows, n_live = reduced.shape
-        expected_live = len(nodes) - sum(1 for n in nodes if n in fixed_spins)
-        if n_live != expected_live:
+
+        missing_clamps = set(fixed_spins) - set(nodes)
+        if missing_clamps:
             raise ValueError(
-                f"reduced width {n_live} != expected live nodes {expected_live} "
+                f"fixed_spins labels {sorted(missing_clamps)} absent from nodes "
+                f"— topology mismatch; clamped spins would be silently dropped"
+            )
+        # dimod sorts SampleSet columns by label, so the reduced columns are the
+        # live labels ascending. Map each live label to its reduced column.
+        live_labels = sorted(n for n in nodes if n not in fixed_spins)
+        if n_live != len(live_labels):
+            raise ValueError(
+                f"reduced width {n_live} != live nodes {len(live_labels)} "
                 f"({len(nodes)} topology - {len(fixed_spins)} clamped)"
             )
+        reduced_col = {label: i for i, label in enumerate(live_labels)}
 
         full = np.empty((n_rows, len(nodes)), dtype=np.int8)
         pos: Dict[Variable, int] = {}  # node label -> output column index
-        live_col = 0
-        for col, node in enumerate(nodes):
-            pos[node] = col
+        for out_col, node in enumerate(nodes):
+            pos[node] = out_col
             if node in fixed_spins:
-                full[:, col] = fixed_spins[node]
+                full[:, out_col] = fixed_spins[node]
             else:
-                full[:, col] = reduced[:, live_col]
-                live_col += 1
+                full[:, out_col] = reduced[:, reduced_col[node]]
 
         energy = np.asarray(reduced_energy, dtype=np.float64) + defect_info.energy_offset
         for (u, v), j_val in defect_info.removed_edges.items():
+            if u not in pos or v not in pos:
+                raise ValueError(
+                    f"removed_edge endpoint ({u}, {v}) absent from nodes — "
+                    f"topology mismatch on the consensus energy path"
+                )
             energy = energy + j_val * (
                 full[:, pos[u]].astype(np.float64) * full[:, pos[v]]
             )

@@ -477,13 +477,28 @@ def test_finalize_sample_reconstructs_without_live_sampler():
 
 
 def test_finalize_sample_preserves_all_reads():
-    """Reconstruction returns one full-topology sample per input read."""
+    """Reconstruction returns one full-topology sample per read, row content intact.
+
+    Uses per-row-distinct spins so a vectorization bug (broadcasting one row, or
+    filling the wrong axis) cannot pass a shape-only assertion.
+    """
+    import numpy as np
+
     from QPU.dwave_miner import DWaveMiner
+    from shared.base_miner import _SharedSampleSet
 
     miner = DWaveMiner.__new__(DWaveMiner)
     miner.sampler = None
 
-    result = miner._finalize_sample(
-        _make_shared_ss(n_reads=4), _make_defect(), [0, 1, 99],
+    # Live columns map to nodes [0, 1]; node 99 clamped to +1. Four distinct rows.
+    reduced = np.array(
+        [[1, -1], [-1, 1], [1, 1], [-1, -1]], dtype=np.int8,
     )
+    shared_ss = _SharedSampleSet(reduced, np.zeros(4, dtype=np.float64))
+
+    result = miner._finalize_sample(shared_ss, _make_defect(), [0, 1, 99])
+
     assert result.record.sample.shape == (4, 3)
+    # Each row: [node0, node1, node99(=+1 clamp)].
+    for i in range(4):
+        assert list(result.record.sample[i]) == [reduced[i, 0], reduced[i, 1], 1]

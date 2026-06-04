@@ -405,3 +405,193 @@ class TestReconstructFromMatrix:
         assert full.record.sample.shape == (1, 6)
         assert list(full.record.sample[0]) == [1, -1, 1, -1, 1, 1]
         assert full.record.energy[0] == pytest.approx(-5.0)
+
+    def test_unsorted_nodes_reconstructs_against_sorted_columns(self):
+        """Reduced columns are dimod-sorted; output follows ``nodes`` order.
+
+        dimod orders SampleSet columns by sorted label, so for an unsorted
+        ``nodes`` the reduced columns are NOT in ``nodes`` order. Reconstruction
+        must map sorted-label columns back to ``nodes`` positions — correctness
+        must not depend on ``nodes`` happening to be sorted.
+        """
+        from QPU.dwave_sampler import DWaveSamplerWrapper, DefectInfo
+
+        # nodes deliberately unsorted; qubit 40 clamped to -1.
+        nodes = [7, 2, 40, 3]
+        defect_info = DefectInfo(fixed_spins={40: -1}, energy_offset=0.0, removed_edges={})
+        # Live labels ascending = [2, 3, 7]; assign distinct spins per label.
+        spin = {2: 1, 3: -1, 7: 1}
+        reduced = np.array([[spin[2], spin[3], spin[7]]], dtype=np.int8)
+        energy = np.array([-4.0], dtype=np.float64)
+
+        full_sample, full_energy = DWaveSamplerWrapper.reconstruct_full_matrix(
+            reduced, energy, defect_info, nodes,
+        )
+
+        # Output column j carries nodes[j]'s spin: [7, 2, 40(-1 clamp), 3].
+        assert list(full_sample[0]) == [spin[7], spin[2], -1, spin[3]]
+        assert full_energy[0] == pytest.approx(-4.0)
+
+    def test_multiple_clamped_qubits_mixed_spins_at_boundaries(self):
+        """Two qubits clamped to different spins, at first and last positions."""
+        from QPU.dwave_sampler import DWaveSamplerWrapper, DefectInfo
+
+        nodes = [0, 1, 2, 3, 4]
+        # Clamp the boundary nodes 0 -> -1 and 4 -> +1; live = [1, 2, 3].
+        defect_info = DefectInfo(
+            fixed_spins={0: -1, 4: 1}, energy_offset=0.0, removed_edges={},
+        )
+        reduced = np.array([[1, -1, 1]], dtype=np.int8)  # cols -> nodes 1,2,3
+        energy = np.array([-2.0], dtype=np.float64)
+
+        full_sample, _ = DWaveSamplerWrapper.reconstruct_full_matrix(
+            reduced, energy, defect_info, nodes,
+        )
+
+        assert list(full_sample[0]) == [-1, 1, -1, 1, 1]
+
+    def test_combined_fixed_spins_and_removed_edges(self):
+        """Clamping and a defective coupler interact in one reconstruction.
+
+        The removed-edge energy term must read the live columns at their
+        post-scatter positions, with a reinserted clamped column in between.
+        """
+        from QPU.dwave_sampler import DWaveSamplerWrapper, DefectInfo
+
+        nodes = [0, 1, 2, 3]
+        # Clamp node 1 -> +1; defective coupler (0, 3) between two live qubits.
+        defect_info = DefectInfo(
+            fixed_spins={1: 1}, energy_offset=0.5, removed_edges={(0, 3): -2.0},
+        )
+        # Live labels ascending = [0, 2, 3]; spins for nodes 0,2,3.
+        reduced = np.array([[1, -1, -1]], dtype=np.int8)
+        energy = np.array([-3.0], dtype=np.float64)
+
+        full_sample, full_energy = DWaveSamplerWrapper.reconstruct_full_matrix(
+            reduced, energy, defect_info, nodes,
+        )
+
+        # Full row by node: 0=1, 1=+1(clamp), 2=-1, 3=-1.
+        assert list(full_sample[0]) == [1, 1, -1, -1]
+        # energy = -3.0 + offset 0.5 + j(0,3)*s0*s3 = -3.0 + 0.5 + (-2.0)*(1*-1)
+        #        = -3.0 + 0.5 + 2.0 = -0.5
+        assert full_energy[0] == pytest.approx(-0.5)
+
+    def test_matrix_matches_label_based_reconstruction(self):
+        """Positional and label-based reconstruction agree (consensus-identical).
+
+        The label-based ``reconstruct_full_sampleset`` is the established,
+        separately-tested reference. For equivalent input the positional path
+        must produce the same per-row energies and the same spin assignment.
+        """
+        from QPU.dwave_sampler import DWaveSamplerWrapper, DefectInfo
+
+        nodes, edges = _make_small_topology()
+        nonce = 123
+        h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+        wrapper = MockSamplerWrapper(defective_qubits=[4])
+        h_r, J_r, fixed, offset, removed = wrapper._clamp_defective_qubits(
+            dict(h), dict(J), nonce_seed=nonce,
+        )
+        defect_info = DefectInfo(fixed, offset, removed)
+
+        # Two distinct reduced rows over the live nodes.
+        live_labels = sorted(h_r)
+        rows = [
+            {lab: (1 if i % 2 == 0 else -1) for i, lab in enumerate(live_labels)},
+            {lab: (-1 if i % 3 == 0 else 1) for i, lab in enumerate(live_labels)},
+        ]
+        reduced_energies = [_ising_energy(r, h_r, J_r) for r in rows]
+
+        # Label-based reference.
+        reduced_ss = dimod.SampleSet.from_samples(
+            rows, vartype=dimod.SPIN, energy=reduced_energies,
+        )
+        label_full = wrapper.reconstruct_full_sampleset(reduced_ss, defect_info)
+
+        # Positional path: columns are the live labels ascending.
+        reduced_matrix = np.array(
+            [[r[lab] for lab in live_labels] for r in rows], dtype=np.int8,
+        )
+        pos_sample, pos_energy = DWaveSamplerWrapper.reconstruct_full_matrix(
+            reduced_matrix, np.array(reduced_energies), defect_info, nodes,
+        )
+
+        # Row order differs (the label path's .data() sorts by energy; the
+        # positional path preserves input order), which is irrelevant for a
+        # solution pool. Compare content-keyed: each positional row must match a
+        # label row with the same spins (in nodes order) and the same energy.
+        label_by_sample = {
+            tuple(int(datum.sample[node]) for node in nodes): datum.energy
+            for datum in label_full.data(sorted_by=None)
+        }
+        for i in range(len(reduced_energies)):
+            key = tuple(int(x) for x in pos_sample[i])
+            assert key in label_by_sample, "positional row absent from label path"
+            assert pos_energy[i] == pytest.approx(label_by_sample[key])
+
+    def test_reconstructed_energy_matches_consensus_recompute(self):
+        """Reconstructed energy equals the validator's full-topology recompute.
+
+        ``energies_for_solutions`` is the positional, ``nodes``-indexed energy
+        the chain recomputes. Feeding the reconstructed full matrix through it
+        must reproduce ``reconstruct_full_matrix``'s returned energy — otherwise
+        the miner would submit a proof the validator scores differently.
+        """
+        from QPU.dwave_sampler import DWaveSamplerWrapper, DefectInfo
+        from shared.quantum_proof_of_work import energies_for_solutions
+
+        nodes, edges = _make_small_topology()
+        nonce = 321
+        h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+        wrapper = MockSamplerWrapper(defective_qubits=[2])
+        h_r, J_r, fixed, offset, removed = wrapper._clamp_defective_qubits(
+            dict(h), dict(J), nonce_seed=nonce,
+        )
+        defect_info = DefectInfo(fixed, offset, removed)
+
+        live_labels = sorted(h_r)
+        reduced_row = {lab: (1 if i % 2 == 0 else -1)
+                       for i, lab in enumerate(live_labels)}
+        reduced_energy = _ising_energy(reduced_row, h_r, J_r)
+        reduced_matrix = np.array(
+            [[reduced_row[lab] for lab in live_labels]], dtype=np.int8,
+        )
+
+        full_sample, full_energy = DWaveSamplerWrapper.reconstruct_full_matrix(
+            reduced_matrix, np.array([reduced_energy]), defect_info, nodes,
+        )
+
+        recomputed = energies_for_solutions(full_sample, h, J, nodes)
+        assert full_energy[0] == pytest.approx(recomputed[0])
+
+    def test_fixed_spin_label_absent_from_nodes_raises(self):
+        """A clamp label not in ``nodes`` fails fast instead of dropping a spin."""
+        from QPU.dwave_sampler import DWaveSamplerWrapper, DefectInfo
+
+        nodes = [0, 1, 2]
+        # Clamp qubit 9, which is not in the topology nodes.
+        defect_info = DefectInfo(fixed_spins={9: 1}, energy_offset=0.0, removed_edges={})
+        reduced = np.array([[1, -1, 1]], dtype=np.int8)
+        energy = np.array([-1.0], dtype=np.float64)
+
+        with pytest.raises(ValueError, match="absent from nodes"):
+            DWaveSamplerWrapper.reconstruct_full_matrix(
+                reduced, energy, defect_info, nodes,
+            )
+
+    def test_removed_edge_endpoint_absent_from_nodes_raises(self):
+        """A defective-coupler endpoint not in ``nodes`` fails fast."""
+        from QPU.dwave_sampler import DWaveSamplerWrapper, DefectInfo
+
+        nodes = [0, 1, 2]
+        defect_info = DefectInfo(
+            fixed_spins={}, energy_offset=0.0, removed_edges={(0, 9): 1.0},
+        )
+        reduced = np.array([[1, -1, 1]], dtype=np.int8)
+        energy = np.array([-1.0], dtype=np.float64)
+
+        with pytest.raises(ValueError, match="removed_edge endpoint"):
+            DWaveSamplerWrapper.reconstruct_full_matrix(
+                reduced, energy, defect_info, nodes,
+            )
