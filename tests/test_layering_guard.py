@@ -39,11 +39,6 @@ _ALLOWED = frozenset(
     {
         ("base_miner.py", "substrate.difficulty_decay"),
         ("base_miner.py", "substrate.types"),
-        ("mempool_miner_controller.py", "substrate.client"),
-        ("mempool_miner_controller.py", "substrate.event_manager"),
-        ("mempool_miner_controller.py", "substrate.pool"),
-        ("mempool_miner_controller.py", "substrate.pool_client"),
-        ("mempool_miner_controller.py", "substrate.types"),
         ("miner_bootstrap.py", "substrate.client"),
         ("miner_bootstrap.py", "substrate.types"),
         ("telemetry_process.py", "substrate.client"),

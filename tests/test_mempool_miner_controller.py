@@ -1,4 +1,4 @@
-"""Unit + integration tests for `shared.mempool_miner_controller`.
+"""Unit + integration tests for `substrate.mempool_miner_controller`.
 
 Unit tests cover:
   - `_should_accept_job` mode + topology filtering
@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from shared.mempool_miner_controller import (
+from substrate.mempool_miner_controller import (
     CLAIM_STALE_ERRORS,
     MempoolMinerController,
     SOLUTION_FATAL_ERRORS,
@@ -218,7 +218,7 @@ def test_should_reject_bid_with_no_matching_criteria():
 def _bare_active_order_controller(num_handles: int = 3):
     """Construct a MempoolMinerController with the minimum state to exercise
     `_record_handle_terminal_for_active` and `_clear_active_order`."""
-    from shared.mempool_miner_controller import MempoolControllerStats
+    from substrate.mempool_miner_controller import MempoolControllerStats
 
     c = MempoolMinerController.__new__(MempoolMinerController)
     c._active_order = None
@@ -315,7 +315,7 @@ def _bare_event_controller(num_handles: int = 1):
     code paths under test read; everything else stays unset so a regression
     that introduces a new dependency fails loudly rather than silently.
     """
-    from shared.mempool_miner_controller import MempoolControllerStats
+    from substrate.mempool_miner_controller import MempoolControllerStats
 
     c = MempoolMinerController.__new__(MempoolMinerController)
     c._active_order = None
@@ -471,7 +471,7 @@ async def test_process_head_ignores_non_mempool_events():
 @pytest.mark.asyncio
 async def test_handle_result_stale_order_dropped():
     """Late results from a previously-cancelled order are dropped, not submitted."""
-    from shared.mempool_miner_controller import _MempoolResultEnvelope
+    from substrate.mempool_miner_controller import _MempoolResultEnvelope
 
     c = _bare_event_controller()
     c._active_order = 100
@@ -501,7 +501,7 @@ async def test_handle_result_stale_order_dropped():
 async def test_handle_result_ok_marks_submitted_and_clears_active():
     """A successful submission records the order in ``_submitted_orders`` and
     clears ``_active_order`` so the dispatch gate can release."""
-    from shared.mempool_miner_controller import _MempoolResultEnvelope
+    from substrate.mempool_miner_controller import _MempoolResultEnvelope
     from shared.miner_types import MiningResult
 
     c = _bare_event_controller(num_handles=2)
@@ -618,7 +618,7 @@ async def test_controller_submits_solution_end_to_end(tmp_path):
 
     from CPU.sa_miner import SimulatedAnnealingMiner  # noqa: F401 — ensures sampler module loads
     from shared.keystore_hybrid import generate
-    from shared.mempool_miner_controller import MempoolMinerController
+    from substrate.mempool_miner_controller import MempoolMinerController
     from shared.mempool_types import MinerType
     from shared.miner_bootstrap import _resolve_dev_signer
     from shared.miner_worker import MinerHandle

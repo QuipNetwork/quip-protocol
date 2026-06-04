@@ -30,7 +30,7 @@ from dwave_topologies.topologies.json_loader import load_topology
 from dwave_topologies.topologies.zephyr import zephyr
 from shared.keystore_hybrid import generate, load
 from shared.logging_config import setup_logging
-from shared.mempool_miner_controller import MempoolMinerController
+from substrate.mempool_miner_controller import MempoolMinerController
 from shared.mempool_types import MinerType, qpu_miner_kind
 from shared.miner_bootstrap import (
     DEFAULT_MIN_BALANCE_PLANCKS,
