@@ -1030,6 +1030,62 @@ def phase6_chain_strength_sweep(
     return best_mult, best_energies
 
 
+def _sweep_boolean_param(
+    phase_num: int,
+    param_name: str,
+    sampler: DWaveSamplerWrapper,
+    nodes: List[int],
+    edges: List[Tuple[int, int]],
+    solver_props: Dict[str, Any],
+    csv_path: str,
+    completed: set,
+    best_annealing_time: float,
+    best_num_reads: int,
+    num_ising_models: int = 1024,
+    queue_depth: int = 30,
+    solver_name: str = "",
+) -> Tuple[Optional[bool], List[float]]:
+    """Sweep a boolean solver parameter (False vs True).
+
+    Returns: (best_setting, energies at best point)
+    """
+    print("\n" + "="*60)
+    print(f"PHASE {phase_num}: {param_name}")
+    print(f"  Fixed annealing_time: {best_annealing_time} us")
+    print(f"  Fixed num_reads: {best_num_reads}")
+    print("="*60)
+
+    # Check solver support
+    raw_params = sampler.properties.get('parameters', {})
+    if param_name not in raw_params:
+        print(f"  SKIPPED: Solver does not support {param_name}")
+        return None, []
+
+    best_setting: Optional[bool] = None
+    best_energies: List[float] = []
+
+    for setting in [False, True]:
+        print(f"\n  --- {param_name} = {setting} ---")
+        energies = run_configuration(
+            sampler, nodes, edges,
+            best_num_reads, best_annealing_time,
+            csv_path, completed, solver_props, num_ising_models, queue_depth,
+            solver_name=solver_name,
+            **{param_name: setting},
+        )
+
+        if energies:
+            if not best_energies or statistics.mean(energies) < statistics.mean(best_energies):
+                best_setting = setting
+                best_energies = energies
+
+    print(f"\n  Best {param_name}: {best_setting}")
+    if best_energies:
+        print(f"  Best avg min_energy: {statistics.mean(best_energies):.1f}")
+
+    return best_setting, best_energies
+
+
 def phase7_intersample_correlation(
     sampler: DWaveSamplerWrapper,
     nodes: List[int],
@@ -1047,41 +1103,12 @@ def phase7_intersample_correlation(
 
     Returns: (best_setting, energies at best point)
     """
-    print("\n" + "="*60)
-    print("PHASE 7: reduce_intersample_correlation")
-    print(f"  Fixed annealing_time: {best_annealing_time} us")
-    print(f"  Fixed num_reads: {best_num_reads}")
-    print("="*60)
-
-    # Check solver support
-    raw_params = sampler.properties.get('parameters', {})
-    if 'reduce_intersample_correlation' not in raw_params:
-        print("  SKIPPED: Solver does not support reduce_intersample_correlation")
-        return None, []
-
-    best_setting: Optional[bool] = None
-    best_energies: List[float] = []
-
-    for setting in [False, True]:
-        print(f"\n  --- reduce_intersample_correlation = {setting} ---")
-        energies = run_configuration(
-            sampler, nodes, edges,
-            best_num_reads, best_annealing_time,
-            csv_path, completed, solver_props, num_ising_models, queue_depth,
-            solver_name=solver_name,
-            reduce_intersample_correlation=setting,
-        )
-
-        if energies:
-            if not best_energies or statistics.mean(energies) < statistics.mean(best_energies):
-                best_setting = setting
-                best_energies = energies
-
-    print(f"\n  Best reduce_intersample_correlation: {best_setting}")
-    if best_energies:
-        print(f"  Best avg min_energy: {statistics.mean(best_energies):.1f}")
-
-    return best_setting, best_energies
+    return _sweep_boolean_param(
+        7, 'reduce_intersample_correlation',
+        sampler, nodes, edges, solver_props, csv_path, completed,
+        best_annealing_time, best_num_reads, num_ising_models, queue_depth,
+        solver_name=solver_name,
+    )
 
 
 def phase8_reinitialize_state(
@@ -1101,41 +1128,12 @@ def phase8_reinitialize_state(
 
     Returns: (best_setting, energies at best point)
     """
-    print("\n" + "="*60)
-    print("PHASE 8: reinitialize_state")
-    print(f"  Fixed annealing_time: {best_annealing_time} us")
-    print(f"  Fixed num_reads: {best_num_reads}")
-    print("="*60)
-
-    # Check solver support
-    raw_params = sampler.properties.get('parameters', {})
-    if 'reinitialize_state' not in raw_params:
-        print("  SKIPPED: Solver does not support reinitialize_state")
-        return None, []
-
-    best_setting: Optional[bool] = None
-    best_energies: List[float] = []
-
-    for setting in [False, True]:
-        print(f"\n  --- reinitialize_state = {setting} ---")
-        energies = run_configuration(
-            sampler, nodes, edges,
-            best_num_reads, best_annealing_time,
-            csv_path, completed, solver_props, num_ising_models, queue_depth,
-            solver_name=solver_name,
-            reinitialize_state=setting,
-        )
-
-        if energies:
-            if not best_energies or statistics.mean(energies) < statistics.mean(best_energies):
-                best_setting = setting
-                best_energies = energies
-
-    print(f"\n  Best reinitialize_state: {best_setting}")
-    if best_energies:
-        print(f"  Best avg min_energy: {statistics.mean(best_energies):.1f}")
-
-    return best_setting, best_energies
+    return _sweep_boolean_param(
+        8, 'reinitialize_state',
+        sampler, nodes, edges, solver_props, csv_path, completed,
+        best_annealing_time, best_num_reads, num_ising_models, queue_depth,
+        solver_name=solver_name,
+    )
 
 
 def estimate_total_configs(skip_phases: List[int]) -> int:
