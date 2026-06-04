@@ -19,8 +19,9 @@ import dataclasses
 import logging
 import os
 import time
+from itertools import chain
 from typing import (
-    Dict, Iterable, Iterator, List, Optional, Tuple,
+    Any, Dict, Iterable, Iterator, List, Optional, Tuple,
 )
 
 import cupy as cp
@@ -29,6 +30,7 @@ import numpy as np
 
 from shared.ising_model import IsingModel
 
+from GPU.gpu_scheduler import throttled_stream
 from GPU.sampler_utils import (
     build_csr_structure_from_edges,
     build_edge_position_index,
@@ -87,6 +89,7 @@ class BaseCudaSampler(abc.ABC):
         _allocate_kernel_buffers()
         _kernel_launch_args()
         _extra_download_info()
+        _self_feeding_kwargs()
     """
 
     CTRL_STRIDE = 8
@@ -317,6 +320,14 @@ class BaseCudaSampler(abc.ABC):
         """Extra metadata for download_slot SampleSet info.
 
         Override to add sampler-specific info fields.
+        """
+        return {}
+
+    def _self_feeding_kwargs(self) -> dict:
+        """Extra kwargs forwarded to prepare_self_feeding().
+
+        Override to pass sampler-specific allocation params
+        (e.g., sms_per_nonce) into _allocate_kernel_buffers().
         """
         return {}
 
@@ -1037,6 +1048,186 @@ class BaseCudaSampler(abc.ABC):
 
         finally:
             self.signal_exit(wait=False)
+
+    # ----------------------------------------------------------
+    # Public sampling API (shared SA/Gibbs bodies)
+    # ----------------------------------------------------------
+
+    def sample_ising_streaming(
+        self,
+        models: Iterable[IsingModel],
+        *,
+        num_reads: int = 200,
+        num_sweeps: int = 1000,
+        num_sweeps_per_beta: int = 1,
+        beta_range: Optional[Tuple[float, float]] = None,
+        beta_schedule_type: str = "geometric",
+        seed: Optional[int] = None,
+        num_kernels: Optional[int] = None,
+        poll_timeout: Optional[float] = None,
+        scheduler: Any = None,
+    ) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
+        """Stream Ising model solutions via the kernel.
+
+        Prepare topology/self-feeding buffers if needed, peek
+        the first model to build the beta schedule, then run
+        the base rotation loop under the scheduler throttle.
+
+        Args:
+            models: Iterable of IsingModel.
+            num_reads: Samples per model.
+            num_sweeps: Total sweeps per model.
+            num_sweeps_per_beta: Sweeps per beta value.
+            beta_range: (hot, cold) or None for auto.
+            beta_schedule_type: Schedule type.
+            seed: RNG seed.
+            num_kernels: Concurrent nonces (default: auto).
+            poll_timeout: Seconds before TimeoutError.
+            scheduler: Optional throttling scheduler.
+
+        Yields:
+            (model, SampleSet) in completion order.
+        """
+        num_k = num_kernels or max(
+            1,
+            self.max_sms // self._sms_per_nonce,
+        )
+
+        if not self._prepared:
+            self.prepare(
+                num_reads=num_reads,
+                num_sweeps=num_sweeps,
+                num_sweeps_per_beta=num_sweeps_per_beta,
+            )
+
+        if not self._sf_prepared:
+            self.prepare_self_feeding(
+                num_nonces=num_k,
+                reads_per_nonce=num_reads,
+                num_sweeps=num_sweeps,
+                num_sweeps_per_beta=num_sweeps_per_beta,
+                **self._self_feeding_kwargs(),
+            )
+
+        # Peek first model for beta schedule
+        model_iter = iter(models)
+        try:
+            first = next(model_iter)
+        except StopIteration:
+            return
+
+        num_betas, _ = self.upload_beta_schedule(
+            first.h, first.J, num_sweeps,
+            num_sweeps_per_beta, beta_range,
+            beta_schedule_type,
+        )
+
+        # Throttle before pulling each result (yielding mode): the unified
+        # driver path bypasses the old _sample_batch back-off, so honor it here.
+        yield from throttled_stream(
+            self._run_streaming_loop(
+                chain([first], model_iter),
+                num_k=num_k,
+                num_betas=num_betas,
+                seed=seed,
+                poll_timeout=poll_timeout,
+            ),
+            scheduler,
+        )
+
+    def sample_ising(
+        self,
+        h: List[Dict[int, float]],
+        J: List[Dict[Tuple[int, int], float]],
+        num_reads: int = 200,
+        num_sweeps: int = 1000,
+        num_sweeps_per_beta: int = 1,
+        beta_range: Optional[Tuple[float, float]] = None,
+        beta_schedule_type: str = "geometric",
+        seed: Optional[int] = None,
+        **kwargs,
+    ) -> List[dimod.SampleSet]:
+        """Sample from Ising models using the self-feeding kernel.
+
+        Args:
+            h: List of linear biases per problem.
+            J: List of quadratic biases per problem.
+            num_reads: Number of independent samples per
+                problem.
+            num_sweeps: Total number of sweeps.
+            num_sweeps_per_beta: Sweeps per beta value.
+            beta_range: (hot_beta, cold_beta) or None for
+                auto.
+            beta_schedule_type: Schedule type.
+            seed: RNG seed.
+
+        Returns:
+            List of dimod.SampleSet, one per problem.
+        """
+        num_problems = len(h)
+        assert len(J) == num_problems, (
+            f"h and J must have same length: "
+            f"{num_problems} vs {len(J)}"
+        )
+
+        if not self._prepared:
+            self.prepare(
+                num_reads=num_reads,
+                num_sweeps=num_sweeps,
+                num_sweeps_per_beta=num_sweeps_per_beta,
+            )
+
+        if not self._sf_prepared:
+            self.prepare_self_feeding(
+                num_nonces=num_problems,
+                reads_per_nonce=num_reads,
+                num_sweeps=num_sweeps,
+                num_sweeps_per_beta=num_sweeps_per_beta,
+                **self._self_feeding_kwargs(),
+            )
+
+        # Reset ctrl array (clears stale EXIT_NOW from
+        # previous sample_ising call)
+        self._d_sf_ctrl[:] = 0
+
+        # Upload beta schedule
+        num_betas, beta_range = self.upload_beta_schedule(
+            h[0], J[0], num_sweeps,
+            num_sweeps_per_beta, beta_range,
+            beta_schedule_type,
+        )
+
+        # Upload one model per nonce to slot 0
+        for i in range(num_problems):
+            self.upload_slot(i, 0, h[i], J[i])
+
+        # Launch kernel
+        self._sf_kernel_running = False  # allow re-launch
+        self.launch_self_feeding(
+            num_betas=num_betas,
+            seed=seed,
+            active_nonce_count=num_problems,
+        )
+
+        # Poll until all nonces complete
+        completed = set()
+        while len(completed) < num_problems:
+            for nonce_id, slot_id in self.poll_completions():
+                if nonce_id not in completed:
+                    completed.add(nonce_id)
+            if len(completed) < num_problems:
+                time.sleep(0.001)
+
+        # Download results
+        results = []
+        for i in range(num_problems):
+            ss = self.download_slot(i, 0)
+            results.append(ss)
+
+        # Signal exit and wait
+        self.signal_exit()
+
+        return results
 
     def close(self) -> None:
         """Synchronize streams and free GPU buffers.
