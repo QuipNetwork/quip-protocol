@@ -1154,6 +1154,85 @@ async def test_handle_result_not_won_pow_sequence_none_on_rpc_failure(monkeypatc
     )
 
 
+_RECORD_SUBMISSION_LOG_COMMON = {
+    "solution_number": _TEST_SOLUTION_NUMBER,
+    "miner_id": "miner-7",
+    "miner_type": "cpu",
+    "energy_milli": -1234,
+    "diversity_milli": 250,
+    "threshold_milli": -1000,
+    "last_proof_block_hash_hex": "0x" + "ab" * 32,
+    "num_valid": 5,
+}
+
+
+@pytest.mark.parametrize(
+    "outcome,extra",
+    [
+        # chain_error / RPC-error
+        ("chain_error", {"pow_sequence": 11, "error": "RuntimeError: boom"}),
+        # submitted_inblock / OK
+        (
+            "submitted_inblock",
+            {
+                "extrinsic_hash": "0xext",
+                "chain_block_hash": "0xblk",
+                "chain_block_number": 999,
+                "qpu_access_us_total": 61000,
+            },
+        ),
+        # rejected_stale / STALE
+        (
+            "rejected_stale",
+            {"extrinsic_hash": "0xext", "pow_sequence": 12, "error": "stale"},
+        ),
+        # chain_error / FATAL
+        (
+            "chain_error",
+            {"extrinsic_hash": "0xext", "pow_sequence": 13, "error": "fatal"},
+        ),
+    ],
+)
+def test_record_submission_forwards_kwargs(outcome, extra):
+    """``_record_submission`` writes the same row as a flat ``record(...)`` call.
+
+    Guards the helper that collapsed the four formerly inline
+    ``self._submission_log.record(...)`` blocks in ``_handle_result``: the row
+    it writes must be byte-identical (modulo the always-changing ``ts_ns``) to
+    a direct ``record(**log_common, outcome=outcome, **extra)`` call.
+    """
+    import tempfile
+
+    from shared.mining_attempt_log import SubmissionLogger
+
+    controller = _bare_controller()
+    controller._record_submission(
+        dict(_RECORD_SUBMISSION_LOG_COMMON), outcome, **extra
+    )
+    helper_path = (
+        controller._submission_log.log_dir
+        / str(_TEST_SOLUTION_NUMBER)
+        / "submission.json"
+    )
+    helper_record = json.loads(helper_path.read_text())
+
+    direct_log = SubmissionLogger(
+        log_dir=Path(tempfile.mkdtemp(prefix="quip-test-direct-")),
+    )
+    direct_log.record(
+        **_RECORD_SUBMISSION_LOG_COMMON, outcome=outcome, **extra
+    )
+    direct_path = (
+        direct_log.log_dir / str(_TEST_SOLUTION_NUMBER) / "submission.json"
+    )
+    direct_record = json.loads(direct_path.read_text())
+
+    # ts_ns is wall-clock and necessarily differs between the two writes.
+    helper_record.pop("ts_ns", None)
+    direct_record.pop("ts_ns", None)
+    assert helper_record == direct_record
+
+
 # ----------------------------------------------------------------------
 # Anticipatory-submission preview store (Task 6a)
 # ----------------------------------------------------------------------

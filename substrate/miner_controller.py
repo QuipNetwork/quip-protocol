@@ -1102,15 +1102,66 @@ class SubstrateMinerController:
             len(ctx.nodes),
             len(ctx.edges),
         )
+        self._dispatch_context_to_handles(
+            ctx, solution_number=solution_number,
+        )
+        self.stats.contexts_dispatched += len(self.miner_handles)
+        if self.core is not None:
+            self.core.record_dispatch()
+
+    def _dispatch_context_to_handles(
+        self,
+        ctx: SubstrateMiningContext,
+        *,
+        solution_number: Optional[int] = None,
+        gate_idle: bool = False,
+    ) -> list[str]:
+        """Dispatch *ctx* to miner handles, recording each per-handle context.
+
+        Shared by ``on_new_head`` (fresh head, all handles) and the
+        verify-mismatch re-dispatch path in ``_handle_result`` (idle handles
+        only). Stores each dispatch under ``_dispatch_contexts`` and prunes the
+        per-handle ring, mirroring the original inline loops exactly.
+
+        Args:
+            ctx: Mining context to dispatch.
+            solution_number: Chain-global solution ordinal forwarded to the
+                worker; ``None`` matches not passing it (the re-dispatch path).
+            gate_idle: When ``True``, skip handles with an active dispatch so
+                only idle workers are re-dispatched.
+
+        Returns:
+            The miner ids that were dispatched, in handle order. Callers own
+            the ``stats.contexts_dispatched`` increment because its semantics
+            differ between the two call sites.
+        """
+        dispatched: list[str] = []
         for handle in self.miner_handles:
+            if gate_idle and handle._active_dispatch_id != 0:
+                continue
             dispatch_id = handle.mine_work_item(
                 ctx, solution_number=solution_number,
             )
             self._dispatch_contexts[(handle.miner_id, dispatch_id)] = ctx
             self._prune_dispatch_contexts(handle.miner_id, dispatch_id)
-        self.stats.contexts_dispatched += len(self.miner_handles)
-        if self.core is not None:
-            self.core.record_dispatch()
+            dispatched.append(handle.miner_id)
+        return dispatched
+
+    def _record_submission(
+        self,
+        log_common: dict[str, Any],
+        outcome: str,
+        **extra: Any,
+    ) -> None:
+        """Write one submission-log row for *outcome*.
+
+        Forwards the shared per-result fields in *log_common* plus *outcome*
+        and any per-outcome *extra* (error, pow_sequence, extrinsic_hash,
+        chain_block_hash, chain_block_number, qpu_access_us_total) to
+        :meth:`SubmissionLogger.record`. Collapses the four formerly inline
+        ``record(...)`` calls in :meth:`_handle_result`; byte-identical kwargs.
+        """
+        self._submission_log.record(**log_common, outcome=outcome, **extra)
 
     async def _handle_result(self, envelope: _ResultEnvelope) -> None:
         self.stats.results_received += 1
@@ -1219,16 +1270,9 @@ class SubstrateMinerController:
                 exc,
             )
             pow_seq_rpc_err = await self._query_proofs_submitted_safe()
-            self._submission_log.record(
-                solution_number=solution_number,
-                miner_id=envelope.handle_id,
-                miner_type=envelope.result.miner_type,
-                energy_milli=result_energy_milli,
-                diversity_milli=result_diversity_milli,
-                threshold_milli=snapshot_threshold_milli,
-                last_proof_block_hash_hex=last_proof_hex,
-                outcome="chain_error",
-                num_valid=envelope.result.num_valid,
+            self._record_submission(
+                log_common,
+                "chain_error",
                 pow_sequence=pow_seq_rpc_err,
                 error=f"{type(exc).__name__}: {exc}",
             )
@@ -1236,151 +1280,9 @@ class SubstrateMinerController:
 
         outcome = classify_submission(receipt)
         if outcome is SubmissionOutcome.OK:
-            # Verify the runtime actually recorded *our* proof before
-            # closing the work key. Without this, a receipt that looked
-            # OK (made it into a block, no obvious ExtrinsicFailed) but
-            # whose proof the runtime silently rejected leaves us idling
-            # on `_closed_work_keys` forever while the chain keeps
-            # advancing the round on someone else's proof. The check
-            # reads `LastProofBlock` and `winning_solution(N)` and
-            # matches miner+nonce against the receipt.
-            #
-            # Best-effort: RPC errors during verification only WARN —
-            # failing closed here would cause the same submission storm
-            # we just stopped, since the next head would re-dispatch
-            # this exact context. Persistent failures stay visible via
-            # stats.proofs_unverified.
-            verified = await self._verify_proof_recorded(envelope)
-            # verified >= 0  → won, value is the PoW block number
-            # verified < 0   → mismatch (-1 sentinel)
-            # verified is None → RPC failed, inconclusive
-            if verified is not None and verified < 0:
-                await self._record_verify_fail(
-                    envelope.context, None, log_common,
-                    extrinsic_hash=receipt.extrinsic_hash,
-                    receipt_block=receipt.block_hash,
-                )
-                # Re-dispatch immediately on the same context. The
-                # worker is idle (mine_result drainer already cleared
-                # `_active_dispatch_id`), and waiting for the next head
-                # would deadlock: the verify-mismatch path leaves
-                # `_current_work_key` set, so every subsequent head
-                # carrying the same `last_proof_block_hash` falls into
-                # the same-key short-circuit at the top of
-                # `on_new_head` and skips dispatch. Without an active
-                # re-dispatch here, the worker sits idle until someone
-                # else wins the round and rolls `LastProofBlock`.
-                if (
-                    envelope_key == self._current_work_key
-                    and self._current_context is not None
-                ):
-                    redispatch_context = self._current_context
-                    redispatched: list[str] = []
-                    for handle in self.miner_handles:
-                        if handle._active_dispatch_id != 0:
-                            continue
-                        new_dispatch_id = handle.mine_work_item(redispatch_context)
-                        self._dispatch_contexts[
-                            (handle.miner_id, new_dispatch_id)
-                        ] = redispatch_context
-                        self._prune_dispatch_contexts(
-                            handle.miner_id, new_dispatch_id,
-                        )
-                        redispatched.append(handle.miner_id)
-                    if redispatched:
-                        self.stats.contexts_dispatched += len(redispatched)
-                    logger.warning(
-                        "submit_proof receipt OK but verification failed for "
-                        "%s (extrinsic=%s block=%s); NOT closing work key — "
-                        "re-dispatched %d handle(s) on same context: %s",
-                        envelope.handle_id,
-                        receipt.extrinsic_hash,
-                        receipt.block_hash,
-                        len(redispatched),
-                        redispatched,
-                    )
-                else:
-                    # Work key already rolled while we were verifying —
-                    # the natural head path will dispatch the new round.
-                    logger.warning(
-                        "submit_proof receipt OK but verification failed for "
-                        "%s (extrinsic=%s block=%s); work key already "
-                        "advanced (envelope_key matches=%s, current_context=%s) — "
-                        "deferring to next head",
-                        envelope.handle_id,
-                        receipt.extrinsic_hash,
-                        receipt.block_hash,
-                        envelope_key == self._current_work_key,
-                        self._current_context is not None,
-                    )
-                return
-            self.stats.proofs_submitted += 1
-            # Resolve the receipt's block hash → block number so the
-            # work-key record can distinguish stale subscription heads
-            # (number <= accepted) from current already-won heads. The
-            # receipt only carries `block_hash` (hex string); we fetch
-            # the number via the shallow header read.
-            #
-            # Best-effort: a failure here would leave us without a
-            # ground-truth number, so we fall back to `_highest_handled_block + 1`.
-            # The fallback is correct in the common case (we won the
-            # round at or just past the most recent head we processed)
-            # and the subscription will re-converge within one or two
-            # heads even if it's slightly off.
-            accepted_block_hash, accepted_block_number = (
-                await self._resolve_accepted_block(receipt.block_hash)
+            await self._finalize_accepted_proof(
+                envelope, envelope_key, receipt, solution_number, log_common,
             )
-            record = ClosedWorkRecord(
-                accepted_block_hash=accepted_block_hash,
-                accepted_block_number=accepted_block_number,
-                closed_at_monotonic=time.monotonic(),
-            )
-            # Mark this work key as won and cancel sibling handles
-            # immediately so they don't keep mining (and then submitting
-            # redundant proofs the chain will reject). This is the
-            # primary submission-storm fix; the duplicate-drop check at
-            # the top of _handle_result is the belt-and-suspenders
-            # backstop for sibling results that were already in flight
-            # when we got here.
-            self._mark_work_key_closed(envelope_key, record)
-            self._cancel_siblings_for_won_work(envelope.handle_id)
-            # Post-win round-roll detection is handled by the
-            # ChainEventManager poll loop: within ~5 s the next snapshot
-            # carries the new last_proof_block_hash and on_new_head
-            # dispatches fresh work.
-            logger.info(
-                "submit_proof accepted: extrinsic=%s block=%s number=%d miner=%s",
-                receipt.extrinsic_hash,
-                receipt.block_hash,
-                accepted_block_number,
-                self.signer.ss58_address(),
-            )
-            # Precise QPU spent on this solution # (summed from the per-attempt
-            # QPU times in the attempt log). Telemetry/log only — not on-chain.
-            qpu_access_us_total = self._sum_qpu_access_us(solution_number)
-            self._submission_log.record(
-                solution_number=solution_number,
-                miner_id=envelope.handle_id,
-                miner_type=envelope.result.miner_type,
-                energy_milli=result_energy_milli,
-                diversity_milli=result_diversity_milli,
-                threshold_milli=snapshot_threshold_milli,
-                last_proof_block_hash_hex=last_proof_hex,
-                outcome="submitted_inblock",
-                num_valid=envelope.result.num_valid,
-                extrinsic_hash=receipt.extrinsic_hash,
-                chain_block_hash=receipt.block_hash,
-                chain_block_number=self._resolve_won_block_number(
-                    verified, accepted_block_number
-                ),
-                qpu_access_us_total=qpu_access_us_total,
-            )
-            if self.core is not None:
-                self.core.record_result(
-                    winning_miner_id=envelope.result.miner_id,
-                    mining_time=float(envelope.result.mining_time),
-                )
-            await self._invoke_proof_submitted_callback(receipt, envelope.context)
         elif outcome is SubmissionOutcome.STALE:
             self.stats.stale_drops += 1
             logger.info(
@@ -1389,16 +1291,9 @@ class SubstrateMinerController:
                 receipt.extrinsic_hash,
             )
             pow_seq_stale = await self._query_proofs_submitted_safe()
-            self._submission_log.record(
-                solution_number=solution_number,
-                miner_id=envelope.handle_id,
-                miner_type=envelope.result.miner_type,
-                energy_milli=result_energy_milli,
-                diversity_milli=result_diversity_milli,
-                threshold_milli=snapshot_threshold_milli,
-                last_proof_block_hash_hex=last_proof_hex,
-                outcome="rejected_stale",
-                num_valid=envelope.result.num_valid,
+            self._record_submission(
+                log_common,
+                "rejected_stale",
                 extrinsic_hash=receipt.extrinsic_hash,
                 pow_sequence=pow_seq_stale,
                 error=str(receipt.error or ""),
@@ -1407,16 +1302,9 @@ class SubstrateMinerController:
             self.stats.submission_errors += 1
             self.stats.last_submission_error = str(receipt.error or "")
             pow_seq_fatal = await self._query_proofs_submitted_safe()
-            self._submission_log.record(
-                solution_number=solution_number,
-                miner_id=envelope.handle_id,
-                miner_type=envelope.result.miner_type,
-                energy_milli=result_energy_milli,
-                diversity_milli=result_diversity_milli,
-                threshold_milli=snapshot_threshold_milli,
-                last_proof_block_hash_hex=last_proof_hex,
-                outcome="chain_error",
-                num_valid=envelope.result.num_valid,
+            self._record_submission(
+                log_common,
+                "chain_error",
                 extrinsic_hash=receipt.extrinsic_hash,
                 pow_sequence=pow_seq_fatal,
                 error=str(receipt.error or ""),
@@ -1424,6 +1312,158 @@ class SubstrateMinerController:
             raise RuntimeError(
                 f"submit_proof failed fatally: error={receipt.error} "
                 f"extrinsic={receipt.extrinsic_hash}"
+            )
+
+    async def _finalize_accepted_proof(
+        self,
+        envelope: _ResultEnvelope,
+        envelope_key: WorkKey,
+        receipt: ExtrinsicReceipt,
+        solution_number: Optional[int],
+        log_common: dict[str, Any],
+    ) -> None:
+        """Verify, close, and record an OK-receipt submission.
+
+        The OK branch of :meth:`_handle_result`: confirm the runtime recorded
+        *our* proof, re-dispatch on a verify mismatch, otherwise mark the work
+        key won, cancel siblings, and write the ``submitted_inblock`` row.
+        """
+        # Verify the runtime actually recorded *our* proof before
+        # closing the work key. Without this, a receipt that looked
+        # OK (made it into a block, no obvious ExtrinsicFailed) but
+        # whose proof the runtime silently rejected leaves us idling
+        # on `_closed_work_keys` forever while the chain keeps
+        # advancing the round on someone else's proof. The check
+        # reads `LastProofBlock` and `winning_solution(N)` and
+        # matches miner+nonce against the receipt.
+        #
+        # Best-effort: RPC errors during verification only WARN —
+        # failing closed here would cause the same submission storm
+        # we just stopped, since the next head would re-dispatch
+        # this exact context. Persistent failures stay visible via
+        # stats.proofs_unverified.
+        verified = await self._verify_proof_recorded(envelope)
+        # verified >= 0  → won, value is the PoW block number
+        # verified < 0   → mismatch (-1 sentinel)
+        # verified is None → RPC failed, inconclusive
+        if verified is not None and verified < 0:
+            await self._record_verify_fail(
+                envelope.context, None, log_common,
+                extrinsic_hash=receipt.extrinsic_hash,
+                receipt_block=receipt.block_hash,
+            )
+            self._redispatch_after_verify_fail(envelope, envelope_key, receipt)
+            return
+        self.stats.proofs_submitted += 1
+        # Resolve the receipt's block hash → block number so the
+        # work-key record can distinguish stale subscription heads
+        # (number <= accepted) from current already-won heads. The
+        # receipt only carries `block_hash` (hex string); we fetch
+        # the number via the shallow header read.
+        #
+        # Best-effort: a failure here would leave us without a
+        # ground-truth number, so we fall back to `_highest_handled_block + 1`.
+        # The fallback is correct in the common case (we won the
+        # round at or just past the most recent head we processed)
+        # and the subscription will re-converge within one or two
+        # heads even if it's slightly off.
+        accepted_block_hash, accepted_block_number = (
+            await self._resolve_accepted_block(receipt.block_hash)
+        )
+        record = ClosedWorkRecord(
+            accepted_block_hash=accepted_block_hash,
+            accepted_block_number=accepted_block_number,
+            closed_at_monotonic=time.monotonic(),
+        )
+        # Mark this work key as won and cancel sibling handles
+        # immediately so they don't keep mining (and then submitting
+        # redundant proofs the chain will reject). This is the
+        # primary submission-storm fix; the duplicate-drop check at
+        # the top of _handle_result is the belt-and-suspenders
+        # backstop for sibling results that were already in flight
+        # when we got here.
+        self._mark_work_key_closed(envelope_key, record)
+        self._cancel_siblings_for_won_work(envelope.handle_id)
+        # Post-win round-roll detection is handled by the
+        # ChainEventManager poll loop: within ~5 s the next snapshot
+        # carries the new last_proof_block_hash and on_new_head
+        # dispatches fresh work.
+        logger.info(
+            "submit_proof accepted: extrinsic=%s block=%s number=%d miner=%s",
+            receipt.extrinsic_hash,
+            receipt.block_hash,
+            accepted_block_number,
+            self.signer.ss58_address(),
+        )
+        # Precise QPU spent on this solution # (summed from the per-attempt
+        # QPU times in the attempt log). Telemetry/log only — not on-chain.
+        qpu_access_us_total = self._sum_qpu_access_us(solution_number)
+        self._record_submission(
+            log_common,
+            "submitted_inblock",
+            extrinsic_hash=receipt.extrinsic_hash,
+            chain_block_hash=receipt.block_hash,
+            chain_block_number=self._resolve_won_block_number(
+                verified, accepted_block_number
+            ),
+            qpu_access_us_total=qpu_access_us_total,
+        )
+        if self.core is not None:
+            self.core.record_result(
+                winning_miner_id=envelope.result.miner_id,
+                mining_time=float(envelope.result.mining_time),
+            )
+        await self._invoke_proof_submitted_callback(receipt, envelope.context)
+
+    def _redispatch_after_verify_fail(
+        self,
+        envelope: _ResultEnvelope,
+        envelope_key: WorkKey,
+        receipt: ExtrinsicReceipt,
+    ) -> None:
+        """Re-dispatch idle handles when an OK receipt fails proof verification.
+
+        Re-dispatch immediately on the same context. The worker is idle
+        (mine_result drainer already cleared ``_active_dispatch_id``), and
+        waiting for the next head would deadlock: the verify-mismatch path
+        leaves ``_current_work_key`` set, so every subsequent head carrying the
+        same ``last_proof_block_hash`` falls into the same-key short-circuit at
+        the top of ``on_new_head`` and skips dispatch. Without an active
+        re-dispatch here, the worker sits idle until someone else wins the round
+        and rolls ``LastProofBlock``.
+        """
+        if (
+            envelope_key == self._current_work_key
+            and self._current_context is not None
+        ):
+            redispatched = self._dispatch_context_to_handles(
+                self._current_context, gate_idle=True,
+            )
+            if redispatched:
+                self.stats.contexts_dispatched += len(redispatched)
+            logger.warning(
+                "submit_proof receipt OK but verification failed for "
+                "%s (extrinsic=%s block=%s); NOT closing work key — "
+                "re-dispatched %d handle(s) on same context: %s",
+                envelope.handle_id,
+                receipt.extrinsic_hash,
+                receipt.block_hash,
+                len(redispatched),
+                redispatched,
+            )
+        else:
+            # Work key already rolled while we were verifying —
+            # the natural head path will dispatch the new round.
+            logger.warning(
+                "submit_proof receipt OK but verification failed for "
+                "%s (extrinsic=%s block=%s); work key already "
+                "advanced (envelope_key matches=%s, current_context=%s) — "
+                "deferring to next head",
+                envelope.handle_id,
+                receipt.extrinsic_hash,
+                receipt.block_hash,
+                envelope_key == self._current_work_key,
+                self._current_context is not None,
             )
 
     async def _await_handle_done(
