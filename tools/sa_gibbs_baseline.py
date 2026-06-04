@@ -125,7 +125,6 @@ def sa_gibbs_baseline_test(
         h_values = [-1.0, 0.0, 1.0]
 
     mode_name = "Gibbs" if update_mode == "gibbs" else "Metropolis"
-    acceptance = "Gibbs" if update_mode == "gibbs" else "Metropolis"
 
     print(f"CPU Block {mode_name} Baseline Parameter Test")
     print("=" * 50)
@@ -226,7 +225,7 @@ def sa_gibbs_baseline_test(
                 J=J_bg,
                 num_reads=reads,
                 num_sweeps=sweeps,
-                proposal_acceptance_criteria=acceptance,
+                proposal_acceptance_criteria=mode_name,
             )
             runtime = time.time() - start_time
 
