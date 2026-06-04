@@ -21,6 +21,8 @@ import sys
 from pathlib import Path
 from typing import Dict, Optional
 
+sys.path.append(str(Path(__file__).parent.parent))
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
