@@ -52,6 +52,7 @@ from shared.quantum_proof_of_work import (
 )
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies import load_topology
+from QPU.qpu_time_manager import parse_duration
 
 
 def ensure_solver_topology(solver_name: str, region: Optional[str] = None):
@@ -68,27 +69,6 @@ def ensure_solver_topology(solver_name: str, region: Optional[str] = None):
     print(f"Topology for {solver_name} not found locally, dumping from API...")
     dump_topo(solver_name, use_gzip=True, region=region)
     return load_topology(solver_name)
-
-
-def parse_duration(duration_str: str) -> float:
-    """Parse duration string to seconds.
-
-    Supports: 30s, 5m, 2h, 1d, 1w
-    """
-    duration_str = duration_str.strip().lower()
-
-    if duration_str.endswith('s'):
-        return float(duration_str[:-1])
-    elif duration_str.endswith('m'):
-        return float(duration_str[:-1]) * 60.0
-    elif duration_str.endswith('h'):
-        return float(duration_str[:-1]) * 3600.0
-    elif duration_str.endswith('d'):
-        return float(duration_str[:-1]) * 86400.0
-    elif duration_str.endswith('w'):
-        return float(duration_str[:-1]) * 604800.0
-    else:
-        return float(duration_str)
 
 
 def parse_int_list(s: str) -> List[int]:

@@ -32,6 +32,7 @@ from CPU.sa_miner import SimulatedAnnealingMiner
 from shared.block import BlockRequirements, create_genesis_block
 from shared.energy_utils import energy_to_difficulty
 from shared.time_utils import utc_timestamp
+from QPU.qpu_time_manager import parse_duration
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,25 +62,6 @@ class NodeInfo:
     """Simple node info for testing."""
 
     miner_id: str
-
-
-def parse_duration(duration_str: str) -> float:
-    """Parse duration string to minutes.
-
-    Supports: 30s, 5m, 2h, 1d, 1w, or raw minute values.
-    """
-    duration_str = duration_str.strip().lower()
-    if duration_str.endswith('s'):
-        return int(duration_str[:-1]) / 60.0
-    elif duration_str.endswith('m'):
-        return float(duration_str[:-1])
-    elif duration_str.endswith('h'):
-        return int(duration_str[:-1]) * 60.0
-    elif duration_str.endswith('d'):
-        return int(duration_str[:-1]) * 1440.0
-    elif duration_str.endswith('w'):
-        return int(duration_str[:-1]) * 10080.0
-    return float(duration_str)
 
 
 def aggregate_results(
@@ -358,7 +340,7 @@ def run_benchmark(args) -> int:
         args.duration = '4h'
 
     try:
-        duration_minutes = parse_duration(args.duration)
+        duration_minutes = parse_duration(args.duration) / 60.0
     except (ValueError, IndexError):
         print(f"Invalid duration: '{args.duration}'")
         return 1

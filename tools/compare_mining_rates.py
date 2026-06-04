@@ -43,6 +43,7 @@ from shared.block import BlockRequirements, create_genesis_block
 from shared.time_utils import utc_timestamp
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies import load_topology
+from QPU.qpu_time_manager import parse_duration
 
 import os
 import numpy as np
@@ -534,35 +535,6 @@ def mine_worker(
             print(f"   [{miner_id}] CUDA cleanup warning: {e}")
 
 
-def parse_duration(duration_str: str) -> float:
-    """
-    Parse duration string to minutes.
-
-    Supports: 30s, 5m, 2h, 1d, 1w
-    Examples:
-        "30s" -> 0.5 (minutes)
-        "5m" -> 5.0
-        "2h" -> 120.0
-        "1d" -> 1440.0
-        "1w" -> 10080.0
-    """
-    duration_str = duration_str.strip().lower()
-
-    if duration_str.endswith('s'):
-        return int(duration_str[:-1]) / 60.0
-    elif duration_str.endswith('m'):
-        return float(duration_str[:-1])
-    elif duration_str.endswith('h'):
-        return int(duration_str[:-1]) * 60.0
-    elif duration_str.endswith('d'):
-        return int(duration_str[:-1]) * 1440.0
-    elif duration_str.endswith('w'):
-        return int(duration_str[:-1]) * 10080.0
-    else:
-        # Try parsing as raw minutes
-        return float(duration_str)
-
-
 def _force_terminate_all(processes, drain_queue) -> None:
     """Drain once then terminate/join/kill all alive processes.
 
@@ -669,7 +641,7 @@ def main():
 
     # Parse duration
     try:
-        duration_minutes = parse_duration(args.duration)
+        duration_minutes = parse_duration(args.duration) / 60.0
     except (ValueError, IndexError):
         print(f"❌ Invalid duration format: '{args.duration}'. Use formats like: 30s, 5m, 2h, 1d, 1w")
         return 1

@@ -49,36 +49,7 @@ from shared.quantum_proof_of_work import (
 )
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies import load_topology
-
-
-_DURATION_SUFFIX_MULTIPLIERS = {
-    's': 1 / 60.0,
-    'm': 1.0,
-    'h': 60.0,
-    'd': 1440.0,
-    'w': 10080.0,
-}
-
-
-def parse_duration(duration_str: str) -> float:
-    """
-    Parse duration string to minutes.
-
-    Supports: 30s, 5m, 2h, 1d, 1w
-    Examples:
-        "30s" -> 0.5 (minutes)
-        "5m" -> 5.0
-        "2h" -> 120.0
-        "1d" -> 1440.0
-        "1w" -> 10080.0
-    """
-    duration_str = duration_str.strip().lower()
-    suffix = duration_str[-1]
-    multiplier = _DURATION_SUFFIX_MULTIPLIERS.get(suffix)
-    if multiplier is not None:
-        return float(duration_str[:-1]) * multiplier
-    # Try parsing as raw minutes
-    return float(duration_str)
+from QPU.qpu_time_manager import parse_duration
 
 
 def determine_canary_params(num_sweeps: int = 4, num_reads: int = 10) -> Dict[str, int]:
@@ -878,7 +849,7 @@ def main():
 
     # Parse duration
     try:
-        duration_minutes = parse_duration(args.duration)
+        duration_minutes = parse_duration(args.duration) / 60.0
     except (ValueError, IndexError):
         print(f"❌ Invalid duration format: '{args.duration}'. Use formats like: 30s, 5m, 2h, 1d, 1w")
         return 1
