@@ -16,7 +16,6 @@ Usage:
 """
 
 import argparse
-import logging
 import multiprocessing
 import os
 import sys
@@ -53,16 +52,27 @@ class NodeInfo:
     miner_id: str
 
 
+@dataclass
+class MockProof:
+    """Minimal QuantumProof-like object for validate_quantum_proof."""
+    nonce: int
+    salt: bytes
+    nodes: list
+    edges: list
+    solutions: list
+    mining_time: float
+    h_values: list = None
+
+
 def run_trial(
     trial_num: int,
     miner,
     topology,
     difficulty_energy: float,
-    timeout: float,
 ):
     """Run one mining trial and validate the result.
 
-    Returns dict with trial results, or None on timeout.
+    Returns dict with trial results, or None if mining fails.
     """
     prev_block = create_genesis_block()
     requirements = BlockRequirements(
@@ -130,17 +140,6 @@ def run_trial(
           f"below {difficulty_energy}")
 
     # --- Verification 3: Full validator check ---
-    # Build a QuantumProof-like object for validate_quantum_proof
-    @dataclass
-    class MockProof:
-        nonce: int
-        salt: bytes
-        nodes: list
-        edges: list
-        solutions: list
-        mining_time: float
-        h_values: list = None
-
     proof = MockProof(
         nonce=result.nonce,
         salt=result.salt,
@@ -257,7 +256,6 @@ def main():
             miner=miner,
             topology=topology,
             difficulty_energy=args.difficulty_energy,
-            timeout=300.0,
         )
         results.append(trial)
 
