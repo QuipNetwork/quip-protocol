@@ -32,62 +32,9 @@ try:
 except ImportError:
     METAL_AVAILABLE = False
 
-try:
-    from GPU.cuda_sa import CudaSASampler
-    CUDA_AVAILABLE = False  # Disabled for now (requires CUDA machine)
-except ImportError:
-    CUDA_AVAILABLE = False
 
-
-def calibrate_curve(
-    topology_name: str = "advantage2",
-    h_values: List[float] = None,
-    sweeps_range: List[int] = None,
-    reads_range: List[int] = None,
-    time_per_test: float = 600.0,  # 10 minutes per test configuration
-    output_file: str = None,
-    use_gpu: bool = True
-) -> Dict:
-    """Run SA at different sweep/reads combinations to map out difficulty curve.
-
-    Args:
-        topology_name: Topology to use (default: advantage2)
-        h_values: List of h field values (default: [-1, 0, 1])
-        sweeps_range: List of num_sweeps values to test
-        reads_range: List of num_reads values to test (default: [64, 128, 256])
-        time_per_test: Time budget (seconds) per test config (default: 600s = 10 min)
-        output_file: Output JSON file path
-        use_gpu: Auto-detect and use GPU if available (default: True)
-
-    Returns:
-        Dictionary with calibration results
-    """
-    if h_values is None:
-        h_values = [-1.0, 0.0, 1.0]
-
-    if sweeps_range is None:
-        # Always test practical mining ranges: 64, 128, 256
-        sweeps_range = [64, 128, 256, 512, 1024, 2048, 4096]
-
-    if reads_range is None:
-        # Test practical reads ranges
-        reads_range = [64, 128, 256]
-
-    print("=" * 70)
-    print("🔬 Difficulty Curve Calibration Tool")
-    print("=" * 70)
-    print(f"Topology: {topology_name}")
-    print(f"h_values: {h_values}")
-    print(f"Sweep range: {sweeps_range}")
-    print(f"Reads range: {reads_range}")
-    print(f"Time per test config: {time_per_test:.0f}s ({time_per_test/60:.1f} min)")
-    total_tests = len(sweeps_range) * len(reads_range)
-    total_time = total_tests * time_per_test
-    print(f"Total tests: {total_tests} ({total_time/60:.0f} min estimated)")
-    print()
-
-    # Auto-detect and initialize sampler
-    sampler_type = "CPU"
+def _select_sampler(use_gpu: bool) -> Tuple[object, str, List, List]:
+    """Select and initialize the SA sampler, returning sampler, type, nodes, edges."""
     if use_gpu and METAL_AVAILABLE:
         print("🚀 GPU (Metal) detected - using Metal SA")
         sampler = MetalSASampler()
@@ -96,12 +43,6 @@ def calibrate_curve(
         topology_graph = DEFAULT_TOPOLOGY.graph
         nodes = list(topology_graph.nodes())
         edges = list(topology_graph.edges())
-    elif use_gpu and CUDA_AVAILABLE:
-        print("🚀 GPU (CUDA) detected - using CUDA SA")
-        sampler = CudaSASampler()
-        sampler_type = "CUDA"
-        nodes = sampler.nodes
-        edges = sampler.edges
     else:
         if use_gpu:
             print("⚠️  No GPU available - falling back to CPU")
@@ -111,24 +52,21 @@ def calibrate_curve(
         sampler_type = "CPU"
         nodes = sampler.nodes
         edges = sampler.edges
+    return sampler, sampler_type, nodes, edges
 
-    print(f"Problem size: {len(nodes)} nodes, {len(edges)} edges")
-    print()
 
-    # Results storage
-    results = {
-        'topology': topology_name,
-        'sampler_type': sampler_type,
-        'h_values': h_values,
-        'num_nodes': len(nodes),
-        'num_edges': len(edges),
-        'time_per_test_seconds': time_per_test,
-        'sweeps_range': sweeps_range,
-        'reads_range': reads_range,
-        'curve_data': []
-    }
-
-    # Run experiments for each (sweeps, reads) combination
+def _run_sweep_grid(
+    sampler,
+    sampler_type: str,
+    nodes: List,
+    edges: List,
+    h_values: List[float],
+    sweeps_range: List[int],
+    reads_range: List[int],
+    time_per_test: float,
+) -> List[Dict]:
+    """Run SA across the (sweeps, reads) grid and return per-config curve points."""
+    curve_data = []
     for sweeps in sweeps_range:
         for num_reads in reads_range:
             print(f"Testing num_sweeps={sweeps}, num_reads={num_reads}...")
@@ -202,25 +140,12 @@ def calibrate_curve(
                 'samples': sample_count,
                 'all_energies': energies  # Store all for analysis
             }
-            results['curve_data'].append(curve_point)
+            curve_data.append(curve_point)
+    return curve_data
 
-    # Analyze curve to find calibration parameters
-    print("=" * 70)
-    print("📊 Calibration Analysis")
-    print("=" * 70)
 
-    curve_data = results['curve_data']
-
-    # Find minimum energy (highest computational effort)
-    min_point = min(curve_data, key=lambda x: x['avg_energy'])
-    calibrated_min_energy = min_point['avg_energy']
-
-    # Find maximum energy (lowest computational effort)
-    max_point = max(curve_data, key=lambda x: x['avg_energy'])
-    calibrated_max_energy = max_point['avg_energy']
-
-    # Find knee point (diminishing returns)
-    # Use derivative approximation: find where improvement rate drops below threshold
+def find_knee_point(curve_data: List[Dict]) -> Tuple:
+    """Find the diminishing-returns knee point, returning (knee_sweeps, knee_energy)."""
     knee_sweeps = None
     knee_energy = None
 
@@ -269,16 +194,15 @@ def calibrate_curve(
             knee_sweeps = curve_data[mid_idx]['sweeps']
             knee_energy = curve_data[mid_idx]['avg_energy']
 
-    # Store calibration
-    calibration = {
-        'min_energy': calibrated_min_energy,
-        'min_energy_sweeps': min_point['sweeps'],
-        'knee_energy': knee_energy,
-        'knee_sweeps': knee_sweeps,
-        'max_energy': calibrated_max_energy,
-        'max_energy_sweeps': max_point['sweeps']
-    }
-    results['calibration'] = calibration
+    return knee_sweeps, knee_energy
+
+
+def _print_calibration_summary(calibration: Dict, min_point: Dict, max_point: Dict):
+    """Print the calibrated parameters and a suggested code update."""
+    calibrated_min_energy = calibration['min_energy']
+    calibrated_max_energy = calibration['max_energy']
+    knee_energy = calibration['knee_energy']
+    knee_sweeps = calibration['knee_sweeps']
 
     print(f"Calibrated parameters:")
     print(f"  🎯 Min energy: {calibrated_min_energy:.1f} (at {min_point['sweeps']} sweeps)")
@@ -294,6 +218,117 @@ def calibrate_curve(
         print(f"   knee_energy = {knee_energy:.1f}  # Mid-range difficulty")
     print(f"   max_energy = {calibrated_max_energy:.1f}  # Easiest difficulty")
     print()
+
+
+def calibrate_curve(
+    topology_name: str = "advantage2",
+    h_values: List[float] = None,
+    sweeps_range: List[int] = None,
+    reads_range: List[int] = None,
+    time_per_test: float = 600.0,  # 10 minutes per test configuration
+    output_file: str = None,
+    use_gpu: bool = True
+) -> Dict:
+    """Run SA at different sweep/reads combinations to map out difficulty curve.
+
+    Args:
+        topology_name: Topology to use (default: advantage2)
+        h_values: List of h field values (default: [-1, 0, 1])
+        sweeps_range: List of num_sweeps values to test
+        reads_range: List of num_reads values to test (default: [64, 128, 256])
+        time_per_test: Time budget (seconds) per test config (default: 600s = 10 min)
+        output_file: Output JSON file path
+        use_gpu: Auto-detect and use GPU if available (default: True)
+
+    Returns:
+        Dictionary with calibration results
+    """
+    if h_values is None:
+        h_values = [-1.0, 0.0, 1.0]
+
+    if sweeps_range is None:
+        # Default sweep grid spanning practical mining to high-effort ranges
+        sweeps_range = [64, 128, 256, 512, 1024, 2048, 4096]
+
+    if reads_range is None:
+        # Test practical reads ranges
+        reads_range = [64, 128, 256]
+
+    print("=" * 70)
+    print("🔬 Difficulty Curve Calibration Tool")
+    print("=" * 70)
+    print(f"Topology: {topology_name}")
+    print(f"h_values: {h_values}")
+    print(f"Sweep range: {sweeps_range}")
+    print(f"Reads range: {reads_range}")
+    print(f"Time per test config: {time_per_test:.0f}s ({time_per_test/60:.1f} min)")
+    total_tests = len(sweeps_range) * len(reads_range)
+    total_time = total_tests * time_per_test
+    print(f"Total tests: {total_tests} ({total_time/60:.0f} min estimated)")
+    print()
+
+    # Auto-detect and initialize sampler
+    sampler, sampler_type, nodes, edges = _select_sampler(use_gpu)
+
+    print(f"Problem size: {len(nodes)} nodes, {len(edges)} edges")
+    print()
+
+    # Results storage
+    results = {
+        'topology': topology_name,
+        'sampler_type': sampler_type,
+        'h_values': h_values,
+        'num_nodes': len(nodes),
+        'num_edges': len(edges),
+        'time_per_test_seconds': time_per_test,
+        'sweeps_range': sweeps_range,
+        'reads_range': reads_range,
+        'curve_data': []
+    }
+
+    # Run experiments for each (sweeps, reads) combination
+    results['curve_data'] = _run_sweep_grid(
+        sampler,
+        sampler_type,
+        nodes,
+        edges,
+        h_values,
+        sweeps_range,
+        reads_range,
+        time_per_test,
+    )
+
+    # Analyze curve to find calibration parameters
+    print("=" * 70)
+    print("📊 Calibration Analysis")
+    print("=" * 70)
+
+    curve_data = results['curve_data']
+
+    # Find minimum energy (highest computational effort)
+    min_point = min(curve_data, key=lambda x: x['avg_energy'])
+    calibrated_min_energy = min_point['avg_energy']
+
+    # Find maximum energy (lowest computational effort)
+    max_point = max(curve_data, key=lambda x: x['avg_energy'])
+    calibrated_max_energy = max_point['avg_energy']
+
+    # Find knee point (diminishing returns)
+    # Use derivative approximation: find where improvement rate drops below threshold
+    knee_sweeps, knee_energy = find_knee_point(curve_data)
+
+    # Store calibration
+    calibration = {
+        'min_energy': calibrated_min_energy,
+        'min_energy_sweeps': min_point['sweeps'],
+        'knee_energy': knee_energy,
+        'knee_sweeps': knee_sweeps,
+        'max_energy': calibrated_max_energy,
+        'max_energy_sweeps': max_point['sweeps']
+    }
+    results['calibration'] = calibration
+
+    _print_calibration_summary(calibration, min_point, max_point)
 
     # Save results
     if output_file:
