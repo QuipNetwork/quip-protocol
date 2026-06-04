@@ -27,7 +27,6 @@ Usage:
 
 import argparse
 import json
-import os
 import random
 import sys
 import time
@@ -65,7 +64,6 @@ def generate_models(
     nodes: List[int],
     edges: list,
     num_models: int,
-    h_values: List[float],
     seed: int = 42,
 ) -> List[IsingModel]:
     """Pre-generate deterministic IsingModels.
@@ -235,7 +233,7 @@ def run_grid(
     # Pre-generate models
     print("Generating models...", end=" ", flush=True)
     models = generate_models(
-        nodes, edges, num_models, h_values,
+        nodes, edges, num_models,
     )
     print(f"{len(models)} models ready")
     print()
@@ -808,8 +806,6 @@ def plot_sweep_multiplier(results, output_path):
     thresholds = results['thresholds']
     sweeps_range = results['sweeps_range']
     reads_range = results['reads_range']
-    sa_max_reads = 256
-
     sa = {
         (e['sweeps'], e['reads']): e
         for e in grid if e['sampler_type'] == 'sa'
@@ -818,7 +814,7 @@ def plot_sweep_multiplier(results, output_path):
         (e['sweeps'], e['reads']): e
         for e in grid if e['sampler_type'] == 'gibbs'
     }
-    shared_reads = [r for r in reads_range if r <= sa_max_reads]
+    shared_reads = [r for r in reads_range if r <= SA_MAX_READS]
 
     def _rates(entry):
         return np.array([
