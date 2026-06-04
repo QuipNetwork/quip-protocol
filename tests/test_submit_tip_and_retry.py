@@ -17,7 +17,7 @@ import pytest
 
 from shared.allowed_value_spec import AllowedValueSet
 from shared.miner_types import MiningResult
-from substrate.client import (
+from substrate.scale_codec import (
     _build_hybrid_signed_extrinsic,
     _encode_compact_u128,
 )

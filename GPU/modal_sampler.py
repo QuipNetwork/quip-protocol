@@ -1,10 +1,8 @@
 """Modal Labs GPU-accelerated sampler for cloud GPU mining."""
 
-import time
-import numpy as np
-import collections.abc
 import dimod
 from dwave.system.testing import MockDWaveSampler
+from shared.node_edge_coerce import coerce_int_nodes_edges
 from shared.quantum_proof_of_work import DEFAULT_TOPOLOGY
 from shared.stream_context import stream_from_feeder
 
@@ -13,11 +11,6 @@ try:
     import modal
 except ImportError:
     modal = None
-
-try:
-    from numba import jit
-except ImportError:
-    jit = None
 
 # GPU availability check
 GPU_AVAILABLE = modal is not None
@@ -161,20 +154,7 @@ class ModalSampler(MockDWaveSampler):
         )
         
         # Type conversions to match protocol expectations (nodes should be ints for quantum_proof_of_work functions)
-        nodes = []
-        for node in self.nodelist:
-            if not isinstance(node, int):
-                raise ValueError(f"Expected node index to be int, got {type(node)}")
-            nodes.append(int(node))
-        edges = []
-        for edge in self.edgelist:
-            if not isinstance(edge, tuple) or len(edge) != 2:
-                raise ValueError(f"Expected edge to be tuple of length 2, got {edge}")
-            if not isinstance(edge[0], int) or not isinstance(edge[1], int):
-                raise ValueError(f"Expected edge indices to be int, got {type(edge[0])} and {type(edge[1])}")
-            edges.append((int(edge[0]), int(edge[1])))
-        self.nodes = nodes
-        self.edges = edges
+        self.nodes, self.edges = coerce_int_nodes_edges(self.nodelist, self.edgelist)
 
     def sample_ising(self, h, J, num_reads=100, num_sweeps=512, **kwargs) -> dimod.SampleSet:
         """Sample from Ising model using GPU acceleration."""

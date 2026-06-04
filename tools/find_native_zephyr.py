@@ -29,22 +29,6 @@ except ImportError:
     sys.exit(1)
 
 
-def check_zephyr_feasibility(m: int, t: int, target_graph) -> bool:
-    """
-    Check if Zephyr(m,t) can be embedded on target graph using feasibility filter.
-
-    Args:
-        m: Zephyr m parameter
-        t: Zephyr t parameter
-        target_graph: NetworkX graph of target hardware
-
-    Returns:
-        True if embedding is feasible, False otherwise
-    """
-    source_graph = dnx.zephyr_graph(m, t)
-    return embedding_feasibility_filter(S=source_graph, T=target_graph)
-
-
 def find_embeddable_zephyrs(target_graph, max_m: int = 12, max_t: int = 4) -> List[Dict]:
     """
     Find all Zephyr topologies that are embeddable on target graph.
@@ -69,8 +53,8 @@ def find_embeddable_zephyrs(target_graph, max_m: int = 12, max_t: int = 4) -> Li
             total_nodes = len(zephyr.nodes())
             total_edges = len(zephyr.edges())
 
-            # Check feasibility
-            is_feasible = check_zephyr_feasibility(m, t, target_graph)
+            # Check feasibility (reuse the already-built graph)
+            is_feasible = embedding_feasibility_filter(S=zephyr, T=target_graph)
 
             node_util_pct = 100 * total_nodes / target_nodes
             edge_util_pct = 100 * total_edges / target_edges
@@ -97,6 +81,16 @@ def find_embeddable_zephyrs(target_graph, max_m: int = 12, max_t: int = 4) -> Li
     return results
 
 
+def _print_row(r: Dict, status: str) -> None:
+    """Print one 6-column result row."""
+    print(f"{r['config']:<10} "
+          f"{r['total_nodes']:<8,} "
+          f"{r['total_edges']:<8,} "
+          f"{r['node_utilization_pct']:<7.1f}% "
+          f"{r['edge_utilization_pct']:<7.1f}% "
+          f"{status:<10}")
+
+
 def print_results(results: List[Dict]):
     """Print formatted results table."""
     print("\n" + "="*100)
@@ -115,23 +109,13 @@ def print_results(results: List[Dict]):
 
         # Sort by nodes descending to show largest first
         for r in sorted(feasible, key=lambda x: x['total_nodes'], reverse=True):
-            print(f"{r['config']:<10} "
-                  f"{r['total_nodes']:<8,} "
-                  f"{r['total_edges']:<8,} "
-                  f"{r['node_utilization_pct']:<7.1f}% "
-                  f"{r['edge_utilization_pct']:<7.1f}% "
-                  f"{'✓ Feasible':<10}")
+            _print_row(r, "✓ Feasible")
 
     if infeasible:
         print("\nINFEASIBLE TOPOLOGIES (too large or dense):")
         print("-"*100)
         for r in infeasible:
-            print(f"{r['config']:<10} "
-                  f"{r['total_nodes']:<8,} "
-                  f"{r['total_edges']:<8,} "
-                  f"{r['node_utilization_pct']:<7.1f}% "
-                  f"{r['edge_utilization_pct']:<7.1f}% "
-                  f"{'✗ Infeasible':<10}")
+            _print_row(r, "✗ Infeasible")
 
     if feasible:
         print("\n" + "="*100)

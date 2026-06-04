@@ -14,7 +14,6 @@ Usage:
 """
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -22,6 +21,27 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dwave_topologies.topologies.json_loader import load_json_topology
+
+
+def _report_missing(missing: set, label: str, verbose: bool) -> bool:
+    """Print a validation-failure message for missing nodes or edges.
+
+    Args:
+        missing: Set of items present in the mined topology but absent from the QPU topology.
+        label: Human-readable name for the item type (e.g., ``"nodes"`` or ``"edges"``).
+        verbose: If True, print the first 10 invalid items when there are more than 10.
+
+    Returns:
+        True if ``missing`` is non-empty (i.e. validation failed for this category).
+    """
+    if not missing:
+        return False
+    print(f"\n❌ VALIDATION FAILED: Found {len(missing)} {label} not in QPU topology:")
+    if verbose and len(missing) <= 10:
+        print(f"  Invalid {label}: {sorted(missing)}")
+    elif verbose:
+        print(f"  First 10 invalid {label}: {sorted(missing)[:10]}")
+    return True
 
 
 def validate_topology(mined_topology_file: str, verbose: bool = True) -> bool:
@@ -63,24 +83,10 @@ def validate_topology(mined_topology_file: str, verbose: bool = True) -> bool:
         print(f"  Nodes: {len(mined_nodes)} / {len(qpu_nodes)} ({100 * len(mined_nodes) / len(qpu_nodes):.1f}%)")
         print(f"  Edges: {len(mined_edges)} / {len(qpu_edges)} ({100 * len(mined_edges) / len(qpu_edges):.1f}%)")
 
-    # Validate nodes
-    invalid_nodes = mined_nodes - qpu_nodes
-    if invalid_nodes:
-        print(f"\n❌ VALIDATION FAILED: Found {len(invalid_nodes)} nodes not in QPU topology:")
-        if verbose and len(invalid_nodes) <= 10:
-            print(f"  Invalid nodes: {sorted(invalid_nodes)}")
-        elif verbose:
-            print(f"  First 10 invalid nodes: {sorted(list(invalid_nodes))[:10]}")
+    # Validate nodes then edges; report first failure found
+    if _report_missing(mined_nodes - qpu_nodes, "nodes", verbose):
         return False
-
-    # Validate edges
-    invalid_edges = mined_edges - qpu_edges
-    if invalid_edges:
-        print(f"\n❌ VALIDATION FAILED: Found {len(invalid_edges)} edges not in QPU topology:")
-        if verbose and len(invalid_edges) <= 10:
-            print(f"  Invalid edges: {sorted(invalid_edges)}")
-        elif verbose:
-            print(f"  First 10 invalid edges: {sorted(list(invalid_edges))[:10]}")
+    if _report_missing(mined_edges - qpu_edges, "edges", verbose):
         return False
 
     # Success!
@@ -92,7 +98,7 @@ def validate_topology(mined_topology_file: str, verbose: bool = True) -> bool:
     return True
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Validate mined topologies against Advantage2-System1",
         formatter_class=argparse.RawDescriptionHelpFormatter,

@@ -20,13 +20,14 @@ class _ConcreteMiner(BaseMiner):
 
 
 def _pow_ctx(last_proof: bytes, topology: bytes = b"\xab" * 32):
-    # A plain namespace is not a MempoolJobContext, so _log_work_start takes
-    # the PoW branch.
+    # uses_decay_ratchet() -> True marks this as a PoW work source, so
+    # _log_work_start takes the PoW banner branch.
     return SimpleNamespace(
         last_proof_block_hash=last_proof,
         topology_hash=topology,
         nodes=[0, 1, 2],
         edges=[(0, 1)],
+        uses_decay_ratchet=lambda: True,
     )
 
 

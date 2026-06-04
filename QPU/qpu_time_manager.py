@@ -99,12 +99,6 @@ class QPUTimeEstimate:
     cumulative_used_us: float
     """Total QPU microseconds spent since process start (lifetime)."""
 
-    daily_budget_us: float
-    """Daily budget in microseconds (the reservoir accrual rate basis)."""
-
-    budget_remaining_us: float
-    """Current reservoir pool balance in microseconds (== ``pool_us``)."""
-
     pool_us: float
     """Current reservoir pool balance in microseconds."""
 
@@ -266,7 +260,6 @@ class QPUTimeManager:
         now = now if now is not None else time.time()
         self._accrue(now)
         estimated_time = self.estimate_next_block_time()
-        daily_budget_us = self.config.daily_budget_seconds * 1_000_000
         buffer_us = self.config.min_block_budget_seconds * 1_000_000
         pool_us = self._pool_us
 
@@ -293,8 +286,6 @@ class QPUTimeManager:
         return QPUTimeEstimate(
             estimated_block_time_us=estimated_time,
             cumulative_used_us=self.cumulative_used_us,
-            daily_budget_us=daily_budget_us,
-            budget_remaining_us=pool_us,
             pool_us=pool_us,
             pool_cap_us=self._pool_cap_us,
             burst_active=self._burst_active,

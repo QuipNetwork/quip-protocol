@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Utility: Print number of nodes for D-Wave topologies and show how node lists change
 when topology parameters (m and/or t) are varied.
@@ -11,8 +9,10 @@ Optional: run with -q to reduce verbosity
   python tools/print_topology_nodes.py -q
 """
 
+from __future__ import annotations
+
 import argparse
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import dwave_networkx as dnx
 
@@ -27,13 +27,12 @@ from dwave_topologies.topologies import (
 
 
 def build_graph(topology: str, params: Dict[str, int]):
-    t = topology.lower()
-    if t == "chimera":
-        return dnx.chimera_graph(int(params["m"]), int(params["n"]), int(params["t"]))
-    elif t == "pegasus":
-        return dnx.pegasus_graph(int(params["m"]))
-    elif t == "zephyr":
-        return dnx.zephyr_graph(int(params["m"]), int(params["t"]))
+    if topology == "chimera":
+        return dnx.chimera_graph(params["m"], params["n"], params["t"])
+    elif topology == "pegasus":
+        return dnx.pegasus_graph(params["m"])
+    elif topology == "zephyr":
+        return dnx.zephyr_graph(params["m"], params["t"])
     else:
         raise ValueError(f"Unknown topology: {topology}")
 
@@ -43,6 +42,62 @@ def pretty_nodes(nodes: Iterable[int], limit: int = 10) -> str:
     ns_sorted = sorted(ns)[:limit]
     more = "..." if len(ns) > limit else ""
     return f"{ns_sorted}{more}"
+
+
+def _build_sweeps(t: str, topo_shape: List[int]) -> List[Tuple[str, Dict[str, int]]]:
+    """Return parameter sweep list for the given topology type and shape."""
+    sweeps: List[Tuple[str, Dict[str, int]]] = []
+    if t == "chimera":
+        m0, n0, t0 = topo_shape[0], topo_shape[1], topo_shape[2]
+        for m in [max(2, m0 - 4), m0, m0 + 4]:
+            sweeps.append((f"m={m},n={m0},t={t0}", {"m": m, "n": n0, "t": t0}))
+        for tt in [max(2, t0 - 2), t0, t0 + 2]:
+            sweeps.append((f"m={m0},n={n0},t={tt}", {"m": m0, "n": n0, "t": tt}))
+    elif t == "pegasus":
+        m0 = topo_shape[0]
+        for m in [max(4, m0 - 6), m0, m0 + 8]:
+            sweeps.append((f"m={m}", {"m": m}))
+    elif t == "zephyr":
+        m0, t0 = topo_shape[0], topo_shape[1]
+        for m in [max(4, m0 - 4), m0, m0 + 4]:
+            sweeps.append((f"m={m},t={t0}", {"m": m, "t": t0}))
+        # Many Zephyr installs use t=2 or t=4; try both safely
+        for tt in sorted(set([2, t0, max(2, t0 + 2)])):
+            sweeps.append((f"m={m0},t={tt}", {"m": m0, "t": tt}))
+    return sweeps
+
+
+def _run_sweep(
+    label: str,
+    p: Dict[str, int],
+    t: str,
+    base_nodes: set,
+    base_edges: set,
+    quiet: bool,
+) -> None:
+    """Execute one parameter sweep and print results."""
+    try:
+        g = build_graph(t, p)
+        nodes = set(g.nodes())
+        edges = set(g.edges())
+        changed_nodes = nodes != base_nodes
+        changed_edges = edges != base_edges
+        delta_nodes = len(nodes) - len(base_nodes)
+        delta_edges = len(edges) - len(base_edges)
+        print(
+            f"  Params [{label:>16}]: qubits(num_nodes)={len(nodes):5d} (Δ {delta_nodes:+5d}) | "
+            f"couplers(num_edges)={len(edges):6d} (Δ {delta_edges:+6d}) | "
+            f"nodes_changed={changed_nodes} edges_changed={changed_edges}"
+        )
+        if not quiet and changed_nodes:
+            only_in_new = sorted(list(nodes - base_nodes))[:8]
+            only_in_base = sorted(list(base_nodes - nodes))[:8]
+            if only_in_new:
+                print(f"    + first-only-in-new: {only_in_new} ...")
+            if only_in_base:
+                print(f"    - first-only-in-base: {only_in_base} ...")
+    except Exception as e:
+        print(f"  Params [{label:>16}]: ERROR building graph: {e}")
 
 
 def report_topology(name: str, quiet: bool = False):
@@ -78,53 +133,12 @@ def report_topology(name: str, quiet: bool = False):
     if not quiet:
         print(f"Base node sample: {pretty_nodes(base_nodes)}")
 
-    # Define parameter sweeps per topology
-    sweeps: List[Tuple[str, Dict[str, int]]] = []
     t = topology_obj.topology_type.lower()
     topo_shape = props['topology']['shape']
+    sweeps = _build_sweeps(t, topo_shape)
 
-    if t == "chimera":
-        m0, n0, t0 = topo_shape[0], topo_shape[1], topo_shape[2]
-        for m in [max(2, m0 - 4), m0, m0 + 4]:
-            sweeps.append((f"m={m},n={m0},t={t0}", {"m": m, "n": n0, "t": t0}))
-        for tt in [max(2, t0 - 2), t0, t0 + 2]:
-            sweeps.append((f"m={m0},n={n0},t={tt}", {"m": m0, "n": n0, "t": tt}))
-    elif t == "pegasus":
-        m0 = topo_shape[0]
-        for m in [max(4, m0 - 6), m0, m0 + 8]:
-            sweeps.append((f"m={m}", {"m": m}))
-    elif t == "zephyr":
-        m0, t0 = topo_shape[0], topo_shape[1]
-        for m in [max(4, m0 - 4), m0, m0 + 4]:
-            sweeps.append((f"m={m},t={t0}", {"m": m, "t": t0}))
-        # Many Zephyr installs use t=2 or t=4; try both safely
-        for tt in sorted(set([2, t0, max(2, t0 + 2)])):
-            sweeps.append((f"m={m0},t={tt}", {"m": m0, "t": tt}))
-
-    # Execute sweeps
     for label, p in sweeps:
-        try:
-            g = build_graph(t, p)
-            nodes = set(g.nodes())
-            edges = set(g.edges())
-            changed_nodes = nodes != base_nodes
-            changed_edges = edges != base_edges
-            delta_nodes = len(nodes) - len(base_nodes)
-            delta_edges = len(edges) - len(base_edges)
-            print(
-                f"  Params [{label:>16}]: qubits(num_nodes)={len(nodes):5d} (Δ {delta_nodes:+5d}) | "
-                f"couplers(num_edges)={len(edges):6d} (Δ {delta_edges:+6d}) | "
-                f"nodes_changed={changed_nodes} edges_changed={changed_edges}"
-            )
-            if not quiet and changed_nodes:
-                only_in_new = sorted(list(nodes - base_nodes))[:8]
-                only_in_base = sorted(list(base_nodes - nodes))[:8]
-                if only_in_new:
-                    print(f"    + first-only-in-new: {only_in_new} ...")
-                if only_in_base:
-                    print(f"    - first-only-in-base: {only_in_base} ...")
-        except Exception as e:
-            print(f"  Params [{label:>16}]: ERROR building graph: {e}")
+        _run_sweep(label, p, t, base_nodes, base_edges, quiet)
 
     print()
 
@@ -144,4 +158,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

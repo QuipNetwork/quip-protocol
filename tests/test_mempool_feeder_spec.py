@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 
 from shared.ising_feeder import FixedIsingFeeder, build_feeder
-from shared.mempool_types import MempoolJobContext
+from substrate.mempool_types import MempoolJobContext
 
 
 # ---------------------------------------------------------------------------

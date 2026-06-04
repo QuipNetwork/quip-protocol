@@ -34,7 +34,7 @@ import pytest
 
 from dwave_topologies.topologies.zephyr import zephyr
 from shared.keystore_hybrid import generate
-from shared.miner_bootstrap import BootstrapConfig, _maybe_seed_chain, _resolve_dev_signer
+from substrate.miner_bootstrap import BootstrapConfig, _maybe_seed_chain, _resolve_dev_signer
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from substrate.client import SubstrateClient
@@ -686,7 +686,7 @@ async def _live_controller(
 
         # //Alice resolves to the HybridSigner derived from
         # DEV_HYBRID_SEEDS — not substrate-interface URI derivation — on
-        # hybrid chains. See shared.miner_bootstrap._resolve_dev_signer.
+        # hybrid chains. See substrate.miner_bootstrap._resolve_dev_signer.
         alice = _resolve_dev_signer("//Alice")
         balance = await setup_client.query_balance(
             keystore.signer.account_id_bytes()
@@ -779,7 +779,7 @@ async def _live_controller(
                 "controller.run() raised during _live_controller teardown"
             )
         await client.close()
-        await pool.close()
+        await pool.shutdown()
         # When `core` owns the handle, let `core.close()` tear it down; the
         # caller is responsible for that. Otherwise we built the handle
         # ourselves and own its lifecycle.
@@ -961,6 +961,48 @@ async def test_handle_result_cancels_siblings_on_ok(monkeypatch):
     assert winner.cancel_calls == 0  # don't cancel the winner
     assert sibling_a.cancel_calls == 1
     assert sibling_b.cancel_calls == 1
+
+
+async def test_handle_result_redispatches_idle_handle_on_verify_mismatch(monkeypatch):
+    """OK receipt but the runtime recorded someone else's proof
+    (_verify_proof_recorded returns -1): the controller must NOT close the
+    work key, and must re-dispatch the SAME context to IDLE handles only —
+    skipping a busy handle — while bumping contexts_dispatched. This is the
+    anti-deadlock guarantee that keeps an idle worker from sitting forever
+    after a silent rejection. It exercises _finalize_accepted_proof's
+    mismatch branch and _redispatch_after_verify_fail (gate_idle=True), which
+    are reachable only through _handle_result's OK path."""
+    from substrate.miner_controller import _work_key
+
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+
+    idle = _FakeHandle("idle")            # _active_dispatch_id == 0 → eligible
+    busy = _FakeHandle("busy")
+    busy._active_dispatch_id = 7          # active → must be skipped
+    controller.miner_handles = [idle, busy]
+
+    async def fake_submit_proof(*args, **kwargs):
+        return ExtrinsicReceipt(extrinsic_hash="0xabc")  # classifies OK
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+    controller._verify_proof_recorded = AsyncMock(return_value=-1)  # type: ignore[assignment]
+
+    await controller._handle_result(
+        _ResultEnvelope(result=_mining_result(), context=ctx, handle_id="idle")
+    )
+
+    # Anti-deadlock invariant: the work key stays open (not won by us).
+    assert _work_key(ctx) not in controller._closed_work_keys
+    assert controller.stats.proofs_submitted == 0
+    # Only the idle handle was re-dispatched; the busy one was skipped.
+    assert len(idle.mine_calls) == 1
+    assert idle.mine_calls[0][1] is ctx
+    assert len(busy.mine_calls) == 0
+    assert controller.stats.contexts_dispatched == 1
 
 
 async def test_handle_result_drops_duplicate_after_ok(monkeypatch):
@@ -1152,6 +1194,85 @@ async def test_handle_result_not_won_pow_sequence_none_on_rpc_failure(monkeypatc
         "pow_sequence must be None (not absent, not an exception) when the "
         "chain RPC is unavailable at submission time"
     )
+
+
+_RECORD_SUBMISSION_LOG_COMMON = {
+    "solution_number": _TEST_SOLUTION_NUMBER,
+    "miner_id": "miner-7",
+    "miner_type": "cpu",
+    "energy_milli": -1234,
+    "diversity_milli": 250,
+    "threshold_milli": -1000,
+    "last_proof_block_hash_hex": "0x" + "ab" * 32,
+    "num_valid": 5,
+}
+
+
+@pytest.mark.parametrize(
+    "outcome,extra",
+    [
+        # chain_error / RPC-error
+        ("chain_error", {"pow_sequence": 11, "error": "RuntimeError: boom"}),
+        # submitted_inblock / OK
+        (
+            "submitted_inblock",
+            {
+                "extrinsic_hash": "0xext",
+                "chain_block_hash": "0xblk",
+                "chain_block_number": 999,
+                "qpu_access_us_total": 61000,
+            },
+        ),
+        # rejected_stale / STALE
+        (
+            "rejected_stale",
+            {"extrinsic_hash": "0xext", "pow_sequence": 12, "error": "stale"},
+        ),
+        # chain_error / FATAL
+        (
+            "chain_error",
+            {"extrinsic_hash": "0xext", "pow_sequence": 13, "error": "fatal"},
+        ),
+    ],
+)
+def test_record_submission_forwards_kwargs(outcome, extra):
+    """``_record_submission`` writes the same row as a flat ``record(...)`` call.
+
+    Guards the helper that collapsed the four formerly inline
+    ``self._submission_log.record(...)`` blocks in ``_handle_result``: the row
+    it writes must be byte-identical (modulo the always-changing ``ts_ns``) to
+    a direct ``record(**log_common, outcome=outcome, **extra)`` call.
+    """
+    import tempfile
+
+    from shared.mining_attempt_log import SubmissionLogger
+
+    controller = _bare_controller()
+    controller._record_submission(
+        dict(_RECORD_SUBMISSION_LOG_COMMON), outcome, **extra
+    )
+    helper_path = (
+        controller._submission_log.log_dir
+        / str(_TEST_SOLUTION_NUMBER)
+        / "submission.json"
+    )
+    helper_record = json.loads(helper_path.read_text())
+
+    direct_log = SubmissionLogger(
+        log_dir=Path(tempfile.mkdtemp(prefix="quip-test-direct-")),
+    )
+    direct_log.record(
+        **_RECORD_SUBMISSION_LOG_COMMON, outcome=outcome, **extra
+    )
+    direct_path = (
+        direct_log.log_dir / str(_TEST_SOLUTION_NUMBER) / "submission.json"
+    )
+    direct_record = json.loads(direct_path.read_text())
+
+    # ts_ns is wall-clock and necessarily differs between the two writes.
+    helper_record.pop("ts_ns", None)
+    direct_record.pop("ts_ns", None)
+    assert helper_record == direct_record
 
 
 # ----------------------------------------------------------------------

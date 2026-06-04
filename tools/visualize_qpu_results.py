@@ -8,7 +8,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -61,6 +61,193 @@ def _calculate_grid_layout(n_items: int, max_cols: int = 3) -> tuple[int, int]:
     return (n_rows, n_cols)
 
 
+def _cell_text_color(value: float, matrix: np.ndarray) -> str:
+    """Return 'white' or 'black' for cell annotation contrast.
+
+    Args:
+        value: The cell value to compare against the matrix mean
+        matrix: The full data matrix (NaN values are ignored in the mean)
+
+    Returns:
+        'white' if value is below the matrix mean (darker cell), else 'black'
+    """
+    return 'white' if value < np.nanmean(matrix) else 'black'
+
+
+def _render_per_seed_figure(
+    data: Dict[str, Any],
+    output_dir: str,
+    stem: str,
+    draw_subplot: Any,
+) -> None:
+    """Render one figure per seed and save it.
+
+    Owns data unpacking, figure/subplot grid setup, hiding unused axes,
+    tight_layout, save, and close.  The caller-supplied *draw_subplot*
+    callable is invoked for each (seed, interval, ax) triple and is
+    responsible only for the content of that one subplot.
+
+    Args:
+        data: Loaded JSON data from test_qpu.py
+        output_dir: Directory to save output figures
+        stem: Output filename stem; files are saved as ``<stem>_seed_<s>.png``
+        draw_subplot: Callable with signature
+            ``(seed, interval, ax, data) -> None`` that draws one subplot.
+    """
+    seeds = data['seeds']
+    interval_list = data['interval_tested']
+
+    output_path = Path(output_dir)
+    output_path.mkdir(exist_ok=True)
+
+    for seed in seeds:
+        n_intervals = len(interval_list)
+        n_rows, n_cols = _calculate_grid_layout(n_intervals)
+
+        fig, axes = plt.subplots(
+            n_rows, n_cols,
+            figsize=(6 * n_cols, 5 * n_rows),
+            squeeze=False
+        )
+
+        cpu_baseline = data['cpu_baseline']['results']
+        fig.suptitle(
+            f'QPU Performance - Seed {seed} - Topology {data["topology"]}\n'
+            f'CPU Baseline: {cpu_baseline[str(seed)]["energy_min"]:.1f}',
+            fontsize=16,
+            fontweight='bold'
+        )
+
+        for idx, interval in enumerate(interval_list):
+            row = idx // n_cols
+            col = idx % n_cols
+            ax = axes[row, col]
+            draw_subplot(seed, interval, ax, data)
+
+        # Hide unused subplots
+        for idx in range(n_intervals, n_rows * n_cols):
+            row = idx // n_cols
+            col = idx % n_cols
+            axes[row, col].set_visible(False)
+
+        plt.tight_layout()
+
+        output_file = output_path / f'{stem}_seed_{seed}.png'
+        plt.savefig(output_file, dpi=150, bbox_inches='tight')
+        print(f"✅ Saved {output_file}")
+
+        plt.close(fig)
+
+
+def _draw_heatmap_subplot(
+    seed: int,
+    interval: float,
+    ax: Any,
+    data: Dict[str, Any],
+) -> None:
+    """Draw one heatmap subplot for a (seed, interval) pair."""
+    num_reads_list = data['num_reads_tested']
+    annealing_time_list = data['annealing_time_tested']
+    qpu_results = data['qpu_results']
+
+    key = f"seed_{seed}_interval_{interval}"
+    if key not in qpu_results:
+        ax.text(0.5, 0.5, 'No data', ha='center', va='center')
+        ax.set_title(f'Interval: {interval}s')
+        return
+
+    results = qpu_results[key]['results']
+
+    # Build energy matrix: rows=num_reads, cols=annealing_time
+    energy_matrix = np.full((len(num_reads_list), len(annealing_time_list)), np.nan)
+
+    for result in results:
+        nr = result['num_reads']
+        at = result['annealing_time']
+        # Skip results with unexpected parameter values
+        if nr not in num_reads_list or at not in annealing_time_list:
+            continue
+        nr_idx = num_reads_list.index(nr)
+        at_idx = annealing_time_list.index(at)
+        energy_matrix[nr_idx, at_idx] = result['energy_min']
+
+    # Create heatmap
+    im = ax.imshow(
+        energy_matrix,
+        aspect='auto',
+        cmap='RdYlGn_r',  # Red=high(bad), Green=low(good)
+        interpolation='nearest'
+    )
+
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label('Energy (min)', rotation=270, labelpad=20)
+
+    # Set ticks and labels
+    ax.set_xticks(range(len(annealing_time_list)))
+    ax.set_xticklabels([f'{int(at)}μs' for at in annealing_time_list], rotation=45, ha='right')
+    ax.set_yticks(range(len(num_reads_list)))
+    ax.set_yticklabels([str(nr) for nr in num_reads_list])
+
+    ax.set_xlabel('Annealing Time')
+    ax.set_ylabel('Num Reads')
+    ax.set_title(f'Interval: {interval}s')
+
+    # Add text annotations with energy values
+    for i in range(len(num_reads_list)):
+        for j in range(len(annealing_time_list)):
+            if not np.isnan(energy_matrix[i, j]):
+                text_color = _cell_text_color(energy_matrix[i, j], energy_matrix)
+                ax.text(j, i, f'{energy_matrix[i, j]:.0f}',
+                       ha='center', va='center', color=text_color, fontsize=8)
+
+
+def _draw_lineplot_subplot(
+    seed: int,
+    interval: float,
+    ax: Any,
+    data: Dict[str, Any],
+) -> None:
+    """Draw one line-plot subplot for a (seed, interval) pair."""
+    num_reads_list = data['num_reads_tested']
+    annealing_time_list = data['annealing_time_tested']
+    cpu_baseline = data['cpu_baseline']['results']
+    qpu_results = data['qpu_results']
+
+    key = f"seed_{seed}_interval_{interval}"
+    if key not in qpu_results:
+        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+        ax.set_title(f'Interval: {interval}s')
+        return
+
+    results = qpu_results[key]['results']
+
+    # Plot lines for each annealing_time
+    for at in annealing_time_list:
+        energies = []
+        for nr in num_reads_list:
+            # Find matching result
+            matching = [r for r in results
+                       if r['num_reads'] == nr and r['annealing_time'] == at]
+            if matching:
+                energies.append(matching[0]['energy_min'])
+            else:
+                energies.append(np.nan)
+
+        ax.plot(num_reads_list, energies, marker='o', label=f'{int(at)}μs', linewidth=2)
+
+    # Add CPU baseline
+    cpu_energy = cpu_baseline[str(seed)]["energy_min"]
+    ax.axhline(cpu_energy, color='black', linestyle='--', linewidth=2,
+              label=f'CPU baseline ({cpu_energy:.0f})')
+
+    ax.set_xlabel('Num Reads')
+    ax.set_ylabel('Energy (min)')
+    ax.set_title(f'Interval: {interval}s')
+    ax.legend(title='Annealing Time', fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+
 def create_heatmaps_per_seed(data: Dict[str, Any], output_dir: str = '.') -> None:
     """Create heatmap visualizations, one figure per seed.
 
@@ -73,105 +260,7 @@ def create_heatmaps_per_seed(data: Dict[str, Any], output_dir: str = '.') -> Non
         data: Loaded JSON data from test_qpu.py
         output_dir: Directory to save output figures
     """
-    seeds = data['seeds']
-    num_reads_list = data['num_reads_tested']
-    annealing_time_list = data['annealing_time_tested']
-    interval_list = data['interval_tested']
-    cpu_baseline = data['cpu_baseline']['results']
-    qpu_results = data['qpu_results']
-
-    output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)
-
-    # Create one figure per seed
-    for seed in seeds:
-        n_intervals = len(interval_list)
-        n_rows, n_cols = _calculate_grid_layout(n_intervals)
-
-        fig, axes = plt.subplots(
-            n_rows, n_cols,
-            figsize=(6 * n_cols, 5 * n_rows),
-            squeeze=False
-        )
-
-        fig.suptitle(
-            f'QPU Performance - Seed {seed} - Topology {data["topology"]}\n'
-            f'CPU Baseline: {cpu_baseline[str(seed)]["energy_min"]:.1f}',
-            fontsize=16,
-            fontweight='bold'
-        )
-
-        for idx, interval in enumerate(interval_list):
-            row = idx // n_cols
-            col = idx % n_cols
-            ax = axes[row, col]
-
-            # Get results for this seed+interval
-            key = f"seed_{seed}_interval_{interval}"
-            if key not in qpu_results:
-                ax.text(0.5, 0.5, 'No data', ha='center', va='center')
-                ax.set_title(f'Interval: {interval}s')
-                continue
-
-            results = qpu_results[key]['results']
-
-            # Build energy matrix: rows=num_reads, cols=annealing_time
-            energy_matrix = np.full((len(num_reads_list), len(annealing_time_list)), np.nan)
-
-            for result in results:
-                nr = result['num_reads']
-                at = result['annealing_time']
-                # Skip results with unexpected parameter values
-                if nr not in num_reads_list or at not in annealing_time_list:
-                    continue
-                nr_idx = num_reads_list.index(nr)
-                at_idx = annealing_time_list.index(at)
-                energy_matrix[nr_idx, at_idx] = result['energy_min']
-
-            # Create heatmap
-            im = ax.imshow(
-                energy_matrix,
-                aspect='auto',
-                cmap='RdYlGn_r',  # Red=high(bad), Green=low(good)
-                interpolation='nearest'
-            )
-
-            # Add colorbar
-            cbar = plt.colorbar(im, ax=ax)
-            cbar.set_label('Energy (min)', rotation=270, labelpad=20)
-
-            # Set ticks and labels
-            ax.set_xticks(range(len(annealing_time_list)))
-            ax.set_xticklabels([f'{int(at)}μs' for at in annealing_time_list], rotation=45, ha='right')
-            ax.set_yticks(range(len(num_reads_list)))
-            ax.set_yticklabels([str(nr) for nr in num_reads_list])
-
-            ax.set_xlabel('Annealing Time')
-            ax.set_ylabel('Num Reads')
-            ax.set_title(f'Interval: {interval}s')
-
-            # Add text annotations with energy values
-            for i in range(len(num_reads_list)):
-                for j in range(len(annealing_time_list)):
-                    if not np.isnan(energy_matrix[i, j]):
-                        text_color = 'white' if energy_matrix[i, j] < np.nanmean(energy_matrix) else 'black'
-                        ax.text(j, i, f'{energy_matrix[i, j]:.0f}',
-                               ha='center', va='center', color=text_color, fontsize=8)
-
-        # Hide unused subplots
-        for idx in range(n_intervals, n_rows * n_cols):
-            row = idx // n_cols
-            col = idx % n_cols
-            axes[row, col].set_visible(False)
-
-        plt.tight_layout()
-
-        # Save figure
-        output_file = output_path / f'qpu_heatmap_seed_{seed}.png'
-        plt.savefig(output_file, dpi=150, bbox_inches='tight')
-        print(f"✅ Saved {output_file}")
-
-        plt.close(fig)
+    _render_per_seed_figure(data, output_dir, 'qpu_heatmap', _draw_heatmap_subplot)
 
 
 def create_line_plots_per_seed(data: Dict[str, Any], output_dir: str = '.') -> None:
@@ -183,87 +272,7 @@ def create_line_plots_per_seed(data: Dict[str, Any], output_dir: str = '.') -> N
         data: Loaded JSON data from test_qpu.py
         output_dir: Directory to save output figures
     """
-    seeds = data['seeds']
-    num_reads_list = data['num_reads_tested']
-    annealing_time_list = data['annealing_time_tested']
-    interval_list = data['interval_tested']
-    cpu_baseline = data['cpu_baseline']['results']
-    qpu_results = data['qpu_results']
-
-    output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)
-
-    # Create one figure per seed
-    for seed in seeds:
-        n_intervals = len(interval_list)
-        n_rows, n_cols = _calculate_grid_layout(n_intervals)
-
-        fig, axes = plt.subplots(
-            n_rows, n_cols,
-            figsize=(6 * n_cols, 5 * n_rows),
-            squeeze=False
-        )
-
-        fig.suptitle(
-            f'QPU Performance - Seed {seed} - Topology {data["topology"]}\n'
-            f'CPU Baseline: {cpu_baseline[str(seed)]["energy_min"]:.1f}',
-            fontsize=16,
-            fontweight='bold'
-        )
-
-        for idx, interval in enumerate(interval_list):
-            row = idx // n_cols
-            col = idx % n_cols
-            ax = axes[row, col]
-
-            # Get results for this seed+interval
-            key = f"seed_{seed}_interval_{interval}"
-            if key not in qpu_results:
-                ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-                ax.set_title(f'Interval: {interval}s')
-                continue
-
-            results = qpu_results[key]['results']
-
-            # Plot lines for each annealing_time
-            for at in annealing_time_list:
-                energies = []
-                for nr in num_reads_list:
-                    # Find matching result
-                    matching = [r for r in results
-                               if r['num_reads'] == nr and r['annealing_time'] == at]
-                    if matching:
-                        energies.append(matching[0]['energy_min'])
-                    else:
-                        energies.append(np.nan)
-
-                ax.plot(num_reads_list, energies, marker='o', label=f'{int(at)}μs', linewidth=2)
-
-            # Add CPU baseline
-            cpu_energy = cpu_baseline[str(seed)]["energy_min"]
-            ax.axhline(cpu_energy, color='black', linestyle='--', linewidth=2,
-                      label=f'CPU baseline ({cpu_energy:.0f})')
-
-            ax.set_xlabel('Num Reads')
-            ax.set_ylabel('Energy (min)')
-            ax.set_title(f'Interval: {interval}s')
-            ax.legend(title='Annealing Time', fontsize=8)
-            ax.grid(True, alpha=0.3)
-
-        # Hide unused subplots
-        for idx in range(n_intervals, n_rows * n_cols):
-            row = idx // n_cols
-            col = idx % n_cols
-            axes[row, col].set_visible(False)
-
-        plt.tight_layout()
-
-        # Save figure
-        output_file = output_path / f'qpu_lineplot_seed_{seed}.png'
-        plt.savefig(output_file, dpi=150, bbox_inches='tight')
-        print(f"✅ Saved {output_file}")
-
-        plt.close(fig)
+    _render_per_seed_figure(data, output_dir, 'qpu_lineplot', _draw_lineplot_subplot)
 
 
 def create_summary_comparison(data: Dict[str, Any], output_dir: str = '.') -> None:
@@ -328,7 +337,7 @@ def create_summary_comparison(data: Dict[str, Any], output_dir: str = '.') -> No
                 cpu_energy = cpu_baseline[str(seeds[i])]["energy_min"]
                 delta = best_energies[i, j] - cpu_energy
 
-                text_color = 'white' if best_energies[i, j] < np.nanmean(best_energies) else 'black'
+                text_color = _cell_text_color(best_energies[i, j], best_energies)
                 ax.text(j, i, f'{best_energies[i, j]:.0f}\n({delta:+.0f})',
                        ha='center', va='center', color=text_color, fontsize=10)
 

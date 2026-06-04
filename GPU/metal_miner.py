@@ -13,10 +13,8 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
-from typing import List, Tuple
 
 from shared.base_miner import BaseMiner
-from shared.miner_types import BlockRequirements
 from GPU.metal_sa import MetalSASampler
 from GPU.metal_scheduler import MetalScheduler
 
@@ -155,20 +153,6 @@ class MetalMiner(BaseMiner):
             return False
 
         return True
-
-    def _adapt_mining_params(
-        self,
-        current_requirements: BlockRequirements,
-        nodes: List[int],
-        edges: List[Tuple[int, int]],
-    ) -> dict:
-        return self.adapt_parameters(
-            current_requirements.difficulty_energy,
-            current_requirements.min_diversity,
-            current_requirements.min_solutions,
-            num_nodes=len(nodes),
-            num_edges=len(edges),
-        )
 
     def _stream_factory_kwargs(self, sample_ctx, nodes):
         """Return kwargs forwarded to GPU.metal_stream:build_persistent_context.

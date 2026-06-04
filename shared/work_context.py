@@ -2,7 +2,7 @@
 
 `WorkContext` is a structural Protocol describing the shape both
 PoW (`substrate.types.SubstrateMiningContext`) and mempool
-(`shared.mempool_types.MempoolJobContext`) contexts satisfy. Each
+(`substrate.mempool_types.MempoolJobContext`) contexts satisfy. Each
 context implements `resolve_ising(salt, nodes, edges)` and
 `requirements()` itself — `shared/` no longer needs to import either
 concrete type.
@@ -57,6 +57,19 @@ class WorkContext(Protocol):
         duck-typed deliberately — both implementations expose the same
         ``pop_blocking`` / ``stop`` surface, so the loop doesn't need a
         nominal supertype.
+        """
+        ...
+
+    def uses_decay_ratchet(self) -> bool:
+        """Whether the loop ranks candidates with the decay ratchet.
+
+        PoW (substrate) work takes the "stash the best, submit when the chain
+        threshold catches up" ratchet loop — even with a flat decay schedule
+        that path falls back to strict energy ranking. Mempool jobs carry fixed
+        quality floors and use strict-energy evaluation instead. This single
+        discriminator is what ``mine_work_item`` branches on; it replaces an
+        ``isinstance`` check so the foundation need not import either concrete
+        context type.
         """
         ...
 

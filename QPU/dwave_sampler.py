@@ -9,11 +9,14 @@ from typing import (
 )
 import collections.abc
 import numpy as np
+import dimod
+from dwave.embedding import embed_bqm, unembed_sampleset
 from dwave.system import DWaveSampler, FixedEmbeddingComposite
+from dwave_topologies.embedding_loader import get_embedding_dict, embedding_exists
+from dwave_topologies import DEFAULT_TOPOLOGY
+from dwave_topologies.topologies.dwave_topology import DWaveTopology
 
 logger = logging.getLogger(__name__)
-from dwave.embedding import embed_bqm, unembed_sampleset
-import dimod
 
 if TYPE_CHECKING:
     from dwave.cloud.computation import Future
@@ -109,10 +112,6 @@ class DefectInfo:
         self.energy_offset = energy_offset
         self.removed_edges = removed_edges
 
-
-from dwave_topologies.embedding_loader import get_embedding_dict, embedding_exists
-from dwave_topologies import DEFAULT_TOPOLOGY
-from dwave_topologies.topologies.dwave_topology import DWaveTopology
 
 # Type definitions to match base_miner
 Variable = collections.abc.Hashable
@@ -271,7 +270,7 @@ class DWaveSamplerWrapper:
 
         else:
             # Native hardware topology - no embedding needed
-            logger.info(f"[QPU] Using native hardware topology (no embedding needed)")
+            logger.info("[QPU] Using native hardware topology (no embedding needed)")
             self.sampler = base_sampler
             self.embedding = None
             if topology is not None:
@@ -405,7 +404,13 @@ class DWaveSamplerWrapper:
         h: Dict[int, float],
         J: Dict[Tuple[int, int], float],
         nonce_seed: Union[int, bytes],
-    ) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float], Dict[int, int]]:
+    ) -> Tuple[
+        Dict[int, float],
+        Dict[Tuple[int, int], float],
+        Dict[int, int],
+        float,
+        Dict[Tuple[int, int], float],
+    ]:
         """Clamp defective qubits to deterministic spins and adjust neighbors.
 
         For each offline qubit k, assigns a fixed spin s_k (deterministic from
@@ -423,10 +428,15 @@ class DWaveSamplerWrapper:
                 int seed.
 
         Returns:
-            (h_reduced, J_reduced, fixed_spins) where:
+            5-tuple (h_reduced, J_reduced, fixed_spins, energy_offset, removed_edges):
             - h_reduced: biases without defective qubits (neighbors adjusted)
             - J_reduced: couplings without edges involving defective qubits
             - fixed_spins: {qubit_id: spin_value} for solution reconstruction
+            - energy_offset: constant energy contribution from clamped qubits
+              (h-fields and mutual J among clamped pairs); add once per sample
+            - removed_edges: {(u, v): val} for live-qubit coupler pairs whose
+              hardware coupler is offline; excluded from J_reduced and offset,
+              computed per-sample in _reconstruct_full_sampleset
         """
         defective_set = set(self._defective_qubits)
         # numpy's SeedSequence rejects bytes ("expects int or sequence of
@@ -535,6 +545,36 @@ class DWaveSamplerWrapper:
             samples, vartype=dimod.SPIN, energy=energies, info=info,
         )
 
+    def _prepare_defect_handling(
+        self,
+        h: Union[Mapping[Variable, float], Sequence[float]],
+        J: Mapping[Tuple[Variable, Variable], float],
+        kwargs: Dict[str, Any],
+    ) -> Tuple[
+        Union[Mapping[Variable, float], Sequence[float]],
+        Mapping[Tuple[Variable, Variable], float],
+        Optional[DefectInfo],
+    ]:
+        """Pop ``nonce_seed`` and clamp defective qubits if any are present.
+
+        Returns ``(h_eff, J_eff, defect_info)`` where the effective problem is
+        the defect-reduced one (and ``defect_info`` is populated) when defects
+        exist and a seed was supplied; otherwise the inputs are returned
+        unchanged with ``defect_info`` set to ``None``.
+        """
+        nonce_seed = kwargs.pop('nonce_seed', None)
+
+        has_defects = self._defective_qubits or self._defective_edges
+        if not (has_defects and nonce_seed is not None):
+            return h, J, None
+
+        h_dict = dict(h) if not isinstance(h, dict) else h
+        J_dict = dict(J) if not isinstance(J, dict) else J
+        h_reduced, J_reduced, fixed_spins, offset, removed = (
+            self._clamp_defective_qubits(h_dict, J_dict, nonce_seed)
+        )
+        return h_reduced, J_reduced, DefectInfo(fixed_spins, offset, removed)
+
     @staticmethod
     def reconstruct_full_matrix(
         reduced_sample: np.ndarray,
@@ -640,20 +680,21 @@ class DWaveSamplerWrapper:
         instead — it avoids reconstructing samples that don't meet threshold.
         This method always reconstructs for backward compatibility.
         """
-        nonce_seed = kwargs.pop('nonce_seed', None)
-
-        has_defects = self._defective_qubits or self._defective_edges
-        if has_defects and nonce_seed is not None:
-            h_dict = dict(h) if not isinstance(h, dict) else h
-            J_dict = dict(J) if not isinstance(J, dict) else J
-            h_reduced, J_reduced, fixed_spins, offset, removed = (
-                self._clamp_defective_qubits(h_dict, J_dict, nonce_seed)
-            )
-            sampleset = self._sample_ising_inner(h_reduced, J_reduced, **kwargs)
-            defect_info = DefectInfo(fixed_spins, offset, removed)
+        h_eff, J_eff, defect_info = self._prepare_defect_handling(h, J, kwargs)
+        sampleset = self._sample_ising_inner(h_eff, J_eff, **kwargs)
+        if defect_info is not None:
             return self.reconstruct_full_sampleset(sampleset, defect_info)
+        return sampleset
 
-        return self._sample_ising_inner(h, J, **kwargs)
+    def _chain_strength(self, bqm: dimod.BinaryQuadraticModel, multiplier: float) -> float:
+        """Compute chain strength as the largest absolute bias scaled by *multiplier*.
+
+        If the BQM has quadratic interactions the largest |J| is used; otherwise
+        the largest |h| is used.  Falls back to 1.0 when the BQM is empty.
+        """
+        if bqm.num_interactions > 0:
+            return max(abs(b) for b in bqm.quadratic.values()) * multiplier
+        return max(abs(b) for b in bqm.linear.values()) * multiplier if bqm.linear else 1.0
 
     def _sample_ising_inner(
         self,
@@ -680,16 +721,15 @@ class DWaveSamplerWrapper:
             embedding_vars = set(self.embedding.keys())
 
             if bqm_vars != embedding_vars:
-                import sys
-                print(f"\n⚠️  WARNING: BQM variables don't match embedding keys!", file=sys.stderr)
-                print(f"   BQM vars: {len(bqm_vars)}, range: {min(bqm_vars)}-{max(bqm_vars)}", file=sys.stderr)
-                print(f"   Embedding vars: {len(embedding_vars)}, range: {min(embedding_vars)}-{max(embedding_vars)}", file=sys.stderr)
+                logger.warning(
+                    "BQM variables don't match embedding keys! "
+                    "BQM vars: %d, range: %d-%d; Embedding vars: %d, range: %d-%d",
+                    len(bqm_vars), min(bqm_vars), max(bqm_vars),
+                    len(embedding_vars), min(embedding_vars), max(embedding_vars),
+                )
 
             # Calculate chain strength explicitly so we control the multiplier
-            if bqm.num_interactions > 0:
-                chain_strength = max(abs(b) for b in bqm.quadratic.values()) * chain_strength_multiplier
-            else:
-                chain_strength = max(abs(b) for b in bqm.linear.values()) * chain_strength_multiplier if bqm.linear else 1.0
+            chain_strength = self._chain_strength(bqm, chain_strength_multiplier)
 
             # Sample using BQM (not sample_ising)
             sampleset = self.sampler.sample(bqm, chain_strength=chain_strength, **kwargs)
@@ -703,12 +743,15 @@ class DWaveSamplerWrapper:
             actual_vars = set(sampleset.variables)
 
             if actual_vars != expected_vars:
-                import sys
-                print(f"\n⚠️  WARNING: Sampleset variables don't match logical topology!", file=sys.stderr)
-                print(f"   Expected: {len(expected_vars)} vars (0-{max(expected_vars)})", file=sys.stderr)
-                print(f"   Got: {len(actual_vars)} vars ({min(actual_vars)}-{max(actual_vars)})", file=sys.stderr)
-                print(f"   Missing: {sorted(list(expected_vars - actual_vars))[:20]}", file=sys.stderr)
-                print(f"   Extra: {sorted(list(actual_vars - expected_vars))[:20]}", file=sys.stderr)
+                logger.warning(
+                    "Sampleset variables don't match logical topology! "
+                    "Expected: %d vars (0-%d); Got: %d vars (%d-%d); "
+                    "Missing: %s; Extra: %s",
+                    len(expected_vars), max(expected_vars),
+                    len(actual_vars), min(actual_vars), max(actual_vars),
+                    sorted(list(expected_vars - actual_vars))[:20],
+                    sorted(list(actual_vars - expected_vars))[:20],
+                )
 
         return sampleset
 
@@ -728,23 +771,9 @@ class DWaveSamplerWrapper:
         Returns:
             (future, defect_info) where defect_info is None if no defects.
         """
-        nonce_seed = kwargs.pop('nonce_seed', None)
-
-        has_defects = self._defective_qubits or self._defective_edges
-        if has_defects and nonce_seed is not None:
-            h_dict = dict(h) if not isinstance(h, dict) else h
-            J_dict = dict(J) if not isinstance(J, dict) else J
-            h_reduced, J_reduced, fixed_spins, offset, removed = (
-                self._clamp_defective_qubits(h_dict, J_dict, nonce_seed)
-            )
-            future = self._sample_ising_async_inner(
-                h_reduced, J_reduced, **kwargs
-            )
-            defect_info = DefectInfo(fixed_spins, offset, removed)
-            return future, defect_info
-
-        future = self._sample_ising_async_inner(h, J, **kwargs)
-        return future, None
+        h_eff, J_eff, defect_info = self._prepare_defect_handling(h, J, kwargs)
+        future = self._sample_ising_async_inner(h_eff, J_eff, **kwargs)
+        return future, defect_info
 
     def _sample_ising_async_inner(
         self,
@@ -765,11 +794,7 @@ class DWaveSamplerWrapper:
             source_bqm = dimod.BinaryQuadraticModel.from_ising(h, J)
 
             # Calculate chain strength (using same logic as FixedEmbeddingComposite)
-            # Default to magnitude of strongest interaction
-            if source_bqm.num_interactions > 0:
-                chain_strength = max(abs(bias) for bias in source_bqm.quadratic.values()) * chain_strength_multiplier
-            else:
-                chain_strength = max(abs(bias) for bias in source_bqm.linear.values()) * chain_strength_multiplier if source_bqm.linear else 1.0
+            chain_strength = self._chain_strength(source_bqm, chain_strength_multiplier)
 
             # Manually embed the BQM
             target_bqm = embed_bqm(

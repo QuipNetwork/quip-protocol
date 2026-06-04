@@ -1,4 +1,4 @@
-"""Unit tests for `shared.miner_bootstrap`.
+"""Unit tests for `substrate.miner_bootstrap`.
 
 These don't need a live chain — they stub `SubstrateClient` and exercise the
 state machine directly. The highest-value coverage is the `_assert_dev_chain`
@@ -15,8 +15,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import shared.miner_bootstrap as mb
-from shared.miner_bootstrap import (
+import substrate.miner_bootstrap as mb
+from substrate.miner_bootstrap import (
     DEV_CHAIN_PREFIXES,
     BootstrapConfig,
     _assert_dev_chain,

@@ -4,7 +4,7 @@ Contains core mining logic and defines abstract methods for miner-specific imple
 """
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import ABC
 from collections import OrderedDict
 import logging
 import math
@@ -12,6 +12,7 @@ import multiprocessing
 import multiprocessing.synchronize
 import pickle
 import queue
+import signal
 import sys
 import time
 import traceback
@@ -26,16 +27,14 @@ from shared.energy_utils import (
     DEFAULT_NUM_NODES,
     DEFAULT_NUM_EDGES,
 )
-from shared.mempool_types import MempoolJobContext
-from shared.miner_types import BlockRequirements, IsingSample, MiningResult, Sampler
+from shared.miner_types import BlockRequirements, MiningResult, Sampler
 from shared.mining_attempt_log import AttemptLogger, SolutionStore
 from shared.quantum_proof_of_work import (
     compute_solution_meta,
     evaluate_sampleset,
     pack_spins_hex,
 )
-from substrate.difficulty_decay import step_for_energy
-from substrate.types import SubstrateMiningContext
+from shared.decay_math import step_for_energy
 from shared.work_context import (
     WorkContext,
     requirements_from_context,
@@ -338,17 +337,13 @@ class BaseMiner(ABC):
         }
 
         # Track top 3 mining results
-        self.top_attempts: List[IsingSample] = []
+        self.top_attempts: List = []
 
         # Worker-side feeder slot, always None: every backend mines through
         # the stream-driver process, which owns the feeder. Kept so subclass
         # SIGTERM handlers that guard on ``self._feeder`` have the attribute
         # before their own ``__init__`` runs.
         self._feeder: Optional[Any] = None
-
-        # Count of QPU results dropped under result-queue backpressure.
-        # Reset per dispatch by mine_work_item; logged at dispatch end.
-        self._dropped_results: int = 0
 
         # Persistent driver handles. ``_ensure_driver`` spawns ONE stream-driver
         # process and keeps it alive across dispatches; ``_close_driver`` (miner
@@ -391,17 +386,6 @@ class BaseMiner(ABC):
         # each work-tag still surfaces; repeats are suppressed until the
         # tag is evicted from the bounded cache.
         self._setup_abort_throttle = _SetupAbortThrottle()
-
-    def update_top_samples(self, sampleset: dimod.SampleSet, nonce: int, salt: bytes, requirements: BlockRequirements):
-        """Update the top 3 results list with a new mining result."""
-
-        # Add current result
-        attempt = IsingSample(nonce, salt, sampleset)
-        self.top_attempts.append(attempt)
-        self.top_attempts.sort(key=lambda r: compare_mining_samples(r, attempt, requirements))
-
-        # Keep only top 3
-        self.top_attempts = self.top_attempts[:3]
 
     def capture_partial_timing(self):
         """Capture timing for current mining attempt, including partial progress."""
@@ -1009,7 +993,7 @@ class BaseMiner(ABC):
         # decay-aware "store best, submit when chain catches up" loop;
         # mempool jobs have hard quality floors that don't decay so
         # they keep the strict-energy behaviour.
-        is_substrate = isinstance(context, SubstrateMiningContext)
+        is_substrate = context.uses_decay_ratchet()
         live_threshold_var = getattr(self, '_live_max_energy_milli', None)
         # Seed the worker's live-threshold view with the snapshot value
         # in case the controller hasn't written one yet (e.g. tests, or
@@ -1103,7 +1087,6 @@ class BaseMiner(ABC):
             "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
         }
 
-        self._dropped_results = 0
         generation = 0
         if self._ensure_driver(sample_ctx):
             # New round: bump the generation and tell the persistent driver to
@@ -1467,11 +1450,6 @@ class BaseMiner(ABC):
         delegates to subclass ``_post_mine_cleanup``.
         """
         self.mining = False
-        if self._dropped_results:
-            self.logger.info(
-                "mine_work_item: %d QPU results dropped under "
-                "result-queue backpressure", self._dropped_results,
-            )
         attempt_logger = getattr(self, "_attempt_logger", None)
         if attempt_logger is not None:
             attempt_logger.flush()
@@ -1588,6 +1566,36 @@ class BaseMiner(ABC):
         except Exception as exc:  # noqa: BLE001 — best-effort
             self.logger.debug("threshold forward failed (ignored): %s", exc)
 
+    @staticmethod
+    def _worst_stashed_energy(state: _MiningLoopState) -> float:
+        """Return the worst (highest) energy in the stash, or +inf when not full.
+
+        ``+inf`` means any sample qualifies — used as the legacy-path ratchet
+        threshold when the stash hasn't reached its cap yet.
+        """
+        if len(state.top_k) >= state.top_k_cap:
+            return state.top_k[-1].result.energy
+        return float("inf")
+
+    def _reconstruct_or_skip(
+        self, sampleset: Any, defect_info: Any, state: _MiningLoopState,
+    ) -> Optional[Any]:
+        """Reconstruct a reduced sampleset to full topology, or signal a skip.
+
+        ``evaluate_sampleset`` indexes topology positions, so a sample narrower
+        than the topology must be reconstructed first. A full-width sample is
+        returned unchanged. A reduced sample carrying ``defect_info`` is
+        reconstructed via ``_finalize_sample`` and returned. A reduced sample
+        without ``defect_info`` is unexpectedly narrow — return ``None`` so the
+        caller can translate the skip into its own control outcome and emit its
+        own log line.
+        """
+        if sampleset.record.sample.shape[1] == len(state.nodes):
+            return sampleset
+        if defect_info is not None:
+            return self._finalize_sample(sampleset, defect_info, state.nodes)
+        return None
+
     def _stash_pre_check(
         self,
         state: _MiningLoopState,
@@ -1612,11 +1620,7 @@ class BaseMiner(ABC):
         """
         decay_schedule = state.decay_schedule
         if decay_schedule is None:
-            ratchet_threshold = (
-                state.top_k[-1].result.energy
-                if len(state.top_k) >= state.top_k_cap
-                else float("inf")
-            )
+            ratchet_threshold = self._worst_stashed_energy(state)
             admit = (iter_best_milli / 1000.0) < ratchet_threshold
         elif len(state.top_k) < state.top_k_cap:
             admit = True
@@ -1686,11 +1690,7 @@ class BaseMiner(ABC):
         iter_best_milli = int(iter_best_energy * 1000)
         # ratchet_threshold (legacy energy gate the attempt log records):
         # +inf until the stash is full, then the worst stashed energy.
-        ratchet_threshold = (
-            state.top_k[-1].result.energy
-            if len(state.top_k) >= state.top_k_cap
-            else float("inf")
-        )
+        ratchet_threshold = self._worst_stashed_energy(state)
         improves_stash = self._stash_pre_check(
             state, sampleset, iter_best_energy, iter_best_milli,
         )
@@ -1698,12 +1698,11 @@ class BaseMiner(ABC):
         # must be reconstructed before evaluate_sampleset indexes topology
         # positions. With defect_info, reconstruct here; without it, the
         # sample is unexpectedly narrow — skip evaluation and log a warning.
-        if improves_stash and sampleset.record.sample.shape[1] != len(state.nodes):
-            if defect_info is not None:
-                sampleset = self._finalize_sample(
-                    sampleset, defect_info, state.nodes,
-                )
-            else:
+        if improves_stash:
+            reconstructed = self._reconstruct_or_skip(
+                sampleset, defect_info, state,
+            )
+            if reconstructed is None:
                 self.logger.info(
                     "[%s] Mining attempt - Energy: %.0f (under-reconstructed: "
                     "sample width %d != topology %d; skipping evaluation)",
@@ -1711,6 +1710,8 @@ class BaseMiner(ABC):
                     sampleset.record.sample.shape[1], len(state.nodes),
                 )
                 improves_stash = False
+            else:
+                sampleset = reconstructed
 
         result = None
         stored_replaced = False
@@ -1851,19 +1852,16 @@ class BaseMiner(ABC):
         before evaluation.  Metal/CUDA mempool samples are full-width with
         ``defect_info=None`` and are unaffected.
         """
-        if sampleset.record.sample.shape[1] != len(state.nodes):
-            if defect_info is not None:
-                sampleset = self._finalize_sample(
-                    sampleset, defect_info, state.nodes,
-                )
-            else:
-                self.logger.info(
-                    "[%s] mempool attempt skipped (under-reconstructed: "
-                    "width %d != topology %d)",
-                    self.miner_id, sampleset.record.sample.shape[1],
-                    len(state.nodes),
-                )
-                return None
+        reconstructed = self._reconstruct_or_skip(sampleset, defect_info, state)
+        if reconstructed is None:
+            self.logger.info(
+                "[%s] mempool attempt skipped (under-reconstructed: "
+                "width %d != topology %d)",
+                self.miner_id, sampleset.record.sample.shape[1],
+                len(state.nodes),
+            )
+            return None
+        sampleset = reconstructed
 
         result = self.evaluate_sampleset(
             sampleset, state.requirements, state.nodes, state.edges,
@@ -2054,7 +2052,6 @@ class BaseMiner(ABC):
         """
         return True
 
-    @abstractmethod
     def _adapt_mining_params(
         self,
         current_requirements: BlockRequirements,
@@ -2066,7 +2063,18 @@ class BaseMiner(ABC):
         The returned dict must include at least 'num_sweeps' and
         'num_reads'.  Extra keys are forwarded to the stream-driver context
         factory.
+
+        Default implementation forwards to ``adapt_parameters`` using the
+        subclass-declared calibration bounds. Override only for
+        backend-specific post-processing (e.g. CUDA Gibbs sweep doubling).
         """
+        return self.adapt_parameters(
+            current_requirements.difficulty_energy,
+            current_requirements.min_diversity,
+            current_requirements.min_solutions,
+            num_nodes=len(nodes),
+            num_edges=len(edges),
+        )
 
     def _post_sample(
         self, sampleset: dimod.SampleSet,
@@ -2089,7 +2097,7 @@ class BaseMiner(ABC):
           - Mempool: order_id / nodes / edges
         Both flavors print enough to grep logs for a specific work item.
         """
-        if isinstance(context, MempoolJobContext):
+        if not context.uses_decay_ratchet():
             msg = (
                 f"mine_work_item: order_id={context.order_id} "
                 f"nodes={len(context.nodes)} edges={len(context.edges)} "
@@ -2122,6 +2130,41 @@ class BaseMiner(ABC):
         if sys.is_finalizing():
             return
         sys.exit(0)
+
+    def _register_sigterm_cleanup(self, backend_label: str) -> None:
+        """Install the shared SIGTERM handler for graceful worker cleanup.
+
+        ``backend_label`` is interpolated into the default log lines. Subclasses
+        customize the cleanup body via ``_backend_cleanup`` and (optionally) the
+        first log line via ``_sigterm_log_message``.
+        """
+        self._sigterm_backend_label = backend_label
+        signal.signal(signal.SIGTERM, self._cleanup_handler)
+
+    def _sigterm_log_message(self) -> str:
+        """Return the first-line SIGTERM log text.
+
+        Default uses the backend label; override for backend-specific detail.
+        """
+        label = getattr(self, "_sigterm_backend_label", "")
+        return f"{label} miner {self.miner_id} received SIGTERM, cleaning up..."
+
+    def _backend_cleanup(self) -> None:
+        """Release backend-specific resources on SIGTERM. Default no-op."""
+
+    def _cleanup_handler(self, signum, frame) -> None:
+        """Shared SIGTERM handler: log, run backend cleanup, exit gracefully."""
+        label = getattr(self, "_sigterm_backend_label", "")
+        if hasattr(self, "logger"):
+            self.logger.info(self._sigterm_log_message())
+        try:
+            self._backend_cleanup()
+        except Exception as e:
+            if hasattr(self, "logger"):
+                self.logger.error(f"Error during {label} miner cleanup: {e}")
+        # Exit gracefully — guard against raising SystemExit during
+        # interpreter finalization (would produce "Exception ignored" noise).
+        self._graceful_exit()
 
     def _on_sampling_error(
         self,
@@ -2175,7 +2218,7 @@ class BaseMiner(ABC):
 
 def _work_tag(context: WorkContext) -> str:
     """Short identifier for a work context, used in per-iteration log lines."""
-    if isinstance(context, MempoolJobContext):
+    if not context.uses_decay_ratchet():
         return f"order={context.order_id}"
     return f"last_proof_block_hash=0x{context.last_proof_block_hash.hex()[:16]}"
 
@@ -2217,7 +2260,7 @@ class _BridgePrevBlock:
 
     @classmethod
     def from_work_context(cls, context: WorkContext) -> "_BridgePrevBlock":
-        if isinstance(context, MempoolJobContext):
+        if not context.uses_decay_ratchet():
             return cls(
                 header=_BridgePrevBlockHeader(index=context.order_id),
                 hash=b"\x00" * 32,
@@ -2250,7 +2293,7 @@ class _BridgeNodeInfo:
 
     @classmethod
     def from_work_context(cls, context: WorkContext) -> "_BridgeNodeInfo":
-        if isinstance(context, MempoolJobContext):
+        if not context.uses_decay_ratchet():
             return cls(
                 miner_id=f"mempool-order-{context.order_id}",
                 miner_account_bytes=b"\x00" * 32,
@@ -2260,44 +2303,4 @@ class _BridgeNodeInfo:
             miner_account_bytes=context.miner_account_bytes,
         )
 
-
-def compare_mining_samples(sample_a: IsingSample, sample_b: IsingSample, requirements: BlockRequirements) -> int:
-    """
-    Compare two mining results to determine which is better.
-
-    Returns:
-        -1 if A is better than B
-         0 if A and B are equal
-         1 if B is better than A
-
-    Comparison logic:
-    1. Compare average of top N energies
-       where N = requirements.min_solutions
-    2. If still equal, compare overall average solution energy
-    """
-
-    # 1. Compare average of top N solution energies
-    a_energies = list(sample_a.sampleset.record.energy)
-    b_energies = list(sample_b.sampleset.record.energy)
-    n_energies = min(requirements.min_solutions, len(a_energies), len(b_energies))
-    if n_energies > 0:
-        energies_a = a_energies[:n_energies]
-        energies_b = b_energies[:n_energies]
-        avg_energy_a = np.mean(energies_a)
-        avg_energy_b = np.mean(energies_b)
-
-        if avg_energy_a < avg_energy_b:  # Lower energy is better
-            return -1
-        elif avg_energy_b < avg_energy_a:
-            return 1
-
-    # 2. If still equal, compare overall best energy (lower is better)
-    best_energy_a = min(a_energies)
-    best_energy_b = min(b_energies)
-    if best_energy_a < best_energy_b:
-        return -1
-    elif best_energy_b < best_energy_a:
-        return 1
-
-    return 0  # Equal
 

@@ -2,7 +2,6 @@
 
 This worker runs a loop handling commands from the parent process:
 - mine_work_item {context}
-- stop_mining
 - get_stats
 - shutdown
 
@@ -20,21 +19,13 @@ import multiprocessing.synchronize as mpsync
 import traceback
 from typing import Any, Dict, Optional
 
-import CPU  # noqa: E402
-import GPU  # noqa: E402
-import QPU  # noqa: E402
-
 from shared.logging_config import QuipFormatter
 
-# Global logger for this module
-log = None
 logger = logging.getLogger(__name__)
 
 
 def _setup_child_process_logging(log_queue=None):
     """Set up logging for child processes to use QuipFormatter and optionally queue logging."""
-    global log
-
     root_logger = logging.getLogger()
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
@@ -48,8 +39,6 @@ def _setup_child_process_logging(log_queue=None):
         handler.setFormatter(QuipFormatter())
         root_logger.addHandler(handler)
         root_logger.setLevel(logging.INFO)
-
-    log = logging.getLogger(__name__)
 
 # NOTE: the legacy `_signal_aware_mining_worker` (a dedicated per-attempt
 # child process used by `MinerHandle.mine_with_timeout`) was removed in
@@ -77,26 +66,36 @@ def build_miner_from_spec(spec: Dict[str, Any]):
         # `topology=` override in spec.args propagates to the sampler. Phase 4
         # controller relies on this to bind the miner to the chain's
         # registered topology.
+        import CPU
+
         return CPU.SimulatedAnnealingMiner(miner_id, **cfg, **args)
     elif kind == "metal":
+        import GPU
+
         if not GPU.METAL_AVAILABLE:
             raise RuntimeError(
                 "Metal miner requested but Metal is not available (requires macOS with Metal support)"
             )
         return GPU.MetalMiner(miner_id, **cfg, **args)
     elif kind == "cuda":
+        import GPU
+
         if not GPU.CUDA_AVAILABLE:
             raise RuntimeError(
                 "CUDA miner requested but CUDA is not available (requires CuPy and CUDA toolkit)"
             )
         return GPU.CudaMiner(miner_id, **cfg, **args)
     elif kind == "modal":
+        import GPU
+
         if not GPU.MODAL_AVAILABLE:
             raise RuntimeError(
                 "Modal miner requested but Modal is not available (requires modal SDK: pip install modal)"
             )
         return GPU.ModalMiner(miner_id, **cfg, **args)
     elif kind == "cuda-gibbs":
+        import GPU
+
         if not GPU.CUDA_AVAILABLE:
             raise RuntimeError(
                 "CUDA Gibbs miner requested but not available "
@@ -109,6 +108,8 @@ def build_miner_from_spec(spec: Dict[str, Any]):
             **args,
         )
     elif kind == "qpu":
+        import QPU
+
         # Build QPU time config if daily budget is specified
         time_config = None
         if cfg.get("daily_budget"):
@@ -176,9 +177,8 @@ def miner_worker_main(
     it from ``cancel()``; the miner polls it during its inner mining loop
     and returns None as soon as it fires. Sharing the event across the
     process boundary is what makes cancellation observable while
-    ``mine_block`` is running — the command queue can't deliver a
-    ``stop_mining`` op until ``mine_block`` returns, which defeats the
-    whole point.
+    ``mine_block`` is running — the command queue cannot interrupt the
+    inner loop, so ``stop_event`` is the sole cancellation path.
 
     ``live_max_energy_milli`` is an ``mp.Value('q')`` the parent updates
     on each new head that crosses a decay-step boundary. The substrate
@@ -466,12 +466,10 @@ class MinerHandle:
 
         Signals the running mining loop directly via the shared
         ``stop_event`` so the worker observes the cancel within one
-        iteration of its inner loop. We deliberately do NOT also enqueue
-        a ``stop_mining`` op on the request queue: that op can sit in
-        the queue while the worker is busy mining, and then get consumed
-        by a *later* dispatch's clear → mine_work_item → req.get
-        sequence — cancelling the new work with a stale cancel. The
-        ``stop_event`` is the single source of truth for cancellation.
+        iteration of its inner loop. The ``stop_event`` is the single
+        source of truth for cancellation; no op is enqueued on the
+        command queue, which cannot interrupt an in-progress
+        ``mine_block`` call.
 
         Idempotent — safe to call when the worker is idle (the set is a
         no-op cleared by the next ``mine_work_item()``).

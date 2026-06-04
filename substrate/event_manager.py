@@ -112,17 +112,7 @@ class ChainEventManager:
             if key != self._last_state_key:
                 self._last_state_key = key
                 self._last_change_at = now
-                try:
-                    self._event_q.put_nowait(("new_head", payload))
-                except asyncio.QueueFull:
-                    logger.warning("event manager: event_q full; dropping oldest")
-                    try:
-                        self._event_q.get_nowait()
-                        self._event_q.put_nowait(("new_head", payload))
-                    except (asyncio.QueueEmpty, asyncio.QueueFull):
-                        logger.warning(
-                            "event manager: could not recover from full queue; dropping event"
-                        )
+                self._enqueue_drop_oldest(("new_head", payload))
 
             # Watchdog
             elapsed_since_change = now - self._last_change_at
@@ -156,6 +146,18 @@ class ChainEventManager:
                 else self._settled_s
             )
             await self._sleep_or_shutdown(interval)
+
+    def _enqueue_drop_oldest(self, item: Any) -> None:
+        """Put *item* on the event queue, dropping the oldest entry if full."""
+        try:
+            self._event_q.put_nowait(item)
+        except asyncio.QueueFull:
+            try:
+                self._event_q.get_nowait()
+                self._event_q.put_nowait(item)
+                logger.warning("event manager: event_q full; dropped oldest to make room")
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                logger.warning("event manager: could not recover from full queue; dropping event")
 
     async def _dispatch_loop(self) -> None:
         while not self._shutdown.is_set():

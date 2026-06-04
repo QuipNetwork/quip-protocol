@@ -20,7 +20,7 @@ def test_build_qpu_forwards_topology_connect_false():
         "cfg": {"qpu_type": "dwave", "solver": "Advantage2_system1"},
         "args": {"topology": DEFAULT_TOPOLOGY},
     }
-    with patch.object(miner_worker.QPU, "DWaveMiner") as mk:
+    with patch("QPU.DWaveMiner") as mk:
         miner_worker.build_miner_from_spec(spec)
     _args, kwargs = mk.call_args
     assert kwargs["topology"] is DEFAULT_TOPOLOGY
@@ -40,7 +40,7 @@ def test_build_qpu_parses_reservoir_budget_knobs():
         },
         "args": {"topology": DEFAULT_TOPOLOGY},
     }
-    with patch.object(miner_worker.QPU, "DWaveMiner") as mk:
+    with patch("QPU.DWaveMiner") as mk:
         miner_worker.build_miner_from_spec(spec)
     _args, kwargs = mk.call_args
     tc = kwargs["time_config"]
@@ -59,7 +59,7 @@ def test_build_qpu_defaults_min_block_budget_when_absent():
         "cfg": {"qpu_type": "dwave", "daily_budget": "30m"},
         "args": {"topology": DEFAULT_TOPOLOGY},
     }
-    with patch.object(miner_worker.QPU, "DWaveMiner") as mk:
+    with patch("QPU.DWaveMiner") as mk:
         miner_worker.build_miner_from_spec(spec)
     tc = mk.call_args.kwargs["time_config"]
     assert tc.min_block_budget_seconds == 90.0

@@ -11,6 +11,7 @@ Generates individual PNG files:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import random
 import sys
@@ -24,18 +25,38 @@ sys.path.insert(
 
 from CPU.sa_miner import SimulatedAnnealingMiner
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
-from dwave_topologies import DEFAULT_TOPOLOGY
 from shared.energy_utils import energy_to_difficulty
-from shared.nonce_prefilter import (
-    IsingTopologyCache,
-    greedy_descent_energy,
-)
-import hashlib
-
+from shared.nonce_prefilter import IsingTopologyCache
 from shared.quantum_proof_of_work import (
     derive_nonce,
     generate_ising_model_from_nonce,
 )
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as _plt_module
+    _MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    _plt_module = None
+    _MATPLOTLIB_AVAILABLE = False
+
+
+def _get_plt():
+    """Return matplotlib.pyplot with Agg backend, or None if unavailable."""
+    if not _MATPLOTLIB_AVAILABLE:
+        print("matplotlib not available, skipping plots")
+        return None
+    return _plt_module
+
+
+def _save_fig(fig, path, dpi=150, bbox_inches='tight'):
+    """Save figure, close it, and print the saved path."""
+    fig.tight_layout()
+    fig.savefig(path, dpi=dpi, bbox_inches=bbox_inches)
+    if _plt_module is not None:
+        _plt_module.close(fig)
+    print(f"  Saved {path}")
 
 
 def collect_data(
@@ -119,9 +140,9 @@ def plot_scatter(
     greedy, sa, target_energy, config_str, output_path,
 ):
     """Scatter with regression line, saved to output_path."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+    plt = _get_plt()
+    if plt is None:
+        return
     from scipy.stats import pearsonr
 
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -149,19 +170,16 @@ def plot_scatter(
     )
     ax.legend(fontsize=8)
 
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  Saved {output_path}")
+    _save_fig(fig, output_path)
 
 
 def plot_progressive_correlation(
     greedy_by_pass, sa, config_str, output_path,
 ):
     """Correlation vs greedy pass count, saved to output_path."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+    plt = _get_plt()
+    if plt is None:
+        return
     from scipy.stats import pearsonr, spearmanr
 
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -209,10 +227,7 @@ def plot_progressive_correlation(
             ha='center', va='bottom', fontsize=7,
         )
 
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  Saved {output_path}")
+    _save_fig(fig, output_path)
 
 
 def _compute_roc_curves(greedy, sa, target_energy):
@@ -253,9 +268,9 @@ def plot_roc(
     greedy, sa, target_energy, config_str, output_path,
 ):
     """Filtering ROC curve, saved to output_path."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+    plt = _get_plt()
+    if plt is None:
+        return
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
@@ -272,10 +287,7 @@ def plot_roc(
         ax.set_title(
             f'Filtering ROC (no valid nonces)\n{config_str}'
         )
-        fig.tight_layout()
-        fig.savefig(output_path, dpi=150, bbox_inches='tight')
-        plt.close(fig)
-        print(f"  Saved {output_path}")
+        _save_fig(fig, output_path)
         return
 
     _draw_roc_axes(
@@ -283,10 +295,7 @@ def plot_roc(
         target_energy, config_str,
     )
 
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  Saved {output_path}")
+    _save_fig(fig, output_path)
 
 
 def _draw_roc_axes(
@@ -351,9 +360,9 @@ def plot_energy_distributions(
     greedy, sa_min, sa_mean, config_str, output_path,
 ):
     """Overlapping energy histograms, saved to output_path."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+    plt = _get_plt()
+    if plt is None:
+        return
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
@@ -384,19 +393,16 @@ def plot_energy_distributions(
     )
     ax.legend(fontsize=8)
 
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  Saved {output_path}")
+    _save_fig(fig, output_path)
 
 
 def plot_density_heatmap(
     greedy, sa, target_energy, config_str, output_path,
 ):
     """2D density heatmap with marginals, saved to output_path."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+    plt = _get_plt()
+    if plt is None:
+        return
     from mpl_toolkits.axes_grid1 import make_axes_locatable
 
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -433,10 +439,7 @@ def plot_density_heatmap(
         color='coral', alpha=0.7,
     )
 
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  Saved {output_path}")
+    _save_fig(fig, output_path)
 
 
 def print_summary(

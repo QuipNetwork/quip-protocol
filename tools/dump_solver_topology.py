@@ -16,12 +16,11 @@ Usage:
 import argparse
 import gzip
 import json
-import os
 import re
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -155,7 +154,7 @@ def generate_topology_json(solver_info: Dict[str, Any]) -> Dict[str, Any]:
             'topology_shape': solver_info['topology_shape'],
             'num_nodes': solver_info['num_nodes'],
             'num_edges': solver_info['num_edges'],
-            'generated_from': f"D-Wave API via dump_solver_topology.py",
+            'generated_from': "D-Wave API via dump_solver_topology.py",
             'generated_at': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
         },
         'nodes': solver_info['nodes'],
@@ -282,12 +281,9 @@ def dump_solver_topology(solver_name: str, output_dir: str = "dwave_topologies/t
 
     # Write JSON file
     try:
-        if use_gzip:
-            with gzip.open(json_filepath, 'wt', encoding='utf-8') as f:
-                json.dump(topology_json, f, indent=2)
-        else:
-            with open(json_filepath, 'w', encoding='utf-8') as f:
-                json.dump(topology_json, f, indent=2)
+        opener = gzip.open if use_gzip else open
+        with opener(json_filepath, 'wt', encoding='utf-8') as f:
+            json.dump(topology_json, f, indent=2)
 
         file_size = json_filepath.stat().st_size
         size_str = f"{file_size / 1024:.1f} KB" if file_size < 1024 * 1024 else f"{file_size / (1024 * 1024):.1f} MB"
@@ -384,6 +380,25 @@ python tools/dump_solver_topology.py --all-available --gzip
         print(f"❌ Failed to create README file: {e}")
 
 
+def dump_solver_list(solvers: List[Dict[str, Any]], output_dir: str, use_gzip: bool) -> None:
+    """Dump topologies for a list of solvers and create README."""
+    fmt = "JSON (gzip compressed)" if use_gzip else "JSON (uncompressed)"
+    print(f"\n🚀 Dumping topologies for {len(solvers)} solver(s)...")
+    print(f"   Output format: {fmt}")
+    successful = []
+
+    for solver_info in solvers:
+        print(f"\n--- Processing {solver_info['name']} (region: {solver_info['region']}) ---")
+        if dump_solver_topology(solver_info['name'], output_dir, use_gzip, region=solver_info['region']):
+            successful.append(solver_info['name'])
+
+    if successful:
+        create_readme_file(output_dir, successful, use_gzip)
+        print(f"\n✅ Successfully dumped {len(successful)}/{len(solvers)} solver topologies")
+    else:
+        print("\n❌ Failed to dump any solver topologies")
+
+
 def main():
     """Main function with command line argument parsing."""
     parser = argparse.ArgumentParser(
@@ -462,22 +477,7 @@ Examples:
         if not qpu_solvers:
             print("❌ No QPU solvers available")
             sys.exit(1)
-
-        print(f"\n🚀 Dumping topologies for {len(qpu_solvers)} QPU solver(s)...")
-        print(f"   Output format: JSON (gzip compressed)")
-        successful = []
-
-        for solver_info in qpu_solvers:
-            print(f"\n--- Processing {solver_info['name']} (region: {solver_info['region']}) ---")
-            if dump_solver_topology(solver_info['name'], args.output_dir, True, region=solver_info['region']):
-                successful.append(solver_info['name'])
-
-        if successful:
-            create_readme_file(args.output_dir, successful, True)
-            print(f"\n✅ Successfully dumped {len(successful)}/{len(qpu_solvers)} QPU solver topologies")
-        else:
-            print(f"\n❌ Failed to dump any solver topologies")
-
+        dump_solver_list(qpu_solvers, args.output_dir, True)
         return
 
     # All available solvers mode (includes hybrid)
@@ -486,22 +486,7 @@ Examples:
         if not all_solvers:
             print("❌ No solvers available")
             sys.exit(1)
-
-        print(f"\n🚀 Dumping topologies for {len(all_solvers)} solvers...")
-        print(f"   Output format: {'JSON (gzip compressed)' if args.gzip else 'JSON (uncompressed)'}")
-        successful = []
-
-        for solver_info in all_solvers:
-            print(f"\n--- Processing {solver_info['name']} (region: {solver_info['region']}) ---")
-            if dump_solver_topology(solver_info['name'], args.output_dir, args.gzip, region=solver_info['region']):
-                successful.append(solver_info['name'])
-
-        if successful:
-            create_readme_file(args.output_dir, successful, args.gzip)
-            print(f"\n✅ Successfully dumped {len(successful)}/{len(all_solvers)} solver topologies")
-        else:
-            print(f"\n❌ Failed to dump any solver topologies")
-
+        dump_solver_list(all_solvers, args.output_dir, args.gzip)
         return
 
     # Single solver mode

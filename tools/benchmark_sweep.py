@@ -131,43 +131,33 @@ def run_sweep(h_list, J_list, sweep_values):
         },
     }
 
+    def _record_run(sampler, label, bucket, close=False):
+        elapsed, energies = bench_sampler(
+            sampler, h_list, J_list, sweeps,
+        )
+        if close:
+            sampler.close()
+        mps = n / elapsed
+        avg_e = float(np.mean(energies))
+        bucket["models_per_sec"].append(mps)
+        bucket["avg_energy"].append(avg_e)
+        bucket["per_model_energies"].append(energies)
+        print(
+            f"  {label:<6} {elapsed:6.3f}s  "
+            f"{mps:7.2f} models/s  "
+            f"avg_E={avg_e:.1f}"
+        )
+
     for sweeps in sweep_values:
         print(f"--- num_sweeps={sweeps} ---")
 
-        # SA
         sa = CudaSASampler()
-        elapsed, energies = bench_sampler(
-            sa, h_list, J_list, sweeps,
-        )
-        sa.close()
-        mps = n / elapsed
-        avg_e = float(np.mean(energies))
-        results["sa"]["models_per_sec"].append(mps)
-        results["sa"]["avg_energy"].append(avg_e)
-        results["sa"]["per_model_energies"].append(energies)
-        print(
-            f"  SA:    {elapsed:6.3f}s  "
-            f"{mps:7.2f} models/s  "
-            f"avg_E={avg_e:.1f}"
-        )
+        _record_run(sa, "SA:", results["sa"], close=True)
 
-        # Gibbs
         gibbs = CudaGibbsSampler(
             update_mode="gibbs", parallel=True,
         )
-        elapsed, energies = bench_sampler(
-            gibbs, h_list, J_list, sweeps,
-        )
-        mps = n / elapsed
-        avg_e = float(np.mean(energies))
-        results["gibbs"]["models_per_sec"].append(mps)
-        results["gibbs"]["avg_energy"].append(avg_e)
-        results["gibbs"]["per_model_energies"].append(energies)
-        print(
-            f"  Gibbs: {elapsed:6.3f}s  "
-            f"{mps:7.2f} models/s  "
-            f"avg_E={avg_e:.1f}"
-        )
+        _record_run(gibbs, "Gibbs:", results["gibbs"])
 
     return results
 
@@ -365,12 +355,11 @@ def main():
     num_sms, gpu_name = get_gpu_info()
     print(f"GPU: {gpu_name} ({num_sms} SMs)")
 
-    num_models = args.num_models if args.num_models else 4 * num_sms
-    sweep_values = DEFAULT_SWEEP_VALUES
+    num_models = args.num_models or 4 * num_sms
     print(
         f"Config: {num_models} models, "
         f"num_reads={NUM_READS}, "
-        f"sweeps={sweep_values}"
+        f"sweeps={DEFAULT_SWEEP_VALUES}"
     )
 
     h_list, J_list = generate_models(num_models)
@@ -380,19 +369,19 @@ def main():
         f"{len(J_list[0])} couplings each)"
     )
 
-    data = run_sweep(h_list, J_list, sweep_values)
+    data = run_sweep(h_list, J_list, DEFAULT_SWEEP_VALUES)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     plot_throughput(
-        sweep_values,
+        DEFAULT_SWEEP_VALUES,
         data["sa"]["models_per_sec"],
         data["gibbs"]["models_per_sec"],
         gpu_name, output_dir,
     )
     plot_energy(
-        sweep_values,
+        DEFAULT_SWEEP_VALUES,
         data["sa"], data["gibbs"],
         gpu_name, output_dir,
     )
@@ -403,7 +392,7 @@ def main():
             "num_sms": num_sms,
             "num_reads": NUM_READS,
             "num_models": num_models,
-            "sweep_values": sweep_values,
+            "sweep_values": DEFAULT_SWEEP_VALUES,
             "sa": data["sa"],
             "gibbs": data["gibbs"],
         }
