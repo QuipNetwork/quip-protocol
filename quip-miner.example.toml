@@ -134,7 +134,7 @@ signer_key = "~/.quip-miner/signing.json"
 # [dwave]
 # daily_budget                   = "60s"   # wall-clock QPU access budget per UTC day
 # solver                         = "Advantage2_system1"
-# dwave_region_url               = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
+# region                         = "na-west-1"   # D-Wave region NAME, not a URL
 # qpu_min_blocks_for_estimation  = 5
 # qpu_ema_alpha                  = 0.3
 
