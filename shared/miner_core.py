@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import multiprocessing
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from shared.logging_config import init_component_logger
 from shared.miner_worker import MinerHandle
@@ -62,6 +62,48 @@ _GPU_DEVICE_SECTIONS = {
 _QPU_DEVICE_SECTIONS = (
     "dwave", "ibm", "braket", "pasqal", "ionq", "origin",
 )
+
+logger = logging.getLogger(__name__)
+
+# Recognized [dwave] config keys: everything ``_build_qpu_specs`` forwards into
+# the miner cfg, plus the structural ``type``. Unrecognized keys are warned
+# about, not silently dropped. NOTE: ``dwave_region_url`` is intentionally
+# absent — operators set ``region`` (the D-Wave region NAME, e.g. na-west-1);
+# see quip.network.qpu.example.toml.
+_KNOWN_DWAVE_KEYS = frozenset({
+    "type", "daily_budget", "min_block_budget", "budget_cap",
+    "qpu_min_blocks_for_estimation", "qpu_ema_alpha", "solver", "region",
+    "token", "num_reads", "annealing_time_us", "queue_depth",
+    "embedding_file", "drain_on_stop",
+})
+
+# Recognized keys for the non-D-Wave QPU device types (token + daily budget).
+_KNOWN_OTHER_QPU_KEYS = frozenset({"type", "token", "daily_budget"})
+
+# Recognized GPU keys shared across device types (``_build_gpu_miner_cfg``
+# filters to ``_GPU_CFG_KEYS``); per-type structural extras (``device`` for
+# CUDA, ``_METAL_CFG_KEYS`` for Metal, ``gpu_type`` for Modal) are unioned in
+# at the call site.
+_KNOWN_GPU_BASE_KEYS = frozenset({"type", *_GPU_CFG_KEYS})
+
+
+def _warn_unrecognized_keys(
+    label: str, dev: Dict[str, Any], known: Iterable[str],
+) -> None:
+    """Warn (key names ONLY — never values) about unrecognized device keys.
+
+    The spec builders forward a curated whitelist into the miner cfg — the
+    boundary that keeps secret-bearing keys like ``token`` controlled — and drop
+    everything else. A silently dropped key hides operator typos and unsupported
+    options, so name them at WARNING. Values may be secrets and are NEVER logged.
+    """
+    unknown = sorted(set(dev) - set(known))
+    if unknown:
+        logger.warning(
+            "%s: ignoring unrecognized config key(s): %s "
+            "(typo or unsupported option?)",
+            label, ", ".join(unknown),
+        )
 
 
 def _build_gpu_miner_cfg(
@@ -419,9 +461,13 @@ def _build_gpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
         dev_cfg = _build_gpu_miner_cfg(dev, defaults=common_cfg)
         if dev_type == "cuda":
             device_id = dev.get("device", "0")
+            spec_id = f"{node_id}-GPU-CUDA-{device_id}"
+            _warn_unrecognized_keys(
+                spec_id, dev, _KNOWN_GPU_BASE_KEYS | {"device"},
+            )
             specs.append(
                 {
-                    "id": f"{node_id}-GPU-CUDA-{device_id}",
+                    "id": spec_id,
                     "kind": "cuda",
                     "cfg": dev_cfg,
                     "args": {"device": str(device_id)},
@@ -435,9 +481,13 @@ def _build_gpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
             for key in _METAL_CFG_KEYS:
                 if key in dev:
                     dev_cfg[key] = dev[key]
+            spec_id = f"{node_id}-GPU-MPS"
+            _warn_unrecognized_keys(
+                spec_id, dev, _KNOWN_GPU_BASE_KEYS | set(_METAL_CFG_KEYS),
+            )
             specs.append(
                 {
-                    "id": f"{node_id}-GPU-MPS",
+                    "id": spec_id,
                     "kind": "metal",
                     "cfg": dev_cfg,
                     "args": {"device": "mps"},
@@ -445,9 +495,13 @@ def _build_gpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
             )
         elif dev_type == "modal":
             gpu_type = dev.get("gpu_type", "t4")
+            spec_id = f"{node_id}-GPU-MODAL-{gpu_type}"
+            _warn_unrecognized_keys(
+                spec_id, dev, _KNOWN_GPU_BASE_KEYS | {"gpu_type"},
+            )
             specs.append(
                 {
-                    "id": f"{node_id}-GPU-MODAL-{gpu_type}",
+                    "id": spec_id,
                     "kind": "modal",
                     "cfg": dev_cfg,
                     "args": {"gpu_type": str(gpu_type)},
@@ -553,17 +607,28 @@ def _build_qpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
                 cfg_block["min_block_budget"] = dev["min_block_budget"]
             if dev.get("budget_cap") is not None:
                 cfg_block["budget_cap"] = dev["budget_cap"]
+            # Other supported DWaveMiner __init__ knobs (forwarded as kwargs).
+            if dev.get("queue_depth") is not None:
+                cfg_block["queue_depth"] = dev["queue_depth"]
+            if dev.get("embedding_file") is not None:
+                cfg_block["embedding_file"] = dev["embedding_file"]
+            if dev.get("drain_on_stop") is not None:
+                cfg_block["drain_on_stop"] = dev["drain_on_stop"]
+            spec_id = f"{node_id}-QPU-{tag}-{i}"
+            _warn_unrecognized_keys(spec_id, dev, _KNOWN_DWAVE_KEYS)
             specs.append(
                 {
-                    "id": f"{node_id}-QPU-{tag}-{i}",
+                    "id": spec_id,
                     "kind": "qpu",
                     "cfg": cfg_block,
                 }
             )
         elif dev_type in ("ibm", "braket", "pasqal", "ionq", "origin"):
+            spec_id = f"{node_id}-QPU-{tag}-{i}"
+            _warn_unrecognized_keys(spec_id, dev, _KNOWN_OTHER_QPU_KEYS)
             specs.append(
                 {
-                    "id": f"{node_id}-QPU-{tag}-{i}",
+                    "id": spec_id,
                     "kind": "qpu",
                     "cfg": {
                         "qpu_type": dev_type,

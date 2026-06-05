@@ -43,11 +43,12 @@ retry_backoff_ms = 250
 # The miner banks unused budget into the reservoir and pauses until it has
 # `min_block_budget` of QPU runway accrued, then bursts until the pool
 # drains to 0 (accumulate-then-burst, to amortize D-Wave queue warmup).
-# The sampler's active solver and region come from environment variables —
-# DWAVE_API_SOLVER and DWAVE_REGION_URL — at runtime; `solver` and
-# `dwave_region_url` here are operator-asserted pass-through values
-# surfaced to dashboards. EMA + min-blocks tune the pacing estimator
-# inside QPUTimeManager.
+# `solver` (the active solver, e.g. Advantage2_system1) and `region` (the
+# D-Wave region NAME, e.g. na-west-1 — NOT a SAPI URL) are passed to the
+# D-Wave SDK to select the sampler; `solver` is also surfaced to dashboards.
+# EMA + min-blocks tune the pacing estimator inside QPUTimeManager.
+# Unrecognized [dwave] keys (e.g. a typo) are logged at WARNING, not silently
+# ignored.
 [dwave]
 daily_budget                   = "30m"
 # min_block_budget: QPU runway (access seconds) that must accrue before a
@@ -59,7 +60,7 @@ min_block_budget               = "90s"
 # Defaults to max(daily_budget, min_block_budget) when unset.
 # budget_cap                     = "30m"
 # solver                         = "Advantage2_system1"
-# dwave_region_url               = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
+# region                         = "na-west-1"   # D-Wave region NAME, not a URL
 # qpu_min_blocks_for_estimation  = 5
 # qpu_ema_alpha                  = 0.3
 

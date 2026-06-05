@@ -366,6 +366,113 @@ def test_toml_dwave_budget_overrides_round_trip(tmp_path):
     assert "budget_cap" not in cfg2
 
 
+def test_dwave_forwards_queue_depth_embedding_drain(tmp_path):
+    """Supported DWaveMiner knobs (queue_depth / embedding_file / drain_on_stop)
+    are forwarded into the spec cfg, not dropped by the whitelist."""
+    from shared.miner_config import load_backend_config
+    from shared.miner_core import _build_qpu_specs
+
+    p = tmp_path / "knobs.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[dwave]\n'
+        'daily_budget = "15m"\n'
+        'queue_depth = 50\n'
+        'embedding_file = "emb.json"\n'
+        'drain_on_stop = true\n'
+    )
+    cfg = _build_qpu_specs("rig", load_backend_config(p))[0]["cfg"]
+    assert cfg["queue_depth"] == 50
+    assert cfg["embedding_file"] == "emb.json"
+    assert cfg["drain_on_stop"] is True
+
+
+def test_dwave_unrecognized_key_warns_and_is_dropped(tmp_path, caplog):
+    """An unrecognized [dwave] key (typo / unsupported) emits exactly one
+    WARNING naming it and is not forwarded into the spec cfg."""
+    import logging
+
+    from shared.miner_config import load_backend_config
+    from shared.miner_core import _build_qpu_specs
+
+    p = tmp_path / "typo.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[dwave]\n'
+        'daily_budget = "15m"\n'
+        'min_block_budet = "20m"\n'  # typo of min_block_budget
+    )
+    with caplog.at_level(logging.WARNING, logger="shared.miner_core"):
+        cfg = _build_qpu_specs("rig", load_backend_config(p))[0]["cfg"]
+    assert "min_block_budet" not in cfg
+    warns = [r.message for r in caplog.records if "unrecognized" in r.message]
+    assert len(warns) == 1
+    assert "min_block_budet" in warns[0]
+
+
+def test_dwave_region_url_is_unrecognized(tmp_path, caplog):
+    """A2: `dwave_region_url` is NOT a recognized key (operators use `region`,
+    the D-Wave region name); it warns rather than being silently dropped."""
+    import logging
+
+    from shared.miner_config import load_backend_config
+    from shared.miner_core import _build_qpu_specs
+
+    p = tmp_path / "regurl.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[dwave]\n'
+        'daily_budget = "15m"\n'
+        'region = "na-west-1"\n'
+        'dwave_region_url = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"\n'
+    )
+    with caplog.at_level(logging.WARNING, logger="shared.miner_core"):
+        cfg = _build_qpu_specs("rig", load_backend_config(p))[0]["cfg"]
+    # The supported key IS forwarded; the URL alias is not, and warns.
+    assert cfg["region"] == "na-west-1"
+    assert "dwave_region_url" not in cfg
+    assert any("dwave_region_url" in r.message for r in caplog.records)
+
+
+def test_unrecognized_key_warning_excludes_values(tmp_path, caplog):
+    """The warning names keys ONLY — never values (which may be secrets)."""
+    import logging
+
+    from shared.miner_config import load_backend_config
+    from shared.miner_core import _build_qpu_specs
+
+    p = tmp_path / "secret.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[dwave]\n'
+        'daily_budget = "15m"\n'
+        'tokenn = "super-secret-value-12345"\n'  # typo of token; secret value
+    )
+    with caplog.at_level(logging.WARNING, logger="shared.miner_core"):
+        _build_qpu_specs("rig", load_backend_config(p))
+    text = " ".join(r.message for r in caplog.records)
+    assert "tokenn" in text
+    assert "super-secret-value-12345" not in text
+
+
+def test_gpu_unrecognized_key_warns(tmp_path, caplog):
+    """The same unrecognized-key warning covers the GPU spec builder."""
+    import logging
+
+    from shared.miner_config import load_backend_config
+    from shared.miner_core import _build_gpu_specs
+
+    p = tmp_path / "gpu.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[metal]\n'
+        'utilizaton = 70\n'  # typo of utilization
+    )
+    with caplog.at_level(logging.WARNING, logger="shared.miner_core"):
+        _build_gpu_specs("rig", load_backend_config(p))
+    assert any("utilizaton" in r.message for r in caplog.records)
+
+
 def test_toml_dwave_token_does_not_leak_to_descriptor(tmp_path):
     """Defense-in-depth regression: even though the dwave cfg now
     carries `token`, the descriptor pipeline's whitelist
