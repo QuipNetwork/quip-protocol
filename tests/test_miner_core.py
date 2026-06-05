@@ -473,6 +473,154 @@ def test_gpu_unrecognized_key_warns(tmp_path, caplog):
     assert any("utilizaton" in r.message for r in caplog.records)
 
 
+def test_dwave_recognized_keys_do_not_warn(tmp_path, caplog):
+    """A [dwave] block of only recognized keys produces ZERO warnings — guards
+    against a too-narrow whitelist warning on valid configs (log spam that
+    trains operators to ignore the warning)."""
+    import logging
+
+    from shared.miner_config import load_backend_config
+    from shared.miner_core import _build_qpu_specs
+
+    p = tmp_path / "valid.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[dwave]\n'
+        'daily_budget = "15m"\n'
+        'min_block_budget = "90s"\n'
+        'budget_cap = "30m"\n'
+        'solver = "Advantage2_system1"\n'
+        'region = "na-west-1"\n'
+        'num_reads = 112\n'
+        'annealing_time_us = 80.0\n'
+        'queue_depth = 30\n'
+    )
+    with caplog.at_level(logging.WARNING, logger="shared.miner_core"):
+        _build_qpu_specs("rig", load_backend_config(p))
+    assert not [r for r in caplog.records if "unrecognized" in r.message]
+
+
+def test_ibm_unrecognized_key_warns(tmp_path, caplog):
+    """The non-D-Wave QPU branch warns on keys outside {token, daily_budget}
+    (e.g. an operator pasting D-Wave knobs under [ibm])."""
+    import logging
+
+    from shared.miner_config import load_backend_config
+    from shared.miner_core import _build_qpu_specs
+
+    p = tmp_path / "ibm.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[ibm]\n'
+        'token = "x"\n'
+        'solver = "ibmq_qasm"\n'  # not supported on the non-dwave path
+    )
+    with caplog.at_level(logging.WARNING, logger="shared.miner_core"):
+        _build_qpu_specs("rig", load_backend_config(p))
+    assert any("solver" in r.message for r in caplog.records)
+
+
+def test_cuda_and_modal_unrecognized_keys_warn(tmp_path, caplog):
+    """Each GPU device branch validates against its own known-set (cuda adds
+    ``device``, modal adds ``gpu_type``)."""
+    import logging
+
+    from shared.miner_config import load_backend_config
+    from shared.miner_core import _build_gpu_specs
+
+    pc = tmp_path / "cuda.toml"
+    pc.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[cuda.0]\nfoo = 1\n'
+    )
+    with caplog.at_level(logging.WARNING, logger="shared.miner_core"):
+        _build_gpu_specs("rig", load_backend_config(pc))
+    assert any(
+        "foo" in r.message and "CUDA-0" in r.message for r in caplog.records
+    )
+
+    caplog.clear()
+    pm = tmp_path / "modal.toml"
+    pm.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[modal]\ngpu_type = "t4"\nbar = 2\n'
+    )
+    with caplog.at_level(logging.WARNING, logger="shared.miner_core"):
+        _build_gpu_specs("rig", load_backend_config(pm))
+    assert any("bar" in r.message for r in caplog.records)
+    # gpu_type is recognized on modal → not warned.
+    assert not any("gpu_type" in r.message for r in caplog.records)
+
+
+def test_shared_gpu_section_unrecognized_key_warns(tmp_path, caplog):
+    """A typo in the SHARED [gpu] section (global defaults) warns too — the
+    silent-drop class is not limited to per-device sections."""
+    import logging
+
+    from shared.miner_config import load_backend_config
+    from shared.miner_core import _build_gpu_specs
+
+    p = tmp_path / "sharedgpu.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[gpu]\nutilizaton = 80\n'  # typo in the shared section
+        '[cuda.0]\n'
+    )
+    with caplog.at_level(logging.WARNING, logger="shared.miner_core"):
+        _build_gpu_specs("rig", load_backend_config(p))
+    assert any("utilizaton" in r.message for r in caplog.records)
+
+
+def test_shared_qpu_section_unrecognized_key_warns(tmp_path, caplog):
+    """A key in the shared [qpu] section (never consumed — budget knobs belong
+    on the device) warns rather than being silently dropped."""
+    import logging
+
+    from shared.miner_config import load_backend_config
+    from shared.miner_core import _build_qpu_specs
+
+    p = tmp_path / "sharedqpu.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\n'
+        '[qpu]\ndaily_budget = "15m"\n'  # belongs on the device, not shared
+        '[dwave]\ndaily_budget = "15m"\n'
+    )
+    with caplog.at_level(logging.WARNING, logger="shared.miner_core"):
+        _build_qpu_specs("rig", load_backend_config(p))
+    assert any(
+        "daily_budget" in r.message and "[qpu]" in r.message
+        for r in caplog.records
+    )
+
+
+def test_shipped_example_configs_are_warning_clean():
+    """The shipped example configs must use only recognized keys — couples the
+    whitelist to the docs so drift in either direction is caught."""
+    import io
+    import logging
+    from pathlib import Path
+
+    from shared.miner_config import load_backend_config
+    from shared.miner_core import build_miner_specs
+
+    for name in ("quip.network.qpu.example.toml", "quip-miner.example.toml"):
+        path = Path(name)
+        if not path.exists():
+            continue
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setLevel(logging.WARNING)
+        lg = logging.getLogger("shared.miner_core")
+        lg.addHandler(handler)
+        try:
+            build_miner_specs("rig", load_backend_config(path))
+        finally:
+            lg.removeHandler(handler)
+        assert "unrecognized" not in buf.getvalue(), (
+            f"{name} produced unrecognized-key warning(s): {buf.getvalue()!r}"
+        )
+
+
 def test_toml_dwave_token_does_not_leak_to_descriptor(tmp_path):
     """Defense-in-depth regression: even though the dwave cfg now
     carries `token`, the descriptor pipeline's whitelist

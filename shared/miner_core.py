@@ -86,6 +86,14 @@ _KNOWN_OTHER_QPU_KEYS = frozenset({"type", "token", "daily_budget"})
 # at the call site.
 _KNOWN_GPU_BASE_KEYS = frozenset({"type", *_GPU_CFG_KEYS})
 
+# Recognized keys in the SHARED [gpu]/[qpu] sections (not the per-device
+# sub-tables). The shared [gpu] section supplies device defaults filtered to
+# ``_GPU_CFG_KEYS``; the shared [qpu] section is never consumed (budget knobs
+# belong on the device). ``devices`` is the synthetic key added by
+# ``_normalize_device_config``.
+_KNOWN_GPU_SHARED_KEYS = frozenset({*_GPU_CFG_KEYS, "devices"})
+_KNOWN_QPU_SHARED_KEYS = frozenset({"devices"})
+
 
 def _warn_unrecognized_keys(
     label: str, dev: Dict[str, Any], known: Iterable[str],
@@ -453,6 +461,9 @@ def _build_gpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Yield miner specs for each GPU device in the config."""
     specs: List[Dict[str, Any]] = []
     gpu_cfg = _normalize_gpu_config(cfg)
+    _warn_unrecognized_keys(
+        f"{node_id} [gpu]", gpu_cfg, _KNOWN_GPU_SHARED_KEYS,
+    )
     common_cfg = _build_gpu_miner_cfg(gpu_cfg)
     for dev in gpu_cfg.get("devices", []):
         if dev.get("enabled") is False:
@@ -564,6 +575,9 @@ def _build_qpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Yield miner specs for each QPU device in the config."""
     specs: List[Dict[str, Any]] = []
     qpu_cfg = _normalize_qpu_config(cfg)
+    _warn_unrecognized_keys(
+        f"{node_id} [qpu]", qpu_cfg, _KNOWN_QPU_SHARED_KEYS,
+    )
     for i, dev in enumerate(qpu_cfg.get("devices", []), start=1):
         dev_type = dev.get("type", "dwave").lower()
         tag = dev_type.upper()
