@@ -646,6 +646,12 @@ def quip_miner(log_level: str) -> None:
     setup_logging(log_level=log_level.upper())
 
 
+def _selftest_spawn_child(result_queue) -> None:
+    """Spawn-child target for the selftest round-trip (must be module-level
+    so the spawn child can unpickle it by qualified name)."""
+    result_queue.put("spawn-ok")
+
+
 @quip_miner.command("selftest")
 def quip_miner_selftest() -> None:
     """Verify the packaged binary can load its bundled runtime assets.
@@ -677,6 +683,31 @@ def quip_miner_selftest() -> None:
             )
         runtime_config.update_type_registry(preset)
     click.echo("selftest OK: scalecodec type-registry presets load")
+
+    # Spawn round-trip: re-executes the frozen bootloader and all PyInstaller
+    # runtime hooks in a child process — the exact path miner workers take via
+    # shared/proc_util.spawn_worker. Catches hook/bundle regressions that only
+    # kill spawn children (e.g. the pyi_rth_pkgres hook failing on a missing
+    # setuptools vendor data file, surfacing as BrokenPipeError in production).
+    import multiprocessing
+    import queue as queue_mod
+
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    child = ctx.Process(target=_selftest_spawn_child, args=(result_queue,))
+    child.start()
+    try:
+        token = result_queue.get(timeout=120)
+    except queue_mod.Empty:
+        token = None
+    child.join(timeout=10)
+    if token != "spawn-ok" or child.exitcode != 0:
+        raise click.ClickException(
+            f"multiprocessing spawn round-trip failed (exitcode={child.exitcode}, "
+            f"token={token!r}) — a PyInstaller runtime hook or bundled asset is "
+            "broken in spawn children; check pyinstaller/quip_miner.spec excludes"
+        )
+    click.echo("selftest OK: multiprocessing spawn round-trip")
 
 
 @quip_miner.command("resolve-mode")
