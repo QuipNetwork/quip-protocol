@@ -60,6 +60,7 @@ class CudaMiner(GPUMiner):
             current_requirements.min_solutions,
             num_nodes=len(nodes),
             num_edges=len(edges),
+            allowed_h=getattr(current_requirements, "allowed_h_values", None),
         )
         if self._is_gibbs:
             params['num_sweeps'] = min(

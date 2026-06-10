@@ -22,8 +22,10 @@ from typing import Dict, List, Optional, Tuple, Any
 import dimod
 import numpy as np
 
+from shared.allowed_value_spec import MILLI_SCALE
 from shared.energy_utils import (
     energy_to_difficulty as _energy_to_difficulty,
+    DEFAULT_H_VALUES,
     DEFAULT_NUM_NODES,
     DEFAULT_NUM_EDGES,
 )
@@ -512,22 +514,54 @@ class BaseMiner(ABC):
     # None = use DEFAULT_C_RANGE from energy_utils (SA baseline).
     ADAPT_C_RANGE: Optional[Tuple[float, float]] = None
 
+    @staticmethod
+    def _h_values_from_allowed(allowed_h) -> Tuple[float, ...]:
+        """Physical-unit h field values for the GSE difficulty band.
+
+        The achievable-energy band shifts with the field distribution (zeroing
+        the ternary ``h`` moves the ground state ~+3% shallower), so the
+        difficulty curve must key off the *problem's* ``allowed_h`` rather than
+        a hardcoded ternary default.
+
+        ``allowed_h`` may be:
+
+        - ``None`` — the chain's ternary default (``-1, 0, +1``),
+        - an :class:`~shared.allowed_value_spec.AllowedValueSet` carrying
+          milli-precision ints (as ``BlockRequirements.allowed_h_values`` does),
+        - or an explicit sequence of float field values.
+
+        Returns the float tuple :func:`expected_solution_energy` expects (it
+        keys off which values are zero, so the magnitudes only matter via their
+        nonzero fraction).
+        """
+        if allowed_h is None:
+            return DEFAULT_H_VALUES
+        milli_values = getattr(allowed_h, "values", None)
+        if milli_values is not None:
+            return tuple(v / MILLI_SCALE for v in milli_values)
+        return tuple(float(v) for v in allowed_h)
+
     @classmethod
     def energy_to_difficulty(
         cls,
         target_energy: float,
         num_nodes: int = DEFAULT_NUM_NODES,
         num_edges: int = DEFAULT_NUM_EDGES,
+        h_values: Optional[Tuple[float, ...]] = None,
     ) -> float:
         """Convert energy target to [0, 1] difficulty for this miner.
 
-        Uses the miner's ADAPT_C_RANGE if set, otherwise falls
-        back to the SA baseline. Override in subclasses for
-        fundamentally different difficulty mappings.
+        Uses the miner's ADAPT_C_RANGE if set, otherwise falls back to the SA
+        baseline. ``h_values`` selects the GSE energy band for the problem's
+        field distribution; ``None`` keeps the ternary default (so existing
+        callers are unchanged). Override in subclasses for fundamentally
+        different difficulty mappings.
         """
         kwargs = {}
         if cls.ADAPT_C_RANGE is not None:
             kwargs['c_range'] = cls.ADAPT_C_RANGE
+        if h_values is not None:
+            kwargs['h_values'] = h_values
         return _energy_to_difficulty(
             target_energy,
             num_nodes=num_nodes,
@@ -543,6 +577,7 @@ class BaseMiner(ABC):
         min_solutions: int,
         num_nodes: int = DEFAULT_NUM_NODES,
         num_edges: int = DEFAULT_NUM_EDGES,
+        allowed_h=None,
     ) -> dict:
         """Calculate adaptive mining parameters based on difficulty.
 
@@ -558,6 +593,11 @@ class BaseMiner(ABC):
             min_solutions: Minimum number of valid solutions required.
             num_nodes: Number of nodes in topology.
             num_edges: Number of edges in topology.
+            allowed_h: The problem's ``h`` field distribution (e.g.
+                ``requirements.allowed_h_values``). Selects the GSE difficulty
+                band so a given relative difficulty allocates the same effort
+                across field distributions; ``None`` keeps the ternary default,
+                leaving ternary callers unchanged.
 
         Returns:
             Dictionary with miner-specific parameter keys.
@@ -566,6 +606,7 @@ class BaseMiner(ABC):
             difficulty_energy,
             num_nodes=num_nodes,
             num_edges=num_edges,
+            h_values=cls._h_values_from_allowed(allowed_h),
         )
 
         # QPU path: annealing_time + bonus reads
