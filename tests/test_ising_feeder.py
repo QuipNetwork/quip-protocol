@@ -8,6 +8,7 @@ import weakref
 
 import pytest
 
+from shared.allowed_value_spec import AllowedValueSet
 from shared.ising_feeder import FixedIsingFeeder, RandomIsingFeeder
 from shared.ising_model import IsingModel
 from shared.quantum_proof_of_work import (
@@ -257,6 +258,38 @@ class TestRandomIsingFeeder:
                 feeder.reseed(b"\x03" * 31, b"\x02" * 32)
             with pytest.raises(ValueError):
                 feeder.reseed(b"\x03" * 32, b"\x02" * 31)
+        finally:
+            feeder.stop()
+
+    def test_default_allowed_h_is_ternary(self):
+        """No allowed_h override → fields are the ternary chain default."""
+        feeder = _make_feeder(seed=71)
+        try:
+            models = [feeder.pop_blocking() for _ in range(5)]
+            seen = {v for m in models for v in m.h.values()}
+            assert seen.issubset({-1.0, 0.0, 1.0})
+            # Across several models at least one nonzero field appears (would be
+            # impossible if zero-field had leaked into the default path).
+            assert seen - {0.0}
+        finally:
+            feeder.stop()
+
+    def test_zero_field_allowed_h_zeroes_h_keeps_j(self):
+        """allowed_h=AllowedValueSet((0,)) → all h==0, J untouched (J-only class)."""
+        zero = AllowedValueSet((0,))
+        feeder = _make_feeder(seed=72, allowed_h=zero)
+        try:
+            model = feeder.pop_blocking()
+            assert all(v == 0.0 for v in model.h.values())
+            assert set(model.h.keys()) == set(_NODES)
+
+            # J must match a ternary-default recompute of the SAME nonce: the
+            # field spec changes h only, and h is sampled before J, so the J
+            # draw is identical. This pins that allowed_h doesn't perturb J.
+            _h_ternary, j_ternary = generate_ising_model_from_nonce(
+                model.nonce, _NODES, _EDGES,
+            )
+            assert model.J == j_ternary
         finally:
             feeder.stop()
 
