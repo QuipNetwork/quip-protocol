@@ -353,13 +353,13 @@ def test_all_allowed_log_levels_pass(level):
 
 
 # ----------------------------------------------------------------------
-# End-to-end: TOML backend tables → descriptor → System.remark payload
+# End-to-end: TOML backend tables → descriptor payload
 #
 # Regression tests for the security boundary under the v0.2 regime where
 # `[ibm] token = "..."` and similar credential-carrying TOML sections
 # now flow through `load_backend_config` into the cpu/gpu/qpu CLI
 # subcommands' miner_config dict (which `_auto_identify` then feeds
-# into the on-startup System.remark via `_identify_specs_from_miner_config`
+# into the on-startup descriptor via `_identify_specs_from_miner_config`
 # → `build_descriptor` → `to_canonical_json`).
 #
 # These exercise the FULL chain — loader, spec builder, descriptor
@@ -421,7 +421,7 @@ def _build_canonical_payload_from_toml(tmp_path, toml_body: str, node_id: str = 
 )
 def test_qpu_token_does_not_leak_to_remark_payload(tmp_path, vendor, sentinel):
     """Each gate-model vendor's `token = "<value>"` in TOML must not
-    appear anywhere in the canonical System.remark bytes.
+    appear anywhere in the canonical descriptor bytes.
 
     Regression guard: the spec builder DOES copy the token into the
     spec's cfg block (it's used in-process by the QPU sampler), so the

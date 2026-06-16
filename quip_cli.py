@@ -11,7 +11,6 @@ Runtime architecture is documented in ARCHITECTURE.md at the repo root.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import ipaddress
 import logging
 import os
@@ -64,7 +63,7 @@ from substrate.client import (
     SubstrateClient,
 )
 from substrate.miner_controller import SubstrateMinerController
-from substrate.remark import submit_remark
+from substrate.miner_registry import descriptor_call_params
 from shared.system_info import (
     DescriptorValidationError,
     _scrub,
@@ -82,10 +81,10 @@ _STARTUP_LOGGER = logging.getLogger("quip_miner.startup")
 # Funding, registration, and descriptor filing must each succeed before the
 # miner runs — they retry this many times with exponential backoff (delays
 # 5,10,20,40,45,45,45s ≈ 3.5 minutes) before failing the startup hard. The
-# node descriptor is filed right after register_miner, so its remark can race
-# the registration extrinsic's nonce (stale `accountNextIndex` for ~a block);
-# the retry rides that out. The per-round "participating" remark is separate
-# and stays best-effort — it is not gated here.
+# node descriptor is filed right after register_miner, so its extrinsic can
+# race the registration extrinsic's nonce (stale `accountNextIndex` for
+# ~a block); the retry rides that out. The per-round participation marker is
+# separate and stays best-effort — it is not gated here.
 _STARTUP_RETRY_ATTEMPTS = 8
 _STARTUP_RETRY_BASE_DELAY_SECONDS = 5.0
 _STARTUP_RETRY_MAX_DELAY_SECONDS = 45.0
@@ -221,13 +220,13 @@ async def _auto_identify(
     log_level: Optional[str],
     miners_config: dict,
 ) -> None:
-    """Guard E — file a signed NodeDescriptor remark and verify it lands.
+    """Guard E — file a signed on-chain NodeDescriptor and verify it lands.
 
     Called on every startup after registration. Filing the descriptor is a
     fatal startup requirement: a descriptor that can't be built/validated
     fails immediately (operator misconfiguration), and submission is retried
     over several minutes before failing hard via the ``descriptor-failed`` CLI
-    code. The per-round "participating" remark is a separate, best-effort
+    code. The per-round "participating" marker is a separate, best-effort
     signal and is not gated here. The descriptor's `miners` block is built
     from the same TOML-shaped dict that `MinerCore` used to spawn worker
     handles, so the descriptor always reflects the actual launched topology.
@@ -266,16 +265,19 @@ async def _auto_identify(
             f"error={type(exc).__name__}: {exc}"
         ) from exc
 
-    payload = to_canonical_json(descriptor)
-    payload_hash = hashlib.blake2b(payload, digest_size=32).hexdigest()
+    try:
+        call_params = descriptor_call_params(descriptor, node_id=effective_name)
+    except ValueError as exc:
+        raise click.ClickException(
+            f"descriptor-invalid ss58={keystore.signer.ss58_address()} "
+            f"error={exc}"
+        ) from exc
 
-    # Retry submission over several minutes: a remark fired right after
+    # Retry submission over several minutes: an extrinsic fired right after
     # register_miner can be rejected on a stale nonce until the registration
     # block is imported. Filing the descriptor is a fatal startup requirement.
     async def _attempt():
-        return await _submit_descriptor_remark(
-            client, keystore, payload=payload, payload_hash=payload_hash
-        )
+        return await _submit_descriptor(client, keystore, call_params=call_params)
 
     try:
         await _retry_until_verified("file-descriptor", _attempt)
@@ -286,42 +288,32 @@ async def _auto_identify(
         ) from exc
 
 
-async def _submit_descriptor_remark(
+async def _submit_descriptor(
     client: SubstrateClient,
     keystore,
     *,
-    payload: bytes,
-    payload_hash: str,
+    call_params: dict,
 ) -> Tuple[bool, str]:
-    """Submit the descriptor remark once.
+    """Submit the descriptor extrinsic once.
 
     Returns ``(True, "")`` when it lands in-block, else ``(False, detail)``
-    so the caller can back off and retry. Prefers
-    ``System.remark_with_event`` (dashboards key off the event) and falls back
-    to plain ``remark`` if the event variant fails to compose against the live
-    runtime.
+    so the caller can back off and retry.
     """
-    def _warn_fallback(exc: Exception) -> None:
-        _AUTO_IDENTIFY_LOGGER.warning(
-            "auto-identify: remark_with_event failed (%s); "
-            "retrying with plain remark",
-            exc,
-        )
-
     try:
-        receipt, call_function = await submit_remark(
-            client, keystore.signer, payload, on_fallback=_warn_fallback,
+        receipt = await client.submit_extrinsic(
+            "MinerRegistry",
+            "set_descriptor",
+            call_params,
+            keystore.signer,
+            wait_for="inblock",
         )
         if receipt.error:
-            return False, f"{call_function} rejected: {receipt.error}"
+            return False, f"set_descriptor rejected: {receipt.error}"
         _AUTO_IDENTIFY_LOGGER.info(
-            "auto-identify submitted: account=%s call=System.%s "
-            "extrinsic=%s payload_size=%d payload_hash=0x%s",
+            "auto-identify submitted: account=%s call=MinerRegistry.set_descriptor "
+            "extrinsic=%s",
             keystore.signer.ss58_address(),
-            call_function,
             receipt.extrinsic_hash,
-            len(payload),
-            payload_hash,
         )
         return True, ""
     except Exception as exc:  # noqa: BLE001 — observability path; caller retries
@@ -1410,7 +1402,7 @@ async def _run_startup_guards(
     # prerequisite; the controller still verifies before mining.
     await _ensure_registered_or_fail(client, keystore)
 
-    # Guard E — file the signed NodeDescriptor remark so dashboards can
+    # Guard E — file the signed on-chain NodeDescriptor so dashboards can
     # map our AccountId → node_name + advertised hardware. Retried over
     # several minutes and fatal on failure (descriptor-* codes); there is
     # no opt-out — descriptor visibility is part of the miner contract.
@@ -2213,15 +2205,13 @@ def quip_miner_qpu(
 
 
 # --------------------------------------------------------------------------
-# `quip-miner identify` — post a signed NodeDescriptor remark.
+# `quip-miner identify` — post a signed on-chain NodeDescriptor.
 #
 # Builds a v0.1-shaped `nodes.json` entry (schema=quip.node_descriptor.v1)
 # from auto-detected hardware + optional --miner-config, canonicalizes to
-# UTF-8 JSON, and submits via System.remark_with_event (falling back to
-# System.remark if the runtime metadata doesn't expose the eventful
-# variant). The signer's account is the canonical identity; the dashboard
-# indexer maps AccountId -> descriptor by scanning these remarks. See
-# MINERSURVEY.md for the wire format and Phase 2 roadmap.
+# UTF-8 JSON for dry-run previews. Live submission uses
+# MinerRegistry.set_descriptor. The signer's account is the canonical
+# identity; dashboards/indexers read MinerRegistry.NodeDescriptors.
 # --------------------------------------------------------------------------
 
 
@@ -2340,14 +2330,14 @@ def quip_miner_identify(
     skip_system_info: bool,
     dry_run: bool,
 ) -> None:
-    """Post a signed NodeDescriptor remark for this miner.
+    """Post a signed NodeDescriptor for this miner.
 
     The descriptor carries node_name, optional public_host/public_port,
     advertised rpc_endpoints, auto_mine flag, runtime block (python /
     quip_version / docker), miners block (from --miner-config), and an
     auto-detected system_info block (skippable with --no-system-info).
-    Submitted as `System.remark_with_event` so block indexers see the
-    canonical JSON without needing to scan extrinsic call data.
+    Submitted as `MinerRegistry.set_descriptor`; dry-run still prints the
+    canonical JSON preview used by the local REST/dashboard surface.
     """
     merged = _resolve_runtime_config(
         config_path=config_path,
@@ -2390,44 +2380,38 @@ def quip_miner_identify(
     except DescriptorValidationError as exc:
         raise click.ClickException(f"descriptor-invalid {exc}") from exc
 
-    payload = to_canonical_json(descriptor)
-    payload_hash = hashlib.blake2b(payload, digest_size=32).hexdigest()
-
     if dry_run:
+        payload = to_canonical_json(descriptor)
         click.echo(payload.decode("utf-8"))
         click.echo(
             f"\n# account            : {keystore.signer.ss58_address()}", err=True
         )
         click.echo(f"# payload_size_bytes : {len(payload)}", err=True)
-        click.echo(f"# payload_hash       : 0x{payload_hash}", err=True)
         return
+
+    try:
+        call_params = descriptor_call_params(descriptor, node_id=node_id)
+    except ValueError as exc:
+        raise click.ClickException(f"descriptor-invalid {exc}") from exc
 
     async def _do() -> int:
         client = await _connect_or_fail(tuple(merged["validators"]))
         try:
-            def _warn_fallback(exc: Exception) -> None:
-                # Some metadata caches answer "yes" but the active runtime
-                # rejects the call at compose time — degrade to plain remark
-                # rather than failing the whole identify.
-                click.echo(
-                    f"remark_with_event submission failed ({exc}); "
-                    f"retrying with plain remark",
-                    err=True,
-                )
-
-            receipt, call_function = await submit_remark(
-                client, keystore.signer, payload, on_fallback=_warn_fallback,
+            receipt = await client.submit_extrinsic(
+                "MinerRegistry",
+                "set_descriptor",
+                call_params,
+                keystore.signer,
+                wait_for="inblock",
             )
             if receipt.error:
-                click.echo(f"{call_function} failed: {receipt.error}", err=True)
+                click.echo(f"set_descriptor failed: {receipt.error}", err=True)
                 return 3
             click.echo("identify submitted")
             click.echo(f"  account            : {keystore.signer.ss58_address()}")
-            click.echo(f"  call               : System.{call_function}")
+            click.echo("  call               : MinerRegistry.set_descriptor")
             click.echo(f"  extrinsic_hash     : {receipt.extrinsic_hash}")
             click.echo(f"  block_hash         : {receipt.block_hash}")
-            click.echo(f"  payload_size_bytes : {len(payload)}")
-            click.echo(f"  payload_hash       : 0x{payload_hash}")
             return 0
         finally:
             await client.close()

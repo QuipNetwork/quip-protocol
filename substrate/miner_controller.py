@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import multiprocessing as mp
 import os
 import queue as _queue
@@ -62,9 +61,9 @@ from shared.signer import Signer
 from shared.stats_snapshot import StatsSnapshotWriter, snapshot_filename_for
 from substrate.telemetry_process import telemetry_main
 from substrate.client import SubstrateClient
+from substrate.miner_registry import participation_call_params
 from substrate.pool import ValidatorPool
 from substrate.pool_client import PoolClient
-from substrate.remark import submit_remark
 from substrate.decay_timing import TimingTracker
 from substrate.difficulty_decay import EnergyCurve, build_decay_schedule
 from substrate.submitter import (
@@ -231,12 +230,13 @@ _DISPATCH_CONTEXT_RETENTION = 4
 
 # Upper bound on the write-once participation dedup map. Generous because
 # solution numbers are monotonic and eviction is oldest-first, so a still-active
-# solution is never dropped (which would let its remark re-fire).
+# solution is never dropped (which would let its marker re-fire).
 _PARTICIPATION_RETENTION = 2048
 
-# Participation remark retry budget. The node submits one System.remark per
-# solution # from the same signer account the win submission uses, so a remark
-# can lose a nonce race and be rejected with ``1010 Transaction is outdated``;
+# Participation marker retry budget. The node submits one MinerRegistry
+# participate extrinsic per solution # from the same signer account the win
+# submission uses, so it can lose a nonce race and be rejected with
+# ``1010 Transaction is outdated``;
 # each retry re-composes (reading a fresh nonce) before giving up. ``RETRIES``
 # is the number of *additional* attempts after the first (total ≤ RETRIES + 1).
 _PARTICIPATION_REMARK_RETRIES = 3
@@ -531,10 +531,10 @@ class SubstrateMinerController:
         # operators can see live daily-budget usage; never drives submission.
         self._latest_budget: dict[str, Any] = {}
         # Write-once participation dedup: solution #s the node has already
-        # published a System.remark for. Node-level (one remark per solution#),
+        # published a participation marker for. Node-level (one marker per solution#),
         # keyed by solution# alone — not by per-instance miner id. Insertion-
         # ordered so the retention bound evicts the OLDEST entry, never an
-        # arbitrary still-active solution (which would re-fire its remark).
+        # arbitrary still-active solution (which would re-fire its marker).
         self._participated: "OrderedDict[int, None]" = OrderedDict()
         # Anticipatory-submission state (Task 6b).
         # ``_pow_constants`` caches the four decay constants
@@ -1804,14 +1804,14 @@ class SubstrateMinerController:
             return None
 
     def _mark_participating(self, msg: dict) -> None:
-        """Submit a write-once participation remark for this node + solution #.
+        """Submit a write-once participation extrinsic for this node + solution #.
 
         Node-level: dedups on ``solution_number`` alone, so the node publishes
         at most one marker per solution # however many miner instances report
         it. The marker identifies the node (our on-chain signer account), not
-        the per-instance worker — one remark per solution avoids N miner
+        the per-instance worker — one marker per solution avoids N miner
         instances racing the signer nonce (the ``1010 Transaction is outdated``
-        rejections). Spawns a best-effort, supervised task to submit the remark
+        rejections). Spawns a best-effort, supervised task to submit the marker
         (never blocks the drain loop; participation is observability, not
         consensus).
         """
@@ -1826,12 +1826,12 @@ class SubstrateMinerController:
         # propagate (the loop's broad except would shut the controller down —
         # an observability failure crashing mining); and pre-marking the
         # solution done before a transient failure would permanently suppress
-        # its remark. Resolve first, bail cleanly, mark done only on success.
+        # its marker. Resolve first, bail cleanly, mark done only on success.
         try:
             miner = self.signer.ss58_address()
         except Exception as exc:  # noqa: BLE001 — observability path
             logger.warning(
-                "participation remark skipped for solution %s: signer address "
+                "participation marker skipped for solution %s: signer address "
                 "unavailable (%s: %s); mining continues",
                 solution_number, type(exc).__name__, exc,
             )
@@ -1863,34 +1863,41 @@ class SubstrateMinerController:
         *,
         sleeper: Optional[Callable[[float], Awaitable[None]]] = None,
     ) -> None:
-        """Submit one participation remark (best-effort, retried, never raises).
+        """Submit one participation extrinsic (best-effort, retried, never raises).
 
-        Prefers ``System.remark_with_event`` (observable in block events),
-        falling back to plain ``System.remark`` — the same pattern as the
-        auto-identify flow. Submission goes through the parent ``build_client``,
-        the same signer account as the win submission, so a remark can lose a
-        nonce race and be rejected with ``1010 Transaction is outdated``. Each
-        attempt re-composes via :func:`submit_remark`, reading a fresh nonce, so
-        a stale-nonce rejection clears on retry. Retries transient submit
-        exceptions up to ``_PARTICIPATION_REMARK_RETRIES`` times with linear
-        backoff, then logs and swallows the final failure so mining continues.
-        ``sleeper`` is injected so tests run with zero real delay (defaults to
-        :func:`asyncio.sleep`).
+        Submission goes through the parent ``build_client``, the same signer
+        account as the win submission, so it can lose a nonce race and be
+        rejected with ``1010 Transaction is outdated``. Each attempt re-reads
+        ``QuantumPow.LatestQBlockId`` and re-composes ``MinerRegistry.participate``
+        for the current candidate qblock id, so stale-nonce and block-boundary
+        races can clear on retry. Retries transient submit exceptions up to
+        ``_PARTICIPATION_REMARK_RETRIES`` times with linear backoff, then logs
+        and swallows the final failure so mining continues. ``sleeper`` is
+        injected so tests run with zero real delay (defaults to :func:`asyncio.sleep`).
         """
-        if self.build_client is None:
+        if self.build_client is None or self.pool_client is None:
             return
         sleep = sleeper if sleeper is not None else asyncio.sleep
-        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         total_attempts = _PARTICIPATION_REMARK_RETRIES + 1
         for attempt in range(1, total_attempts + 1):
             try:
-                receipt, _call_function = await submit_remark(
-                    self.build_client, self.signer, body,
+                latest_qblock_id = await self.pool_client.query_latest_qblock_id()
+                call_params = participation_call_params(
+                    latest_qblock_id=latest_qblock_id,
+                    kind=payload.get("kind"),
+                    budget_seconds=payload.get("budget_seconds"),
+                )
+                receipt = await self.build_client.submit_extrinsic(
+                    "MinerRegistry",
+                    "participate",
+                    call_params,
+                    self.signer,
+                    wait_for="inblock",
                 )
             except Exception as exc:  # noqa: BLE001 — observability path; retry then swallow
                 if attempt < total_attempts:
                     logger.debug(
-                        "participation remark transient failure for %s on "
+                        "participation marker transient failure for %s on "
                         "attempt %d/%d (%s: %s); retrying",
                         payload.get("miner"), attempt, total_attempts,
                         type(exc).__name__, exc,
@@ -1898,7 +1905,7 @@ class SubstrateMinerController:
                     await sleep(_PARTICIPATION_REMARK_BACKOFF_S * attempt)
                     continue
                 logger.warning(
-                    "participation remark failed for %s after %d attempts "
+                    "participation marker failed for %s after %d attempts "
                     "(%s: %s); mining continues",
                     payload.get("miner"), total_attempts,
                     type(exc).__name__, exc,
@@ -1906,12 +1913,12 @@ class SubstrateMinerController:
                 return
             if receipt.error:
                 logger.warning(
-                    "participation remark rejected for %s (%s); mining continues",
+                    "participation marker rejected for %s (%s); mining continues",
                     payload.get("miner"), receipt.error,
                 )
                 return
             logger.info(
-                "participation remark submitted: miner=%s solution=%s budget=%s",
+                "participation marker submitted: miner=%s solution=%s budget=%s",
                 payload.get("miner"), payload.get("solution"),
                 payload.get("budget_seconds"),
             )
@@ -2603,7 +2610,7 @@ class SubstrateMinerController:
             elif op == "participating":
                 # Write-once participation marker for a solution #. Node-level
                 # (deduped per solution#, identified by our signer account, not
-                # this worker) + best-effort System.remark; never blocks drain.
+                # this worker) + best-effort MinerRegistry.participate; never blocks drain.
                 self._mark_participating(msg)
             elif op == "stats":
                 # Stats responses are pulled directly by callers of

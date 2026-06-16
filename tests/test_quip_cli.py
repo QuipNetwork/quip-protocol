@@ -523,9 +523,6 @@ def test_auto_identify_submission_failure_is_fatal(monkeypatch):
     import asyncio
 
     class FakeClient:
-        async def has_call(self, *_a, **_kw):
-            return True
-
         async def submit_extrinsic(self, *_a, **_kw):
             raise RuntimeError("validator rejected extrinsic")
 
@@ -579,9 +576,6 @@ def test_auto_identify_retries_then_posts(monkeypatch, caplog):
         def __init__(self):
             self.attempts = 0
 
-        async def has_call(self, *_a, **_kw):
-            return False  # plain remark
-
         async def submit_extrinsic(self, _module, _call, _args, _signer, **_kw):
             self.attempts += 1
             if self.attempts == 1:
@@ -619,11 +613,8 @@ def test_auto_identify_retries_then_posts(monkeypatch, caplog):
     ), [r.message for r in caplog.records]
 
 
-def test_auto_identify_falls_back_to_remark_after_remark_with_event_fails(
-    monkeypatch, caplog
-):
-    """If remark_with_event compose-time fails (cached metadata vs.
-    active runtime mismatch), the helper retries with plain remark."""
+def test_auto_identify_submits_miner_registry_descriptor(monkeypatch, caplog):
+    """Startup identification submits MinerRegistry.set_descriptor."""
     import asyncio
     import logging
 
@@ -636,13 +627,8 @@ def test_auto_identify_falls_back_to_remark_after_remark_with_event_fails(
         def __init__(self):
             self.calls = []
 
-        async def has_call(self, *_a, **_kw):
-            return True  # answer "yes" → preferred is remark_with_event
-
-        async def submit_extrinsic(self, module, call, _args, _signer, **_kw):
-            self.calls.append(call)
-            if call == "remark_with_event":
-                raise RuntimeError("runtime rejected call")
+        async def submit_extrinsic(self, module, call, args, _signer, **_kw):
+            self.calls.append((module, call, args))
             return FakeReceipt()
 
     class FakeSigner:
@@ -669,7 +655,13 @@ def test_auto_identify_falls_back_to_remark_after_remark_with_event_fails(
         log_level=None,
         miners_config={"cpu": {"num_cpus": 1}},
     ))
-    assert client.calls == ["remark_with_event", "remark"], client.calls
+    assert len(client.calls) == 1
+    module, call, params = client.calls[0]
+    assert (module, call) == ("MinerRegistry", "set_descriptor")
+    body = params["descriptor"]["V1"]
+    assert body["node_id"] == b"test-rig"
+    assert body["node_name"] == b"test-rig"
+    assert body["miners"][0]["kind"] == "Cpu"
 
 
 # ----------------------------------------------------------------------
@@ -775,8 +767,6 @@ def test_auto_identify_uses_detected_public_ip_when_unset(monkeypatch):
         block_hash = "0xdef"
 
     class FakeClient:
-        async def has_call(self, *_a, **_kw):
-            return False  # take the plain `remark` path
         async def submit_extrinsic(self, *_a, **_kw):
             return FakeReceipt()
 
@@ -827,8 +817,6 @@ def test_auto_identify_skips_detection_when_public_host_set(monkeypatch):
         block_hash = "0xdef"
 
     class FakeClient:
-        async def has_call(self, *_a, **_kw):
-            return False
         async def submit_extrinsic(self, *_a, **_kw):
             return FakeReceipt()
 
@@ -1051,12 +1039,13 @@ def test_quip_miner_qpu_default_qpu_type_with_toml_dwave_ok(monkeypatch, tmp_pat
     assert captured["miner_config"]["dwave"]["daily_budget"] == "120s"
 
 
-# ── _auto_identify secret-leakage guard (TOML → remark) ────────────────
+# ── _auto_identify secret-leakage guard (TOML → MinerRegistry) ─────────
 
 
-def _capture_auto_identify_payload(monkeypatch, miners_config: Dict[str, Any]) -> bytes:
-    """Run _auto_identify with a fake client and return the bytes that
-    would have been submitted as System.remark. Exercises the same
+def _capture_auto_identify_params(monkeypatch, miners_config: Dict[str, Any]) -> dict:
+    """Run _auto_identify with a fake client and return set_descriptor params.
+
+    Exercises the same
     code path that cpu/gpu/qpu subcommands invoke on every startup."""
     import asyncio
     captured: Dict[str, Any] = {}
@@ -1067,13 +1056,10 @@ def _capture_auto_identify_payload(monkeypatch, miners_config: Dict[str, Any]) -
         block_hash = "0xdef"
 
     class FakeClient:
-        async def has_call(self, *_a, **_kw):
-            return False  # use plain `remark`, simpler shape
-
         async def submit_extrinsic(self, module, call, args, _signer, **_kw):
             captured["module"] = module
             captured["call"] = call
-            captured["remark"] = args["remark"]
+            captured["params"] = args
             return FakeReceipt()
 
     class FakeSigner:
@@ -1098,9 +1084,12 @@ def _capture_auto_identify_payload(monkeypatch, miners_config: Dict[str, Any]) -
         log_level=None,
         miners_config=miners_config,
     ))
-    assert "remark" in captured, "_auto_identify did not call submit_extrinsic"
-    assert captured["module"] == "System"
-    return captured["remark"]
+    assert "params" in captured, "_auto_identify did not call submit_extrinsic"
+    assert (captured["module"], captured["call"]) == (
+        "MinerRegistry",
+        "set_descriptor",
+    )
+    return captured["params"]
 
 
 def test_auto_identify_does_not_leak_tokens_from_toml_loaded_miners_config(
@@ -1109,11 +1098,11 @@ def test_auto_identify_does_not_leak_tokens_from_toml_loaded_miners_config(
     """Full live-startup integration: write a TOML with every QPU
     vendor's `token`, load it through `load_backend_config`, hand the
     resulting dict to `_auto_identify`, and inspect the bytes that
-    would land on chain via `System.remark`.
+    would land on chain via `MinerRegistry.set_descriptor`.
 
     This is the regression test the v0.2 backend-table restoration
     needs. The descriptor pipeline is the only layer between the
-    in-memory `miners_config` dict and the on-chain remark; if any
+    in-memory `miners_config` dict and the on-chain descriptor; if any
     refactor in that layer regresses, this catches it."""
     from shared.miner_config import load_backend_config
 
@@ -1127,9 +1116,9 @@ def test_auto_identify_does_not_leak_tokens_from_toml_loaded_miners_config(
         '[origin]\ntoken = "origin-startup-sentinel-eeeee"\n'
     )
     miners_config = load_backend_config(p)
-    remark_bytes = _capture_auto_identify_payload(monkeypatch, miners_config)
+    params = _capture_auto_identify_params(monkeypatch, miners_config)
 
-    text = remark_bytes.decode("utf-8")
+    text = repr(params)
     for sentinel in (
         "ibm-startup-sentinel-aaaaa",
         "braket-startup-sentinel-bbbbb",
@@ -1138,18 +1127,20 @@ def test_auto_identify_does_not_leak_tokens_from_toml_loaded_miners_config(
         "origin-startup-sentinel-eeeee",
     ):
         assert sentinel not in text, (
-            f"secret leaked to System.remark payload: {sentinel}\n"
+            f"secret leaked to MinerRegistry descriptor: {sentinel}\n"
             f"payload was: {text}"
         )
 
-    # The vendor entries DID make it into the descriptor (the legitimate
-    # signal indexers need); just without the credentials.
-    import json
-    body = json.loads(text)
-    miners = body.get("miners", {})
+    # The vendor entries DID make it into the descriptor as backend labels
+    # (the legitimate signal indexers need); just without credentials.
+    miners = params["descriptor"]["V1"]["miners"]
+    backends = {
+        m["backend"].decode("utf-8")
+        for m in miners
+        if m.get("backend") is not None
+    }
     for vendor in ("ibm", "braket", "pasqal", "ionq", "origin"):
-        assert vendor in miners, f"{vendor} entry missing from descriptor"
-        assert "token" not in miners[vendor]
+        assert vendor in backends, f"{vendor} entry missing from descriptor"
 
 
 def test_auto_identify_blocks_credential_smuggled_through_solver(
@@ -1158,7 +1149,7 @@ def test_auto_identify_blocks_credential_smuggled_through_solver(
     """Live-startup path: a TOML where the operator pastes a credential
     into the solver field. The strict solver-name regex at
     `_qpu_spec_entry` drops the value before it reaches the descriptor,
-    so the remark gets submitted (with `solver` absent) — _auto_identify
+    so the descriptor gets submitted (with `solver` absent) — _auto_identify
     is best-effort by contract, it doesn't block mining on identify
     failures. Assert the bad value never leaves the process."""
     from shared.miner_config import load_backend_config
@@ -1171,8 +1162,8 @@ def test_auto_identify_blocks_credential_smuggled_through_solver(
         'solver = "DWAVE_API_KEY=smuggle-via-solver-1234"\n'
     )
     miners_config = load_backend_config(p)
-    remark_bytes = _capture_auto_identify_payload(monkeypatch, miners_config)
-    text = remark_bytes.decode("utf-8")
+    params = _capture_auto_identify_params(monkeypatch, miners_config)
+    text = repr(params)
     assert "DWAVE_API_KEY" not in text
     assert "smuggle-via-solver-1234" not in text
 

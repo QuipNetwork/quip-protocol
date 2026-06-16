@@ -134,6 +134,7 @@ def _bare_controller() -> SubstrateMinerController:
     # Default get_block_number returns 0; tests override as needed.
     c.pool_client.get_head = AsyncMock(return_value=b"\xff" * 32)
     c.pool_client.get_block_number = AsyncMock(return_value=0)
+    c.pool_client.query_latest_qblock_id = AsyncMock(return_value=None)
     # Default: no on-chain timestamp anchor (best-effort; tests override).
     c.pool_client.query_block_timestamp_ms = AsyncMock(return_value=None)
     c._shutdown_event = asyncio.Event()
@@ -1970,52 +1971,50 @@ def test_evict_resets_fire_status_key():
 
 
 # ----------------------------------------------------------------------
-# Participation marker (write-once System.remark per solution#, node-level)
+# Participation marker (write-once MinerRegistry.participate per solution#, node-level)
 # ----------------------------------------------------------------------
 
 
-async def test_participation_remark_submits_with_payload():
+async def test_participation_marker_submits_with_call_params():
     controller = _bare_controller()
-    controller.build_client.has_call = AsyncMock(return_value=True)
     controller.build_client.submit_extrinsic = AsyncMock(
         return_value=MagicMock(error=None)
     )
+    controller.pool_client.query_latest_qblock_id = AsyncMock(return_value=4)
     await controller._submit_participation_remark(
         {"schema": "quip-participation", "solution": 7, "miner": "qpu-0",
          "kind": "qpu", "budget_seconds": 90.0}
     )
     controller.build_client.submit_extrinsic.assert_awaited_once()
     args, kwargs = controller.build_client.submit_extrinsic.call_args
-    assert args[0] == "System"
-    assert args[1] == "remark_with_event"
-    body = args[2]["remark"]
-    payload = json.loads(body)
-    assert payload["schema"] == "quip-participation"
-    assert payload["solution"] == 7
-    assert payload["miner"] == "qpu-0"
-    assert payload["kind"] == "qpu"
-    assert payload["budget_seconds"] == 90.0
+    assert args[0] == "MinerRegistry"
+    assert args[1] == "participate"
+    assert args[2] == {
+        "qblock_id": 5,
+        "kind": "QpuDwave",
+        "budget_seconds": 90,
+    }
+    assert kwargs["wait_for"] == "inblock"
 
 
-async def test_participation_remark_falls_back_to_plain_remark():
+async def test_participation_marker_uses_first_qblock_when_no_latest_id():
     controller = _bare_controller()
-    controller.build_client.has_call = AsyncMock(return_value=True)
-    # remark_with_event raises; plain remark succeeds.
+    controller.pool_client.query_latest_qblock_id = AsyncMock(return_value=None)
     controller.build_client.submit_extrinsic = AsyncMock(
-        side_effect=[RuntimeError("no event variant"), MagicMock(error=None)]
+        return_value=MagicMock(error=None)
     )
     await controller._submit_participation_remark(
         {"schema": "quip-participation", "solution": 1, "miner": "cpu-0",
          "kind": "cpu"}
     )
-    assert controller.build_client.submit_extrinsic.await_count == 2
-    second_call = controller.build_client.submit_extrinsic.call_args_list[1]
-    assert second_call.args[1] == "remark"
+    args, _kwargs = controller.build_client.submit_extrinsic.call_args
+    assert args[2]["qblock_id"] == 1
+    assert args[2]["kind"] == "Cpu"
 
 
 async def test_participation_remark_retries_transient_then_succeeds():
     controller = _bare_controller()
-    controller.build_client.has_call = AsyncMock(return_value=False)
+    controller.pool_client.query_latest_qblock_id = AsyncMock(return_value=2)
     # First attempt fails with a stale-nonce "outdated" error (the reported
     # 1010 Invalid Transaction); the retry re-composes a fresh nonce and lands.
     controller.build_client.submit_extrinsic = AsyncMock(
@@ -2042,7 +2041,7 @@ async def test_participation_remark_swallows_persistent_failure():
     from substrate.miner_controller import _PARTICIPATION_REMARK_RETRIES
 
     controller = _bare_controller()
-    controller.build_client.has_call = AsyncMock(return_value=False)
+    controller.pool_client.query_latest_qblock_id = AsyncMock(return_value=2)
     controller.build_client.submit_extrinsic = AsyncMock(
         side_effect=RuntimeError("rpc down")
     )
@@ -2066,7 +2065,7 @@ async def test_mark_participating_dedups_per_solution_across_instances():
     controller = _bare_controller()
     controller._submit_participation_remark = AsyncMock(return_value=None)
     # Two different miner instances report the SAME solution # → exactly one
-    # node-level remark (deduped on solution#, not on the per-instance worker).
+    # node-level marker (deduped on solution#, not on the per-instance worker).
     controller._mark_participating(
         {"solution_number": 5, "kind": "qpu", "budget_seconds": 90.0}
     )
@@ -2121,7 +2120,7 @@ async def test_mark_participating_evicts_oldest_deterministically(monkeypatch):
     controller = _bare_controller()
     controller._submit_participation_remark = AsyncMock(return_value=None)
     # Add 4 with retention 3 → the OLDEST (1) is evicted, never an arbitrary
-    # (possibly still-active) entry that would re-fire its remark.
+    # (possibly still-active) entry that would re-fire its marker.
     for sol in (1, 2, 3, 4):
         controller._mark_participating({"solution_number": sol, "kind": "cpu"})
     await asyncio.sleep(0)
@@ -2130,7 +2129,7 @@ async def test_mark_participating_evicts_oldest_deterministically(monkeypatch):
 
 async def test_participation_remark_receipt_error_is_terminal():
     controller = _bare_controller()
-    controller.build_client.has_call = AsyncMock(return_value=False)
+    controller.pool_client.query_latest_qblock_id = AsyncMock(return_value=2)
     controller.build_client.submit_extrinsic = AsyncMock(
         return_value=MagicMock(error="System.ExtrinsicFailed")
     )
@@ -2138,8 +2137,8 @@ async def test_participation_remark_receipt_error_is_terminal():
     async def _no_sleep(_seconds: float) -> None:
         return None
 
-    # An included-but-rejected remark won't be fixed by resubmitting the same
-    # body — it's terminal, not retried (no pointless resubmission storm).
+    # An included-but-rejected marker won't be fixed by resubmitting the same
+    # call — it's terminal, not retried (no pointless resubmission storm).
     await controller._submit_participation_remark(
         {"schema": "quip-participation", "solution": 4, "miner": "5Test",
          "kind": "cpu"},
@@ -2150,16 +2149,12 @@ async def test_participation_remark_receipt_error_is_terminal():
 
 async def test_participation_remark_retries_when_fallback_path_also_fails():
     controller = _bare_controller()
-    controller.build_client.has_call = AsyncMock(return_value=True)
-    # Attempt 1: remark_with_event raises (caught inside submit_remark →
-    # fallback), then plain remark ALSO raises and ESCAPES submit_remark — this
-    # is the literal 1010-outdated nonce race the retry loop exists for. Attempt
-    # 2: the recomposed (fresh-nonce) plain remark lands.
+    controller.pool_client.query_latest_qblock_id = AsyncMock(side_effect=[2, 3])
+    # Attempt 1 loses a stale-nonce race. Attempt 2 re-reads LatestQBlockId and
+    # recomposes for the new candidate qblock before landing.
     controller.build_client.submit_extrinsic = AsyncMock(side_effect=[
-        RuntimeError("no event variant"),              # a1 remark_with_event
-        RuntimeError("1010 Transaction is outdated"),  # a1 plain (escapes)
-        RuntimeError("no event variant"),              # a2 remark_with_event
-        MagicMock(error=None),                         # a2 plain — lands
+        RuntimeError("1010 Transaction is outdated"),
+        MagicMock(error=None),
     ])
 
     async def _no_sleep(_seconds: float) -> None:
@@ -2170,7 +2165,9 @@ async def test_participation_remark_retries_when_fallback_path_also_fails():
          "kind": "qpu"},
         sleeper=_no_sleep,
     )
-    assert controller.build_client.submit_extrinsic.await_count == 4
+    assert controller.build_client.submit_extrinsic.await_count == 2
+    assert controller.build_client.submit_extrinsic.call_args_list[0].args[2]["qblock_id"] == 3
+    assert controller.build_client.submit_extrinsic.call_args_list[1].args[2]["qblock_id"] == 4
 
 
 

@@ -721,7 +721,7 @@ class BaseMiner(ABC):
                 so a budget-starved QPU dispatch that aborts never fires it).
                 Receives ``(solution_number, extra_dict)`` where ``extra_dict``
                 is ``self._participation_extra()`` (QPU adds ``budget_seconds``).
-                Drives the controller's write-once participation remark.
+                Drives the controller's write-once participation marker.
                 Default ``None`` = no-op; a failing callback never breaks mining.
             **kwargs: Forwarded to ``_pre_mine_setup``.
 
@@ -2343,5 +2343,4 @@ class _BridgeNodeInfo:
             miner_id="0x" + context.miner_account_bytes.hex(),
             miner_account_bytes=context.miner_account_bytes,
         )
-
 

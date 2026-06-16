@@ -301,7 +301,7 @@ def miner_worker_main(
             # Write-once participation channel. The miner calls this exactly
             # once per accepted dispatch (after its budget gate passes) with the
             # solution number + backend-specific extras (QPU: budget_seconds).
-            # The controller dedups and submits the participation remark.
+            # The controller dedups and submits the participation marker.
             # Best-effort: a put failure must not break mining.
             def _emit_participating(
                 solution_number: int, extra: Dict[str, Any],
@@ -499,4 +499,3 @@ class MinerHandle:
             raise ValueError(
                 f"Miner {self.miner_id} did not respond to get_stats: {msg}"
             )
-
