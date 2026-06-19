@@ -111,6 +111,17 @@ check-version:
     name: gcr.io/kaniko-project/executor:v1.23.2-debug
     entrypoint: [""]
   before_script:
+    # The cuda runners' NVIDIA container runtime bind-mounts host GPU driver
+    # firmware into every job container at /lib/firmware/nvidia/. kaniko's
+    # rootfs extraction cannot replace /lib with the usr-merge symlink while
+    # those mounts are busy, so the executor runs with --ignore-path=/lib,
+    # which skips that replacement and preserves /lib as a plain directory.
+    # The ELF interpreter resolves through /lib/x86_64-linux-gnu (via the
+    # /lib64 → /usr/lib64 → /lib/x86_64-linux-gnu symlink chain), so RUN
+    # commands need this shim. It dangles until kaniko unpacks the rootfs,
+    # and never reaches the image: /lib is excluded from snapshots and the
+    # final image's /lib symlink comes from the base layers.
+    - mkdir -p /lib && ln -sfn /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu
     - mkdir -p /kaniko/.docker
     - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(echo -n ${CI_REGISTRY_USER}:${CI_REGISTRY_PASSWORD} | base64)\"}}}" > /kaniko/.docker/config.json
   rules: !reference [.shared_image_rules, rules]
@@ -127,15 +138,14 @@ build-cpu-amd64:
   extends: .docker_build
   tags: [linux, amd64]
   script:
-    # --ignore-path=/lib/firmware: GPU runners bind-mount host NVIDIA firmware
-    # into the container; kaniko can't remove /lib to recreate the usr-merge
-    # symlink while those mounts are busy, so it must skip that subtree.
+    # --ignore-path=/lib: paired with the /lib/x86_64-linux-gnu shim in the
+    # .docker_build before_script — see the comment there.
     - /kaniko/executor
         --context $CI_PROJECT_DIR
         --dockerfile docker/Dockerfile.cpu
         --build-arg QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA
         --destination $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA-amd64
-        --ignore-path=/lib/firmware
+        --ignore-path=/lib
 
 build-cpu-arm64:
   stage: build
@@ -193,15 +203,14 @@ build-cuda:
       for tag in $MUTABLE_TAGS; do
         DESTINATIONS="$DESTINATIONS --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$tag"
       done
-      # --ignore-path=/lib/firmware: GPU runners bind-mount host NVIDIA firmware
-      # into the container; kaniko can't remove /lib to recreate the usr-merge
-      # symlink while those mounts are busy, so it must skip that subtree.
+      # --ignore-path=/lib: paired with the /lib/x86_64-linux-gnu shim in the
+      # .docker_build before_script — see the comment there.
       /kaniko/executor \
         --context $CI_PROJECT_DIR \
         --dockerfile docker/Dockerfile.cuda \
         --build-arg QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA \
         $DESTINATIONS \
-        --ignore-path=/lib/firmware
+        --ignore-path=/lib
 
 # ---------------------------------------------------------------------------
 # PyInstaller native binaries
