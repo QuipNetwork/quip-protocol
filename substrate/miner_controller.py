@@ -2028,6 +2028,12 @@ class SubstrateMinerController:
             c_easy_milli=constants.curve_c_easy_milli,
             c_knee_milli=constants.curve_c_knee_milli,
             c_hard_milli=constants.curve_c_hard_milli,
+            # Spec-aware: the chain calibrates the curve against the default
+            # topology's field/coupling specs (quip-protocol-rs MR !35). The
+            # context carries the snapshot's specs, so the local curve tracks
+            # an operator topology repoint (e.g. to an h=0 spin glass).
+            allowed_h=ctx.allowed_h_values,
+            allowed_j=ctx.allowed_j_values,
         )
         return base, int(last_proof_block), constants, curve
 

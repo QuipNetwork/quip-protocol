@@ -31,6 +31,14 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
+from shared.allowed_value_spec import (
+    MILLI_SCALE,
+    AllowedValueContinuousRange,
+    AllowedValueIntegerRange,
+    AllowedValueSet,
+    AllowedValueSpec,
+    EmptyAllowedValues,
+)
 from shared.decay_math import step_for_energy
 from substrate.types import SubstrateDifficulty
 
@@ -79,18 +87,31 @@ class EnergyCurve:
         c_easy_milli: int,
         c_knee_milli: int,
         c_hard_milli: int,
+        *,
+        allowed_h: Optional[AllowedValueSpec] = None,
+        allowed_j: Optional[AllowedValueSpec] = None,
     ) -> "EnergyCurve":
         """Build a curve matching ``EnergyCurve::new`` in the Rust.
 
         c values are stored on chain as scaled u32 (e.g. 700 = 0.70)
         because pallet constants must implement ``Get<_>`` and ``f64``
         does not implement ``Encode``. They divide by 1000 here before
-        feeding into ``expected_gse_with_c``.
+        feeding into ``expected_gse_for_specs``.
+
+        ``allowed_h`` / ``allowed_j`` are the default topology's field and
+        coupling value specs. The chain derives the curve's mean magnitudes
+        from them (``expected_gse_for_specs``), so a zero-field topology
+        (``allowed_h = Set([0])``) gets a curve with no h contribution. When
+        omitted they default to the legacy ternary-h / binary-J specs, which
+        reproduce the pre-spec-aware ``expected_gse_with_c`` bit-for-bit — so
+        callers against the legacy default topology need no change.
         """
+        h = allowed_h if allowed_h is not None else _LEGACY_H_SPEC
+        j = allowed_j if allowed_j is not None else _LEGACY_J_SPEC
         return cls(
-            min_milli=_expected_gse_with_c(num_nodes, num_edges, c_hard_milli / 1000.0),
-            knee_milli=_expected_gse_with_c(num_nodes, num_edges, c_knee_milli / 1000.0),
-            max_milli=_expected_gse_with_c(num_nodes, num_edges, c_easy_milli / 1000.0),
+            min_milli=_expected_gse_for_specs(num_nodes, num_edges, c_hard_milli / 1000.0, h, j),
+            knee_milli=_expected_gse_for_specs(num_nodes, num_edges, c_knee_milli / 1000.0, h, j),
+            max_milli=_expected_gse_for_specs(num_nodes, num_edges, c_easy_milli / 1000.0, h, j),
         )
 
 
@@ -269,26 +290,95 @@ def _saturating_sub(a: int, b: int) -> int:
     return _saturating_add(a, -b)
 
 
-def _expected_gse_with_c(num_nodes: int, num_edges: int, c: float) -> int:
-    """Port of ``quantum_validation::expected_gse_with_c``.
+# Empirical SA alignment-efficiency factor for the field term, calibrated
+# against the v0.1 Python reference. Applies only to the h contribution.
+# Mirrors ``quantum_validation::energy::DEFAULT_H_ALPHA``.
+_DEFAULT_H_ALPHA: float = 0.88
+
+# Legacy registered specs: ternary field {-1, 0, +1} (⟨|h|⟩ = 2/3) and binary
+# coupling {-1, +1} (⟨|J|⟩ = 1.0), expressed in milli units. Used as the
+# default so ``expected_gse_for_specs`` over them reproduces the old hardcoded
+# ``expected_gse_with_c`` exactly.
+_LEGACY_H_SPEC: AllowedValueSpec = AllowedValueSet((-MILLI_SCALE, 0, MILLI_SCALE))
+_LEGACY_J_SPEC: AllowedValueSpec = AllowedValueSet((-MILLI_SCALE, MILLI_SCALE))
+
+
+def _discrete_mean_abs(min_v: int, max_v: int) -> float:
+    """Mean of |i| over the uniform integer distribution on ``[min, max]``.
+
+    Mirrors ``quantum_validation::energy::discrete_mean_abs``. Python ints are
+    arbitrary precision, so the straddle-zero triangular sum is always exact.
+    """
+    if max_v < min_v:
+        raise EmptyAllowedValues("allowed value spec is empty or inverted")
+    if min_v >= 0:
+        return (min_v + max_v) / 2.0
+    if max_v <= 0:
+        return -(min_v + max_v) / 2.0
+    # Straddles zero: Σ|i| = T(-min) + T(max) with T(k) = k(k+1)/2.
+    triangle = lambda k: k * (k + 1) // 2  # noqa: E731
+    sum_abs = triangle(-min_v) + triangle(max_v)
+    span = max_v - min_v + 1
+    return sum_abs / span
+
+
+def _mean_abs_unit(spec: AllowedValueSpec) -> float:
+    """Mean |value| of a spec on the unit scale (1.0 == ``MILLI_SCALE`` milli),
+    under the spec's own uniform sampling distribution.
+
+    Mirrors ``quantum_validation::energy::mean_abs_unit``.
+    """
+    if isinstance(spec, AllowedValueSet):
+        if not spec.values:
+            raise EmptyAllowedValues("allowed value spec is empty")
+        sum_abs_milli = sum(abs(int(v)) for v in spec.values)
+        return sum_abs_milli / (len(spec.values) * MILLI_SCALE)
+    if isinstance(spec, AllowedValueIntegerRange):
+        # IntegerRange samples whole integers scaled by MILLI_SCALE, so the
+        # integers themselves are already unit scale.
+        return _discrete_mean_abs(spec.min, spec.max)
+    if isinstance(spec, AllowedValueContinuousRange):
+        # ContinuousRange samples integer milli steps, so the discrete mean
+        # over milli values divided by MILLI_SCALE is exact.
+        return _discrete_mean_abs(spec.min, spec.max) / MILLI_SCALE
+    raise TypeError(f"unknown AllowedValueSpec variant: {type(spec).__name__}")
+
+
+def _expected_gse_for_specs(
+    num_nodes: int,
+    num_edges: int,
+    c: float,
+    allowed_h: AllowedValueSpec,
+    allowed_j: AllowedValueSpec,
+) -> int:
+    """Port of ``quantum_validation::expected_gse_for_specs``.
 
     Constants and formula must match ``crates/quantum-validation/src/
-    energy.rs`` exactly — the chain registers topologies with curve
-    bounds it computes via this function, so any Python drift would
+    energy.rs`` exactly — the chain calibrates the difficulty curve via this
+    function on the default topology's value specs, so any Python drift would
     yield a different ``EnergyCurve`` and a different decay trajectory.
     """
     if num_nodes == 0 or num_edges == 0:
         return 0
-    DEFAULT_H_NONZERO_FRACTION = 2.0 / 3.0
-    DEFAULT_H_ALPHA = 0.88
-    MILLI_SCALE = 1_000
+    h_mean_abs = _mean_abs_unit(allowed_h)
+    j_mean_abs = _mean_abs_unit(allowed_j)
     n = float(num_nodes)
     m = float(num_edges)
     avg_degree = (2.0 * m) / n
     sqrt_avg_degree = math.sqrt(avg_degree)
-    j_contribution = -c * sqrt_avg_degree * n
-    h_contribution = -c * DEFAULT_H_ALPHA * DEFAULT_H_NONZERO_FRACTION * n / sqrt_avg_degree
+    j_contribution = -c * j_mean_abs * sqrt_avg_degree * n
+    h_contribution = -c * _DEFAULT_H_ALPHA * h_mean_abs * n / sqrt_avg_degree
     return _libm_round((j_contribution + h_contribution) * MILLI_SCALE)
+
+
+def _expected_gse_with_c(num_nodes: int, num_edges: int, c: float) -> int:
+    """Port of ``quantum_validation::expected_gse_with_c``.
+
+    The legacy curve hardcodes ternary-h / binary-J magnitudes; this delegates
+    to :func:`_expected_gse_for_specs` over the legacy specs so the two paths
+    stay bit-identical (the Rust ships the same equivalence test).
+    """
+    return _expected_gse_for_specs(num_nodes, num_edges, c, _LEGACY_H_SPEC, _LEGACY_J_SPEC)
 
 
 __all__ = [

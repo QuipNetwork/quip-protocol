@@ -401,6 +401,21 @@ class SubstrateClient:
                 return False
         return await self._run(_probe)
 
+    async def has_storage(self, module: str, function: str) -> bool:
+        """Return True iff the runtime metadata exposes storage ``module.function``.
+
+        Mirrors :meth:`has_call` for storage items: substrate-interface returns
+        ``None`` (or raises) for an absent storage function, so we treat both as
+        "not present". Used to pick the right winning-solution counter across the
+        ``WinningSolutions``→``QBlockCount`` rename (quip-protocol-rs MR !35).
+        """
+        def _probe() -> bool:
+            try:
+                return self._iface.get_metadata_storage_function(module, function) is not None
+            except Exception:
+                return False
+        return await self._run(_probe)
+
     async def get_finalized_head(self) -> bytes:
         return bytes.fromhex(
             strip_0x(await self._run(lambda: self._iface.get_chain_finalised_head()))
@@ -744,18 +759,28 @@ class SubstrateClient:
             return None
 
     async def query_winning_solution_count(self) -> int:
-        """Return the number of recorded ``QuantumPow.WinningSolutions``.
+        """Return the number of recorded winning solutions (qblocks).
 
-        The chain stores no solution counter — solutions are keyed in the
-        ``WinningSolutions`` map by the block number they won at. The ordinal
-        *solution number* is therefore the count of that map's keys, and the
-        solution currently being mined is ``count + 1`` (computed by the
-        controller, cached per round). Enumerates *keys only* via
-        ``state_getKeysPaged`` over the storage prefix — one cheap RPC per
-        ``KEYS_PAGE_SIZE`` keys, not a full value scan. Returns ``0`` on a
-        fresh chain with no winners yet.
+        The ordinal *solution number* is this count; the solution currently
+        being mined is ``count + 1`` (computed by the controller, cached per
+        round). Returns ``0`` on a fresh chain with no winners yet.
+
+        Two runtime layouts are supported (quip-protocol-rs MR !35 renamed the
+        storage ``WinningSolutions``→``QBlocks`` and added a direct counter):
+
+        - New runtime: ``QBlockCount`` is a ``u64`` ``StorageValue`` — one O(1)
+          read.
+        - Old runtime: solutions are keyed in the ``WinningSolutions`` map by
+          the block number they won at; count its keys via ``state_getKeysPaged``
+          (*keys only* — one cheap RPC per ``KEYS_PAGE_SIZE`` keys, no value
+          scan).
         """
-
+        if await self.has_storage("QuantumPow", "QBlockCount"):
+            result = await self._run(
+                lambda: self._iface.query("QuantumPow", "QBlockCount")
+            )
+            value = _storage_value(result)
+            return int(value) if value is not None else 0
         return await self._run(
             lambda: _count_map_keys(
                 self._iface, "QuantumPow", "WinningSolutions",

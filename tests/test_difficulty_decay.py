@@ -17,11 +17,13 @@ import math
 
 import pytest
 
+from shared.allowed_value_spec import AllowedValueSet
 from substrate.difficulty_decay import (
     DECAY_RATE_MILLI,
     MIN_DECAY_DELTA_MILLI,
     Direction,
     EnergyCurve,
+    _expected_gse_for_specs,
     adjust_energy_along_curve,
     apply_decay,
     current_difficulty,
@@ -116,6 +118,61 @@ def test_energy_curve_zero_nodes_or_edges() -> None:
     assert curve.max_milli == 0
     curve = EnergyCurve.from_topology(2, 0, 700, 750, 800)
     assert curve.min_milli == 0
+
+
+# ----------------------------------------------------------------------
+# Spec-aware curve — mirrors expected_gse_for_specs (quip-protocol-rs MR !35)
+# ----------------------------------------------------------------------
+
+# Legacy registered specs: ternary h {-1,0,+1} (⟨|h|⟩ = 2/3) and binary J.
+_LEGACY_H_SET = AllowedValueSet((-1000, 0, 1000))
+_LEGACY_J_SET = AllowedValueSet((-1000, 1000))
+
+
+def test_expected_gse_for_specs_matches_legacy_for_default_specs() -> None:
+    """Feeding the legacy ternary/binary specs must reproduce the old
+    hardcoded formula bit-for-bit — the Python mirror of the Rust test
+    ``expected_gse_for_specs_matches_legacy_for_default_specs``."""
+    for n, m in ((TEST_NODES, TEST_EDGES), (1368, 7692), (4800, 48000)):
+        for c in (0.700, 0.725, 0.750, 0.800):
+            assert _expected_gse_for_specs(
+                n, m, c, _LEGACY_H_SET, _LEGACY_J_SET
+            ) == _expected_gse_milli(n, m, c)
+
+
+def test_expected_gse_for_specs_zero_field_drops_h_term() -> None:
+    """h = {0} → pure ±J spin glass. n=1024,m=2048,c=0.75: avg degree 4,
+    √4=2 → -0.75·1.0·2·1024 = -1536.0 → -1_536_000 milli. Mirrors the
+    Rust ``expected_gse_for_specs_zero_field_drops_h_term``."""
+    zero_h = AllowedValueSet((0,))
+    assert _expected_gse_for_specs(1024, 2048, 0.75, zero_h, _LEGACY_J_SET) == -1_536_000
+
+
+def test_from_topology_default_specs_match_explicit_legacy() -> None:
+    """``from_topology`` with no specs must equal passing the legacy specs
+    explicitly — old call sites stay valid against the legacy default
+    topology with zero behavior change."""
+    implicit = EnergyCurve.from_topology(1368, 7692, 700, 750, 800)
+    explicit = EnergyCurve.from_topology(
+        1368, 7692, 700, 750, 800,
+        allowed_h=_LEGACY_H_SET, allowed_j=_LEGACY_J_SET,
+    )
+    assert implicit == explicit
+
+
+def test_from_topology_zero_field_curve_less_negative() -> None:
+    """A zero-field (h={0}) topology yields a strictly less-negative curve
+    than the ternary-field curve of the same graph — the chain credits no
+    energy the puzzle cannot produce."""
+    zero_h = AllowedValueSet((0,))
+    legacy = EnergyCurve.from_topology(1368, 7692, 700, 750, 800)
+    zero_field = EnergyCurve.from_topology(
+        1368, 7692, 700, 750, 800,
+        allowed_h=zero_h, allowed_j=_LEGACY_J_SET,
+    )
+    assert zero_field.min_milli > legacy.min_milli
+    assert zero_field.knee_milli > legacy.knee_milli
+    assert zero_field.max_milli > legacy.max_milli
 
 
 # ----------------------------------------------------------------------
