@@ -127,11 +127,15 @@ build-cpu-amd64:
   extends: .docker_build
   tags: [linux, amd64]
   script:
+    # --ignore-path=/lib/firmware: GPU runners bind-mount host NVIDIA firmware
+    # into the container; kaniko can't remove /lib to recreate the usr-merge
+    # symlink while those mounts are busy, so it must skip that subtree.
     - /kaniko/executor
         --context $CI_PROJECT_DIR
         --dockerfile docker/Dockerfile.cpu
         --build-arg QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA
         --destination $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA-amd64
+        --ignore-path=/lib/firmware
 
 build-cpu-arm64:
   stage: build
@@ -189,11 +193,15 @@ build-cuda:
       for tag in $MUTABLE_TAGS; do
         DESTINATIONS="$DESTINATIONS --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$tag"
       done
+      # --ignore-path=/lib/firmware: GPU runners bind-mount host NVIDIA firmware
+      # into the container; kaniko can't remove /lib to recreate the usr-merge
+      # symlink while those mounts are busy, so it must skip that subtree.
       /kaniko/executor \
         --context $CI_PROJECT_DIR \
         --dockerfile docker/Dockerfile.cuda \
         --build-arg QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA \
-        $DESTINATIONS
+        $DESTINATIONS \
+        --ignore-path=/lib/firmware
 
 # ---------------------------------------------------------------------------
 # PyInstaller native binaries
