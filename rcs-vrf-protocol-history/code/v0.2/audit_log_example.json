@@ -1,0 +1,206 @@
+[
+  {
+    "leg": "PROTOCOL_PARAMS",
+    "data": {
+      "n_qubits": 8,
+      "depth": 10,
+      "shots_per_circuit": 1000,
+      "num_circuits": 100,
+      "chi_low": 0.15,
+      "chi_high": 2.5,
+      "noise_rate": 0.005,
+      "epsilon": 2.3283064365386963e-10,
+      "extractor_output_bits": 64
+    },
+    "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "hash": "cff11cd3cd0467319627d2681f36560dec432393d45acf4dd2de92dd5d90640d",
+    "timestamp": 1779390447.3605738
+  },
+  {
+    "leg": "LEG_1_VRF",
+    "data": {
+      "public_input": "726f756e645f315f626c6f636b5f6865696768745f31323334",
+      "n_participants": 5,
+      "vrf_construction": "Ed25519-Sign + SHA3-256 (VRF-like, v0.2)",
+      "contributions": [
+        {
+          "index": 0,
+          "pk": "133bd9368b098a1ae6faf7214015daca8ab6223b23245e480684fa57778bbada",
+          "beta": "aa069f42f30b1976f813d85b1e8f1c97b622224db1b5ea882139ad8456e2924f",
+          "pi": "1f82f0dc2ea08c5eb3ee9483596a045f0c93c79e2a038313c278ab80585e2edf069c08f7b951a30f4d152578e4a7d8080441dbfd69e4e481ac2bf9d1dea4970c"
+        },
+        {
+          "index": 1,
+          "pk": "36a6601cc805a426e713c25f9995beaf5b69279b1f9c204bae3210c01cd05ada",
+          "beta": "c3727ec6ba565af50ea65a374f47a502b7f89684f53c2e0c677f105e03406179",
+          "pi": "b9b910267d89fbe0a1e5f806471c63cb86b0d588df20f9a06bcba4c6220e761e708bf8b958b61d56c282ba7b00836b1fbcb5ec9634249fda34a2604f7b5ebf02"
+        },
+        {
+          "index": 2,
+          "pk": "cc6245f3dc899e7afcc4da9d1af70b658e043b49808f47b2539ffa3515b4f880",
+          "beta": "223f03755b797d275d609f4e1074eddcdb5803d36b8c8de4ca40fe8b545f0675",
+          "pi": "fe5dd733fb4fb8fd262aa5186ec33e8ed435566f29dafa913573ac31e703993442690d5044d6c685e437449a3da6ad5ebfb73b6b17cfb8f53f5205229af9c708"
+        },
+        {
+          "index": 3,
+          "pk": "a7841f97d344785d6fcd007c00e11f1262427447f3002cac58aea7929a0135b1",
+          "beta": "c4f2a2e073a325aede41ea6b450cdfb9c6cf5f15ccd3bb0ba4e0fe4b487314e2",
+          "pi": "4485d9457055b5f6c0504f5170a518b10d6a96ed8b5264656b8cf42e4bb1132a2b8c5648b6a911c6a6304c3f4c6df2b5cf06ef2ba6cc38177e56bf4a195c030d"
+        },
+        {
+          "index": 4,
+          "pk": "9514410b3f7b27bd048a24a076897af52654a59ab183bcf4cf28d81d060efd56",
+          "beta": "6553110e01989ed816f248af3f3bc077432b34c51f1f310fe4e181691a7423c3",
+          "pi": "19dcb43d4d2ceb986e475985e554e2eae71e00f8756a80e3b4c128815dd5033bcb49bae94313bc4cf1b9aae7762e357c26b1a315addfa141d4feb3541ad4d00f"
+        }
+      ],
+      "verification_results": [
+        {
+          "index": 0,
+          "signature_valid": true,
+          "beta_matches_hash_of_pi": true,
+          "accepted": true
+        },
+        {
+          "index": 1,
+          "signature_valid": true,
+          "beta_matches_hash_of_pi": true,
+          "accepted": true
+        },
+        {
+          "index": 2,
+          "signature_valid": true,
+          "beta_matches_hash_of_pi": true,
+          "accepted": true
+        },
+        {
+          "index": 3,
+          "signature_valid": true,
+          "beta_matches_hash_of_pi": true,
+          "accepted": true
+        },
+        {
+          "index": 4,
+          "signature_valid": true,
+          "beta_matches_hash_of_pi": true,
+          "accepted": true
+        }
+      ],
+      "concatenated_length_bytes": 160,
+      "aggregation": "H(beta_1 || ... || beta_n) where H = SHA3-256",
+      "seed_after_H": "f86af835ca025af9eb5a4b77e1c0c11e418884049e800f4781cfb1375fde3c42",
+      "seed_length_bytes": 32
+    },
+    "prev_hash": "cff11cd3cd0467319627d2681f36560dec432393d45acf4dd2de92dd5d90640d",
+    "hash": "27a4eef3b39a654ee5191c8afebc72d0484126d95f8c675583a3095b085a9cb7",
+    "timestamp": 1779390447.3641198
+  },
+  {
+    "leg": "LEG_3_CIRCUIT",
+    "data": {
+      "n_qubits": 8,
+      "depth": 10,
+      "connectivity": "all-to-all (random perfect matching per layer)",
+      "seed_hex": "f86af835ca025af9eb5a4b77e1c0c11e418884049e800f4781cfb1375fde3c42...",
+      "bits_consumed": 1336,
+      "circuit_moment_count": 44,
+      "circuit_gate_count": 305
+    },
+    "prev_hash": "27a4eef3b39a654ee5191c8afebc72d0484126d95f8c675583a3095b085a9cb7",
+    "hash": "1c27b0eca08567651715b8aafd2bbb6f018e6a4e7fa220632bc80e1a2f0e1eba",
+    "timestamp": 1779390447.3684626
+  },
+  {
+    "leg": "LEG_4_SAMPLING",
+    "data": {
+      "shots": 1000,
+      "n_qubits": 8,
+      "wall_time_seconds": 1.3918631076812744,
+      "first_5_samples": [
+        [
+          1,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          1,
+          1,
+          0,
+          1,
+          1
+        ],
+        [
+          0,
+          1,
+          1,
+          0,
+          1,
+          0,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          1,
+          1,
+          0,
+          0,
+          1,
+          0
+        ],
+        [
+          1,
+          1,
+          0,
+          1,
+          0,
+          0,
+          1,
+          1
+        ]
+      ]
+    },
+    "prev_hash": "1c27b0eca08567651715b8aafd2bbb6f018e6a4e7fa220632bc80e1a2f0e1eba",
+    "hash": "7431770d5b763230c56e2843092f9214ca3633a71e272279ee9d3d78448f5779",
+    "timestamp": 1779390448.760527
+  },
+  {
+    "leg": "LEG_5_XEB",
+    "data": {
+      "f_xeb": 0.5218147039413452,
+      "chi_low": 0.15,
+      "chi_high": 2.5,
+      "lower_check_passed": true,
+      "upper_check_passed": true,
+      "accepted": true,
+      "rejection_reason": null,
+      "mean_p_observed": 0.00594458868727088,
+      "n_samples_scored": 1000
+    },
+    "prev_hash": "7431770d5b763230c56e2843092f9214ca3633a71e272279ee9d3d78448f5779",
+    "hash": "9cc40017ba5809688924da437653e5ab942d8f6367b82ef22f785678383e5e79",
+    "timestamp": 1779390448.7805207
+  },
+  {
+    "leg": "LEG_6_EXTRACTION",
+    "data": {
+      "input_bits": 8000,
+      "output_bits": 64,
+      "drand_seed_hex": "3240948b2bf22c241a5a8a6fff281e4c35f15f242dc83e60ed00a64e3d70f4ed",
+      "extractor": "Toeplitz",
+      "output_hex": "14a17378698bc739"
+    },
+    "prev_hash": "9cc40017ba5809688924da437653e5ab942d8f6367b82ef22f785678383e5e79",
+    "hash": "fe68ade31f1d93ff1523bd07db29a972c45faad12881d2d3b61c80336bbf7b12",
+    "timestamp": 1779390449.1599653
+  }
+]

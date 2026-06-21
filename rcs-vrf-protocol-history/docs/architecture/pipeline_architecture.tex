@@ -1,0 +1,385 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tcolorbox}
+
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection.}{0.5em}{}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!50!black,
+    urlcolor=blue!50!black,
+}
+
+\title{RCS + VRF Subnet --- Pipeline Architecture \\
+\large A seven-leg architecture for provably-quantum, on-chain-verifiable randomness}
+\author{Personal working notes}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Document purpose}
+
+This document elaborates on the architecture of the proposed RCS + VRF subnet, synthesizing the certification mechanism from Liu et al.\ 2025 (random circuit sampling with cross-entropy benchmarking) with the traceability machinery from Kavuri et al.\ 2025 (the Twine protocol of distributed intertwined hash chains). It's a working specification --- detailed enough to show the architecture is coherent and the design choices are defensible, while flagging the open questions that benchmarking and team conversations will resolve.
+
+The audience is anyone wanting to understand how the subnet would actually work end-to-end: what each component does, what attack it defends against, what comes from which paper, and what's still undecided.
+
+\section{One-page summary}
+
+\paragraph{Goal.} A Bittensor subnet that produces \emph{certified-random bits} --- output that is (a) genuinely random, originating from quantum measurement, (b) classically verifiable, so any participant can confirm the bits weren't faked, and (c) on-chain auditable, so the entire generation process is tamper-evident.
+
+\paragraph{Why this is a proof-of-quantumness service.} The certification rests on a complexity-theoretic argument: a quantum computer can sample from the output distribution of a random circuit faster than any classical attacker can fake samples that pass the same statistical test. A miner without quantum hardware therefore cannot produce valid output --- so participation in the subnet \emph{is} evidence of quantum capability. This is what positions the subnet as a proof-of-quantum-work mechanism that incentivizes major quantum providers (IonQ, Quantinuum, IBM, Google) to compete.
+
+\paragraph{The pipeline in one line.} VRF contributions $\to$ parameter precommitment $\to$ combined seed $\to$ deterministic circuit $\to$ multi-host quantum sampling $\to$ XEB verification with timing check $\to$ extraction with independent seed $\to$ Twine-anchored on-chain publication.
+
+\paragraph{Seven legs, two complementary security guarantees.}
+
+\begin{itemize}
+    \item \textbf{VRF certifies the input.} It guarantees the seed used to generate the quantum circuit was produced honestly --- no participant could have biased it, ground for favorable outputs, or kept it hidden from others.
+    \item \textbf{XEB certifies the output.} It guarantees the bitstrings returned by miners really came from running the circuit on quantum hardware, not faked classically. XEB is about integrity of the response; it guarantees the work was done quantumly.
+    \item These two sit at different layers and are complementary, not alternatives. Both are required.
+    \item Twine hash chains wrap everything, making the entire pipeline cryptographically auditable end-to-end.
+\end{itemize}
+
+\paragraph{Where the ingredients come from.}
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Leg} & \textbf{Source} \\
+\midrule
+1. VRF-based seed generation & Chainlink VRF / RANDAO patterns \\
+2. Protocol parameter precommitment & Kavuri et al.\ (PEF precommit pattern) \\
+3. Deterministic circuit specification & Liu et al.\ (circuit family + PRG expansion) \\
+4. Multi-host quantum sampling & Liu et al.\ + Kavuri (three-party generalization) \\
+5. Classical XEB verification & Liu et al.\ (XEB + timing check) \\
+6. Randomness extraction & Liu et al.\ (Toeplitz/Cryptomite) or Kavuri (TMPS Trevisan) \\
+7. Twine-style hash-chain anchoring & Kavuri et al.\ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Leg 1 --- VRF-based seed generation}
+
+\paragraph{Role.} Produce an unbiasable, publicly verifiable seed that nobody could have ground for favorable outputs.
+
+\paragraph{Inputs.} A shared public input $x$ that no participant controls. Typically: previous round's output, the current block height, and a public nonce, concatenated.
+
+\paragraph{Process.} Each of $n$ classical participants on the subnet holds a VRF keypair $(sk_i, pk_i)$ with public keys $pk_i$ registered on-chain. On the shared input $x$, each participant computes:
+\[
+(y_i, \pi_i) = \text{VRF}_{sk_i}(x)
+\]
+where $y_i$ is the VRF output (looks uniformly random to anyone without $sk_i$) and $\pi_i$ is a non-interactive zero-knowledge proof that $y_i$ is the unique correct output for input $x$ under public key $pk_i$. Each participant publishes $(y_i, \pi_i)$ on-chain.
+
+Anyone with $pk_i$ can run the verification algorithm and confirm $(y_i, \pi_i)$ is legitimate without learning anything about $sk_i$. Invalid contributions are discarded.
+
+The combined seed is then computed deterministically:
+\[
+\text{seed} = H(y_1 \| y_2 \| \ldots \| y_k)
+\]
+across all valid contributions, using a cryptographic hash $H$ (SHA-3 or BLAKE3). The seed is $\sim$256 bits.
+
+\paragraph{Outputs.} A 256-bit seed, plus the set of $(y_i, \pi_i)$ tuples preserved for audit.
+
+\paragraph{Properties enforced.}
+\begin{itemize}
+    \item \textbf{Unbiasability.} No single participant can choose the seed: each VRF output is the unique correct value given their secret key and the public input, so they can't grind for favorable outputs.
+    \item \textbf{Public verifiability.} Anyone can re-run the verification on each $(y_i, \pi_i)$ and re-hash to confirm the seed is the correct deterministic function of public inputs.
+    \item \textbf{Unpredictability before publication.} Until participants publish their $y_i$, nobody (including other participants) can predict the seed --- it depends on every participant's secret key.
+\end{itemize}
+
+\paragraph{Why VRF instead of RANDAO.} RANDAO is multi-party commit-reveal: participants commit hashes of secrets, then reveal. The known weakness is the last-revealer attack --- whoever reveals last can see all other contributions and choose whether to publish their own (biasing the result). VRFs eliminate this: there's no commit-reveal asymmetry, just ``produce the unique VRF output or be marked as abstaining.'' A participant who doesn't like their contribution cannot pretend their machine crashed and avoid releasing their value while keeping the option to release.
+
+\paragraph{Open questions.} The team's preferred VRF construction (ECVRF? threshold BLS?) needs to be confirmed with Medi. If many independent participants are expected, threshold-VRF or aggregate VRF schemes could distribute trust further.
+
+\section{Leg 2 --- Protocol parameter precommitment}
+
+\paragraph{Role.} Bind the protocol's verification parameters \emph{before} the seed is finalized, eliminating adaptive-choice attacks where parameters could be tuned after seeing the seed.
+
+\paragraph{Inputs.} The current protocol epoch number, plus protocol-defined defaults for parameters that may be updated.
+
+\paragraph{Process.} On the subnet's parameter hash chain, the following are publicly committed for the round before the VRF contributions in Leg 1 are finalized:
+
+\begin{itemize}
+    \item Circuit family description (gate set, topology, layer pattern --- e.g., ``Liu et al.\ edge-coloured graph SU(2)+U\_ZZ at $n=32$, depth $d=10$'').
+    \item The PRG used to expand seed $\to$ circuit (e.g., SHAKE-256).
+    \item Number of circuits per round $M$.
+    \item Number of shots per circuit.
+    \item XEB acceptance threshold $\chi$.
+    \item Timing threshold $t_{\text{threshold}}$.
+    \item Size of verification subset $m$ chosen by validators.
+    \item Randomness extractor used and its parameters.
+    \item Soundness target $\varepsilon_{\text{sou}}$.
+    \item Independent-seed source for the extractor (e.g., next drand pulse).
+\end{itemize}
+
+\paragraph{Outputs.} A signed, hash-chained parameter commitment block referencing the round number.
+
+\paragraph{Properties enforced.}
+\begin{itemize}
+    \item \textbf{No adaptive parameter choice.} Validators can't tune $\chi$ down after seeing bad samples, or up after seeing good ones.
+    \item \textbf{Symmetry of expectations.} All participants (miners, validators, on-chain consumers, external auditors) work from the same parameter set without trust.
+    \item \textbf{Replayability.} Any external verifier can read the parameter commitment and re-run the round end-to-end.
+\end{itemize}
+
+\paragraph{Why this leg matters.} This is the most underrated lesson from Kavuri. Their PEFs are recalibrated daily but committed before each round's Bell data is taken. Without this pattern, a malicious validator could observe bad samples and selectively loosen $\chi$ to accept them, or observe good samples and selectively tighten $\chi$ to reject (and thus deny rewards). Precommitment makes the parameter choice non-adversarial.
+
+\paragraph{Open questions.} How often are parameters updated (per round? per epoch? per protocol upgrade?). Whether the parameter commitment is on the main chain or a sidechain. The governance process for parameter changes.
+
+\section{Leg 3 --- Deterministic circuit specification}
+
+\paragraph{Role.} Transform the 256-bit seed into a complete, reproducible quantum circuit description.
+
+\paragraph{Inputs.} The seed from Leg 1, plus the circuit family and PRG specification from Leg 2.
+
+\paragraph{Process.} The seed feeds a deterministic pseudorandom generator (SHAKE-256 in PRG mode, ChaCha20, or similar), which produces a long pseudorandom byte stream. The stream is consumed by the circuit generation algorithm.
+
+Following Liu et al.'s recipe:
+
+\begin{enumerate}
+    \item Sample a random graph $G$ on $n$ qubits --- typically an edge-coloured random graph with all-to-all connectivity, where the colouring determines the order of two-qubit-gate application.
+    \item For each of $d$ layers:
+        \begin{itemize}
+            \item Sample $n$ independent random SU(2) single-qubit gates (each specified by three Euler angles drawn from the PRG stream).
+            \item Apply fixed $U_{ZZ}$ two-qubit entangling gates along the edges of $G$, in the order determined by the edge colouring (gates of the same colour applied in parallel, different colours sequenced).
+        \end{itemize}
+\end{enumerate}
+
+The result is a complete circuit description $C$: a list of (gate, qubits, parameters) tuples.
+
+\paragraph{Outputs.} A circuit specification $C$ --- typically serialized as a JSON or OpenQASM document --- fully determined by the seed and the parameter commitment.
+
+\paragraph{Properties enforced.}
+\begin{itemize}
+    \item \textbf{Determinism.} Same seed $+$ same parameters $\to$ same circuit. Always.
+    \item \textbf{Public reproducibility.} Validators, external auditors, and any participant can independently regenerate $C$ from the public seed and parameter commitment.
+    \item \textbf{Pseudorandomness over the circuit family.} If the seed is uniformly random (Leg 1 ensures this), the circuit is statistically indistinguishable from a uniformly drawn circuit in the family, up to small computational distinguishing advantage.
+    \item \textbf{Cannot be precomputed.} Since the seed is unknown until Leg 1 finalizes, miners can't prepare samples in advance. The seed-to-circuit-to-miner path must complete within a window short enough that the miner's quantum hardware is the only realistic compute resource available --- this addresses Colton's fourth requirement (``cannot be pre-prepared'').
+\end{itemize}
+
+\paragraph{Why this circuit family.} The Liu et al.\ choice (SU(2) random rotations $+$ $U_{ZZ}$ entanglers on edge-coloured graphs) achieves three things together: (1) the SU(2) rotations provide local randomness, (2) the edge-coloured graph provides rapid mixing across qubits (faster than 2D nearest-neighbor), and (3) the structure is an approximate 2-design at modest depth --- meaning XEB-relevant moments match Haar-random behavior to good approximation. Sycamore-style brickwork and IBM heavy-hex circuits are alternative choices; the right pick depends on which platforms our miners use.
+
+\paragraph{Open questions.} Whether to use Liu et al.'s exact recipe or a variant. Whether to fix one circuit family for the whole protocol or allow per-platform variants (e.g., Quantinuum miners use all-to-all, IBM miners use heavy-hex). The latter would need separate validator simulations per platform.
+
+\section{Leg 4 --- Multi-host quantum sampling}
+
+\paragraph{Role.} Execute the circuit on real quantum hardware and return measurement samples, fast enough that classical simulation by an attacker can't keep up.
+
+\paragraph{Inputs.} Circuit specification $C$, distributed to one or more quantum miners.
+
+\paragraph{Process.} Each miner takes $C$ and submits it to their quantum hardware (IonQ, Quantinuum H-series, IBM Heron, Google Willow, etc.). The hardware:
+
+\begin{enumerate}
+    \item Initializes $n$ qubits in the $|0\rangle^{\otimes n}$ state.
+    \item Applies the gates of $C$ in order.
+    \item Measures all $n$ qubits in the computational basis.
+    \item Returns a bitstring $x \in \{0,1\}^n$.
+\end{enumerate}
+
+This is one shot. The miner repeats this $M$ times (or shots-per-circuit-per-miner times if multiple circuits are batched). Each shot is an independent run; results are independent samples from the circuit's output distribution $p(x) = |\langle x | C | 0 \rangle|^2$.
+
+The miner must return all $M$ samples within the protocol-specified time window $t_{\text{threshold}}$. If samples arrive late, they are rejected even if otherwise valid.
+
+\paragraph{The multi-host generalization (from Kavuri).} Rather than a single quantum miner per round, the subnet supports multiple miners running the same circuit in parallel (or running related circuits whose outputs combine). This is the structural analog of Kavuri's three-party split (NIST/CU/drand), lifted to the quantum sampling layer. The benefits:
+
+\begin{itemize}
+    \item \textbf{No single-vendor trust.} If IBM's hardware were silently compromised, IonQ's and Quantinuum's still produce honest output.
+    \item \textbf{Cross-validation.} Different miners' samples on the same circuit should produce statistically similar XEB scores; large divergences flag a misbehaving miner.
+    \item \textbf{Economic competition.} Miners with higher fidelity earn proportionally more, incentivizing fidelity improvements.
+    \item \textbf{Resilience to vendor outages.} A round can still produce output if some miners are unavailable.
+\end{itemize}
+
+\paragraph{Outputs.} For each miner $j$: a set of $M$ bitstrings $\{x_1^{(j)}, \ldots, x_M^{(j)}\}$, plus a signed timestamp proving they were returned within $t_{\text{threshold}}$, plus a checksum of the data.
+
+\paragraph{Properties enforced.}
+\begin{itemize}
+    \item \textbf{Quantum-hardware-required.} On honest hardware, executing the circuit takes microseconds to milliseconds per shot. On classical simulation at the protocol's $(n, d)$, it takes far longer than $t_{\text{threshold}}$ allows.
+    \item \textbf{Not pre-computable.} The circuit is unknown until Leg 1 finalizes; miners cannot prepare samples in advance.
+    \item \textbf{Subject to noise.} Real hardware has fidelity $< 1$. Some fraction of shots are corrupted by noise rather than sampled from $p(x)$. This is what XEB will measure as $\phi_{\text{honest}}$.
+\end{itemize}
+
+\paragraph{Open questions.} How many miners per round (2? 5? variable?). How to handle miner failures and timeouts (drop just the late miner, or fail the round?). Whether the protocol mandates a specific quantum provider's API or accepts any.
+
+\section{Leg 5 --- Classical XEB verification}
+
+\paragraph{Role.} Score the returned samples for evidence of genuine quantum sampling, and reject rounds that fail either the statistical test (XEB) or the timing test.
+
+\paragraph{Inputs.} The samples $\{x_1, \ldots, x_M\}$ from each miner, the circuit $C$ (recomputed deterministically from the public seed), and the timestamps.
+
+\paragraph{Process.} Validators perform three checks per round:
+
+\subparagraph{Check 1: Timing.} Was the response received within $t_{\text{threshold}}$? Compare the timestamps. Cheap.
+
+\subparagraph{Check 2: Sample integrity.} Sanity filter --- no obviously fake patterns (all-zero strings, periodic data, etc.). Also cheap.
+
+\subparagraph{Check 3: XEB scoring.} The expensive part. Validators select a random subset of $m$ samples from the $M$ submitted (Liu et al.\ used $m \approx 1500$). For each sample $x_i$ in the subset, validators classically simulate the circuit using tensor-network contraction to compute the ideal amplitude:
+\[
+p(x_i) = |\langle x_i | C | 0 \rangle|^2
+\]
+Then compute the linear cross-entropy benchmark:
+\[
+F_{\text{XEB}} = \frac{2^n}{m} \sum_{i=1}^{m} p(x_i) - 1
+\]
+This score has the property that:
+\begin{itemize}
+    \item Honest quantum samples with fidelity $\phi$ produce $F_{\text{XEB}} \approx \phi$.
+    \item Uniform random samples produce $F_{\text{XEB}} \approx 0$.
+\end{itemize}
+The round is accepted iff $F_{\text{XEB}} \geq \chi$ AND the timing check passed. Otherwise rejected.
+
+\paragraph{Outputs.} Per round: an accept/reject decision, the computed $F_{\text{XEB}}$ (preserved for audit and miner-reward calculation), the timing data, and the subset of indices used for verification.
+
+\paragraph{The security argument.} The Aaronson--Hung inequality bounds the classical adversary's spoofing capability:
+\[
+\phi_{\text{honest}} > \frac{A \cdot t_{\text{threshold}}}{B(n, d)}
+\]
+where $A$ is the adversary's compute budget, $t_{\text{threshold}}$ is the timing window, and $B(n, d)$ is the cost of one classical circuit simulation. If this holds, no adversary can produce samples passing both XEB and timing checks. Parameter selection in Leg 2 must enforce this inequality.
+
+\paragraph{Re-verifiability.} Anyone with the seed (which is publicly committed), the parameter commitment (Leg 2), and the samples (published on-chain) can recompute $C$ and re-run XEB to confirm the validator's decision. This is the property Colton specifically called out: validators \emph{or external auditors or anyone else} can verify the round.
+
+\paragraph{Open questions.} The computationally hardest aspect of the whole protocol. Specifically:
+\begin{itemize}
+    \item What $(n, d)$ are feasible for subnet validators? See the separate parameter feasibility study.
+    \item What's the optimal $m$ that balances cost vs.\ statistical confidence?
+    \item Should validators use the same tensor-network software and contraction order (canonical) or compete on contraction quality (adversarial)?
+    \item How are multiple miners' XEB scores aggregated when the protocol is multi-host?
+\end{itemize}
+
+\section{Leg 6 --- Randomness extraction}
+
+\paragraph{Role.} Convert the raw biased quantum samples into uniformly random bits suitable for cryptographic use.
+
+\paragraph{Inputs.} The accepted samples (across one or more miners), an independent extractor seed (from drand or similar), and the certified min-entropy bound derived from the XEB score.
+
+\paragraph{Process.} Two sub-steps.
+
+\subparagraph{Min-entropy bounding.} The raw samples have some min-entropy $H_{\min}$ that depends on the measured $F_{\text{XEB}}$. Approximately, $H_{\min} \approx M \cdot n \cdot f(F_{\text{XEB}})$ where $f$ is a fidelity-to-entropy conversion derived from the Aaronson--Hung security analysis. The exact bound is technical; for our purposes, what matters is that we can compute a rigorous lower bound on the raw samples' min-entropy after passing XEB.
+
+\subparagraph{Extraction.} The raw samples plus the independent seed are fed into a strong randomness extractor. Two natural choices:
+
+\begin{itemize}
+    \item \textbf{Toeplitz extractor (Liu et al.\ via Cryptomite library).} Fast, well-characterized, used by Liu et al.\ Output length depends on input min-entropy and chosen error.
+    \item \textbf{TMPS Trevisan extractor (Kavuri et al.).} Slower but more output-efficient; widely used in DI-QRNG literature. Requires more seed bits.
+\end{itemize}
+
+The extractor takes biased input of min-entropy $H_{\min}$ and produces $\ell$ uniformly random output bits where $\ell$ is bounded by:
+\[
+\ell \leq H_{\min} - 2 \log(1/\varepsilon_x) - O(1)
+\]
+for some extractor-specific constants and target error $\varepsilon_x$.
+
+\paragraph{Outputs.} A short string of near-uniformly-random bits with provable min-entropy $\geq \ell - \log(1/\varepsilon_x)$, plus the extractor seed used and the input min-entropy bound.
+
+\paragraph{Why the independent seed is critical.} A Trevisan extractor (or any seeded extractor) needs an independent uniform seed to extract from a non-uniform source. If the seed and the source share entropy with an adversary, the extraction is compromised. The independent seed should come from a source orthogonal to the VRF layer: drand is the obvious choice, since it's:
+\begin{itemize}
+    \item Cryptographically random (threshold-BLS signatures).
+    \item Time-scheduled --- drand publishes pulses on a known schedule, so the protocol can precommit to using ``the next drand pulse after time $T$'' before that pulse is known.
+    \item Independent of the subnet's own randomness sources.
+\end{itemize}
+This matches Kavuri's drand integration exactly.
+
+\paragraph{Open questions.} Which extractor (Toeplitz vs.\ TMPS Trevisan) is the right tradeoff for our throughput targets. Whether the independent seed comes from drand directly or via a wrapper chain. How many output bits per round (depends on $M$, $n$, $F_{\text{XEB}}$, $\varepsilon_x$).
+
+\section{Leg 7 --- Twine-style hash-chain anchoring}
+
+\paragraph{Role.} Create a tamper-evident audit trail spanning the entire protocol execution, so that every step can be cryptographically verified after the fact by anyone.
+
+\paragraph{Inputs.} All artifacts from Legs 1--6: VRF tuples $(y_i, \pi_i)$, parameter commitment, combined seed, circuit specification, per-miner samples and timestamps, validator XEB scores and decisions, drand pulse, extractor inputs and outputs, and the final extracted bits.
+
+\paragraph{Process.} Following the Kavuri Twine pattern, multiple independent parties maintain hash chains and \emph{intertwine} them by including each other's pulse hashes. The minimum set of chains for our subnet would be:
+
+\begin{enumerate}
+    \item \textbf{VRF contributor chain(s)} --- one per VRF participant, recording their published $(y_i, \pi_i)$ tuples per round.
+    \item \textbf{Subnet orchestration chain} --- analog of CURBy-Q. Records parameter commitments, the combined seed, the circuit specification, and the round-by-round protocol state.
+    \item \textbf{Quantum miner chain(s)} --- one per miner. Records the sample data checksum and the timestamps.
+    \item \textbf{Validator chain} --- records XEB scores, accept/reject decisions, and the verification subsets used.
+    \item \textbf{drand wrapper chain} --- records the drand pulses consumed as extractor seeds.
+    \item \textbf{Output chain} --- records the final extracted bits per round, with hashes pointing to the full audit trail.
+    \item \textbf{Time-stamping chain} (optional but recommended) --- external RFC 3161 timestamp service to provide independent timing certification.
+\end{enumerate}
+
+Each chain's pulses include both internal links (to previous pulses on the same chain) and external mixins (hashes of pulses from other chains). Together they form a directed acyclic graph that is tamper-evident at the granularity of the entire protocol.
+
+\paragraph{Outputs.} A continuously updated DAG of hash-chained pulses, available via an HTTP API or directly on-chain. The final extracted bits are published on the output chain as the consumable subnet output.
+
+\paragraph{Properties enforced.}
+\begin{itemize}
+    \item \textbf{End-to-end auditability.} Any external party can fetch the DAG, verify all hash links, and re-run every protocol step from public data.
+    \item \textbf{Tamper-evidence.} Modifying any artifact retroactively requires rewriting all subsequent hash chains AND coordinating with every other party whose chain references the changed data. Detection is essentially guaranteed.
+    \item \textbf{Time-ordering.} The DAG enforces a partial ordering on events: hypothesis before data, data before extraction, extraction before output. Adaptive attacks (where parameters are chosen after observing data) become detectable.
+    \item \textbf{Decentralized trust.} No single party controls the audit trail. Even compromising the subnet operator wouldn't compromise an external auditor's ability to detect tampering.
+\end{itemize}
+
+\paragraph{Implementation.} Following Kavuri's choices: SHA3-512 hashing, DAG-CBOR serialization, content-addressed pulses via CIDs (IPLD data model), RSA-4096 or ES256 signatures. The Twine specification and reference implementation at \href{https://github.com/buff-beacon-project}{github.com/buff-beacon-project} would be a starting point, adapted for the subnet's specific chain structure.
+
+\paragraph{Open questions.} Where the DAG is stored (IPFS? a dedicated indexer? on the host blockchain directly?). The economic model for chain operators (does the subnet pay for chain hosting, or do participants run their own?). The relationship between Twine and the Bittensor consensus mechanism --- whether these are independent or integrated.
+
+\section{Summary of attacks the pipeline defends against}
+
+\begin{center}
+\begin{tabular}{lp{4.5cm}p{6cm}}
+\toprule
+\textbf{Attack} & \textbf{Description} & \textbf{Defended by} \\
+\midrule
+Biased seed & Adversary chooses a seed that produces favorable circuits & Leg 1 (VRF unbiasability) \\
+Grinding & Adversary tries many seeds to find favorable outputs & Leg 1 (VRF uniqueness per public input) \\
+Last-revealer attack & In commit-reveal, last participant withholds to bias output & Leg 1 (VRF has no commit-reveal asymmetry) \\
+Adaptive parameter tuning & Validator changes $\chi$ after seeing samples & Leg 2 (parameter precommitment) \\
+Circuit ambiguity & Disagreement on which circuit was supposed to run & Leg 3 (deterministic expansion) \\
+Pre-computation & Miner caches samples in advance & Legs 1+2+3 (seed unknown until just before round) \\
+Classical spoofing & Adversary fakes samples without quantum hardware & Leg 4+5 (timing + XEB inequality $\phi > At/B$) \\
+Heavy-output guessing & Partial classical simulation to pick high-$p(x)$ samples & Leg 5 (parameter choice in $A t / B$) \\
+Single-vendor compromise & One quantum provider's hardware is corrupted & Leg 4 (multi-host) \\
+Forged samples & Miner submits unrelated bitstrings & Leg 5 (XEB scoring) \\
+Late samples & Miner is slow & Leg 5 (timing check) \\
+Non-uniform output & Raw quantum samples aren't directly usable as cryptographic randomness & Leg 6 (randomness extraction) \\
+Compromised extractor seed & Extractor seed correlated with quantum samples & Leg 6 (independent drand seed) \\
+Post-hoc tampering & Adversary alters historical records to fake past rounds & Leg 7 (Twine hash chains) \\
+Collusion across audit parties & Multiple parties coordinate to rewrite history & Leg 7 (intertwined DAG makes this exponentially harder as network grows) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Every defense rests on a different assumption --- cryptographic hardness for VRFs and hashing, computational hardness for XEB, physical correctness of the quantum hardware --- which means a single broken assumption doesn't compromise the whole protocol.
+
+\section{What's still open}
+
+This pipeline is a working architecture, but several decisions and validations are still required:
+
+\paragraph{Parameters.} The $(n, d)$ choice for the circuits is the load-bearing decision. The separate parameter feasibility study sketches the tradeoff between honest miner fidelity, classical spoofing resistance, and validator simulation cost. The provisional recommendation is $(n, d) = (32, 10)$ all-to-all, but actual benchmarking is needed.
+
+\paragraph{VRF construction.} Which VRF variant the team is standardizing on, and how it integrates with the existing Bittensor subnet infrastructure. Conversation with Medi needed.
+
+\paragraph{Miner pool.} Which quantum providers we target first (Quantinuum seems natural given Liu et al.'s hardware), how many miners per round, how to handle different platforms with different connectivities.
+
+\paragraph{Multi-host integration details.} How miners' samples are combined --- concatenated, cross-validated, threshold-aggregated. Affects both verification cost and security analysis.
+
+\paragraph{Throughput vs.\ soundness tradeoff.} Liu et al.\ used $\varepsilon = 2^{-64}$ and produced bits slowly. Kavuri achieved 512 bits per pulse at the same $\varepsilon$. What's the right target for an on-chain randomness service consumed by casinos, NFTs, and loot boxes? Likely depends on go-to-market timeline.
+
+\paragraph{On-chain integration.} How the output chain interfaces with consumers, gas costs for verifying VRF proofs and hash chains on-chain, whether the Twine DAG lives on the host blockchain or as an off-chain attested data structure.
+
+\paragraph{Economic model.} Miner reward formula, validator reward formula, treatment of failed rounds, slashing conditions for misbehavior.
+
+These are not blockers to building the architecture --- they are decisions to be made along the way, with the seven-leg structure providing the framework within which each is resolved.
+
+\section{Cross-references to companion documents}
+
+\begin{itemize}
+    \item Liu et al.\ walkthrough --- detailed reading notes on the RCS-XEB certification mechanism.
+    \item Kavuri et al.\ walkthrough --- detailed reading notes on the Twine traceability protocol.
+    \item Liu vs.\ Kavuri comparison --- side-by-side analysis of the two paradigms and what's transferable.
+    \item Parameter feasibility study --- back-of-envelope analysis of the $(n, d)$ tradeoff and recommended starting parameters.
+\end{itemize}
+
+Together these four documents plus this pipeline spec form the working understanding of the subnet architecture. Anything not addressed here is in one of the others; anything not in any of them is genuinely open.
+
+\end{document}

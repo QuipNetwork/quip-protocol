@@ -1,0 +1,212 @@
+[
+  {
+    "leg": "PROTOCOL_PARAMS",
+    "data": {
+      "n_qubits": 8,
+      "depth": 10,
+      "shots_per_circuit": 1000,
+      "num_circuits": 100,
+      "chi_low": 0.15,
+      "chi_high": 2.5,
+      "noise_rate": 0.005,
+      "epsilon": 2.3283064365386963e-10,
+      "extractor_output_bits": 64
+    },
+    "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "hash": "cff11cd3cd0467319627d2681f36560dec432393d45acf4dd2de92dd5d90640d",
+    "timestamp": 1779392348.982404
+  },
+  {
+    "leg": "LEG_1_VRF",
+    "data": {
+      "public_input": "726f756e645f315f626c6f636b5f6865696768745f31323334",
+      "n_participants": 5,
+      "vrf_construction": "Ed25519-Sign + SHA3-256 (VRF-like, v0.2)",
+      "contributions": [
+        {
+          "index": 0,
+          "pk": "587f79bb317755962a58a04d690d4a6d8d8e135e2879f6f1a05c38f0f7cf9b68",
+          "beta": "faaf86c7d0cb44d65954711bbcf6821620a131655a583b5a7063b0688098ca5c",
+          "pi": "2b0d0197c51ec1ad65f853f0d8e89e0a5cb072ae6db5e20fe5c53b848cd9b03c8b25bbf1624dba87bb0a95ec68d7e98cc8913c950a5a8f9eae52eee141b18b06"
+        },
+        {
+          "index": 1,
+          "pk": "47f23a0de0269e423f37116ab397a23b206414b6b63f00227126f29b75db4869",
+          "beta": "8b2abe19e8bd2b65141f201ee2b6474db2f3b49069d336f91fa00f8ddc978d9a",
+          "pi": "ddbba32fc6e2ecb0ab660804924fa550c6bf7adc8616ae9d043f4242f0abe5a01dd13fea079506720ba3bf553067e72a6706923fe77886b12b91c0cfe070ab05"
+        },
+        {
+          "index": 2,
+          "pk": "81737f08c5eca2e62e8b38e22447b3cb6536893621a41fc32b45ccafe52e7162",
+          "beta": "3269dea574e398439b417feba94481c6e20bc9cd8be05b863d07e9bfa6308e3c",
+          "pi": "2192fb879179c03d36a8bbf8c71430b2ad59d41e13660fa409dee614b045cf7c8c067b9df1e3a0aa34c5d4e30080f219f351cd5a550dad8e80d87612f6098a0a"
+        },
+        {
+          "index": 3,
+          "pk": "6b9030595a3e71baebe6cf8a5eae94d61689c48d56aab25ee321c82072a47b05",
+          "beta": "2d44628cbff8bbf28278b48930548eb0d2740f882cc35e4fa4a96a6718f4ef71",
+          "pi": "a8a8074c4fe750a28d3d15a1ba5c7327d7b7b541f605859c957ab553a22afd1adfe0d829157f9b12a6692d793a21b14a86ccf7fa1d7e9aa2d5c096afb9b79c01"
+        },
+        {
+          "index": 4,
+          "pk": "ad703df955ba17f4a6dd8a38e8349d64e5245d4bdc2d7ed5d280e2d45a68710b",
+          "beta": "c3c67dffbb8503ff79c5005064c6b369d871fcf28c73c3a63581753354b3d8b4",
+          "pi": "276c0d29e820a2fbef89b7b708c95d025e3172f3f10b3f6bd1aaf3bace9cf10d99bca36d65d4bd31466986307c82ed2b9442ef9efa2b03cd3bf67e36f8d3890a"
+        }
+      ],
+      "verification_results": [
+        {
+          "index": 0,
+          "signature_valid": true,
+          "beta_matches_hash_of_pi": true,
+          "accepted": true
+        },
+        {
+          "index": 1,
+          "signature_valid": true,
+          "beta_matches_hash_of_pi": true,
+          "accepted": true
+        },
+        {
+          "index": 2,
+          "signature_valid": true,
+          "beta_matches_hash_of_pi": true,
+          "accepted": true
+        },
+        {
+          "index": 3,
+          "signature_valid": true,
+          "beta_matches_hash_of_pi": true,
+          "accepted": true
+        },
+        {
+          "index": 4,
+          "signature_valid": true,
+          "beta_matches_hash_of_pi": true,
+          "accepted": true
+        }
+      ],
+      "concatenated_length_bytes": 160,
+      "aggregation": "H(beta_1 || ... || beta_n) where H = SHA3-256",
+      "seed_after_H": "1cb21fc6fce33c84ca5c979e9a64404e0ac5c014ed08640f81cf671a02cdaa94",
+      "seed_length_bytes": 32
+    },
+    "prev_hash": "cff11cd3cd0467319627d2681f36560dec432393d45acf4dd2de92dd5d90640d",
+    "hash": "586c7d449ab7f68c257c96d3e93fefe505186787e5fe4565e9d4ff71a2ae699a",
+    "timestamp": 1779392348.988672
+  },
+  {
+    "leg": "LEG_3_CIRCUIT",
+    "data": {
+      "n_qubits": 8,
+      "depth": 10,
+      "connectivity": "all-to-all (random perfect matching per layer)",
+      "seed_hex": "1cb21fc6fce33c84ca5c979e9a64404e0ac5c014ed08640f81cf671a02cdaa94...",
+      "bits_consumed": 1336,
+      "circuit_moment_count": 44,
+      "circuit_gate_count": 305
+    },
+    "prev_hash": "586c7d449ab7f68c257c96d3e93fefe505186787e5fe4565e9d4ff71a2ae699a",
+    "hash": "2d19b47a7d0cfe2a7184e39f84b618f687ec1c6d54250e52122fade4e3fba146",
+    "timestamp": 1779392348.9922996
+  },
+  {
+    "leg": "LEG_4_SAMPLING",
+    "data": {
+      "shots": 1000,
+      "n_qubits": 8,
+      "wall_time_seconds": 1.3870248794555664,
+      "first_5_samples": [
+        [
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          0,
+          0,
+          0,
+          1,
+          0,
+          1
+        ],
+        [
+          1,
+          1,
+          1,
+          0,
+          0,
+          1,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          1,
+          0,
+          1,
+          0,
+          1
+        ],
+        [
+          1,
+          0,
+          1,
+          1,
+          1,
+          0,
+          0,
+          1
+        ]
+      ]
+    },
+    "prev_hash": "2d19b47a7d0cfe2a7184e39f84b618f687ec1c6d54250e52122fade4e3fba146",
+    "hash": "720f28f9432cad7d888bef30d0f4028020b02b61ea9345c1f9c77d29c2800f93",
+    "timestamp": 1779392350.3795285
+  },
+  {
+    "leg": "LEG_5_XEB",
+    "data": {
+      "f_xeb": 0.25541067123413086,
+      "chi_low": 0.15,
+      "chi_high": 2.5,
+      "lower_check_passed": true,
+      "upper_check_passed": true,
+      "accepted": true,
+      "rejection_reason": null,
+      "mean_p_observed": 0.004903947934508324,
+      "n_samples_scored": 1000,
+      "estimated_min_entropy_bits": 1412.10595703125,
+      "epsilon": 2.3283064365386963e-10,
+      "max_extractable_bits_at_epsilon": 1348,
+      "min_entropy_method": "simplified conservative bound: m * F_XEB * (n - log2(n) - log2(ln 2)); production target = exact AH 2023"
+    },
+    "prev_hash": "720f28f9432cad7d888bef30d0f4028020b02b61ea9345c1f9c77d29c2800f93",
+    "hash": "29579173d351e35f5b28a734258f55ce46bbe9b073d0930e00a0be675e1aa0eb",
+    "timestamp": 1779392350.3973415
+  },
+  {
+    "leg": "LEG_6_EXTRACTION",
+    "data": {
+      "input_bits": 8000,
+      "output_bits": 64,
+      "drand_seed_hex": "ff3463f7fe56522cc4555e5a2e2afd0f87e47ef15483b452b6d5de3eb3160db2",
+      "extractor": "Toeplitz",
+      "output_hex": "5727a03931754d49",
+      "lhl_bound_enforced": true,
+      "lhl_max_extractable_bits": 1348
+    },
+    "prev_hash": "29579173d351e35f5b28a734258f55ce46bbe9b073d0930e00a0be675e1aa0eb",
+    "hash": "db91673594bd933143bd108befa2b6dd01e46a9c931734406060304d01f40e72",
+    "timestamp": 1779392350.7154403
+  }
+]

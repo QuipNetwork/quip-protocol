@@ -1,0 +1,218 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[most]{tcolorbox}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=teal!60!black,urlcolor=teal!60!black,citecolor=teal!60!black}
+
+\definecolor{navy}{HTML}{13233F}
+\definecolor{teal}{HTML}{1C7293}
+\definecolor{amber}{HTML}{C77700}
+\definecolor{boxbg}{HTML}{EEF3F8}
+\definecolor{ambbg}{HTML}{FFF6E8}
+\definecolor{okbg}{HTML}{EAF5EE}
+\definecolor{okfr}{HTML}{2A9D5C}
+
+\newtcolorbox{keybox}{colback=boxbg,colframe=teal,boxrule=1pt,arc=2pt,left=8pt,right=8pt,top=6pt,bottom=6pt}
+\newtcolorbox{warnbox}{colback=ambbg,colframe=amber,boxrule=1pt,arc=2pt,left=8pt,right=8pt,top=6pt,bottom=6pt}
+\newtcolorbox{okbox}{colback=okbg,colframe=okfr,boxrule=1pt,arc=2pt,left=8pt,right=8pt,top=6pt,bottom=6pt}
+
+\theoremstyle{definition}
+\newtheorem{assumption}{Assumption}
+\theoremstyle{plain}
+\newtheorem{lemma}{Lemma}
+\newtheorem{theorem}{Theorem}
+
+\newcommand{\Fxeb}{\mathrm{XEB}}
+\newcommand{\Hmin}{H_{\min}}
+\newcommand{\epss}{\varepsilon_{s}}
+\newcommand{\epssou}{\varepsilon_{\mathrm{sou}}}
+\newcommand{\Qmin}{Q_{\min}}
+
+\title{\vspace{-1.5em}\textbf{The Certified Min-Entropy Bound for Leg 5}\\[0.3em]
+\large What Liu \emph{et al.}\ actually prove --- and the two things our first draft got wrong}
+\author{RCS-VRF Subnet --- Leg 5 working derivation (rev.\ 2, reconciled with the paper)}
+\date{\today}
+
+\begin{document}
+\maketitle
+\vspace{-1em}
+
+\begin{keybox}
+\textbf{Status of this revision.} An earlier draft derived the Leg-5 bound under an
+``honest-server'' assumption and got the right \emph{formula} but justified it incorrectly.
+Having now read Liu \emph{et al.}\ (Nature \textbf{640}:343--348, 2025; arXiv:2503.20498) in
+full, this version replaces that derivation with the paper's \emph{actual} implemented theorem,
+and flags exactly what was wrong. The headline number for our honest-server case is unchanged;
+its justification is now correct and anchored to a published, verified result.
+\end{keybox}
+
+\section{What changed from the first draft}
+
+\begin{warnbox}
+Two corrections and one dissolved ``open seam'':
+\begin{enumerate}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{The per-round entropy is exact, and it is the \emph{collision} entropy, not von Neumann.}
+The single-round quantity is the $2$-R\'enyi entropy $H_2$ of Porter--Thomas, which equals
+\emph{exactly} $n-1$ (SM Eq.~III.33). Our first draft called $n-1$ a ``conservative von Neumann
+floor with $0.39$ bits of slack.'' The value was right; the reasoning was wrong.
+\item \textbf{There is no EAT / $\sqrt{M}$ / $\eta$ penalty.} Because the protocol restricts to an
+i.i.d.\ adversary, the finite-size bound uses i.i.d.\ smooth-min-entropy accumulation
+(Tomamichel--Colbeck--Renner), a clean closed form. The generalized-EAT term we scaffolded and
+worried about does not appear. That seam is gone.
+\item \textbf{There is no score$\to$entropy curve $h(\Fxeb)$.} The per-round entropy is a flat
+$n-1$; the observed XEB score does \emph{not} modulate it. The score's entire role is to set
+$\Qmin$, the forced quantum-round count. The real remaining object is $\Qmin$ (the adversary
+analysis), not a min-tradeoff curve.
+\end{enumerate}
+\end{warnbox}
+
+\section{The setup and the one assumption}
+
+A client sends $M$ pseudo-random $n$-qubit circuits, one sample requested per circuit; the server
+returns $X^M=(X_1,\dots,X_M)$. A random size-$m$ subset is scored,
+$\Fxeb = \tfrac{N}{m}\sum_{i\in V} p_{C_i}(x_i) - 1$ with $N=2^n$. The protocol accepts iff the
+average response time is below $t_{\mathrm{threshold}}$ \emph{and} $\Fxeb \ge \chi$.
+
+\begin{assumption}[Honest server --- our near-term scope]\label{ass:hs}
+Every accepted round is sampled faithfully on the QPU. In the paper's notation this is the special
+case $\Qmin = M$: an honest server runs \emph{all} rounds quantum-mechanically.
+\end{assumption}
+
+\noindent The full theorem below holds for \emph{any} server via $\Qmin$; Assumption~\ref{ass:hs}
+is just the substitution $\Qmin\mapsto M$, which is what we can defend today and quote with its
+label attached.
+
+\section{Ingredient 1: the exact per-round entropy (collision entropy)}
+
+\begin{lemma}[Per-round collision entropy of Porter--Thomas; SM Eq.~III.33]\label{lem:h2}
+For the Porter--Thomas density $f(p)=N e^{-Np}$, the conditional $2$-R\'enyi (collision) entropy
+of one outcome is
+\[
+H_2(X_i\mid C_i)
+= -\log_2\!\Big(\textstyle\int_0^\infty N\,f(p)\,p^2\,dp\Big)
+= -\log_2\!\Big(N^2\cdot\tfrac{2}{N^3}\Big)
+= -\log_2\!\tfrac{2}{N}
+= n-1 .
+\]
+\end{lemma}
+
+\begin{okbox}
+\textbf{Why collision entropy, not von Neumann.} The i.i.d.\ accumulation step lower-bounds smooth
+min-entropy by the \emph{collision} entropy per round, not the Shannon/von Neumann entropy. So
+$H_2=n-1$ is the \emph{correct exact} quantity --- not a conservative floor we chose. (For
+reference, the von Neumann entropy of Porter--Thomas is $n-0.610$; it plays no role in the bound.)
+\end{okbox}
+
+\section{Ingredient 2: i.i.d.\ accumulation (no EAT, no $\eta$)}
+
+Because each quantum round is i.i.d.\ (a stated adversary restriction), the smooth min-entropy of
+$Q$ i.i.d.\ quantum rounds obeys the Tomamichel--Colbeck--Renner i.i.d.\ bound (SM Eq.~III.32):
+\[
+\Hmin^{\epss}(X_Q \mid \tilde I_{\mathrm{sn}})
+\;\ge\; Q\cdot H_2(X_i\mid C_i) - \log_2\!\tfrac{1}{\epss}
+\;=\; Q(n-1) - \log_2\!\tfrac{1}{\epss}.
+\]
+
+\begin{okbox}
+\textbf{The $\eta$ seam is gone.} No $\sqrt{M}$ second-order term, no generalized-EAT constant to
+import. The i.i.d.\ restriction buys the clean closed form. (The asymptotic Aaronson--Hung analysis
+\emph{does} use EAT, but the \emph{implemented} finite-size bound here does not.)
+\end{okbox}
+
+\section{The certified bound, and its numbers}
+
+\begin{theorem}[Liu \emph{et al.}, Theorem~1 / SM Theorem~3, Eq.~III.30]\label{thm:main}
+Given $\epss\in(0,\tfrac14)$, the protocol either aborts with probability $>1-4\epss$, or
+\[
+\boxed{\;\Hmin^{\epss}(X^M \mid \tilde I_{\mathrm{sn}}) \;\ge\; \Qmin\,(n-1) - \log_2\!\tfrac{1}{\epss}\;}
+\]
+where $\Qmin=\arg\min_Q\{\varepsilon_{\mathrm{adv}}(Q,\chi)\ge 4\epss\}$ is the minimum number of
+quantum rounds any admissible adversary must perform.
+\end{theorem}
+
+\noindent Extraction with a quantum-proof strong (Toeplitz) extractor then yields (SM Corollary~7,
+Eq.~III.39)
+\[
+\ell \;\le\; \Qmin(n-1) - 3\log_2\!\tfrac{1}{\epssou} - 2 .
+\]
+
+\begin{okbox}
+\textbf{Verified against the paper.} At $n=56$, $\Qmin=1297$, $\epssou=10^{-6}$, $\epss=\epssou/4$:
+\[
+\Hmin \ge 1297\cdot 55 - \log_2\tfrac{1}{2.5\times10^{-7}} = 71{,}335 - 21.9 = \mathbf{71{,}313}\ \text{bits},
+\]
+matching the paper exactly; and $\ell \le 71{,}335 - 3\log_2 10^{6} - 2 = \mathbf{71{,}273}$ bits,
+exactly the number they extracted. Our code reproduces both.
+\end{okbox}
+
+\paragraph{Our toy honest-server case.} With $\Qmin=M$ (Assumption~\ref{ass:hs}), $n=8$, $M=1000$,
+$\epss=2^{-33}$:
+\[
+\Hmin \ge 1000\cdot 7 - 33 = 6967\ \text{bits} \quad(\text{vs.\ the old heuristic }1659).
+\]
+Unchanged from the first draft --- the formula was right; only its justification is now correct.
+The $\approx4\times$ gap to the heuristic still decomposes as the heuristic's two errors (the
+spurious $\times\Fxeb$ multiplier and the wrong per-sample constant).
+
+\begin{warnbox}
+\textbf{Toy scale, adversarially, is still $0$.} Run Theorem~\ref{thm:main} against a real adversary
+at $n=8$ and $\Qmin\to 0$ (a laptop simulates $8$-qubit circuits), so the certified entropy is
+$\approx 0$ --- by design. The positive $6967$ exists \emph{only} under Assumption~\ref{ass:hs};
+quote it as ``$\approx 6967$ bits, assuming the server did not spoof.''
+\end{warnbox}
+
+\section{The real remaining object: $\Qmin$ (the adversary model)}
+
+The score $\chi$ and the deadline enter \emph{only} through $\Qmin$ (SM Lemma~2):
+\begin{align*}
+\Phi_{\mathcal A} &= \min\!\Big(M-Q,\ \tfrac{c_{\mathrm{eff}}\,\mathcal A\,(M\,t_{\mathrm{threshold}})}{B}\Big), &
+\varepsilon_1 &= \exp\!\big(-\tfrac{\delta^2 \Phi_{\mathcal A}}{3}\big), \\
+L_{\max} &= Q + \Phi_{\mathcal A}(1+\delta), &
+\varepsilon_2 &= \!\sum_{l=0}^{m}\! \mathrm{Hyp}(l;M,L_{\max},m)\,\widetilde\Gamma^{c}(m{+}l,\,m(\chi{+}1)),
+\end{align*}
+with $\varepsilon_{\mathrm{adv}}(Q,\chi)=\min_\delta(\varepsilon_1+\varepsilon_2)$ and
+$\Qmin=\min\{Q:\varepsilon_{\mathrm{adv}}\ge4\epss\}$. Here $\mathcal A$ is the adversary's FLOP rate,
+$B$ the per-circuit simulation cost, $c_{\mathrm{eff}}$ the numerical efficiency.
+
+\begin{warnbox}
+\textbf{Transcribed, not yet calibrated.} Our \texttt{compute\_q\_min} implements this faithfully
+and is structurally correct (monotone, sensible), but with the paper's Table-I values it reproduces
+$\Qmin$ only to order of magnitude ($\sim1700$ vs $1297$): the exact conventions for $B$,
+$c_{\mathrm{eff}}$, $\mathcal A$, and the $\delta$-selection rule live in the authors' released code
+(Zenodo 10.5281/zenodo.12952178). It ships with a \texttt{calibrated=False} flag and must be
+reconciled there / verified by Mehdi before any real use. We deliberately did \emph{not} tune
+parameters to force $1297$ --- that would be fitting to the answer.
+\end{warnbox}
+
+\section{What is verified, and what remains}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{>{\raggedright}p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{Verified / closed} & \textbf{Remaining} \\
+\midrule
+Per-round entropy $H_2=n-1$ (exact, Lemma~\ref{lem:h2}). & Calibrate $\Qmin$ to the authors' code (Mehdi). \\
+Certified bound reproduces $71{,}313$ bits. & Real QPU for Leg 4 (Property 1; Colton). \\
+Toeplitz extraction reproduces $71{,}273$ bits; extractor is quantum-proof (closes the quantum-conditional-LHL question). & Timing check in Leg 5 (Property 4). \\
+No $\eta$ / EAT term needed (i.i.d.\ accumulation). & At production scale, $\Qmin$ becomes the central security argument. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.5em}
+\hrule
+\vspace{0.5em}
+\small
+\noindent\textbf{References.}
+M.\ Liu \emph{et al.}, \emph{Certified randomness using a trapped-ion quantum processor},
+Nature \textbf{640}:343--348 (2025); arXiv:2503.20498 (Methods + SM Sec.~III).\quad
+S.\ Aaronson \& S.-H.\ Hung, STOC 2023; arXiv:2303.01625.\quad
+M.\ Tomamichel, R.\ Colbeck, R.\ Renner, IEEE Trans.\ Inf.\ Theory \textbf{55}, 5840 (2009).
+\end{document}

@@ -1,0 +1,682 @@
+\documentclass[11pt,a4paper]{article}
+
+% ============ Packages ============
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage[margin=2.5cm]{geometry}
+% \usepackage{microtype}  % removed: font expansion not supported with default CM fonts
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{tcolorbox}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!50!black,
+  citecolor=blue!50!black,
+  pdftitle={RCS-VRF Subnet: Mathematical Reference},
+  pdfauthor={RCS-VRF Subnet Project}
+}
+
+% Page headers/footers
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancyhead[L]{\small\textit{RCS-VRF Mathematical Reference}}
+\fancyhead[R]{\small\thepage}
+
+% Theorem-like environments
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+
+\theoremstyle{remark}
+\newtheorem*{remark}{Remark}
+
+% A "fact" box for important results
+\newtcolorbox{factbox}[1][]{
+  colback=blue!5!white,
+  colframe=blue!50!black,
+  fonttitle=\bfseries,
+  arc=2pt,
+  boxrule=0.7pt,
+  left=8pt, right=8pt, top=4pt, bottom=4pt,
+  #1
+}
+
+% Code listing style
+\definecolor{codebg}{rgb}{0.96,0.96,0.96}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=leftline,
+  framesep=6pt,
+  framerule=1pt,
+  rulecolor=\color{gray},
+  xleftmargin=12pt,
+  breaklines=true,
+  showstringspaces=false,
+}
+
+% Custom math shortcuts
+\newcommand{\Hmin}{H_{\infty}}
+\newcommand{\Hsmin}[1][\varepsilon_s]{H^{#1}_{\min}}
+\newcommand{\Prob}{\Pr}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\F}{\mathcal{F}}
+\renewcommand{\Pr}{\operatorname{Pr}}
+
+\title{\textbf{RCS-VRF Subnet:\\Mathematical Reference}}
+\author{}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+
+\begin{abstract}
+\noindent Reference document capturing the mathematical content underpinning the RCS-VRF Subnet protocol. Covers F\textsubscript{XEB} statistics, Haar-randomness and Porter--Thomas, min-entropy and the Leftover Hash Lemma, the Aaronson--Hung 2023 bound (and its Liu et al.\ 2025 correction), the heavy-output attack family, the VRF construction, and the hash-chained audit log. Not a full derivation of every theorem --- focused on the relationships and formulas the protocol depends on, with derivations included where they are short or illuminating.
+\end{abstract}
+
+\vspace{1em}
+
+\noindent\textbf{Notation.}
+\begin{itemize}[itemsep=2pt,topsep=2pt]
+  \item $n$ = number of qubits
+  \item $N = 2^n$ = dimension of the Hilbert space
+  \item $m$ = number of samples (shots)
+  \item $M$ = total number of circuits in a multi-circuit protocol
+  \item $p_C(x) = |\langle x | C | 0^n \rangle|^2$ = ideal probability of measuring bitstring $x$ from circuit $C$
+  \item $F$ = fidelity of the quantum sampling
+  \item $\varepsilon$ = soundness parameter
+  \item $\Hmin$ = min-entropy; $H$ = Shannon (von Neumann) entropy
+\end{itemize}
+
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{The F\textsubscript{XEB} statistic}
+
+\subsection{Definition}
+
+Given $m$ samples $\{x_i\}_{i=1}^{m}$ from a quantum device running circuit $C$, the Linear Cross-Entropy Benchmarking score (LXEB or $F_{\mathrm{XEB}}$) is:
+\begin{equation}
+F_{\mathrm{XEB}} \;=\; \frac{2^n}{m} \sum_{i=1}^{m} p_C(x_i) - 1 \;=\; N \cdot \langle p_C(x_i) \rangle_i - 1
+\label{eq:fxeb-def}
+\end{equation}
+The ideal probabilities $p_C(x_i)$ are computed classically (full state-vector simulation up to $n \approx 25$, tensor-network contraction beyond).
+
+\subsection{Expected values under different sampling strategies}
+
+\paragraph{Uniform sampling.} If samples are drawn uniformly from $\{0,1\}^n$:
+\begin{align}
+\E[\langle p(x_i) \rangle] &= \E_x[p(x)] = \frac{1}{N} \\
+\E[F_{\mathrm{XEB}}] &= N \cdot \frac{1}{N} - 1 = 0
+\end{align}
+
+\paragraph{Ideal quantum sampling.} Samples drawn from $p_C$. The expected value of $\langle p(x_i)\rangle$ is the \emph{collision probability} of $p_C$:
+\begin{equation}
+\E[\langle p(x_i) \rangle] = \sum_x p(x)^2
+\end{equation}
+For a Haar-random circuit (see §\ref{sec:haar-pt}):
+\begin{align}
+\E_{\mathrm{Haar}}\!\left[\sum_x p(x)^2\right] &= \frac{2}{N+1} \;\approx\; \frac{2}{N} \\
+\E[F_{\mathrm{XEB}}] &= N \cdot \frac{2}{N} - 1 = 1
+\end{align}
+
+\paragraph{Quantum sampling at fidelity $F < 1$.} Model the noisy state as a depolarising mixture:
+\begin{equation}
+\rho_F \;=\; F \cdot |\psi\rangle\langle\psi| + (1-F) \cdot \frac{I}{N}
+\end{equation}
+The expected $p(x_i)$ under this mixture is:
+\begin{align}
+\E[p(x_i)] &= F \cdot \frac{2}{N} + (1-F) \cdot \frac{1}{N} = \frac{1+F}{N} \\
+F_{\mathrm{XEB}} &= N \cdot \frac{1+F}{N} - 1 = F
+\end{align}
+
+\begin{factbox}
+\textbf{Linear fidelity relation.} $F_{\mathrm{XEB}} \approx F$. This is the defining property that makes $F_{\mathrm{XEB}}$ a useful fidelity \emph{measurement}, not just a yes/no test.
+\end{factbox}
+
+\subsection{Variance and statistical convergence}
+
+For $m$ samples, the standard deviation of $F_{\mathrm{XEB}}$ scales as $\sim 1/\sqrt{m}$. At $m=1000$ (our v0.x parameter), the shot-noise contribution to $\sigma(F_{\mathrm{XEB}})$ is $\sim 3\%$ of the mean.
+
+Per-circuit variance (across different random circuits with same $n, d$) is typically larger than shot noise. Our depth sweep at $n=8, d=10$ measured noiseless $F_{\mathrm{XEB}} \approx 1.0 \pm 0.2$ across multiple circuits --- circuit-to-circuit variance dominates shot noise at this scale.
+
+% ============================================================
+\section{Haar-randomness and Porter--Thomas}
+\label{sec:haar-pt}
+
+\subsection{Haar measure}
+
+The \emph{Haar measure} is the unique probability distribution on the unitary group $U(N)$ that is invariant under multiplication by any fixed unitary --- the quantum analogue of ``uniform random'' on the unitary group.
+
+A Haar-random circuit is one whose unitary is sampled from the Haar measure. Properties computed under the Haar measure are reference values the protocol calibrates against.
+
+\subsection{Porter--Thomas distribution}
+
+For a Haar-random circuit acting on $|0^n\rangle$, the output probabilities $p(x)$ follow the Porter--Thomas distribution:
+\begin{equation}
+f(p) = N \cdot e^{-N \cdot p}, \qquad \Pr[p(x) \leq t] = 1 - e^{-N t}
+\label{eq:pt}
+\end{equation}
+This is an exponential distribution with mean $1/N$. Key moments:
+\begin{align}
+\E[p(x)] &= \frac{1}{N} && \text{(mean --- same as uniform)} \\
+\mathrm{Var}[p(x)] &= \frac{1}{N^2} && \text{(variance --- much larger than uniform's)} \\
+\E\!\left[\sum_x p(x)^2\right] &= \frac{2}{N+1} && \text{(collision probability --- twice uniform's $1/N$)}
+\end{align}
+The factor of 2 in the collision probability is what gives $F_{\mathrm{XEB}} \approx 1$ for honest noiseless quantum sampling.
+
+\subsection{Why Porter--Thomas matters for the protocol}
+
+PT is not a passive consequence of using random circuits --- every quantitative claim in the protocol is calibrated to PT statistics:
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{5cm}p{8cm}@{}}
+\toprule
+\textbf{Protocol mechanism} & \textbf{What it needs from PT} \\
+\midrule
+$F_{\mathrm{XEB}} \approx 1$ for honest & $\E_{\mathrm{PT}}[\sum p^2] = 2/N$ \\
+$F_{\mathrm{XEB}} = F$ for noisy & Linear mixture of PT and uniform \\
+Quantum-classical hardness gap & PT's heavy outcomes are classically unpredictable \\
+Min-entropy $\approx n - \log n$ & PT's specific $\Hmin$ structure \\
+Heavy-output attack analysis & Defined relative to PT's heavy outcomes \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+If the circuit distribution deviates from PT (e.g., undertrained circuit family, shallow depth), all these calibrations break. Empirically, our v0 depth sweep found noiseless $F_{\mathrm{XEB}} \approx 3$--$7$ at $d=4$ --- direct evidence the $d=4$ circuit family was not producing PT statistics.
+
+\subsection{Approximate $t$-designs}
+
+A truly Haar-random unitary on $n$ qubits requires exponentially many parameters to specify --- no finite gate set can realise it exactly. RCS approximates Haar using finite circuit families. The relevant notion is \emph{approximate $t$-design}:
+
+\begin{definition}
+A circuit family is an $\varepsilon$-approximate $t$-design if its first $t$ moments match Haar's first $t$ moments to error $\varepsilon$.
+\end{definition}
+
+For $F_{\mathrm{XEB}}$ (which depends on second moments --- collision probabilities), we need approximately a \emph{2-design}. The AH 2023 / Liu et al.\ 2025 analysis nominally requires sufficient depth that the circuit family is close to a 2-design.
+
+\subsection{Empirical convergence}
+
+The depth at which a circuit family becomes a good 2-design depends on connectivity:
+\begin{itemize}[itemsep=2pt,topsep=2pt]
+  \item \emph{1D brickwork (nearest-neighbor):} depth $\sim n$ needed for 2-design
+  \item \emph{All-to-all random pairing (Liu et al.\ recipe):} depth $\sim \log n$ needed for 2-design
+\end{itemize}
+
+Our v0 depth sweep at $n=8$ found:
+
+\begin{center}
+\small
+\begin{tabular}{@{}cccc@{}}
+\toprule
+$d$ & Noiseless $F_{\mathrm{XEB}}$ & Noisy $F_{\mathrm{XEB}}$ & Interpretation \\
+\midrule
+4 & 3.1 & 0.7 & Far from Haar \\
+8 & $1.06 \pm 0.09$ & $0.38 \pm 0.06$ & Close to Haar \\
+10 & $1.11 \pm 0.09$ & $0.29 \pm 0.03$ & Close to Haar (Liu et al.\ choice) \\
+14 & $0.96 \pm 0.05$ & $0.12 \pm 0.02$ & Close to Haar (high noise) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+We use $d=10$ with all-to-all connectivity as v0.x's default --- confirmed empirically to put the circuit family close enough to Haar for PT statistics to hold.
+
+% ============================================================
+\section{F\textsubscript{XEB} CDFs under realistic sampling}
+
+\subsection{Uniform samples}
+
+For $m$ samples drawn uniformly from $\{0,1\}^n$, the sum $\sum p(x_i)$ follows an Erlang distribution of shape $m$:
+\begin{equation}
+\Pr[F_{\mathrm{XEB}} \leq \chi \mid \text{uniform}] \;=\; \tilde{\Gamma}\!\left(m,\; m(\chi+1)\right)
+\end{equation}
+where $\tilde{\Gamma}$ is the regularised lower-incomplete Gamma function.
+
+\subsection{Ideal quantum samples}
+
+For $m$ samples drawn from the ideal PT distribution, $\sum p(x_i)$ follows an Erlang distribution of shape $2m$:
+\begin{equation}
+\Pr[F_{\mathrm{XEB}} \leq \chi \mid \text{quantum}] \;=\; \tilde{\Gamma}\!\left(2m,\; m(\chi+1)\right)
+\end{equation}
+
+\subsection{Mixed-fidelity samples}
+
+A fidelity-$F$ sample is modelled as drawn from the PT distribution with probability $F$ and uniform with probability $1-F$. The CDF over $m$ mixed samples is (Liu et al.\ 2025 Eq. III.12):
+\begin{equation}
+\Pr[F_{\mathrm{XEB}} \leq \chi \mid \text{fidelity } F] \;=\; \sum_{\ell=0}^{m} \tilde{\Gamma}\!\left(m+\ell,\; m(\chi+1)\right) \binom{m}{\ell} F^{\ell} (1-F)^{m-\ell}
+\label{eq:mixed-cdf}
+\end{equation}
+This is the formula used to compute $Q_{\min}$ in the security analysis (§\ref{sec:ah-bound}).
+
+% ============================================================
+\section{Min-entropy and the Leftover Hash Lemma}
+
+\subsection{Min-entropy definition}
+
+For a discrete distribution $P$ over $X$:
+\begin{equation}
+\Hmin(X) \;=\; -\log_2\!\left(\max_x P(X = x)\right)
+\end{equation}
+This is the worst-case unpredictability. If $\Hmin = k$, no specific outcome has probability greater than $2^{-k}$.
+
+\begin{remark}
+\textbf{Operational meaning.} An attacker's best guessing strategy has success probability $2^{-\Hmin}$. Min-entropy directly bounds guessability, which is exactly what cryptographic applications need.
+\end{remark}
+
+\subsection{Min-entropy vs.\ Shannon entropy}
+
+For a uniform distribution, $\Hmin = H = \log_2 N$. For non-uniform distributions, $\Hmin \leq H$, with the gap potentially large.
+
+\paragraph{Example.} Consider $P(00\ldots0) = 1/2$ and $P(\text{other}) = 0.5/(N-1)$.
+\begin{align}
+H &\approx 1 + 0.5 \log_2(N-1) \approx n/2 \quad\text{(looks decent)} \\
+\Hmin &= -\log_2(0.5) = 1 \quad\text{(terrible)}
+\end{align}
+The Leftover Hash Lemma requires \emph{min-entropy}, not Shannon. If we used Shannon, extraction on this distribution would collapse half the time --- the opposite of uniform.
+
+\subsection{Min-entropy for Haar / Porter--Thomas}
+
+For a single sample drawn from a Haar-random circuit:
+\begin{equation}
+\Hmin(\mathrm{PT}) \;\approx\; n - \log_2(n) - \log_2(\ln 2) \;\approx\; n - \log_2(n) - 0.529
+\end{equation}
+The derivation uses the fact that the maximum probability under PT is approximately $n \cdot \ln(2) / 2^n$.
+
+For $n=8$: $\Hmin^{\mathrm{Haar}} \approx 8 - 3 - 0.53 \approx 5.5$ bits per sample.
+
+\subsection{The Leftover Hash Lemma}
+
+\begin{theorem}[Leftover Hash Lemma]
+Let $X$ be a random variable with $\Hmin(X) \geq k$. Let $\mathcal{H}$ be a 2-universal hash family from $X$ to $\{0,1\}^{\ell}$. For uniformly random $h \leftarrow \mathcal{H}$, the joint distribution of $(h, h(X))$ is $\varepsilon$-close to uniform on $\mathcal{H} \times \{0,1\}^{\ell}$, where:
+\begin{equation}
+\varepsilon \;=\; \frac{1}{2}\sqrt{\frac{2^{\ell}}{2^k}}
+\end{equation}
+\end{theorem}
+
+Solving for $\ell$ in terms of $\varepsilon$:
+\begin{factbox}
+\begin{equation}
+\boxed{\ell \;\leq\; k - 2\log_2\!\left(\frac{1}{\varepsilon}\right)}
+\label{eq:lhl}
+\end{equation}
+This is the maximum number of bits we can safely extract.
+\end{factbox}
+
+\subsection{Toeplitz extractor as a 2-universal hash}
+
+The Toeplitz extractor maps $n$ input bits to $\ell$ output bits via $T \cdot x \bmod 2$, where $T$ is an $\ell \times n$ Toeplitz matrix (constant along anti-diagonals). The matrix is generated from a fresh random seed of length $\ell + n - 1$ bits.
+
+The Toeplitz family is 2-universal: for any distinct $x \neq y$:
+\begin{equation}
+\Pr_T[T \cdot x = T \cdot y] \leq 2^{-\ell}
+\end{equation}
+which is exactly the condition the LHL needs.
+
+In our protocol:
+\begin{itemize}[itemsep=2pt,topsep=2pt]
+  \item Input: 8000 bits (1000 samples $\times$ 8 qubits) from quantum measurement
+  \item Seed: from drand pulse, expanded via SHAKE256 to needed length
+  \item Output: 64 bits (in v0.x; production target depends on $\Hmin$ bound)
+\end{itemize}
+
+The drand pulse serves as the LHL's ``uniformly random hash selection.'' Crucially, drand is independent of the quantum samples, which is what the LHL requires.
+
+% ============================================================
+\section{The Aaronson--Hung bound}
+\label{sec:ah-bound}
+
+\subsection{What the bound aims to prove}
+
+The AH 2023 protocol's goal: given that samples pass $F_{\mathrm{XEB}}$ at score $\geq \chi$, lower-bound the min-entropy of those samples (conditional on the circuit).
+
+If proved, this lets us:
+\begin{enumerate}[itemsep=2pt,topsep=2pt]
+  \item Run XEB to certify the samples are ``good enough''
+  \item Compute a min-entropy bound from the $F_{\mathrm{XEB}}$ score
+  \item Apply the LHL to extract uniform bits
+\end{enumerate}
+Without such a bound, passing $F_{\mathrm{XEB}}$ does not translate into a quantitative randomness claim.
+
+\subsection{The corrected single-round bound (von Neumann entropy)}
+
+AH 2023's original Theorem 5.8 claimed to lower-bound \emph{min-entropy} directly. Liu et al.\ 2025 identified a flaw: the theorem as stated is impossible.
+
+\begin{remark}[Counterexample to original AH min-entropy claim]
+An algorithm that samples honestly $99\%$ of the time and returns the all-zeros bitstring $1\%$ of the time has $\Hmin = -\log_2(0.01) \approx 6.6$ bits regardless of $n$, and passes LXEB with high probability.
+\end{remark}
+
+Liu et al.'s fix: bound \emph{von Neumann entropy} in the single-round analysis, then derive smooth min-entropy at the protocol level via the Entropy Accumulation Theorem.
+
+\begin{theorem}[Liu et al.\ 2025 Theorem 6, corrected single-round bound]
+Under the LLHA hardness assumption, for any device $A$ solving $\mathrm{MLXEB}_{b,k}(\mathcal{D})$ with probability $q$:
+\begin{equation}
+H(Z \mid \vec{C}) \;\geq\; \frac{B}{2}\!\left(\frac{bq - 1}{b - 1}\right) - n^{-\omega(1)}
+\end{equation}
+where $Z$ = device output ($k$ bitstrings); $\vec{C}$ = input circuits; $B$ = LLHA parameter ($B \leq n/2$ by Grover); $b$ = LXEB threshold (corresponds to $1 + F_{\mathrm{XEB}}$); $q$ = probability of passing LXEB.
+\end{theorem}
+
+This bounds Shannon / von Neumann entropy, not min-entropy directly.
+
+\subsection{The protocol-level smooth min-entropy bound}
+
+\begin{theorem}[Liu et al.\ 2025 Theorem 1]
+\label{thm:liu-main}
+Let $\Omega$ denote the event that the protocol does not abort. Given $\varepsilon_s \in (0, 1/4)$, the protocol either aborts with probability $> 1 - 4\varepsilon_s$, or:
+\begin{equation}
+\boxed{\Hsmin(X_M \mid \tilde{I}_{\mathrm{sn}}) \;\geq\; Q_{\min}(n-1) + \log \varepsilon_s}
+\label{eq:liu-bound}
+\end{equation}
+where $X_M$ = the $M$ bitstrings collected; $\tilde{I}_{\mathrm{sn}}$ = classical side information; $Q_{\min}$ = minimum quantum rounds the adversary must execute for the protocol to pass with probability $\geq 4\varepsilon_s$.
+\end{theorem}
+
+The per-quantum-round smooth min-entropy contribution is $n-1$ bits, plus a $\log \varepsilon_s$ ``soundness tax.''
+
+\subsection{Computing $Q_{\min}$}
+
+$Q_{\min}$ is the result of an optimisation over adversary strategies. The adversary's optimal strategy uses $Q$ quantum samples (honest) and $(M-Q)$ classical samples simulated at effective fidelity:
+\begin{equation}
+\phi_{\mathrm{classical}} \;=\; \frac{A \cdot t_{\mathrm{threshold}}}{B}
+\end{equation}
+where $A$ is adversary FLOPS, $B$ is per-circuit simulation cost, $t_{\mathrm{threshold}}$ is the protocol's time threshold.
+
+Using the mixed-fidelity CDF \eqref{eq:mixed-cdf}, the adversary's success probability is:
+\begin{equation}
+\varepsilon_{\mathrm{adv}}(Q, \chi) \;=\; 1 - \sum_{\ell=0}^{m} \tilde{\Gamma}\!\left(m+\ell,\; m(\chi+1)\right) \binom{m}{\ell} \phi_{\mathrm{eff}}^{\ell} (1 - \phi_{\mathrm{eff}})^{m-\ell}
+\end{equation}
+where $\phi_{\mathrm{eff}}(Q) = \tfrac{Q}{M} + \tfrac{M-Q}{M} \phi_{\mathrm{classical}}$. Then:
+\begin{equation}
+Q_{\min} \;=\; \arg\min_Q \;\{Q : \varepsilon_{\mathrm{adv}}(Q, \chi) \geq 4\varepsilon_s\}
+\end{equation}
+
+\subsection{Honest-server simplification}
+\label{sec:honest-server}
+
+For a server that does all $M$ rounds honestly (no classical mixing), $Q_{\min} = M$ and \eqref{eq:liu-bound} becomes:
+\begin{equation}
+\Hsmin \;\geq\; M(n-1) + \log \varepsilon_s
+\end{equation}
+
+For our v0.3a parameters ($n=8$, $M=1000$, $\varepsilon_s \approx 2^{-34}$):
+\begin{equation}
+\Hsmin \;\geq\; 1000 \cdot 7 + \log_2(2^{-34}) \;\approx\; 7000 - 34 \;=\; 6966 \text{ bits}
+\end{equation}
+After LHL with $\varepsilon = 2^{-32}$:
+\begin{equation}
+\text{max extractable} \;\approx\; 6966 - 64 \;=\; 6902 \text{ bits}
+\end{equation}
+
+\begin{remark}[Caveat at v0.3a scale]
+At $n=8$, classical simulation is trivial (microseconds on a laptop). For any reasonable adversary classical power $A$, $\phi_{\mathrm{classical}} \approx 1$, forcing $Q_{\min} \approx 0$ and the bound to $\approx 0$. The honest-server simplification only makes sense as a ``what would the bound say if we trusted the server'' exercise; real security at $n=8$ is not achievable. The protocol's security activates at larger $n$ where classical simulation costs become prohibitive (Liu et al.\ 2025 demonstrates this experimentally at $n=56$).
+\end{remark}
+
+\subsection{Comparison with v0.3a's heuristic}
+
+v0.3a uses a simplified bound:
+\begin{equation}
+\Hmin \;\approx\; m \cdot F_{\mathrm{XEB}} \cdot (n - \log_2 n - \log_2 \ln 2)
+\end{equation}
+At our parameters: $\approx 1660$ bits. The Liu et al.\ honest-server bound: $\approx 6966$ bits.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Bound} & $\Hmin$ (bits) & Max extractable (bits) & Ratio \\
+\midrule
+v0.3a heuristic $m \cdot F (n - \log n - \log \ln 2)$ & 1660 & 1596 & $1.0\times$ \\
+AH/Liu corrected (honest server) $M(n-1) + \log \varepsilon_s$ & 6966 & 6902 & $4.3\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Differences:}
+\begin{itemize}[itemsep=2pt,topsep=2pt]
+  \item \emph{Magnitude:} v0.3a is $\sim 4\times$ conservative.
+  \item \emph{Functional form:} v0.3a scales with $F_{\mathrm{XEB}}$; the real bound has $F_{\mathrm{XEB}}$ entering only through $Q_{\min}$, not as a per-sample multiplier.
+  \item \emph{Per-quantum-sample entropy:} v0.3a uses $(n - \log n - \log \ln 2)$; the real bound uses $(n-1)$.
+\end{itemize}
+
+v0.3a's bound is \emph{safe} (conservative) but has the wrong functional form. v0.3a-revised should adopt the honest-server bound or full $Q_{\min}$ computation.
+
+% ============================================================
+\section{The heavy-output attack}
+
+\subsection{Why PT enables this attack}
+
+Porter--Thomas has a tail of ``heavy'' bitstrings --- outcomes with probability much higher than $1/N$. An attacker who can identify heavy outcomes (e.g., by classical simulation) can submit only those, achieving $F_{\mathrm{XEB}}$ much higher than honest quantum sampling.
+
+For the top-$k$ strategy: attacker sorts bitstrings by $p(x)$, submits the top $k$. Expected $F_{\mathrm{XEB}}$:
+\begin{equation}
+F_{\mathrm{XEB}}^{\text{top-}k} \;=\; \frac{N}{k}\sum_{x \in \text{top-}k} p(x) - 1
+\end{equation}
+For PT, the top fraction $k/N$ captures a much larger probability mass than $k/N$ would suggest (heavy-tail effect), making $F_{\mathrm{XEB}} \gg 1$.
+
+\subsection{Empirical values from v0 spoofing experiment}
+
+At $n=8$, $d=10$, $5$ trials per strategy:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Attack strategy} & \textbf{Mean $F_{\mathrm{XEB}}$} & \textbf{Std} \\
+\midrule
+Honest noiseless & 1.08 & 0.23 \\
+Honest noisy ($F=0.5$) & 0.30 & 0.08 \\
+Uniform random (circuit-blind) & 0.005 & 0.009 \\
+Sample from $p$ (perfect classical) & 1.07 & 0.22 \\
+Top-1 guess & 5.31 & 1.43 \\
+Top-4 guess & 4.37 & 0.99 \\
+Top-16 guess & 3.18 & 0.50 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{v0.1's two-sided defence}
+
+v0.1 added an upper bound: $\chi_{\mathrm{low}} \leq F_{\mathrm{XEB}} \leq \chi_{\mathrm{high}}$. At our parameters: $\chi_{\mathrm{low}} = 0.15$, $\chi_{\mathrm{high}} = 2.5$.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Strategy} & \textbf{v0 (one-sided) pass rate} & \textbf{v0.1 (two-sided) pass rate} \\
+\midrule
+Honest noiseless & 100\% & 100\% \\
+Honest noisy & 100\% & 100\% \\
+Uniform random & 0\% & 0\% \\
+Top-1 guess & 100\% & 0\% \\
+Top-4 guess & 100\% & 0\% \\
+Top-16 guess & 100\% & 20\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The upper bound closes the heavy-output attack vector for top-1 and top-4 perfectly, and substantially for top-16.
+
+\subsection{The remaining attack: perfect classical sampling}
+
+The ``sample from $p$'' strategy gives $F_{\mathrm{XEB}} \approx 1.07$ --- indistinguishable from honest noiseless quantum. This attack:
+\begin{itemize}[itemsep=2pt,topsep=2pt]
+  \item Requires $O(2^n)$ compute to enumerate all amplitudes
+  \item Is trivially feasible at $n=8$ ($N=256$)
+  \item Is infeasible at $n=56$ ($N \approx 7 \times 10^{16}$, Frontier-scale)
+\end{itemize}
+
+The defence is \emph{parameter scale}, not the $F_{\mathrm{XEB}}$ bounds. This is why the LLHA hardness assumption is required: no efficient classical algorithm for this task at appropriate parameter scales.
+
+% ============================================================
+\section{The VRF construction}
+
+\subsection{v0.2 / v0.3a: Sign + Hash}
+
+For each participant $i$ with Ed25519 keypair $(sk_i, pk_i)$:
+\begin{align}
+\pi_i &= \mathrm{Ed25519\_sign}(sk_i, \alpha) && \text{(proof)} \\
+\beta_i &= \mathrm{SHA3\text{-}256}(\pi_i) && \text{(VRF output)}
+\end{align}
+where $\alpha$ is the round's public input.
+
+\paragraph{Verification.} Given $(pk_i, \alpha, \beta_i, \pi_i)$:
+\begin{enumerate}[itemsep=2pt,topsep=2pt]
+  \item Check $\mathrm{Ed25519\_verify}(pk_i, \alpha, \pi_i)$ succeeds.
+  \item Check $\mathrm{SHA3\text{-}256}(\pi_i) = \beta_i$.
+\end{enumerate}
+
+\paragraph{Properties.}
+\begin{itemize}[itemsep=2pt,topsep=2pt]
+  \item \emph{Deterministic:} same $(sk_i, \alpha)$ always gives same $(\pi_i, \beta_i)$ (Ed25519 per RFC 8032 is deterministic).
+  \item \emph{Verifiable:} any party with $pk_i$ can check both conditions.
+  \item \emph{Unpredictable without $sk_i$} (under the assumption SHA3-256 is a good PRF over Ed25519 signatures).
+\end{itemize}
+
+\paragraph{What this construction is NOT.}
+\begin{itemize}[itemsep=2pt,topsep=2pt]
+  \item Not full RFC 9381 ECVRF, which has a more elaborate proof structure giving stronger formal pseudorandomness guarantees.
+  \item Not formally proved pseudorandom --- depends on SHA3-256 destroying the algebraic structure of Ed25519 signatures.
+\end{itemize}
+
+\subsection{H + SHAKE256 aggregation}
+
+After collecting $n_p$ VRF outputs $(\beta_1, \ldots, \beta_{n_p})$:
+\begin{align}
+c &= \beta_1 \,\|\, \beta_2 \,\|\, \cdots \,\|\, \beta_{n_p} && \text{(concatenation)} \\
+\text{seed} &= \mathrm{SHA3\text{-}256}(c) && \text{($H$ step --- compress to 32 bytes)} \\
+\text{bytes} &= \mathrm{SHAKE256}(\text{seed}) && \text{(XOF --- expand to arbitrary length)}
+\end{align}
+
+The 32-byte seed is what LEG 3 uses as input to circuit generation. SHAKE256 expands it into all the bytes needed for random angles, gate selections, and pairings.
+
+The compress-then-expand pattern provides a clean cryptographic boundary independent of how many participants there are or what their contributions look like (collusion-resistance rationale).
+
+% ============================================================
+\section{Hash chains and the audit log}
+
+\subsection{v0.x audit log structure}
+
+Each entry has the form:
+\begin{equation}
+\text{entry}_i = (\text{leg}_i,\, \text{data}_i,\, h_{i-1},\, h_i,\, t_i)
+\end{equation}
+where:
+\begin{align}
+h_i &= \mathrm{SHA3\text{-}256}\!\left(\mathrm{serialize}(\text{leg}_i, \text{data}_i, h_{i-1})\right) \\
+h_0 &= 0^{256} \quad \text{(chain root)}
+\end{align}
+
+\subsection{What single-chain hashing detects}
+
+For an attacker who modifies one entry's data field:
+\begin{itemize}[itemsep=2pt,topsep=2pt]
+  \item The entry's recomputed hash does not match the stored $h$.
+  \item The next entry's $\text{prev\_hash}$ no longer matches.
+  \item Multiple consistency checks fail.
+\end{itemize}
+This catches \emph{casual tampering} --- single-point modifications without re-doing the chain math.
+
+\subsection{What single-chain hashing does NOT detect}
+
+For a sophisticated attacker willing to redo work:
+\begin{enumerate}[itemsep=2pt,topsep=2pt]
+  \item Modify entry $j$'s data.
+  \item Recompute $h_j$.
+  \item Update entry $j+1$'s $\text{prev\_hash}$.
+  \item Recompute $h_{j+1}$.
+  \item Repeat for all subsequent entries.
+\end{enumerate}
+The result is an internally consistent forged chain that passes all single-chain checks.
+
+\begin{remark}
+In v0.3a, this is documented as a known limit (deliberate negative test \texttt{test\_cascading\_tamper\_is\_not\_caught\_v0\_3a} in the test suite).
+\end{remark}
+
+\subsection{Multi-party hash graph defence}
+
+The architecture's LEG 7 calls for a hash \emph{graph} (DAG) instead of a chain. Each party maintains its own per-party chain. Entries cross-reference entries in other parties' chains. Every entry is signed by its producing party.
+
+To forge the graph, an attacker would need to:
+\begin{enumerate}[itemsep=2pt,topsep=2pt]
+  \item Modify their own entry.
+  \item Forge signatures from all parties whose entries reference theirs.
+  \item Recursively forge signatures up the cross-reference graph.
+\end{enumerate}
+This requires compromising multiple independent parties' signing keys simultaneously --- much harder than single-key cascading.
+
+Bitcoin's defence against cascading tamper comes from proof-of-work plus distributed consensus. Our protocol's defence (in the eventual LEG 7 design) comes from multi-party signatures plus cross-reference structure. Both protect against cascading; they use different cryptographic primitives.
+
+% ============================================================
+\section{End-to-end security chain}
+
+The protocol's security argument composes the pieces:
+\begin{enumerate}[itemsep=4pt,topsep=4pt]
+  \item \textbf{Circuit family is approximately Haar-random.} At $d=10$ with all-to-all connectivity, the family is close to a 2-design --- PT statistics hold (empirically validated).
+
+  \item \textbf{$F_{\mathrm{XEB}}$ measures fidelity.} Under PT, $F_{\mathrm{XEB}} \approx F$. Empirically: noiseless $F_{\mathrm{XEB}} \approx 1$, noisy $F_{\mathrm{XEB}} \approx F$.
+
+  \item \textbf{Two-sided XEB check rejects classical attacks.} $\chi_{\mathrm{low}}$ rejects circuit-blind attacks; $\chi_{\mathrm{high}}$ rejects heavy-output attacks.
+
+  \item \textbf{Passing $F_{\mathrm{XEB}}$ implies min-entropy.} Under LLHA and Liu et al.\ 2025 Theorem~\ref{thm:liu-main}, passing $F_{\mathrm{XEB}} \geq \chi$ implies $\Hsmin \geq Q_{\min}(n-1) + \log \varepsilon_s$.
+
+  \item \textbf{Leftover Hash Lemma extracts uniform bits.} Given $\Hmin \geq k$ and soundness $\varepsilon$, the Toeplitz extractor (with independent drand seed) produces up to $k - 2\log_2(1/\varepsilon)$ bits $\varepsilon$-close to uniform.
+
+  \item \textbf{Audit log makes the chain verifiable.} Every cryptographic artifact is recorded with hash-chain integrity. Any party can independently verify each step.
+\end{enumerate}
+
+Each step is a separate piece of math with its own assumptions and limits. The composition gives the final claim: \emph{the output bits are unforgeable, unpredictable, and $\varepsilon$-close to uniform under the protocol's stated assumptions.}
+
+% ============================================================
+\section{Open mathematical questions}
+
+Items needing cryptographer input before the spec is rigorous:
+
+\begin{enumerate}[itemsep=3pt,topsep=4pt]
+  \item \textbf{VRF construction.} Sign+Hash (v0.x) vs.\ RFC 9381 ECVRF vs.\ threshold BLS. Affects formal pseudorandomness claims.
+  \item \textbf{AH bound to use.} Honest-server simplification vs.\ full $Q_{\min}$ computation. At what parameter scales is each appropriate?
+  \item \textbf{LLHA parameter $B$.} Currently bounded by $B \leq n/2$ (Grover). Tighter bounds for our specific circuit family?
+  \item \textbf{Extractor strength.} Toeplitz is 2-universal (classical). Liu et al.\ use ``quantum-proof strong extractor.'' Do we need the stronger primitive given our threat model?
+  \item \textbf{Sample independence.} The $(n-1)$-per-sample bound assumes independence. Realistic at our parameters, or correlated analysis needed?
+  \item \textbf{Smoothness parameter $\varepsilon_s$.} Liu et al.\ use $\varepsilon_s = \varepsilon_{\mathrm{sou}}/4$. Tunable for our protocol?
+  \item \textbf{Multi-shot vs.\ single-shot model.} AH 2023 uses many samples per circuit; Liu et al.\ uses one. Which model does our protocol commit to?
+\end{enumerate}
+
+% ============================================================
+\section*{References}
+\addcontentsline{toc}{section}{References}
+
+\begin{itemize}[itemsep=4pt,topsep=4pt]
+  \item Aaronson, S.\ \& Hung, S.-H. \textit{Certified Randomness from Quantum Supremacy.} arXiv:2303.01625 (STOC 2023). Original certified-randomness protocol from RCS.
+
+  \item Liu, M., Shaydulin, R., Niroula, P., DeCross, M., Hung, S.-H., et al. \textit{Certified randomness using a trapped-ion quantum processor.} arXiv:2503.20498 (Nature 2025). Experimental realisation at $n=56$ plus corrections to AH 2023.
+
+  \item Boixo, S.\ et al. \textit{Characterizing quantum supremacy in near-term devices.} Nat.\ Phys.\ 14, 595--600 (2018). XEB definition and analysis.
+
+  \item Porter, C.\ E.\ \& Thomas, R.\ G. \textit{Fluctuations of Nuclear Reaction Widths.} Phys.\ Rev.\ 104, 483 (1956). Original Porter--Thomas distribution.
+
+  \item Haber, S.\ \& Stornetta, W.\ S. \textit{How to Time-Stamp a Digital Document.} J.\ Cryptology 3, 99--111 (1991). Foundational paper on hash-chained tamper-evident logs.
+
+  \item Aaronson, S.\ \& Zhang, Y. \textit{On quantum supremacy and certified randomness.} arXiv:2404.14493 (2024).
+
+  \item RFC 9381. \textit{Verifiable Random Functions (VRFs).} IETF (2023). Standard ECVRF construction.
+
+  \item NIST FIPS 202. \textit{SHA-3 Standard.} NIST (2015). SHA3-256 and SHAKE256 specifications.
+\end{itemize}
+
+\end{document}

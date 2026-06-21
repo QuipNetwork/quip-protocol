@@ -1,0 +1,200 @@
+[
+  {
+    "leg": "LEG_1_VRF",
+    "data": {
+      "public_input": "726f756e642d31",
+      "n_participants": 5,
+      "vrf_construction": "Ed25519-Sign + SHA3-256 (VRF-like, v0.2)",
+      "contributions": [
+        {
+          "index": 0,
+          "pk": "b8453d1c9feb6b8c8508cdabc6d8f0138f4e1801d55702c5b331ed69f6809e7d",
+          "beta": "c17f9fb9ad9fd0050658ce4ae2daf6b75276a112549345e368f556e05aaf5e9d",
+          "pi": "71b51343dce98f6f28532fab12d32a6719df0ccd38df078bdd92e15711f6fcca61c466fc61968c99d1b53feb83a271948a9aee66d027cc2a5b0a36c7649dff06"
+        },
+        {
+          "index": 1,
+          "pk": "9cbea301b6a4c024eb75cb9bf2b1ab48441752daffb9f929d930b6076c7c5d34",
+          "beta": "93178afe598769c6c8e41613396c2b7c61e5efb7e38961d913942ece42b2e022",
+          "pi": "2b82c41576d986cd71c9409270058f41babf5517cdf0c7c684b2705a4ddb8435d757747f714288bed28ffa8d60ec72a4c7ceefa0d1f33437c5cbcc6f5101fe07"
+        },
+        {
+          "index": 2,
+          "pk": "21cd08dfff7341e0536d0cf841a7e946d5c2a150dc6142c5e9e5aac4882a1186",
+          "beta": "ca753ae6adabbc51a0e5bf5aca5ffe1f17fc9c047f08828b99f79bbad09a48fe",
+          "pi": "50cfed026f5698ddd8d91da118c324b93d42371c2dfa1c24c0fa248f675560a8ab49860a86ecff16cc29126ebce5b46c662f56b62a27f1adc1160cfd9cf35804"
+        },
+        {
+          "index": 3,
+          "pk": "e114531df618e88b0bb2f264f51d4edac45cbf04e13c3d974768451181caa4d8",
+          "beta": "400eefcee2413cbea2ed8a8cd59380bde84b2e7708e6ee2e3f8a7d027702b623",
+          "pi": "64e4f3b1126662aadb7f686ede26f9158226a99900c7a97a3b02e72c9593e0b91e93f74acc2c292e0f7012d4c74564d8b6e70f496fd31cdecfec6b4b70c9a30b"
+        },
+        {
+          "index": 4,
+          "pk": "f5c6b070ae108e856c9d6be1eb0e1da65682f8de230d6ea7278445fddb7f4454",
+          "beta": "882ede2d8df4ab97bac0080a0fee1af2d60d5ebe267a6917e5a65becd0f1baf9",
+          "pi": "61aff8005759151786294608c5088d1529700d4297d3d7c0aa4a9b97054c61dfad41e90a3e65202ceb2df4a4d84d2d07a900bc27d280457b90b5bd9fd1299304"
+        }
+      ],
+      "verification_results": [
+        {
+          "index": 0,
+          "signature_valid": true,
+          "beta_matches_hash_of_pi": true,
+          "accepted": true
+        },
+        {
+          "index": 1,
+          "signature_valid": true,
+          "beta_matches_hash_of_pi": true,
+          "accepted": true
+        },
+        {
+          "index": 2,
+          "signature_valid": true,
+          "beta_matches_hash_of_pi": true,
+          "accepted": true
+        },
+        {
+          "index": 3,
+          "signature_valid": true,
+          "beta_matches_hash_of_pi": true,
+          "accepted": true
+        },
+        {
+          "index": 4,
+          "signature_valid": true,
+          "beta_matches_hash_of_pi": true,
+          "accepted": true
+        }
+      ],
+      "concatenated_length_bytes": 160,
+      "aggregation": "H(beta_1 || ... || beta_n) where H = SHA3-256",
+      "seed_after_H": "e94e63d16a227c52967ad3990294e6f21b825ff6947f0dec486e44d2a720174c",
+      "seed_length_bytes": 32
+    },
+    "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "hash": "d10d01977f66351e727d8878b7e03e9dcd26b92c3751fcc3145657844e664cf2",
+    "timestamp": 1782078860.2081263
+  },
+  {
+    "leg": "LEG_3_CIRCUITS_MULTI",
+    "data": {
+      "num_circuits": 300,
+      "structure": "Liu: many distinct circuits, one shot each",
+      "master_seed_hex": "e94e63d16a227c52967ad3990294e6f21b825ff6947f0dec486e44d2a720174c...",
+      "sub_seed_derivation": "SHAKE256(master || 'circuit-index' || i)",
+      "n_qubits": 8,
+      "depth": 10
+    },
+    "prev_hash": "d10d01977f66351e727d8878b7e03e9dcd26b92c3751fcc3145657844e664cf2",
+    "hash": "d3ca353194233f80b624ef2e14b3a8cf222b217ad5f97c3adfa6164f6fd6ece6",
+    "timestamp": 1782078861.696813
+  },
+  {
+    "leg": "LEG_4_SAMPLING_MULTI",
+    "data": {
+      "num_circuits": 300,
+      "shots_per_circuit": 1,
+      "sampling_model": "phi_mixture",
+      "samples_shape": [
+        300,
+        8
+      ],
+      "wall_time_seconds": 7.0929484367370605,
+      "first_5_samples": [
+        [
+          0,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        [
+          0,
+          0,
+          0,
+          1,
+          1,
+          1,
+          0,
+          1
+        ],
+        [
+          0,
+          0,
+          1,
+          1,
+          0,
+          1,
+          1,
+          1
+        ],
+        [
+          0,
+          1,
+          0,
+          0,
+          1,
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    "prev_hash": "d3ca353194233f80b624ef2e14b3a8cf222b217ad5f97c3adfa6164f6fd6ece6",
+    "hash": "c5bdd1b87733ba1742635ce591a89e3865479afca8791169863b3c85c22c0890",
+    "timestamp": 1782078868.7901707
+  },
+  {
+    "leg": "LEG_5_XEB_MULTI",
+    "data": {
+      "structure": "Liu: F_XEB averaged over DISTINCT circuits, one shot each",
+      "f_xeb": 0.2254241704940796,
+      "M_circuits": 300,
+      "m_audited": 300,
+      "audit_subset_selection": "seed-derived, post-commit (unpredictable to server)",
+      "chi_low": 0.15,
+      "chi_high": 2.5,
+      "accepted": true,
+      "mean_p_observed": 0.004786813165992498,
+      "rounds_counted": 300,
+      "certified_min_entropy_bits_honest_server": 2065.0,
+      "certified_assumption": "honest server (Q_min = M); adversarial toy-scale ~ 0",
+      "certified_method": "Liu Thm 1/3: Q_min*(n-1) - log2(1/eps_s) [leg5_qmin_liu]",
+      "smoothing_eps": 1.1641532182693481e-10
+    },
+    "prev_hash": "c5bdd1b87733ba1742635ce591a89e3865479afca8791169863b3c85c22c0890",
+    "hash": "64a583448f47f4da98af0f57f826a52f72ff4ac2588b6d7ba9fe84f0f09b95d2",
+    "timestamp": 1782078876.556145
+  },
+  {
+    "leg": "LEG_6_EXTRACTION",
+    "data": {
+      "input_bits": 2400,
+      "output_bits": 256,
+      "drand_seed_hex": "a5da9534bb158964c6955d4a03f707b3f6f55aea831bace82291d79ac644c5dd",
+      "extractor": "Toeplitz",
+      "output_hex": "7290b6129ead9f97d5d291ae1fb808e5c51b489746bcb0fb71510628486d2c50",
+      "lhl_bound_enforced": true,
+      "lhl_max_extractable_bits": 2001
+    },
+    "prev_hash": "64a583448f47f4da98af0f57f826a52f72ff4ac2588b6d7ba9fe84f0f09b95d2",
+    "hash": "5b32e90bf9d02963ac1b92d4e3d5638149ca3886846c8c304a1b4bdb552428e5",
+    "timestamp": 1782078878.0891023
+  }
+]

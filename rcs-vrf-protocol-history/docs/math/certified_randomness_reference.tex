@@ -1,0 +1,544 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[most]{tcolorbox}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=teal!55!black,urlcolor=teal!55!black,citecolor=teal!55!black}
+
+\definecolor{navy}{HTML}{13233F}
+\definecolor{teal}{HTML}{1C7293}
+\definecolor{amber}{HTML}{C77700}
+\definecolor{plainbg}{HTML}{F4F1E8}
+\definecolor{plainfr}{HTML}{B8923A}
+\definecolor{boxbg}{HTML}{EEF3F8}
+\definecolor{ambbg}{HTML}{FFF6E8}
+\definecolor{okbg}{HTML}{EAF5EE}
+\definecolor{okfr}{HTML}{2A9D5C}
+
+% Plain-English box
+\newtcolorbox{plain}{colback=plainbg,colframe=plainfr,boxrule=1pt,arc=2pt,
+  left=8pt,right=8pt,top=6pt,bottom=6pt,
+  fonttitle=\bfseries,title=In plain English}
+\newtcolorbox{keybox}{colback=boxbg,colframe=teal,boxrule=1pt,arc=2pt,left=8pt,right=8pt,top=6pt,bottom=6pt}
+\newtcolorbox{warnbox}{colback=ambbg,colframe=amber,boxrule=1pt,arc=2pt,left=8pt,right=8pt,top=6pt,bottom=6pt}
+\newtcolorbox{okbox}{colback=okbg,colframe=okfr,boxrule=1pt,arc=2pt,left=8pt,right=8pt,top=6pt,bottom=6pt}
+
+\theoremstyle{definition}
+\newtheorem{assumption}{Assumption}
+\theoremstyle{plain}
+\newtheorem{lemma}{Lemma}
+\newtheorem{theorem}{Theorem}
+
+\newcommand{\Fxeb}{F_{\mathrm{XEB}}}
+\newcommand{\Hmin}{H_{\min}}
+\newcommand{\epss}{\varepsilon_{s}}
+\newcommand{\epssou}{\varepsilon_{\mathrm{sou}}}
+\newcommand{\Qmin}{Q_{\min}}
+\newcommand{\E}{\mathbb{E}}
+
+\title{\vspace{-1.5em}\textbf{Certified Quantum Randomness}\\[0.3em]
+\large Protocol, Mathematics, and Status --- a consolidated reference}
+\author{RCS-VRF Subnet --- working notes}
+\date{\today}
+
+\begin{document}
+\maketitle
+\vspace{-1em}
+
+\begin{keybox}
+\textbf{What this document is.} A single ordered reference pulling together the
+intuition \emph{and} the mathematics behind the RCS-VRF certified-randomness protocol:
+why it exists, what it must achieve, how the XEB verification works (with a fully
+worked numerical example), the certified min-entropy bound (anchored to Liu \emph{et al.},
+Nature \textbf{640}:343, 2025; arXiv:2503.20498), and an honest accounting of what is
+proven versus still open. Plain-English boxes summarise each technical section.
+\end{keybox}
+
+\tableofcontents
+\bigskip
+
+% =====================================================================
+\part*{Part I --- The big picture}
+\addcontentsline{toc}{section}{Part I --- The big picture}
+% =====================================================================
+
+\section{What the protocol is for}
+The goal is to produce random bits that come with a \emph{proof} they are genuinely
+unpredictable and genuinely quantum in origin --- verifiable by anyone with a laptop,
+without trusting the hardware provider. A client generates pseudo-random ``challenge''
+circuits from a small seed, sends them to an untrusted quantum server, and asks for one
+measured bitstring per circuit. The server's results are then checked, and if they pass,
+distilled into certified-uniform randomness.
+
+\begin{plain}
+We sell ``randomness you don't have to trust us for.'' Ordinary random-number generators
+say ``trust me, it's random.'' This protocol instead hands you a number \emph{and} a
+mathematical certificate that no classical computer could have produced it on demand --- so
+a casino, lottery, or blockchain can verify fairness without trusting the operator.
+\end{plain}
+
+\section{The four required properties}
+A batch of output must satisfy four properties before it can be sold as certified quantum
+randomness:
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+\item \textbf{Quantum in origin} --- the bits really came from quantum hardware, not a
+classical RNG. (Established by the XEB score plus the timing deadline.)
+\item \textbf{Genuinely random} --- truly unpredictable and uniform, not merely
+``quantum-flavoured.'' (Min-entropy bound $+$ randomness extraction.)
+\item \textbf{Classically verifiable} --- anyone can check properties 1--2 with only a
+laptop and the recorded log. (Recompute the score, replay the audit log.)
+\item \textbf{On-demand} --- fresh randomness whenever requested, quickly. (The
+unpredictable seed drops, the answer returns inside a deadline.)
+\end{enumerate}
+
+\begin{plain}
+Where did it come from (quantum), is it actually random (provably yes), can outsiders
+check (yes, classically), can you get it when you ask (yes, fast). Properties 1 and 4 are
+about the \emph{source}; properties 2 and 3 are about the \emph{guarantee}. They prop each
+other up: on-demand is \emph{how} we get quantum-in-origin (the deadline rules out
+faking), and verifiability is \emph{how} anyone trusts the rest.
+\end{plain}
+
+\section{Who is the ``attacker,'' and why we model one}
+The attacker is not an outside hacker --- it is a \emph{miner}: a participant paid to run
+the quantum sampling who would rather collect the reward without doing the expensive
+quantum work (by faking samples classically), or who wants to \emph{bias} the output to
+win a bet. We assume the worst-case: the most capable, most motivated such participant.
+
+\begin{plain}
+Defending against the attacker \emph{is} the product. Strip it out and you've built an
+expensive RNG that says ``trust me.'' The value is precisely that the output holds up
+against a participant with money on the line and every reason to cheat. We assume the
+worst case because security that only works against lazy attackers is luck, not security.
+\end{plain}
+
+\section{Proving ``quantum'' by ruling out ``classical''}
+We cannot directly inspect qubits. Instead we rule out every \emph{feasible classical}
+way the samples could have been produced; what remains is genuine quantum sampling. The
+list of ``classical methods to rule out'' is identical to the ``attacker playbook,'' so
+one argument does both jobs.
+
+\begin{warnbox}
+The claim is ``not \emph{feasibly} classical,'' not ``not classical in principle.'' A
+classical computer \emph{can} reproduce the samples given enough time; we only prove it
+cannot do so \emph{here, now, on demand}, within the deadline. The proof is therefore only
+as strong as our list of classical strategies being complete --- which is why the hardness
+of spoofing XEB is an active research assumption, not a theorem.
+\end{warnbox}
+
+\section{The timing asymmetry: ``a clock, not a computer''}
+The attacker and the verifier face the \emph{same} hard calculation, but under opposite
+time pressure. The attacker must produce passing samples \emph{fast and on demand}; the
+verifier only has to \emph{recognise} them \emph{slowly and offline, after the fact}.
+
+\begin{plain}
+The quantum machine answers in seconds (it just measures). A classical faker must simulate
+the circuit, which takes hours--days, so it misses the deadline. The verifier checks the
+recorded log later with no clock running, so it can take all the time it needs. Two legs
+exist purely to police this clock: the VRF seed stops the attacker starting early, the
+timing check enforces the deadline. The security is the \emph{gap in deadlines}, not a gap
+in horsepower.
+\end{plain}
+
+% =====================================================================
+\part*{Part II --- How verification works (the XEB machinery)}
+\addcontentsline{toc}{section}{Part II --- How verification works}
+% =====================================================================
+
+\section{Two roles: prediction vs.\ measurement}
+The same distribution --- the circuit's ideal output probabilities
+$p_C(x)=|\langle x|C|0\rangle|^2$ --- is used by both parties, in opposite senses.
+\begin{itemize}[leftmargin=1.6em,itemsep=1pt]
+\item \textbf{Step 0 (verifier, prediction).} Computes the probabilities by classically
+simulating the circuit. Knows the whole ``map,'' but cannot sample cheaply. Deterministic;
+contains \emph{no} randomness. Exponentially expensive.
+\item \textbf{Step 1 (server, measurement).} Runs the circuit and measures, collapsing the
+state to one bitstring with probability exactly $p_C(x)$ (Born rule). Effortless for a
+quantum device, but yields one draw and no knowledge of the odds. This is the \emph{only}
+step where randomness enters.
+\end{itemize}
+
+\begin{plain}
+Step 0 is the verifier drawing a perfect \emph{weather map} --- every region's rain
+probability, computed exactly but at great cost. Step 1 is the server reporting whether
+it's \emph{actually raining right now} --- one real observation, instant, but unpredictable
+even to someone holding the perfect map. The protocol works because the map is expensive
+to draw (a faker can't quickly forge one) and the actual weather is genuinely
+unpredictable (no map pre-determines it). Even the verifier, who knows the entire
+distribution, cannot predict the outcome of a single measurement --- that residual
+unpredictability is the certified randomness.
+\end{plain}
+
+\subsection{Why sampling is easy but prediction is hard}
+Sampling (Step 1) is free for a quantum computer --- it is what the hardware physically
+does. Predicting (Step 0) means computing amplitudes, which is exponentially costly. A
+classical faker is asked to do the easy-for-quantum thing (sample) and the only classical
+route is to first do the hard-for-classical thing (predict). That asymmetry is the resource
+the protocol monetises.
+
+\section{How a circuit is simulated (Step 0 in detail)}
+Two clarifications:
+\begin{itemize}[leftmargin=1.6em,itemsep=2pt]
+\item \textbf{The gates are not random at simulation time.} The circuit is pseudo-random
+but generated \emph{deterministically from the seed} (single-qubit $SU(2)$ gates from a
+seeded PRG; two-qubit topology fixed by an edge-colouring). Once the seed is fixed the
+circuit is one concrete, fully-determined object that verifier and server both reconstruct.
+\item \textbf{Simulation computes one exact amplitude, run once --- not many shots.} The
+verifier needs $p_C(x_i)$ only for the specific strings the server returned. For each it
+computes the single number $\langle x_i|C|0\rangle$ \emph{exactly, once}. No statistics, no
+repetition.
+\end{itemize}
+Computing $\langle x|C|0\rangle$ for $n=56$ cannot use the naive $2^n$ state vector
+($2^{56}\approx7\times10^{16}$ amplitudes). Instead one uses \textbf{tensor-network
+contraction}: represent each gate as a small tensor, fix input $|0\rangle$ and output $x$,
+and contract the network down to a single scalar without ever materialising the full state.
+Index slicing breaks the contraction into GPU-sized pieces.
+
+\begin{keybox}
+The per-circuit simulation cost is $B\approx 90\times10^{18}$ FLOPs --- about $100$ seconds
+on the full Frontier supercomputer for \emph{one} amplitude. Crucially, $B$ is both the
+verifier's cost (paid offline, no clock) \emph{and} the cost a classical faker would pay to
+predict the distribution (which it must pay \emph{within the deadline}). That shared cost,
+under opposite time pressure, is the security argument made quantitative.
+\end{keybox}
+
+\section{The cross-entropy benchmark $\Fxeb$}
+\label{sec:xebdef}
+The verification statistic is the linear cross-entropy benchmark, over a random test subset
+$V$ of size $m$:
+\begin{equation}\label{eq:xebdef}
+\Fxeb \;=\; \frac{N}{m}\sum_{i\in V} p_{C_i}(x_i)\;-\;1, \qquad N=2^n .
+\end{equation}
+Up to constants it is the \emph{average ideal-probability of the strings the server
+returned}, rescaled so that blind guessing scores $0$ and perfect quantum sampling scores
+$1$.
+
+\begin{plain}
+$\Fxeb$ asks: ``do the strings the server sent land on the circuit's \emph{likely}
+outcomes more than chance would?'' An honest quantum machine returns high-probability
+strings (the Born rule biases it that way), so the average is high. A blind guesser
+scatters everywhere and averages out to chance. The score is built so chance $=0$ and
+perfect $=1$.
+\end{plain}
+
+\subsection{A fully worked example ($n=2$)}
+Take $N=2^2=4$, uniform baseline $1/N=0.25$. Suppose the verifier's simulation (Step 0)
+gives
+\[
+p_C(00)=0.50,\quad p_C(01)=0.30,\quad p_C(10)=0.15,\quad p_C(11)=0.05 .
+\]
+The server returns $m=5$ samples (Step 1): $\;00,\,01,\,00,\,11,\,01$. Then:
+\begin{center}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{r l l}
+\toprule
+Step & Operation & Result \\
+\midrule
+2 & look up each returned string's $p_C$ & $0.50,0.30,0.50,0.05,0.30$ \\
+3 & sum & $\sum p_C(x_i)=1.65$ \\
+4 & average ($\div m$) & $1.65/5 = 0.33$ \\
+5 & rescale ($\times N$) so chance $=1$ & $4\times0.33 = 1.32$ \\
+6 & subtract $1$ so chance $=0$ & $\Fxeb = 0.32$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+Each step has one job: Step 2 connects samples to the circuit, Step 4 averages out
+per-sample noise, Step 5 sets the unit, Step 6 sets the zero. Sanity checks on the same
+circuit: blind guessing (all four strings equally) averages $p_C\to0.25$, giving
+$\Fxeb=4(0.25)-1=0$; returning only the top string $00$ gives $4(0.50)-1=1$.
+
+\begin{plain}
+Strings come in $\to$ look up each one's ideal probability $\to$ average them $\to$ rescale
+so chance $=1$ $\to$ subtract so chance $=0$. The arithmetic is trivial; the expensive part
+is Step 2's lookups, because computing each $p_C$ means simulating the circuit.
+\end{plain}
+
+\section{The mathematics of the reference cases}
+Everything follows from the \textbf{Porter--Thomas} law for a random circuit's output
+probabilities,
+\begin{equation}\label{eq:pt}
+f(p) = N e^{-Np}, \qquad \E[p]=\frac1N .
+\end{equation}
+
+\paragraph{$\Fxeb=0$ (uniform / spoof).} A string chosen independently of the circuit lands
+on the plain PT mean:
+\[
+\E_{x\sim U}[p_C(x)] = \int_0^\infty p\,f(p)\,dp = \frac1N
+\;\Longrightarrow\;
+\Fxeb=\frac{N}{m}\,m\,\tfrac1N - 1 = 0 .
+\]
+
+\paragraph{$\Fxeb=1$ (perfect quantum).} Quantum sampling returns $x$ with probability
+$p_C(x)$, \emph{size-biasing} the density by an extra factor $p$:
+\[
+\mathrm{PDF}_{x\sim Q}[p]=N\,f(p)\,p = N^2 p\,e^{-Np},\qquad
+\E_{x\sim Q}[p_C(x)] = \int_0^\infty p\,(N^2 p e^{-Np})\,dp = N^2\frac{2}{N^3}=\frac2N .
+\]
+The sampled probability is \emph{twice} the uniform mean --- that factor of $2$ is the
+quantum signal:
+\[
+\Fxeb=\frac{N}{m}\,m\,\tfrac2N - 1 = 1 .
+\]
+
+\paragraph{$0<\Fxeb=\phi$ (noisy real machine).} A device of fidelity $\phi$ is modelled
+(depolarising) as $\rho_\phi=\phi\,|\psi\rangle\langle\psi|+(1-\phi)\,I/N$, whose sampling
+PDF is the convex mixture
+\[
+\mathrm{PDF}_{x\sim Q_\phi}[p]=\phi\,\mathrm{PDF}_Q[p]+(1-\phi)\,\mathrm{PDF}_U[p],
+\qquad
+\E[p_C(x)]=\phi\tfrac2N+(1-\phi)\tfrac1N=\frac{1+\phi}{N}.
+\]
+Hence the headline relationship
+\begin{equation}\label{eq:fxebphi}
+\boxed{\;\Fxeb = (1+\phi)-1 = \phi\;}
+\end{equation}
+The score \emph{equals the fidelity}: Liu \emph{et al.}\ had $\phi\approx0.3$ and measured
+$\Fxeb=0.32$.
+
+\paragraph{$\Fxeb>1$ (cherry-picking --- why the band is two-sided).} A cheater that computes
+$p_C$ and returns only the \emph{highest}-probability strings reports the expected maximum,
+$\E[\max_x p_C(x)]\approx \tfrac{\ln N}{N}=\tfrac{n\ln2}{N}$, giving
+$\Fxeb\approx n\ln2-1>1$. No physical noisy device can exceed $\sim1$ (noise only pulls
+down). Hence the acceptance rule is two-sided,
+\[
+\chi_{\text{low}} \le \Fxeb \le \chi_{\text{high}},
+\]
+the low edge killing uniform spoofers, the high edge killing cherry-pickers.
+
+\begin{warnbox}
+$\Fxeb\approx\phi$ holds only in the \emph{low-noise} regime ($\epsilon n<\ln3\approx1.1$;
+the experiment sits at $\epsilon n\approx0.13$). Past that threshold score and fidelity
+decouple --- one can get high $\Fxeb$ at low fidelity. So ``score $=$ fidelity'' is a
+regime-dependent truth, not an identity.
+\end{warnbox}
+
+\subsection{The full distributions (used by the security proof)}
+The means above are the centres; the proof needs the CDFs. Because $\sum_i p_{C_i}(x_i)$ is
+a sum of exponential-type variables, the XEB score follows \textbf{Erlang}/regularised
+incomplete-gamma ($\widetilde\Gamma$) laws:
+\[
+\Pr[\Fxeb\le\chi] =
+\begin{cases}
+\widetilde\Gamma(m,\,m(\chi+1)) & \text{uniform ($0$ quantum samples),}\\[2pt]
+\widetilde\Gamma(2m,\,m(\chi+1)) & \text{perfect quantum,}\\[2pt]
+\widetilde\Gamma(m+l,\,m(\chi+1)) & \text{mixture of $l$ quantum }+\,(m-l)\text{ uniform.}
+\end{cases}
+\]
+The mixture form $\widetilde\Gamma(m+l,\dots)$ is the workhorse of the $\Qmin$ calculation
+(Part III).
+
+% =====================================================================
+\part*{Part III --- The certified entropy (Leg 5)}
+\addcontentsline{toc}{section}{Part III --- The certified entropy}
+% =====================================================================
+
+\section{Why min-entropy, and extraction}
+Passing XEB shows the samples are quantum, but they are not yet \emph{uniform} --- a real
+device's bits are biased and partly predictable. The relevant currency is the
+\textbf{smooth min-entropy} $\Hmin^{\epss}$, which measures how many truly-uniform bits can
+be squeezed out. A randomness extractor (here a Toeplitz hash) then compresses the raw bits
+to that many uniform bits. Garbage-in-garbage-out applies: the extractor is only as sound
+as the min-entropy number it is handed.
+
+\section{The heuristic we started with --- and why it was wrong}
+The first implementation used
+\[
+\Hmin \;\approx\; m\cdot\Fxeb\cdot\big(n-\log_2 n-\log_2\ln 2\big),
+\]
+giving $\approx1659$ bits at $n=8,m=1000,\Fxeb=0.3$. This was \emph{formulated, not cited}:
+three plausible factors multiplied. Only one is legitimate (the per-sample Porter--Thomas
+min-entropy $n-\log_2 n-\log_2\ln2$). The other two are wrong:
+\begin{itemize}[leftmargin=1.6em,itemsep=1pt]
+\item $\times\Fxeb$ treats the score as a per-sample \emph{multiplier} --- but the score is
+a \emph{gate} (pass/fail), not a dial.
+\item the per-sample constant is the wrong quantity for accumulation (see below).
+\end{itemize}
+
+\begin{plain}
+The heuristic was an educated placeholder so the pipeline could run --- a formula with the
+right variables but invented glue. The danger was never the placeholder; it was forgetting
+it was one and quoting its number as if certified. The fix below replaces it with a
+published theorem.
+\end{plain}
+
+\section{The honest-server bound (our near-term scope)}
+\begin{assumption}[Honest server]\label{ass:hs}
+Every accepted round is sampled faithfully on the QPU. In the paper's notation this is the
+special case $\Qmin=M$.
+\end{assumption}
+
+\subsection{Per-round entropy: the exact collision entropy}
+\begin{lemma}[Porter--Thomas collision entropy; Liu \emph{et al.}\ SM Eq.~III.33]\label{lem:h2}
+\[
+H_2(X_i\mid C_i) = -\log_2\!\Big(\int_0^\infty N f(p)\,p^2\,dp\Big)
+= -\log_2\!\Big(N^2\tfrac{2}{N^3}\Big) = -\log_2\tfrac{2}{N} = n-1 .
+\]
+\end{lemma}
+
+\begin{okbox}
+The per-round quantity is the \emph{exact} $2$-R\'enyi (collision) entropy, $n-1$ --- not a
+conservative von Neumann floor. (An earlier draft of ours justified $n-1$ as a ``von Neumann
+floor with $0.39$ bits of slack''; the value was right, the reasoning wrong. The von Neumann
+entropy of Porter--Thomas is $n-(1-\gamma)/\ln2\approx n-0.610$ and plays no role here.) The
+collision entropy is what the i.i.d.\ min-entropy accumulation requires.
+\end{okbox}
+
+\subsection{Accumulation: i.i.d., no EAT, no $\eta$}
+Because each quantum round is i.i.d.\ (a stated adversary restriction), the smooth
+min-entropy of $Q$ rounds obeys the Tomamichel--Colbeck--Renner i.i.d.\ bound:
+\[
+\Hmin^{\epss}(X_Q\mid \tilde I_{\mathrm{sn}}) \;\ge\; Q(n-1)-\log_2\tfrac1{\epss}.
+\]
+There is \emph{no} $\sqrt{M}$ second-order term and \emph{no} generalized-EAT constant
+$\eta$ to import --- a seam we once worried about that simply does not appear in the
+implemented bound.
+
+\section{The certified bound (Liu \emph{et al.})}
+\begin{theorem}[Liu \emph{et al.}\ Theorem~1 / SM Theorem~3, Eq.~III.30]\label{thm:main}
+Given $\epss\in(0,\tfrac14)$, the protocol either aborts with probability $>1-4\epss$, or
+\[
+\boxed{\;\Hmin^{\epss}(X^M\mid\tilde I_{\mathrm{sn}}) \;\ge\; \Qmin\,(n-1)-\log_2\tfrac1{\epss}\;}
+\]
+\end{theorem}
+Extraction with a quantum-proof strong (Toeplitz) extractor gives (SM Corollary~7):
+\[
+\ell \;\le\; \Qmin(n-1) - 3\log_2\tfrac1{\epssou} - 2 .
+\]
+
+\begin{okbox}
+\textbf{Verified against the paper.} At $n=56,\ \Qmin=1297,\ \epssou=10^{-6},\ \epss=\epssou/4$:
+\[
+\Hmin\ge 1297\cdot55-\log_2\tfrac1{2.5\times10^{-7}} = 71{,}335-21.9 = \mathbf{71{,}313}\text{ bits},
+\]
+matching the paper exactly; and $\ell\le 71{,}335-3\log_2 10^6-2=\mathbf{71{,}273}$ bits,
+exactly what they extracted. Our code reproduces both.
+\end{okbox}
+
+\paragraph{Our toy honest-server case.} With $\Qmin=M$ (Assumption~\ref{ass:hs}),
+$n=8,M=1000,\epss=2^{-33}$:
+\[
+\Hmin\ge 1000\cdot7-33 = 6967\text{ bits}\quad(\text{vs.\ the heuristic }1659).
+\]
+The $\approx4\times$ gap is exactly the heuristic's two errors (spurious $\times\Fxeb$, wrong
+constant).
+
+\section{$\Qmin$: the real remaining object}
+The score $\chi$ and the deadline enter \emph{only} through $\Qmin$, the forced
+quantum-round count (Liu SM Lemma~2):
+\begin{align*}
+\Phi_{\mathcal A}&=\min\!\Big(M-Q,\ \tfrac{c_{\mathrm{eff}}\,\mathcal A\,(M\,t_{\mathrm{th}})}{B}\Big), &
+\varepsilon_1&=\exp\!\big(-\tfrac{\delta^2\Phi_{\mathcal A}}{3}\big),\\
+L_{\max}&=Q+\Phi_{\mathcal A}(1+\delta), &
+\varepsilon_2&=\textstyle\sum_{l=0}^m \mathrm{Hyp}(l;M,L_{\max},m)\,\widetilde\Gamma^{c}(m{+}l,m(\chi{+}1)),
+\end{align*}
+with $\varepsilon_{\mathrm{adv}}=\min_\delta(\varepsilon_1+\varepsilon_2)$ and
+$\Qmin=\min\{Q:\varepsilon_{\mathrm{adv}}\ge4\epss\}$. Here $\mathcal A$ is the adversary's
+FLOP rate, $B$ the per-circuit cost, $c_{\mathrm{eff}}$ numerical efficiency.
+
+\begin{plain}
+There is no ``score $\to$ entropy curve'' to fill in: the per-round entropy is a flat
+$n-1$, and the score's whole role is to set $\Qmin$ --- how many rounds the attacker is
+forced to run on real hardware. Computing $\Qmin$ \emph{is} the adversary analysis, and it
+is what makes the certified number positive only at large scale.
+\end{plain}
+
+\begin{warnbox}
+\textbf{$\Qmin$ is transcribed, not yet calibrated.} Our \texttt{compute\_q\_min} implements
+the formulas faithfully and is structurally correct (monotone, sensible), but with the
+paper's Table-I values it reproduces $\Qmin$ only to order of magnitude ($\sim1700$ vs
+$1297$); the exact conventions for $B,c_{\mathrm{eff}},\mathcal A$ and the $\delta$-rule live
+in the authors' released code (Zenodo 10.5281/zenodo.12952178). We deliberately did
+\emph{not} tune parameters to force $1297$ --- that would be fitting to the answer.
+Reconciling against their code turns ``reproduce $1297$'' into a permanent regression test.
+\end{warnbox}
+
+\section{Aaronson--Hung vs.\ Liu: which bound we use}
+We use the \textbf{Liu \emph{et al.}}\ bound, which is the \emph{corrected, finite-size,
+one-sample-per-circuit} descendant of Aaronson--Hung (AH, arXiv:2303.01625). AH is the
+asymptotic ancestor: it shows passing XEB forces $\Omega(n)$ bits, but with unknown
+finite-size constants, for many-samples-from-one-circuit, and with a technical flaw (its
+single-round \emph{min}-entropy bound is impossible --- the $99\%$-honest/$1\%$-zeros
+counterexample). Liu corrects it (bounding von Neumann/collision entropy), adapts it to one
+sample per circuit, and replaces the asymptotics with a concrete restricted-adversary
+analysis that yields actual numbers.
+
+\begin{plain}
+Say ``based on the Aaronson--Hung framework,'' but the precise, defensible statement is
+``we use Liu \emph{et al.}'s corrected finite-size bound, which adapts Aaronson--Hung to
+one-sample-per-circuit.'' AH alone does not give a number you can extract against at finite
+scale.
+\end{plain}
+
+% =====================================================================
+\part*{Part IV --- Status and honest accounting}
+\addcontentsline{toc}{section}{Part IV --- Status and honest accounting}
+% =====================================================================
+
+\section{What is verified, and what remains}
+\begin{center}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{>{\raggedright}p{0.46\textwidth} p{0.46\textwidth}}
+\toprule
+\textbf{Verified / closed} & \textbf{Remaining} \\
+\midrule
+Per-round entropy $H_2=n-1$ (exact, Lemma~\ref{lem:h2}). & Calibrate $\Qmin$ to the authors' code (Mehdi). \\
+Certified bound reproduces $71{,}313$ bits. & Real QPU for Leg 4 (Property 1; Colton). \\
+Toeplitz extraction reproduces $71{,}273$; extractor is quantum-proof (closes the quantum-conditional-LHL question). & Timing check in Leg 5 (Property 4). \\
+No $\eta$/EAT term needed (i.i.d.\ accumulation). & At production scale, $\Qmin$ becomes the central security argument. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Honest caveats that did not change}
+\begin{warnbox}
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{Toy scale is $\approx0$ adversarially.} At $n=8$ a laptop simulates every
+circuit, so $\Qmin\to0$ and the certified entropy is $\approx0$ --- by design. The positive
+$6967$ exists \emph{only} under the honest-server assumption; quote it with that label.
+\item \textbf{The two biggest product gaps are untouched by the math.} Leg 4 is still a
+simulator (Property 1) and the timing check is still stubbed (Property 4). Those are
+hardware/engineering problems, not math problems.
+\item \textbf{Verifiability has limits at scale.} The regime where security switches on is
+roughly the regime where brute-force classical verification dies, which is why the protocol
+needs the $\Fxeb$ \emph{estimator} and spot-checking rather than full verification.
+\end{itemize}
+\end{warnbox}
+
+\section{Why security is the whole point}
+``Certified quantum'' and ``secure'' are the \emph{same} claim: both reduce to ``no feasible
+classical machine could have produced this on demand.'' So the proof-of-quantumness and the
+proof-of-security are one proof. Commercially, the only thing worth a premium over a free
+classical RNG is the certificate; the load-bearing market question (a Colton question) is
+whether customers will pay for \emph{physical} unpredictability over a cheaper
+\emph{cryptographic} one (e.g.\ Chainlink VRF). Likely yes in high-stakes, regulated, or
+adversarial settings; worth validating with a concrete willingness-to-pay signal before the
+expensive QPU spend.
+
+\section{Summary}
+\begin{keybox}
+The randomness-certification math is now anchored to a published, verified theorem (Liu
+\emph{et al.}), reproducing their exact numbers, with two of our own earlier errors corrected
+and one phantom ``open seam'' ($\eta$/EAT) dissolved. The single genuinely-open piece is the
+$\Qmin$ calibration, now reduced to a bounded regression-test task. This is real progress in
+\emph{rigour and trustworthiness} --- not in toy-scale capability, which remains gated on a
+real QPU (Leg 4) and the timing check (Leg 5). Every later claim now rests on something
+checkable.
+\end{keybox}
+
+\vspace{0.5em}
+\hrule
+\vspace{0.5em}
+\small
+\noindent\textbf{References.}
+M.\ Liu \emph{et al.}, \emph{Certified randomness using a trapped-ion quantum processor},
+Nature \textbf{640}:343--348 (2025); arXiv:2503.20498 (Methods + Supplemental Material).\quad
+S.\ Aaronson \& S.-H.\ Hung, \emph{Certified randomness from quantum supremacy}, STOC 2023;
+arXiv:2303.01625.\quad
+M.\ Tomamichel, R.\ Colbeck, R.\ Renner, IEEE Trans.\ Inf.\ Theory \textbf{55}, 5840 (2009).\quad
+F.\ Dupuis, O.\ Fawzi, R.\ Renner, Commun.\ Math.\ Phys.\ \textbf{379}, 867 (2020).
+\end{document}

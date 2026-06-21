@@ -1,0 +1,622 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{tcolorbox}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\geometry{margin=1in}
+\tcbuselibrary{breakable, skins}
+
+% Hyperlink colors
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!50!black,
+  citecolor=blue!50!black
+}
+
+% Theorem environments
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\theoremstyle{remark}
+\newtheorem*{remark}{Remark}
+
+% Custom commands
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\mathrm{Var}}
+\newcommand{\Cov}{\mathrm{Cov}}
+\renewcommand{\Pr}{\mathbb{P}}
+\newcommand{\N}{\mathbb{N}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\half}{\tfrac{1}{2}}
+
+% Intuition box
+\newtcolorbox{intuition}{
+  colback=blue!5!white,
+  colframe=blue!50!black,
+  fonttitle=\bfseries,
+  title=Intuition,
+  breakable
+}
+
+\title{\textbf{Porter-Thomas Statistics under Two Sampling Regimes}\\[0.5em]
+\large Why ``many shots, one circuit'' and ``many circuits, one shot'' \\ 
+give the same expected F\textsubscript{XEB} but different concentration\\[0.5em]
+\large \textit{A side-by-side variance analysis}}
+\author{Quip Protocol Project --- Internal Reference Document}
+\date{June 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+\noindent
+Both the Aaronson--Hung (AH) and Liu et al.\ protocols sample from random
+quantum circuits and use the cross-entropy benchmark F\textsubscript{XEB} as
+their acceptance test. They differ in \textit{how} the samples are collected:
+AH uses one circuit with $m$ shots per round; Liu uses $m$ distinct circuits
+with one shot each. This document establishes that both regimes yield
+identically Porter-Thomas-distributed observed probabilities, produce the
+same expected F\textsubscript{XEB}, but differ in their variance structure
+in a way that has direct consequences for certified-entropy bounds. The
+core result is a variance decomposition (\S\ref{sec:variance})
+demonstrating that AH's samples are correlated through the shared circuit
+while Liu's samples are independent across rounds. This correlation gap
+explains why AH requires the Entropy Accumulation Theorem for its
+concentration argument and gives a looser bound, while Liu's i.i.d.\ structure
+admits direct Chernoff concentration and a tighter certified-entropy claim
+for the same hardware. Quip's v0.4 implementation adopts Liu's structure.
+\end{abstract}
+
+\tableofcontents
+\vspace{1em}
+
+\section{Setup and Notation}
+
+We consider an $n$-qubit quantum circuit $C$ drawn from a distribution
+sufficiently close to the Haar measure on $U(2^n)$. Throughout this
+document, write $N := 2^n$ for the dimension of the computational basis.
+For any circuit $C$ and bitstring $x \in \{0,1\}^n$, define
+\[
+  p_C(x) := |\langle x \mid U_C \mid 0^n \rangle|^2,
+\]
+the probability that an ideal noiseless execution of $C$ produces measurement
+outcome $x$.
+
+A real (noisy) quantum sampler with fidelity $\phi \in [0,1]$ is modelled
+as producing $x$ from the mixture distribution
+\[
+  q_C(x) = \phi \cdot p_C(x) + (1-\phi) \cdot \frac{1}{N},
+\]
+i.e., the ideal distribution with probability $\phi$ and uniform noise with
+probability $1-\phi$.
+
+\subsection{The two sampling regimes}
+
+We distinguish:
+
+\begin{description}
+\item[Regime A (Aaronson--Hung):] Pick one circuit $C$. Take $m$ samples
+  $x_1, x_2, \ldots, x_m$ i.i.d.\ from $q_C$. The $m$ samples share the same
+  underlying circuit.
+\item[Regime B (Liu et al.):] Pick $m$ independent circuits $C_1, C_2,
+  \ldots, C_m$. From each $C_i$, take exactly one sample $x_i \sim
+  q_{C_i}$. Each $(C_i, x_i)$ pair is independent of every other.
+\end{description}
+
+The cross-entropy benchmarking score is identical in form:
+\begin{equation}
+  F_{\mathrm{XEB}} := \frac{N}{m} \sum_{i=1}^{m} p_{C_i}(x_i) - 1,
+  \label{eq:fxeb}
+\end{equation}
+where in Regime A, all $C_i = C$ (the shared circuit), and in Regime B
+each $C_i$ is independent. The protocol accepts if $F_{\mathrm{XEB}} \geq
+\chi$ for some threshold $\chi$ (Liu uses $\chi = 0.3$).
+
+\subsection{What we want to establish}
+
+Two questions:
+\begin{enumerate}[label=(\arabic*)]
+\item Is the \emph{statistical distribution} of $p_{C_i}(x_i)$ identical in
+  the two regimes? \textbf{Yes.}
+\item Is the \emph{concentration behaviour} of $F_{\mathrm{XEB}}$ identical
+  in the two regimes? \textbf{No.}
+\end{enumerate}
+
+The first answer is the source of common confusion --- both regimes
+produce Porter-Thomas statistics, so it's tempting to conclude they're
+interchangeable. The second answer is why they're not, and why Liu's
+structure is preferred in v0.4.
+
+\section{The Porter-Thomas distribution}
+\label{sec:pt}
+
+We collect the relevant facts about $p_C(x)$ for Haar-random circuits.
+
+\begin{theorem}[Porter--Thomas]
+\label{thm:pt}
+Let $C$ be a circuit whose unitary is Haar-distributed on $U(N)$. For any
+fixed bitstring $x \in \{0,1\}^n$, the random variable
+$N \cdot p_C(x)$ converges in distribution to $\mathrm{Exp}(1)$ as
+$N \to \infty$.
+\end{theorem}
+
+The proof appears in Porter and Thomas (1956) and is reviewed in
+Boixo et al.\ (2018). Sufficiently-deep random circuits approximate the
+Haar distribution closely enough that the convergence holds in practice
+once $d \gtrsim n$ (where $d$ is the circuit depth).
+
+\subsection{Moments of Porter-Thomas}
+
+For $Y \sim \mathrm{Exp}(1)$, the moment generating function is
+$\E[e^{tY}] = 1/(1-t)$ for $t < 1$, giving moments $\E[Y^k] = k!$. Since
+$N \cdot p_C(x) \sim Y$, we have
+\begin{equation}
+  \E[p_C(x)^k] = \frac{k!}{N^k}.
+  \label{eq:moments}
+\end{equation}
+The first three moments will appear throughout:
+\[
+  \E[p_C(x)] = \frac{1}{N}, \qquad
+  \E[p_C(x)^2] = \frac{2}{N^2}, \qquad
+  \E[p_C(x)^3] = \frac{6}{N^3}.
+\]
+
+\subsection{The collision probability identity}
+
+A computation we'll use:
+\begin{lemma}
+\label{lem:collision}
+For Haar-random $C$,
+\[
+  \E_C\!\left[\sum_{x \in \{0,1\}^n} p_C(x)^2 \right] = \frac{2}{N}.
+\]
+\end{lemma}
+
+\begin{proof}
+By linearity and \eqref{eq:moments}, $\E_C[\sum_x p_C(x)^2] = N \cdot
+\E_C[p_C(x)^2] = N \cdot 2/N^2 = 2/N$. \qedhere
+\end{proof}
+
+This identity is what produces the famous ``factor of 2'' in F\textsubscript{XEB}
+calculations.
+
+\section{The size-biased distribution: $p_C(x)$ when $x \sim p_C$}
+\label{sec:sizebias}
+
+Both regimes involve a quantity of the form $p_{C_i}(x_i)$ where $x_i$
+\emph{was actually drawn from} $q_{C_i}$ (not a fixed bitstring chosen
+independently of the circuit). This conditional choice changes the
+distribution.
+
+\begin{intuition}
+If you sample from a distribution, you're more likely to observe bitstrings
+the distribution assigned high probability to. So the values of $p_C(x)$
+you see when $x \sim p_C$ are biased toward larger values than $p_C(x)$
+for a fixed independent $x$. This is called \emph{size-biased sampling}.
+\end{intuition}
+
+\subsection{Conditional distribution: ideal sampler}
+
+For the noiseless case $\phi = 1$ (so $q_C = p_C$):
+
+\begin{proposition}
+\label{prop:sizebias}
+Let $C$ be Haar-random and $X \sim p_C$. Then for any measurable bounded
+$f$,
+\[
+  \E[f(p_C(X))] = N \cdot \E[p_C(x_0)\, f(p_C(x_0))]
+\]
+where $x_0$ is any fixed bitstring. In particular:
+\begin{align*}
+  \E[p_C(X)] &= \frac{2}{N}, \\
+  \E[p_C(X)^2] &= \frac{6}{N^2}, \\
+  \mathrm{Var}[p_C(X)] &= \frac{6}{N^2} - \frac{4}{N^2} = \frac{2}{N^2}.
+\end{align*}
+\end{proposition}
+
+\begin{proof}
+For any function $f$ of the probability,
+\begin{align*}
+\E_{C, X \sim p_C}[f(p_C(X))]
+  &= \E_C\!\left[\sum_x p_C(x) f(p_C(x))\right] \\
+  &= N \cdot \E_C[p_C(x_0) f(p_C(x_0))]
+\end{align*}
+where the second line uses symmetry over $x$ (Haar-randomness makes all
+bitstrings statistically equivalent). Setting $f(y) = y^k$ and applying
+\eqref{eq:moments} gives
+\[
+  \E[p_C(X)^k] = N \cdot \E[p_C(x_0)^{k+1}] = N \cdot \frac{(k+1)!}{N^{k+1}}
+  = \frac{(k+1)!}{N^k}.
+\]
+Setting $k=1, 2$ gives the stated values. \qedhere
+\end{proof}
+
+\begin{intuition}
+The conditional distribution of $N \cdot p_C(X)$ when $X \sim p_C$
+is the \emph{Gamma}$(2,1)$ distribution: a sum of two independent
+$\mathrm{Exp}(1)$'s, with mean 2. Compare to $N \cdot p_C(x_0)$ for fixed
+$x_0$, which is $\mathrm{Exp}(1)$ with mean 1. The size-biased version is
+literally ``one extra exponential's worth'' of probability mass.
+\end{intuition}
+
+\subsection{Conditional distribution: noisy sampler}
+
+For $\phi < 1$, $X \sim q_C = \phi p_C + (1-\phi)/N$, so by linearity:
+\begin{equation}
+  \E[p_C(X) \mid C] = \phi \cdot \E_{X \sim p_C}[p_C(X) \mid C] + (1-\phi)
+    \cdot \E_{X \sim U}[p_C(X) \mid C].
+  \label{eq:noisycond}
+\end{equation}
+The first term gives $\phi$ times the size-biased mean; the second term
+gives $(1-\phi)/N$. Averaging over $C$:
+\begin{equation}
+  \E[p_C(X)] = \phi \cdot \frac{2}{N} + (1-\phi) \cdot \frac{1}{N}
+   = \frac{1 + \phi}{N}.
+  \label{eq:noisyexp}
+\end{equation}
+
+This is the key identity: \textbf{the expected probability of an observed
+sample under a fidelity-$\phi$ sampler is $(1+\phi)/N$.}
+
+\section{Expected F\textsubscript{XEB} --- identical in both regimes}
+\label{sec:exp}
+
+We can now compute $\E[F_{\mathrm{XEB}}]$ in both regimes.
+
+\subsection{Regime B (Liu)}
+
+In Regime B, each $(C_i, x_i)$ is an independent draw. Using
+\eqref{eq:noisyexp}:
+\begin{equation}
+  \E[F_{\mathrm{XEB}}^{(B)}]
+   = \frac{N}{m} \sum_{i=1}^m \E[p_{C_i}(x_i)] - 1
+   = N \cdot \frac{1+\phi}{N} - 1
+   = \phi.
+   \label{eq:expB}
+\end{equation}
+
+\subsection{Regime A (AH)}
+
+In Regime A, all $m$ samples come from the same $C$. We need the law of
+total expectation:
+\begin{align}
+  \E[F_{\mathrm{XEB}}^{(A)}]
+   &= \E_C\!\left[ \frac{N}{m} \sum_{i=1}^m \E[p_C(x_i) \mid C] - 1
+   \right] \notag \\
+   &= \E_C\!\left[ \frac{N}{m} \cdot m \cdot \E[p_C(x_1) \mid C] -1 \right]
+   \notag \\
+   &= N \cdot \E_C\!\left[ \E[p_C(x_1) \mid C] \right] - 1 \notag \\
+   &= N \cdot \E[p_C(x_1)] - 1 \notag \\
+   &= N \cdot \frac{1+\phi}{N} - 1 = \phi.
+   \label{eq:expA}
+\end{align}
+
+\begin{intuition}
+Both regimes give $\E[F_{\mathrm{XEB}}] = \phi$. This is what makes
+F\textsubscript{XEB} a useful fidelity estimator in both settings. The
+\emph{mean} is structure-agnostic --- it depends only on the per-sample
+expectation, which involves Porter-Thomas size-biasing in the same way for
+both regimes.
+\end{intuition}
+
+\begin{remark}
+For an honest quantum sampler with $\phi \approx 1$, $\E[F_{\mathrm{XEB}}]
+\approx 1$. For a uniform-random classical adversary with $\phi = 0$,
+$\E[F_{\mathrm{XEB}}] = 0$. The Liu protocol's threshold $\chi = 0.3$ sits
+between these, corresponding to roughly the fidelity Quantinuum H2 delivers
+on the 56-qubit circuit ensemble.
+\end{remark}
+
+\section{Variance --- where the regimes differ}
+\label{sec:variance}
+
+Now we come to the central calculation. We compute $\Var[F_{\mathrm{XEB}}]$
+in each regime.
+
+\subsection{Variance in Regime B (Liu)}
+
+Each term $p_{C_i}(x_i)$ in the sum is an independent random variable
+(independent across $i$ because the $(C_i, x_i)$ pairs are independent).
+So
+\begin{equation}
+  \Var[F_{\mathrm{XEB}}^{(B)}] = \frac{N^2}{m^2} \cdot \sum_{i=1}^m
+  \Var[p_{C_i}(x_i)] = \frac{N^2}{m} \cdot \Var[p_C(X)],
+  \label{eq:varB}
+\end{equation}
+where in the last step we use that the $m$ variances are equal.
+
+We computed $\Var[p_C(X)] = 2/N^2$ for the noiseless case (Proposition
+\ref{prop:sizebias}). For $\phi < 1$ the variance changes by an $O(1)$
+factor; what matters is that
+\begin{equation}
+  \Var[F_{\mathrm{XEB}}^{(B)}] = \frac{c(\phi)}{m}
+  \label{eq:varB-rate}
+\end{equation}
+for some constant $c(\phi) = O(1)$. \textbf{Variance scales as $1/m$.}
+
+\subsection{Variance in Regime A (AH)}
+
+For Regime A we use the \emph{law of total variance}:
+\begin{equation}
+  \Var[F_{\mathrm{XEB}}^{(A)}] = \E_C\big[\Var[F_{\mathrm{XEB}}^{(A)} \mid C]\big]
+  + \Var_C\big[\E[F_{\mathrm{XEB}}^{(A)} \mid C]\big].
+  \label{eq:lotv}
+\end{equation}
+
+We compute each term.
+
+\subsubsection*{First term: within-circuit variance}
+
+Given $C$ fixed, the samples $x_1, \ldots, x_m$ are i.i.d.\ from $q_C$. So
+\begin{equation}
+  \Var[F_{\mathrm{XEB}}^{(A)} \mid C] = \frac{N^2}{m^2} \cdot m \cdot
+  \Var[p_C(X) \mid C] = \frac{N^2}{m} \cdot \Var[p_C(X) \mid C].
+\end{equation}
+Taking the outer expectation:
+\begin{equation}
+  \E_C\big[\Var[F_{\mathrm{XEB}}^{(A)} \mid C]\big]
+  = \frac{N^2}{m} \cdot \E_C[\Var[p_C(X) \mid C]].
+  \label{eq:within}
+\end{equation}
+
+This is the term that scales as $1/m$. So far, indistinguishable from
+Regime B.
+
+\subsubsection*{Second term: between-circuit variance --- the new term}
+
+The conditional expectation given $C$ is $\E[F_{\mathrm{XEB}}^{(A)} \mid C]
+= N \cdot \E[p_C(X) \mid C] - 1$. This is itself a random variable
+(depending on which $C$ was drawn).
+
+For the noiseless case, $\E[p_C(X) \mid C] = \sum_x p_C(x)^2$ (this is the
+\emph{collision probability} of distribution $p_C$). By
+Lemma~\ref{lem:collision}, its expectation is $2/N$. Its variance is
+non-trivial:
+\begin{lemma}
+\label{lem:between}
+For Haar-random $C$,
+\[
+  \Var_C\!\left[\sum_x p_C(x)^2\right] = \frac{20}{N^3} + O(N^{-4}).
+\]
+\end{lemma}
+
+(The leading-order computation involves $\E_C[(\sum_x p_C(x)^2)^2] = 4/N^2
++ 20/N^3 + O(N^{-4})$, which follows from Weingarten calculus on the
+Haar measure. We don't reproduce the calculation here; see the Boixo et
+al.\ supplement.)
+
+So:
+\begin{align}
+  \Var_C\big[\E[F_{\mathrm{XEB}}^{(A)} \mid C]\big]
+   &= \Var_C\big[N \cdot \E[p_C(X) \mid C] - 1\big] \notag\\
+   &= N^2 \cdot \Var_C[\E[p_C(X) \mid C]] \notag \\
+   &\approx N^2 \cdot \frac{20}{N^3} \notag \\
+   &= \frac{20}{N}.
+   \label{eq:between}
+\end{align}
+
+\textbf{Crucially, this term does not depend on $m$.}
+
+\subsubsection*{Putting it together}
+
+Combining \eqref{eq:within} and \eqref{eq:between}:
+\begin{equation}
+  \Var[F_{\mathrm{XEB}}^{(A)}] = \underbrace{\frac{c(\phi)}{m}}_{\text{within-circuit}}
+   + \underbrace{\frac{20}{N} + O(\cdot)}_{\text{between-circuit}}.
+   \label{eq:varA}
+\end{equation}
+
+\subsection{Comparison}
+
+Compare:
+\begin{align*}
+  \Var[F_{\mathrm{XEB}}^{(B)}] &= \frac{c(\phi)}{m}, \\
+  \Var[F_{\mathrm{XEB}}^{(A)}] &= \frac{c(\phi)}{m} + \frac{20}{N} +
+  O(\cdot).
+\end{align*}
+
+For $n = 56$, $N = 2^{56} \approx 7.2 \times 10^{16}$, so $20/N \approx
+3 \times 10^{-16}$. For $m = 1522$, $c(\phi)/m \sim 1/m \approx 6.6
+\times 10^{-4}$. So the between-circuit term is dwarfed by the
+within-circuit term.
+
+\textit{Does this mean the difference is negligible?} No --- and this is
+the subtle point. The variance values \emph{evaluated for a single
+random circuit} are similar in magnitude. But the structural difference
+manifests when we ask about \emph{concentration over many independent
+protocol executions}.
+
+\begin{intuition}
+The two regimes give similar single-run variance because the
+between-circuit fluctuation is small ($N$ is huge, so individual circuits
+all look approximately Porter-Thomas). The structural difference is not
+in the magnitude of variance but in \textbf{which concentration
+inequality applies}: i.i.d.\ samples (Regime B) admit standard Chernoff
+bounds; correlated samples sharing a circuit (Regime A) require the
+Entropy Accumulation Theorem.
+\end{intuition}
+
+\section{Concentration: where the structural difference bites}
+\label{sec:concentration}
+
+The certified-entropy bound depends not just on the variance of
+F\textsubscript{XEB} but on \emph{tail bounds} --- the probability that
+F\textsubscript{XEB} deviates from its expectation by more than $\delta$,
+for various $\delta$.
+
+\subsection{Regime B: direct Chernoff}
+
+In Regime B, the $m$ summands $p_{C_i}(x_i)$ are i.i.d.\ bounded random
+variables (bounded by $1$, since they're probabilities). The Chernoff
+bound (or Hoeffding's inequality) gives
+\begin{equation}
+  \Pr[|F_{\mathrm{XEB}}^{(B)} - \phi| > \delta] \leq 2 \exp(-c \cdot m
+  \delta^2),
+\end{equation}
+for some constant $c$. The protocol's soundness analysis uses
+exactly this bound (with a careful split of the soundness budget
+$\eps_\mathrm{sou}/2$ between this Chernoff term and the hypergeometric
+tail; see Liu et al.\ Lemma 2 and our own implementation in
+\texttt{leg5\_qmin\_liu.compute\_q\_min}).
+
+\textbf{Crucially: nothing more sophisticated is needed.} The bound is
+sharp, computable in closed form, and yields the tight $Q_\mathrm{min}$
+calibration.
+
+\subsection{Regime A: Entropy Accumulation Theorem}
+
+In Regime A, the $m$ summands $p_C(x_i)$ share the single random variable
+$C$. They are not independent; they're conditionally i.i.d.\ given $C$.
+
+A direct Chernoff bound \emph{does not work}: the variance includes a
+between-circuit term that's not reduced by increasing $m$.
+
+Aaronson and Hung handle this with the Entropy Accumulation Theorem (EAT)
+of Dupuis, Fawzi, and Renner (2020). EAT is a chain-rule-style decomposition
+that handles the conditional structure correctly. The high-level statement:
+\begin{quote}
+Even when later rounds are conditioned on earlier rounds' outcomes, the
+total entropy accumulates linearly (modulo correction terms scaling with
+$\sqrt{m}$) provided per-round entropy is appropriately characterised.
+\end{quote}
+
+For RCS with $m$ shots on a single circuit, EAT gives a certified-entropy
+bound of the form
+\begin{equation}
+  H_{\min}^{\mathrm{cert}} \geq m \cdot h(\phi) - O(\sqrt{m}) -
+  \log(1/\eps_\mathrm{sou})
+\end{equation}
+for some per-shot entropy rate $h(\phi)$.
+
+\subsection{Why Liu's bound is tighter}
+
+The crucial comparison: AH's bound has an $O(\sqrt{m})$ correction term;
+Liu's i.i.d.\ Chernoff has an $O(\log(1/\eps)/\sqrt{m})$ correction in the
+deviation.
+
+For typical parameters ($m \sim 10^3$, $\eps_\mathrm{sou} \sim 10^{-6}$),
+the $O(\sqrt{m}) \approx 30$ correction in AH \textbf{eats into the
+certified-entropy budget} more than the $O(\log(1/\eps))$ correction in
+Liu's i.i.d.\ regime.
+
+This is why, for the same hardware and the same nominal $F_{\mathrm{XEB}}$,
+Liu's structure yields \emph{more} certified bits per round than AH's
+structure does. \textbf{Same physics; same expectation; tighter bound from
+the i.i.d.\ structure.}
+
+\section{Numerical comparison for Liu's parameter regime}
+
+For $n=56$, $m=1522$, $M = 30{,}010$, $\chi = 0.3$, $\eps_\mathrm{sou} =
+10^{-6}$, and the calibrated Liu adversary model ($4 \times$ Frontier
+theoretical, $\mathrm{eff} = 0.5$):
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Quantity} & \textbf{Regime A (AH)} & \textbf{Regime B (Liu)} \\
+\midrule
+$\E[F_{\mathrm{XEB}}]$ & $\phi$ (same) & $\phi$ (same) \\
+$\Var[F_{\mathrm{XEB}}]$ & $\sim c(\phi)/m$ & $\sim c(\phi)/m$ \\
+Concentration tool & EAT & i.i.d.\ Chernoff \\
+Soundness-eating correction & $O(\sqrt m)$ & $O(\log(1/\eps))$ \\
+Certified bits per round & smaller & larger \\
+$Q_\mathrm{min}$ (Liu's parameters) & $\approx $ larger$^\dagger$ & $1297$ \\
+$H_{\min}^{\mathrm{cert}}$ & smaller$^\dagger$ & $71{,}313$ bits \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent {\small $^\dagger$ ``Larger $Q_\mathrm{min}$'' for AH means the
+threshold is more conservative --- it certifies less for the same
+acceptance. Exact AH numbers depend on the EAT-derived bound; the
+qualitative point is that AH is strictly looser for the same parameters.}
+
+\section{Implications for Quip}
+
+Three concrete implications for the protocol design:
+
+\paragraph{1. Liu's structure is the right choice.} For the same hardware
+and the same $F_{\mathrm{XEB}}$ score, Liu's i.i.d.\ structure certifies more
+bits per round than AH's. The v0.4 refactor adopted this structure, and
+this document explains \emph{why} that adoption was the right call.
+
+\paragraph{2. F\textsubscript{XEB} computation is structure-agnostic.}
+The formula \eqref{eq:fxeb} is identical in both regimes. The function in
+\texttt{leg5\_certified\_entropy.compute\_fxeb} operates on (sample,
+probability) pairs without caring how the samples were grouped. This is
+why verifying our F\textsubscript{XEB} implementation against Liu's
+experimental data is a meaningful test of the formula, independent of the
+structural choice.
+
+\paragraph{3. The structural choice is separable from hardware.} Whether
+we run on Quantinuum H2, IonQ Forte, or another QPU, the
+expected $F_{\mathrm{XEB}}$ is set by hardware fidelity. The structural
+choice (AH vs Liu) is independent: it's a protocol-level decision about
+how to allocate circuits to rounds. Hardware decisions and structural
+decisions can be made independently.
+
+\section{Summary}
+
+The two questions and their answers:
+
+\begin{enumerate}
+\item \textbf{Is the statistical distribution of $p_{C_i}(x_i)$
+identical in the two regimes?} \\
+\textbf{Yes.} In both regimes, $p_{C_i}(x_i)$ follows the size-biased
+Porter-Thomas distribution, with mean $(1+\phi)/N$.
+\item \textbf{Is the concentration behaviour of F\textsubscript{XEB}
+identical in the two regimes?} \\
+\textbf{No.} Regime B's samples are independent, admitting direct Chernoff
+concentration. Regime A's samples are correlated through the shared
+circuit, requiring the Entropy Accumulation Theorem and producing a
+strictly looser certified-entropy bound.
+\end{enumerate}
+
+The expected $F_{\mathrm{XEB}}$ is identical; the variance has the same
+leading $1/m$ scaling; but the \emph{tail behaviour} differs in a way
+that propagates through the certified-entropy chain. Liu's structure is
+optimal among the two; this is what v0.4 implements.
+
+\section*{References}
+
+\begin{description}
+\item[Aaronson, S.\ and Hung, S.-H.] (2023).
+  \emph{Certified Randomness from Quantum Supremacy}. STOC.
+
+\item[Boixo, S.\ et al.] (2018).
+  \emph{Characterizing quantum supremacy in near-term devices}. Nature
+  Physics 14, 595--600.
+
+\item[Dupuis, F., Fawzi, O., Renner, R.] (2020).
+  \emph{Entropy Accumulation}. Communications in Mathematical Physics 379,
+  867--913.
+
+\item[Liu, M.\ et al.] (2025).
+  \emph{Certified randomness using a trapped-ion quantum processor}.
+  Nature 640:343; arXiv:2503.20498.
+
+\item[Porter, C.E.\ and Thomas, R.G.] (1956).
+  \emph{Fluctuations of nuclear reaction widths}. Physical Review 104,
+  483.
+\end{description}
+
+\vfill
+
+\noindent\rule{\linewidth}{0.4pt}\\[2pt]
+\textit{Quip Protocol Project --- Internal reference. Last revised June 2026.
+Companion documents: \texttt{porter\_thomas\_report.pdf} (full
+Porter-Thomas derivations), \texttt{leg5\_verification\_design.pdf}
+(verification deck), and \texttt{quip\_design\_notes.pdf} (consolidated
+design notes).}
+
+\end{document}

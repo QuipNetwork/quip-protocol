@@ -1,0 +1,597 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1.05in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{microtype}
+\usepackage{parskip}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=blue!60!black,
+}
+
+% Theorem environments
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+
+% Custom intuition box
+\newtcolorbox{intuition}{
+  colback=blue!5!white,
+  colframe=blue!50!black,
+  fonttitle=\bfseries,
+  title=Intuition,
+  boxrule=0.5pt,
+  arc=2pt,
+  left=6pt,right=6pt,top=4pt,bottom=4pt
+}
+
+% Symbols
+\newcommand{\Fxeb}{F_{\text{XEB}}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\mathrm{Var}}
+\newcommand{\Cov}{\mathrm{Cov}}
+\newcommand{\ket}[1]{|#1\rangle}
+\newcommand{\bra}[1]{\langle #1|}
+\newcommand{\eps}{\varepsilon}
+
+\title{\textbf{Porter-Thomas in Both Sampling Schemes} \\
+       \large A complete mathematical account of why $F_{\text{XEB}}$ \\
+       gives the same expectation across the AH and Liu structures, \\
+       and where the schemes diverge}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent This note works out, with no gaps, the mathematics behind a claim made informally throughout the certified-randomness literature: that the linear cross-entropy benchmark $\Fxeb$ has the same expected value $1$ under both the Aaronson-Hung structure (many shots from a single random circuit) and the Liu structure (one shot from each of many distinct random circuits). We derive each step from the Porter-Thomas distribution's moments, show why the equivalence holds (concentration of $\sum_x p_C(x)^2$ over Haar-random circuits), compute the variances explicitly, and explain why the schemes nonetheless differ in their certified-entropy bound tightness. Throughout, an intuition box accompanies each formal step.
+\end{abstract}
+
+\tableofcontents
+
+\section{Setting: Quantum Circuits and Output Distributions}
+
+\subsection{Notation}
+
+We work with $n$ qubits, so the Hilbert space is $\mathbb{C}^N$ with $N = 2^n$. A quantum circuit $C$ on $n$ qubits is a unitary $U_C : \mathbb{C}^N \to \mathbb{C}^N$. Starting in the computational-basis state $\ket{0^n}$, the circuit's output state is
+\[
+\ket{\psi_C} = U_C \ket{0^n}.
+\]
+Computational-basis measurement of $\ket{\psi_C}$ yields each bitstring $x \in \{0, 1\}^n$ with probability
+\begin{equation}
+p_C(x) = |\bra{x} U_C \ket{0^n}|^2.
+\label{eq:prob}
+\end{equation}
+These are the output probabilities of the circuit. There are $N$ of them, one per bitstring, and they sum to $1$:
+\begin{equation}
+\sum_{x \in \{0,1\}^n} p_C(x) = 1.
+\label{eq:normalization}
+\end{equation}
+
+\begin{intuition}
+A circuit $C$ defines a single probability distribution over the $N$ possible measurement outcomes. The number $p_C(x)$ is the probability that bitstring $x$ comes out when you run the circuit and measure. We treat the circuit itself as a black box producing this distribution.
+\end{intuition}
+
+\subsection{What Sampling Means}
+
+When the quantum server runs $C$ once and measures, the protocol receives a single sample $x \in \{0,1\}^n$ drawn from the distribution $\{p_C(x)\}_{x}$. When the server runs $C$ multiple times (or runs $M$ different circuits, once each), the protocol receives a batch of samples whose statistics we analyze below.
+
+\section{Haar Randomness and the Porter-Thomas Distribution}
+
+\subsection{Haar-Random Unitaries}
+
+The set of $N \times N$ unitary matrices $U(N)$ carries a unique left- and right-invariant probability measure (the \emph{Haar measure}). A circuit $C$ is \emph{Haar-random} if $U_C$ is drawn from this measure.
+
+For our purposes, the operational consequence is the following. \emph{Quantum random circuit sampling} (RCS) protocols generate circuits via a fixed recipe (alternating random single-qubit rotations and entangling layers) such that, after enough layers, $U_C$ is approximately Haar-distributed in the sense that its first two moments match those of the Haar measure. Such circuits are \emph{unitary 2-designs}, and for the protocol's purposes (which depend only on first and second moments of $p_C(x)$), they are statistically indistinguishable from truly Haar-random.
+
+\begin{intuition}
+Haar randomness means there is no preferred direction in the space of quantum operations. A Haar-random circuit, applied to any fixed input, scrambles the state to a uniformly random point on the unit sphere in $\mathbb{C}^N$. The output probabilities $p_C(x)$ then inherit this scrambling, leading to a specific universal distribution --- Porter-Thomas.
+\end{intuition}
+
+\subsection{The Porter-Thomas Distribution}
+
+\begin{theorem}[Porter-Thomas, 1956]
+For a Haar-random unitary $U_C \in U(N)$ and any fixed bitstring $x \in \{0,1\}^n$, the random variable
+\[
+s = N \cdot p_C(x) = N \cdot |\bra{x} U_C \ket{0^n}|^2
+\]
+is asymptotically (large $N$) exponentially distributed with rate $1$:
+\[
+\Pr[s \leq t] = 1 - e^{-t} + O(1/N), \quad t \geq 0.
+\]
+\label{thm:pt}
+\end{theorem}
+
+The density function is
+\begin{equation}
+f(s) = e^{-s}, \quad s \geq 0,
+\label{eq:pt-density}
+\end{equation}
+equivalently, in terms of $p$,
+\begin{equation}
+f_p(p) = N e^{-Np}, \quad p \geq 0.
+\label{eq:pt-p-density}
+\end{equation}
+This result was first derived by Porter and Thomas in 1956 in the context of nuclear resonance theory; in our setting it follows from the geometry of the unit sphere in $\mathbb{C}^N$ together with Haar measure properties of $U(N)$.
+
+\begin{intuition}
+The output probabilities of a Haar-random circuit are not uniform. Some bitstrings are much more probable than others, and the distribution of probability values across bitstrings follows an exponential curve. Most bitstrings have probability below the uniform value $1/N$; a few have notably higher probabilities. This lopsidedness is the physical fingerprint of genuine quantum interference.
+\end{intuition}
+
+\subsection{Moments of the Porter-Thomas Distribution}
+
+The moment generating function of the exponential distribution with rate $1$ is
+\[
+M(t) = \E[e^{ts}] = \frac{1}{1-t}, \quad t < 1.
+\]
+Differentiating gives $\E[s^k] = k!$ for integer $k \geq 0$. So in terms of $p_C(x)$ (recall $s = Np$):
+\begin{equation}
+\boxed{\;\E[p_C(x)^k] = \frac{k!}{N^k} \quad \text{for each fixed } x, \text{ averaging over Haar-random } C.}
+\label{eq:moments}
+\end{equation}
+
+For the values we need:
+\begin{align}
+\E[p_C(x)] &= \frac{1}{N}, \label{eq:moment1} \\
+\E[p_C(x)^2] &= \frac{2}{N^2}, \label{eq:moment2} \\
+\E[p_C(x)^3] &= \frac{6}{N^3}. \label{eq:moment3}
+\end{align}
+
+\begin{intuition}
+The first moment $\E[p_C(x)] = 1/N$ is forced --- since $\sum_x p_C(x) = 1$ and by symmetry of Haar measure all bitstrings have equal expected probability, each must average $1/N$. The second moment $\E[p_C(x)^2] = 2/N^2$ is the key non-trivial number: it is \emph{twice} the value $1/N^2$ that a uniform distribution would give. This factor of 2 is the entire quantum signal.
+\end{intuition}
+
+\section{The Universal Quantity: $\sum_x p_C(x)^2 \approx 2/N$}
+
+We now derive the central object $\Fxeb$ will measure.
+
+\subsection{Expected Value over Haar-Random Circuits}
+
+\begin{proposition}
+For a Haar-random circuit $C$ on $n$ qubits with $N = 2^n$,
+\begin{equation}
+\E_C\!\left[\, \sum_{x} p_C(x)^2 \,\right] = \frac{2}{N} \cdot \left(1 + O(1/N)\right).
+\label{eq:sum-squared-mean}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+By linearity of expectation,
+\[
+\E_C\!\left[\, \sum_{x} p_C(x)^2 \,\right] = \sum_{x} \E_C[p_C(x)^2].
+\]
+By the symmetry of Haar measure, $\E_C[p_C(x)^2]$ does not depend on $x$; using Equation~\eqref{eq:moment2},
+\[
+\sum_{x} \E_C[p_C(x)^2] = N \cdot \frac{2}{N^2} = \frac{2}{N}.
+\]
+\end{proof}
+
+\begin{intuition}
+The sum $\sum_x p_C(x)^2$ is the \emph{collision probability} of the distribution $p_C$ --- the chance that two independent samples from $p_C$ land on the same bitstring. For a uniform distribution this is $1/N$; for Porter-Thomas this is $2/N$. The factor of 2 reflects how concentrated Porter-Thomas's mass is on a small subset of high-probability bitstrings.
+\end{intuition}
+
+\subsection{Concentration: the Sum is Close to $2/N$ for Each Typical Circuit}
+
+The expectation $\E_C[\sum_x p_C(x)^2] = 2/N$ tells us the \emph{average} value. For the protocol to work, we need a stronger statement: this sum is close to $2/N$ for \emph{each} typical Haar-random circuit, not just on average.
+
+\begin{proposition}[Concentration]
+The variance of $\sum_x p_C(x)^2$ over Haar-random $C$ satisfies
+\begin{equation}
+\Var_C\!\left[\,\sum_x p_C(x)^2\,\right] = O\!\left(\frac{1}{N^2}\right).
+\label{eq:sum-squared-var}
+\end{equation}
+Hence, for a Haar-random circuit, $\sum_x p_C(x)^2 = \frac{2}{N}(1 + O(1/\sqrt{N}))$ with high probability.
+\end{proposition}
+
+This is a consequence of higher-moment estimates over Haar measure; see e.g.\ Boixo et al.\ (2018) and Hangleiter \& Eisert (2023). The numerical scale: for $n=56$, $N = 2^{56} \approx 7 \times 10^{16}$, so the relative fluctuation $1/\sqrt{N}$ is on the order of $10^{-8}$ --- utterly negligible.
+
+\begin{intuition}
+Porter-Thomas is not just an "average" property of Haar-random circuits. It holds, with overwhelming probability, for \emph{every} Haar-random circuit individually. Two different Haar-random circuits will have different high-probability bitstrings, but they will have nearly identical collision probabilities $\sum_x p_C(x)^2$. The signature is robust across the ensemble. This concentration property is what makes the universality argument in Section~\ref{sec:universality} work.
+\end{intuition}
+
+\section{Interlude: Where Do $1/N$ and $2/N$ Come From?}
+
+The two numbers $1/N$ and $2/N$ govern everything that follows. Their formal derivations above (via the moments of the exponential distribution) are tight but compressed. Three complementary intuitions help build a working feel for what these quantities mean.
+
+\subsection{The Lottery-Ticket Picture}
+
+Picture $N$ lottery tickets, each with some win probability $p_C(x)$. The probabilities sum to $1$. Two natural averages exist.
+
+\paragraph{The count-weighted mean.} If you pick a ticket uniformly at random from the bag, the average ticket has value $1/N$. This is forced by normalization: $\sum_x p_C(x) = 1$ divided across $N$ tickets gives mean $1/N$ regardless of how the probabilities are distributed --- whether uniform, Porter-Thomas, or anything else.
+
+\paragraph{The probability-weighted mean.} The lottery actually draws \emph{winning tickets} --- and the winning ticket is sampled with probability $p_C(x)$, not uniformly. Tickets with higher probability win more often. The expected value of the winning ticket is
+\[
+\sum_x p_C(x) \cdot p_C(x) = \sum_x p_C(x)^2.
+\]
+For Porter-Thomas, this evaluates to $2/N$ --- twice the random-pick average. Winners are, on average, twice as valuable as random picks.
+
+\begin{intuition}
+$1/N$ is the average value of a randomly-picked ticket; $2/N$ is the average value of a winning ticket. The factor of 2 reflects how much Porter-Thomas "rewards itself" --- concentrating probability on a sliver of high-probability bitstrings that the sampling distribution then favors.
+\end{intuition}
+
+\subsection{The Collision-Probability Picture}
+
+A second perspective: draw two independent samples from $p_C$ and ask, "what is the probability they land on the same bitstring?"
+
+By independence of the two draws,
+\[
+\Pr[\text{both samples} = x] = p_C(x)^2,
+\]
+\[
+\Pr[\text{both samples agree}] = \sum_x p_C(x)^2.
+\]
+This is the \emph{collision probability} of the distribution --- a standard measure of how concentrated the probability mass is.
+
+\paragraph{For a uniform distribution} (every $p(x) = 1/N$):
+\[
+\text{collision probability} = N \cdot (1/N)^2 = 1/N.
+\]
+
+\paragraph{For Porter-Thomas:}
+\[
+\text{collision probability} = 2/N.
+\]
+
+\emph{Twice as concentrated as uniform.}
+
+\begin{intuition}
+The number $2/N$ is the literal probability that two independent samples from a Porter-Thomas distribution land on the same bitstring. Uniform gives $1/N$. The factor of $2$ is the quantitative signal of Porter-Thomas's lopsidedness --- measurable from samples, which is what $\Fxeb$ exploits.
+\end{intuition}
+
+\subsection{The Exponential-Distribution Picture}
+
+The deepest perspective: where does the "$2$" come from mathematically?
+
+Porter-Thomas says $s := N\, p_C(x)$ is exponentially distributed with rate $1$. A defining feature of the exponential distribution is that its mean and variance are equal:
+\[
+\E[s] = 1, \qquad \Var(s) = 1.
+\]
+Consequently,
+\[
+\E[s^2] = \Var(s) + \E[s]^2 = 1 + 1 = 2.
+\]
+
+This is the source of the "$2$." Translating back to $p$:
+\[
+\E[(Np_C(x))^2] = 2 \quad \Longrightarrow \quad \E[p_C(x)^2] = \frac{2}{N^2}.
+\]
+
+\begin{intuition}
+The factor of $2$ is, at the deepest level, a property of the exponential distribution itself: its second moment is twice its squared mean, because mean and variance happen to be equal. This is not arbitrary --- it is a consequence of how high-dimensional unit vectors distribute their components on the complex unit sphere $S^{2N-1} \subset \mathbb{C}^N$. Concentration of measure on this sphere forces components' squared moduli to follow an exponential law in the large-$N$ limit.
+\end{intuition}
+
+\subsection{Summary: Uniform vs Porter-Thomas}
+
+The three perspectives line up cleanly:
+
+\begin{center}
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{p{5.5cm}cc}
+\hline
+ & \textbf{Uniform} & \textbf{Porter-Thomas} \\
+\hline
+Count-weighted mean of $p(x)$ & $1/N$ & $1/N$ \\
+Probability-weighted mean $\sum_x p(x)^2$ & $1/N$ & $2/N$ \\
+Collision probability $\Pr[\text{2 samples agree}]$ & $1/N$ & $2/N$ \\
+Lopsidedness ratio & $1$ & $2$ \\
+\hline
+\end{tabular}
+\end{center}
+
+For uniform distributions, the count-weighted and probability-weighted means coincide --- every ticket is equally valuable, so there is no "winner premium." For Porter-Thomas, the probability-weighted mean is exactly twice the count-weighted one --- the lopsidedness ratio is $2$.
+
+This ratio is exactly what $\Fxeb$ measures. The formula
+\[
+\Fxeb = \frac{N}{m}\sum_i p_{C_i}(x_i) - 1
+\]
+multiplies the empirical probability-weighted mean by $N$ (recovering the lopsidedness ratio) and subtracts $1$ (the uniform baseline). Honest quantum sampling gives ratio $2$, hence $\Fxeb = 2 - 1 = 1$. Uniform spoofing gives ratio $1$, hence $\Fxeb = 0$.
+
+\begin{intuition}
+$\Fxeb$ is, at heart, an empirical measurement of the "lopsidedness ratio" of the underlying distribution. Porter-Thomas's ratio is exactly $2$. The protocol's certification is the act of measuring this ratio from samples and confirming it sits where physics predicts it should --- with the deadline ruling out classical spoofs that could produce the same ratio without doing genuine quantum work.
+\end{intuition}
+
+\section{The Linear Cross-Entropy Benchmark}
+
+\subsection{Definition}
+
+\begin{definition}[$\Fxeb$]
+Given a collection of sample-circuit pairs $\{(x_i, C_i)\}_{i=1}^{m}$, the linear cross-entropy benchmark is
+\begin{equation}
+\Fxeb = \frac{N}{m} \sum_{i=1}^{m} p_{C_i}(x_i) - 1.
+\label{eq:fxeb}
+\end{equation}
+\end{definition}
+
+The verifier classically simulates each circuit $C_i$ to compute the ideal probability $p_{C_i}(x_i)$ that an honest quantum machine would assign to the bitstring $x_i$ the server returned. The score $\Fxeb$ is built so that under uniform spoofing it equals $0$ (in expectation) and under honest quantum sampling it equals $1$ (in expectation).
+
+\begin{intuition}
+Think of $\Fxeb$ as: ``how much more often than chance does the server's output land on high-probability bitstrings?'' If the server is sampling honestly, samples will tend to land where the quantum distribution piles probability, giving a high score. If the server is sampling uniformly (or otherwise faking blindly), samples land everywhere equally and the score is low.
+\end{intuition}
+
+The next two sections compute $\E[\Fxeb]$ explicitly under the two sampling schemes.
+
+\section{Scheme A: Many Shots, One Circuit (Aaronson-Hung)}
+
+\subsection{Setup}
+
+A single circuit $C$ is fixed for the round. The server samples $m$ bitstrings $x_1, \ldots, x_m$ independently from the distribution $p_C(\cdot)$:
+\[
+x_1, x_2, \ldots, x_m \overset{\text{i.i.d.}}{\sim} p_C.
+\]
+The verifier then computes $\Fxeb$ via Equation~\eqref{eq:fxeb}, with $C_i = C$ for all $i$.
+
+\subsection{Per-Sample Expectation}
+
+\begin{lemma}
+For the single fixed circuit $C$,
+\begin{equation}
+\E_{x \sim p_C}[p_C(x)] = \sum_x p_C(x)^2.
+\label{eq:scheme-a-per-sample}
+\end{equation}
+\end{lemma}
+
+\begin{proof}
+By definition of sampling from $p_C$:
+\[
+\E_{x \sim p_C}[p_C(x)] = \sum_{x} \Pr[x] \cdot p_C(x) = \sum_x p_C(x) \cdot p_C(x) = \sum_x p_C(x)^2.
+\]
+\end{proof}
+
+\begin{intuition}
+This is the crucial observation: when you sample bitstrings according to $p_C$, you are \emph{probability-weighted} --- high-probability bitstrings show up more often. So the average $p_C(x)$ over your samples is higher than the count-weighted average $1/N$; it equals $\sum_x p_C(x)^2$.
+\end{intuition}
+
+\subsection{Expected $\Fxeb$}
+
+By Equation~\eqref{eq:scheme-a-per-sample} and the concentration of $\sum_x p_C(x)^2$ near $2/N$ (Proposition 3.3), for a typical Haar-random $C$,
+\[
+\E_{x \sim p_C}[p_C(x)] \approx \frac{2}{N}.
+\]
+Therefore
+\begin{align}
+\E[\Fxeb] &= \frac{N}{m} \sum_{i=1}^{m} \E[p_C(x_i)] - 1 \nonumber \\
+          &= \frac{N}{m} \cdot m \cdot \frac{2}{N} - 1 \nonumber \\
+          &= 2 - 1 \nonumber \\
+          &= 1.
+\label{eq:scheme-a-expectation}
+\end{align}
+
+\begin{intuition}
+Scheme A picks up the factor of 2 by sampling many times from one Haar-random circuit's lopsided distribution and observing that the samples land --- on average --- on bitstrings with probability twice the count-weighted mean. The expected $\Fxeb$ is exactly $1$.
+\end{intuition}
+
+\subsection{Within-Round Variance}
+
+For the security analysis we will also need the variance. The samples are i.i.d.\ given $C$:
+\begin{equation}
+\Var_{x \sim p_C}[p_C(x)] = \E_{x \sim p_C}[p_C(x)^2] - \left(\E_{x \sim p_C}[p_C(x)]\right)^2.
+\label{eq:scheme-a-var-def}
+\end{equation}
+
+For the first term:
+\[
+\E_{x \sim p_C}[p_C(x)^2] = \sum_x p_C(x) \cdot p_C(x)^2 = \sum_x p_C(x)^3.
+\]
+Taking expectation over Haar-random $C$ (with $\E_C[p_C(x)^3] = 6/N^3$):
+\[
+\E_C\!\left[\sum_x p_C(x)^3\right] = N \cdot \frac{6}{N^3} = \frac{6}{N^2}.
+\]
+And $\left(\sum_x p_C(x)^2\right)^2 \approx (2/N)^2 = 4/N^2$ for typical $C$. Thus
+\begin{equation}
+\Var_{x \sim p_C}[p_C(x)] \approx \frac{6}{N^2} - \frac{4}{N^2} = \frac{2}{N^2}.
+\label{eq:scheme-a-within-var}
+\end{equation}
+
+The variance of the empirical average $\frac{1}{m}\sum_i p_C(x_i)$ over $m$ i.i.d.\ samples is therefore
+\begin{equation}
+\Var\!\left[\frac{1}{m}\sum_i p_C(x_i)\right] = \frac{1}{m} \Var_{x \sim p_C}[p_C(x)] \approx \frac{2}{mN^2}.
+\label{eq:scheme-a-mean-var}
+\end{equation}
+
+\begin{intuition}
+The empirical average concentrates around $2/N$ with standard deviation roughly $\sqrt{2}/(N\sqrt{m})$. This is small in absolute terms (decays as $1/\sqrt{m}$), but the samples are correlated through the shared circuit --- a fact that becomes critical in the security analysis (Section~\ref{sec:tightness}).
+\end{intuition}
+
+\section{Scheme B: Many Circuits, One Shot Each (Liu)}
+
+\subsection{Setup}
+
+$M$ distinct circuits $C_1, \ldots, C_M$ are generated, each independently Haar-random (or generated from independent seed expansions to be 2-design-equivalent). The server samples one bitstring per circuit:
+\[
+x_i \sim p_{C_i}(\cdot), \quad i = 1, \ldots, M, \quad C_i \overset{\text{i.i.d.}}{\sim} \text{Haar}.
+\]
+The verifier computes $\Fxeb$ via Equation~\eqref{eq:fxeb}, with each $C_i$ different.
+
+\subsection{Per-Sample Expectation}
+
+\begin{lemma}
+For each round $i$, averaging jointly over the Haar-random circuit and the sample from it,
+\begin{equation}
+\E_{C_i \sim \text{Haar},\, x_i \sim p_{C_i}}[p_{C_i}(x_i)] = \E_{C_i \sim \text{Haar}}\!\left[\,\sum_x p_{C_i}(x)^2\,\right] = \frac{2}{N}.
+\label{eq:scheme-b-per-sample}
+\end{equation}
+\end{lemma}
+
+\begin{proof}
+By the tower property of expectation,
+\[
+\E_{C_i, x_i}[p_{C_i}(x_i)] = \E_{C_i}\!\left[\E_{x_i \sim p_{C_i}}[p_{C_i}(x_i)]\right].
+\]
+By Lemma 5.1 (applied to the random circuit $C_i$), the inner expectation equals $\sum_x p_{C_i}(x)^2$. Taking outer expectation and applying Proposition 3.2:
+\[
+\E_{C_i, x_i}[p_{C_i}(x_i)] = \E_{C_i}\!\left[\sum_x p_{C_i}(x)^2\right] = \frac{2}{N}.
+\]
+\end{proof}
+
+\begin{intuition}
+Scheme B's per-sample expectation also lands on $2/N$, but via a different route. Instead of fixing one circuit and averaging over its samples (Scheme A), we average over a Haar-random circuit \emph{and} a sample from it. Tower expectation says we can do the inner integral first --- which gives us Scheme A's quantity, $\sum_x p_C(x)^2$ --- and then average that over Haar. Because $\sum_x p_C(x)^2$ is concentrated near $2/N$ for each $C$, the outer average also lands on $2/N$.
+\end{intuition}
+
+\subsection{Expected $\Fxeb$}
+
+Substituting into Equation~\eqref{eq:fxeb} with $m = M$:
+\begin{equation}
+\E[\Fxeb] = \frac{N}{M} \sum_{i=1}^{M} \E[p_{C_i}(x_i)] - 1 = \frac{N}{M} \cdot M \cdot \frac{2}{N} - 1 = 1.
+\label{eq:scheme-b-expectation}
+\end{equation}
+
+\emph{Same expected value as Scheme A.}
+
+\subsection{Variance: Within and Between Circuits}
+
+The variance per round decomposes via the law of total variance:
+\begin{equation}
+\Var_{C_i, x_i}[p_{C_i}(x_i)] = \E_{C_i}\!\left[\Var_{x_i}[p_{C_i}(x_i)]\right] + \Var_{C_i}\!\left[\E_{x_i}[p_{C_i}(x_i)]\right].
+\label{eq:total-var}
+\end{equation}
+
+\paragraph{The within-circuit term.} By Equation~\eqref{eq:scheme-a-within-var}, $\Var_{x_i}[p_{C_i}(x_i)] \approx 2/N^2$ for typical $C_i$, so
+\[
+\E_{C_i}\!\left[\Var_{x_i}[p_{C_i}(x_i)]\right] \approx \frac{2}{N^2}.
+\]
+
+\paragraph{The between-circuit term.} This is $\Var_{C_i}[\sum_x p_{C_i}(x)^2]$, which by Proposition 3.3 is $O(1/N^2)$ --- in fact much smaller than the within-circuit term in the large-$N$ limit.
+
+\paragraph{Combined.} 
+\begin{equation}
+\Var_{C_i, x_i}[p_{C_i}(x_i)] \approx \frac{2}{N^2} + O\!\left(\frac{1}{N^2}\right) \approx \frac{2}{N^2}.
+\label{eq:scheme-b-per-round-var}
+\end{equation}
+
+The variance of the empirical average over $M$ independent rounds:
+\begin{equation}
+\Var\!\left[\frac{1}{M}\sum_i p_{C_i}(x_i)\right] = \frac{1}{M} \Var_{C_i, x_i}[p_{C_i}(x_i)] \approx \frac{2}{MN^2}.
+\label{eq:scheme-b-mean-var}
+\end{equation}
+
+\emph{Numerically identical to Scheme A's variance per sample.} The schemes have the same expected $\Fxeb$ and the same per-sample variance --- the difference between them lies elsewhere, as we discuss in the next section.
+
+\begin{intuition}
+The variance comes mainly from the spread of $p_{C_i}(x_i)$ within a single circuit, not from variation between circuits. This is because Haar-random circuits are so similar (by concentration) that the between-circuit variance is dwarfed by the within-circuit one. So in scheme B, each round contributes roughly the same amount of variance to $\Fxeb$, and the total decays as $1/M$.
+\end{intuition}
+
+\section{Why Both Schemes Give the Same Expected $\Fxeb$: the Universality Argument}
+\label{sec:universality}
+
+The two derivations of $\E[\Fxeb] = 1$ used the same input ($\E[p_C(x)] = 2/N$ for the relevant sense of expectation) but reached it by averaging over different objects:
+
+\begin{itemize}[leftmargin=2em, itemsep=4pt]
+\item \textbf{Scheme A:} average $p_C(x_i)$ over samples $x_i \sim p_C$ for one fixed (typical Haar-random) $C$. By Equation~\eqref{eq:scheme-a-per-sample}, this average equals $\sum_x p_C(x)^2$, which by concentration is $\approx 2/N$.
+\item \textbf{Scheme B:} average $p_{C_i}(x_i)$ jointly over Haar-random $C_i$ and $x_i \sim p_{C_i}$. By Equation~\eqref{eq:scheme-b-per-sample}, this average equals $\E_C[\sum_x p_C(x)^2] = 2/N$.
+\end{itemize}
+
+\emph{Why these are equal:}
+The function $g(C) := \sum_x p_C(x)^2$ is approximately constant ($\approx 2/N$) across Haar-random $C$ --- this is the concentration result of Proposition 3.3. Therefore:
+\[
+g(C) \approx \E_{C'}[g(C')] \approx \frac{2}{N}
+\]
+for any typical $C$, and the schemes' two averaging strategies become equivalent.
+
+\begin{intuition}
+The signature being measured is Porter-Thomas's second moment $2/N$. This signature is the same in every Haar-random circuit (concentration). So whether you measure it by sampling many times from one circuit (Scheme A) or by sampling once from many different circuits (Scheme B), you measure the same number. The two routes converge because the destination is shared.
+\end{intuition}
+
+\begin{remark}
+This is the precise mathematical content of the informal claim that "Porter-Thomas underlies both schemes." Both schemes give $\E[\Fxeb] = 1$ because both estimate the same quantity $\sum_x p_C(x)^2$ --- one through within-circuit averaging, the other through cross-circuit averaging --- and Porter-Thomas's concentration ensures both averagings yield the same value.
+\end{remark}
+
+\section{Where the Schemes Differ: Independence Structure and Security}
+\label{sec:tightness}
+
+The expected $\Fxeb$ and the per-round variance are the same. So what distinguishes the schemes? \emph{The statistical independence of the samples across rounds, which controls the certified-entropy bound.}
+
+\subsection{Independence Structure}
+
+\paragraph{Scheme A (correlated samples).}
+The $m$ samples $x_1, \ldots, x_m$ are i.i.d.\ \emph{conditional on $C$}. But they are not independent of one another in the unconditional sense; they all share the random variable $C$. Specifically:
+\begin{align}
+\Cov(p_C(x_i),\, p_C(x_j))
+&= \E_C\!\left[\E_{x_i, x_j}[p_C(x_i) p_C(x_j)] \right] - \E[p_C(x_i)] \E[p_C(x_j)] \nonumber \\
+&= \E_C\!\left[\left(\sum_x p_C(x)^2\right)^2\right] - \left(\frac{2}{N}\right)^2 \nonumber \\
+&= \Var_C\!\left[\sum_x p_C(x)^2\right] \nonumber \\
+&= O(1/N^2) \quad \text{(by Proposition 3.3)}.
+\label{eq:scheme-a-cov}
+\end{align}
+The covariance is small in absolute terms ($O(1/N^2)$), but it is \emph{not zero}.
+
+\paragraph{Scheme B (independent samples).}
+Because the circuits $C_i$ are drawn independently, and the samples $x_i$ are drawn given the $C_i$,
+\begin{equation}
+\Cov(p_{C_i}(x_i),\, p_{C_j}(x_j)) = 0 \quad \text{for } i \neq j.
+\label{eq:scheme-b-cov}
+\end{equation}
+The samples are genuinely independent across rounds.
+
+\subsection{The Effect on Concentration Inequalities}
+
+For an i.i.d.\ sample of size $n$, standard concentration inequalities (Hoeffding, Chernoff, Bernstein) give tail bounds of the form
+\[
+\Pr\!\left[\left|\frac{1}{n}\sum_i Y_i - \mu\right| > t\right] \leq 2 \exp\!\left(-\frac{n t^2}{2\sigma^2}\right),
+\]
+where $\sigma^2$ is the per-variable variance and $\mu$ the mean. \emph{This is the tightest possible concentration for an empirical mean.}
+
+For dependent variables, the corresponding bounds either degrade or require alternative machinery. The Entropy Accumulation Theorem (EAT) of Dupuis, Fawzi, and Renner (2020) provides such machinery for entropy estimates over correlated rounds; the resulting bound has the form
+\[
+H_{\min}^{\text{cert}} \;\geq\; n \cdot h_{*} - O(\sqrt{n \log(1/\eps)}) - O(n \cdot \delta) - \cdots
+\]
+where $h_*$ is a single-round entropy floor, $\delta$ captures the deviation from i.i.d., and there are additional correction terms.
+
+\subsection{Schematic Comparison of Bounds}
+
+\paragraph{Scheme B (i.i.d.).} Certified entropy from $M$ rounds with per-round entropy $n-1$:
+\[
+H_{\min}^{\text{cert}} \;\geq\; Q_{\min} \cdot (n-1) - \log_2(1/\eps_s).
+\]
+The correction $\log_2(1/\eps_s)$ is the smoothing margin --- $O(1)$, not growing with $M$ in the relevant scaling.
+
+\paragraph{Scheme A (EAT).} Certified entropy from $m$ shots with per-shot entropy $n-1$:
+\[
+H_{\min}^{\text{cert}} \;\geq\; Q_{\min}^{(\text{AH})} \cdot (n-1) - O(\sqrt{m \log(1/\eps)}) - O(m \cdot \delta) - \cdots
+\]
+The corrections include additional terms scaling with the deviation parameter $\delta$, which do not vanish as $1/\sqrt{m}$.
+
+\begin{intuition}
+Liu's structure trades a slight throughput cost (a fresh circuit per round) for tighter security accounting. The cost is small --- on trapped-ion hardware, the per-circuit overhead is similar to per-shot overhead --- but the benefit (cleaner i.i.d.\ analysis) translates to a tighter certified-entropy bound for the same parameters. AH's structure works mathematically; Liu's just works \emph{more efficiently}.
+\end{intuition}
+
+\subsection{An Important Caveat About "Independence"}
+
+The covariance computation in Equation~\eqref{eq:scheme-a-cov} concerned the \emph{honest} sampling case. For the security analysis, the more important notion is \emph{adversarial} independence:
+
+\begin{itemize}[leftmargin=2em, itemsep=4pt]
+\item In Scheme A with an adversarial server: the server can simulate the single circuit $C$ classically (cost: $O(2^n)$ operations) and then cheaply produce many fake samples. The classical cost is paid once per circuit, not per shot.
+\item In Scheme B with an adversarial server: the server must classically simulate each $C_i$ separately. The classical cost is paid per circuit.
+\end{itemize}
+
+This is the deeper sense in which Liu's structure forces "independence": each round demands its own quantum (or expensive classical) work, with no amortization across rounds. Liu's bound is tighter because the adversary's strategy is constrained per-round, not per-batch.
+
+\begin{intuition}
+Even though the honest statistics are similar in both schemes, the adversarial cost structure is different. In Scheme A, a cheater pays a fixed classical cost once and harvests many fake samples; in Scheme B, the cost is per-sample. Liu's structure makes the adversary's effort scale with the number of rounds, which is what gives the protocol its tighter quantitative guarantees.
+\end{intuition}
+
+\section{Synthesis}
+
+The mathematical narrative in one paragraph:
+
+\begin{quote}
+Porter-Thomas's defining property is that $\E[p_C(x)^k] = k!/N^k$ over Haar-random $C$, and in particular $\sum_x p_C(x)^2 \approx 2/N$ for each typical Haar-random circuit (Section 3, Propositions 3.2 \& 3.3). The linear cross-entropy benchmark $\Fxeb$ is built so that its expectation under honest quantum sampling equals exactly $1$: in Scheme A this is verified by averaging $p_C(x_i)$ over samples from one $C$ (Lemma 5.1, Section 5.3), in Scheme B by averaging over both circuit and sample jointly (Lemma 6.1, Section 6.3). Both averagings hit $2/N$ because $\sum_x p_C(x)^2$ is concentrated as a function of $C$ (the universality result of Section 7). The schemes diverge in their independence structure: Scheme A's samples are correlated through the shared circuit (Equation 8.1), while Scheme B's are independent across rounds (Equation 8.2). Scheme A's certified-entropy bound therefore requires the Entropy Accumulation Theorem; Scheme B's admits clean i.i.d.\ concentration inequalities. The two bounds are both valid; Scheme B is tighter. This is the precise content of the v0.4 protocol change from AH to Liu.
+\end{quote}
+
+\section*{Acknowledgements (intent)}
+
+This note draws on the formal results of Aaronson \& Hung (STOC 2023), Liu et al.\ (Nature 2025), Hangleiter \& Eisert (Reviews of Modern Physics 2023), Boixo et al.\ (Nature Physics 2018), and Dupuis, Fawzi \& Renner (Communications in Mathematical Physics 2020). The exposition is original to this document but the results are all available in the cited literature.
+
+\end{document}

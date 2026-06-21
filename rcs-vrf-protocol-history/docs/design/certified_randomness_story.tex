@@ -1,0 +1,358 @@
+\documentclass[11pt]{article}
+
+% --- Packages ---
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{microtype}
+\usepackage{parskip}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{xcolor}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=blue!60!black,
+}
+
+% --- Custom commands ---
+\newenvironment{aside}{\par\medskip\noindent\itshape\small\color{black!70}}{\normalfont\par\medskip}
+\newcommand{\formula}[1]{\[\boxed{#1}\]}
+\newcommand{\Fxeb}{F_{\text{XEB}}}
+\newcommand{\Hmin}{H_{\min}}
+\newcommand{\Qmin}{Q_{\min}}
+\newcommand{\Phia}{\Phi_{\!A}}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\epss}{\eps_{\!s}}
+\newcommand{\epssou}{\eps_{\text{sou}}}
+
+\title{\textbf{The Whole Story of Certified Quantum Randomness} \\
+       \large A walk through the math, from the first roll of the dice \\ to a clean bag of certified random bits}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{aside}
+A friendly reading guide. This document tells one continuous story: how a quantum computer's output gets turned, step by step, into a guarantee of randomness anyone can verify. Each chapter introduces one new mathematical object, explains what it does in words, then writes down the formula and shows where it came from. By the end, every number in the protocol --- including the headline ``71{,}313 certified bits'' from Liu et al. --- will have a reason behind it. Nothing is skipped.
+\end{aside}
+
+\section*{Prologue: the trust problem}
+
+Imagine you want some random numbers. Truly random ones --- the kind a bank or a court or an election would trust. You can ask a quantum computer for them; quantum mechanics is genuinely unpredictable in a way no classical machine can fully imitate. But the quantum computer is owned by someone else, somewhere far away, and you have no way to look inside it. They could be running a real quantum machine. They could also be running a regular laptop pretending to be one, hoping you won't notice.
+
+What you need is a way to ask the machine some questions, see its answers, and decide --- using only your own ordinary computer and a stopwatch --- whether those answers really did come from a quantum measurement. And then, if they did, you need to convert those messy quantum outputs into a clean bag of perfectly random bits that you can hand to whoever needs them.
+
+That conversion --- from ``messy bits out of an untrusted quantum box'' to ``clean, verified, certified-random bits with a receipt anyone can check'' --- is what this whole protocol does. It's a chain of mathematical steps. Each step solves one specific worry. Let's walk through them in order.
+
+\section*{Cast of characters}
+
+\begin{description}[leftmargin=0pt, itemsep=4pt]
+\item[The client.] You. The one who wants random bits.
+\item[The server.] The party who owns the quantum machine. \emph{Untrusted by default.}
+\item[The verifier.] A classical computer (also you, or anyone) that checks the server's answers afterwards.
+\item[The challenge circuit.] A specific quantum puzzle the server will be asked to solve.
+\item[$n$.] The number of qubits in the puzzle. Liu et al.\ use $n=56$. Our toy build uses $n=8$.
+\item[$N=2^n$.] The number of possible answers (bitstrings) the puzzle can produce.
+\item[$M$.] The number of \emph{distinct} circuits used in one round of the protocol (each one different, each one used once). Liu et al.: $M=30{,}010$.
+\end{description}
+
+\section{Chapter 1: the puzzles we ask --- Haar-random circuits}
+
+To check that the server is really doing quantum work, we don't just ask it for ``a random number.'' We ask it to solve a specific kind of \emph{quantum puzzle}, and we look at the pattern of its answers.
+
+The puzzle is a \textbf{quantum circuit} --- a sequence of gates acting on $n$ qubits. Crucially, we don't pick any old circuit. We pick one that is \textbf{as random as possible} --- a so-called \textbf{Haar-random circuit}. ``Haar'' is just the name of the perfectly-uniform way to choose a random rotation in quantum space, the same way a fair coin is the perfectly-uniform way to choose a 50/50 outcome.
+
+\begin{aside}
+Picture shuffling a deck of cards. A \emph{Haar-random} shuffle is the mathematically perfect shuffle, the one where every possible arrangement of the deck is equally likely. There is no bias, no pattern, no memory of the original order. We want our quantum circuits to be ``shuffled'' that thoroughly. (In practice, real circuits are only \emph{approximately} Haar; they are close enough to behave like the ideal for our purposes.)
+\end{aside}
+
+Why this matters: a perfectly random circuit is the hardest possible thing for a cheater to fake. There are no shortcuts a clever cheater could exploit, no patterns to learn. And, on the upside, a Haar-random circuit produces output statistics with a very specific, very recognizable shape --- the shape we'll use to detect cheating in the next chapter.
+
+How we actually build the circuit: we don't roll dice for hours. We start with a small, fresh, unpredictable \textbf{seed} (a short string of random bits), and we expand it deterministically into a full Haar-like circuit using a public, agreed-upon recipe (in code, a hash function called SHAKE-256). Two people with the same seed always get the same circuit. This matters because the verifier has to be able to reconstruct the exact same circuit the server saw, in order to check its answer.
+
+So the picture so far: we drop a fresh small seed, expand it into $M$ different Haar-random-like circuits, and ship them off to the server.
+
+\section{Chapter 2: the shape of quantum answers --- Porter-Thomas}
+
+When a quantum computer runs one of these random circuits and measures its output, it doesn't return ``a random bitstring drawn uniformly.'' It returns a bitstring drawn from a very specific, lopsided probability distribution.
+
+Here's what's happening. Each of the $N = 2^n$ possible bitstrings has some probability $p(x)$ of coming out. For an honest random quantum circuit, these probabilities aren't all equal. Some bitstrings are much more likely than others, and they're spread out according to a specific law, called the \textbf{Porter-Thomas distribution}:
+\formula{f(p) \;=\; N\, e^{-Np}}
+
+\noindent What this formula says: ``most bitstrings have very low probability (near zero); a few have noticeably higher probability; and the spread between them follows an exponential curve.''
+
+\begin{aside}
+The intuition: imagine throwing $N$ dots at random onto a line of length 1, then asking, ``how big a piece of the line did each dot grab?'' Most pieces would be small, a few would be lucky and large, and the distribution of sizes would look exponential. The output probabilities of a deep random quantum circuit behave exactly like that.
+\end{aside}
+
+This shape is called \emph{lopsided} because, unlike a flat uniform distribution where every outcome is equally likely, here the probability is concentrated unevenly across outcomes. The lopsidedness is the \emph{fingerprint of real quantum behaviour} --- a quantum circuit creates constructive and destructive interference between all the possible computational paths, and the resulting amplitudes pile up on some bitstrings while cancelling out on others. A classical machine that hasn't actually done that interference produces a flat (uniform) distribution.
+
+\subsection*{Two averages, easy to confuse}
+
+There are two different ``averages'' we can compute from this distribution, and they are different numbers. Getting them straight is important.
+
+\paragraph{Average 1: ``the average probability of a string''.} If you list all $N$ probabilities $p(x)$ and average them, you get
+\[
+\frac{1}{N}\sum_x p(x) \;=\; \frac{1}{N}\cdot 1 \;=\; \frac{1}{N}.
+\]
+This is forced --- the probabilities must sum to 1, so their average is $1/N$. This is the \emph{count-weighted} average; every bitstring counts equally.
+
+\paragraph{Average 2: ``the average probability of a string you actually sample''.} When the quantum computer samples, it picks bitstring $x$ \emph{with probability $p(x)$}. So high-probability strings come up more often. The expected probability of a string you sample is
+\[
+\sum_x p(x) \cdot p(x) \;=\; \sum_x p(x)^2.
+\]
+Compute this using the Porter-Thomas density:
+\[
+\mathbb{E}[p^2] \;=\; \int_0^{\infty} p^2 \cdot N e^{-Np}\, dp \;=\; \frac{2}{N^2}.
+\]
+And so
+\formula{\sum_x p(x)^2 \;=\; N \cdot \frac{2}{N^2} \;=\; \frac{2}{N}.}
+
+\noindent So sampling lands you on strings averaging $2/N$, twice the count-weighted mean $1/N$.
+
+\begin{aside}
+This factor of 2 is the whole quantum signal: ``a real quantum sampler lands on strings that are, on average, twice as probable as a random guess would predict.'' It's not a huge effect, but it is consistent and statistically detectable. The protocol is going to use exactly this gap.
+\end{aside}
+
+\section{Chapter 3: the cheater-detector --- the F\textsubscript{XEB} score}
+
+The server sends back its answers. The verifier looks at them and asks: ``Do these look like genuine Porter-Thomas samples, or like flat noise, or like something a cheater cooked up?''
+
+The tool for asking that question is called the \textbf{linear cross-entropy benchmark}, $\Fxeb$. It is one number per batch of answers, and its job is to compare the server's samples against the ideal Porter-Thomas prediction.
+
+Here's how it's computed. Suppose the verifier received samples $x_1, x_2, \ldots, x_m$ from $m$ different circuits $C_1, \ldots, C_m$. For each sample $x_i$, the verifier classically simulates the circuit $C_i$ to compute the \emph{ideal probability} $p_{C_i}(x_i)$ that an honest quantum machine would have assigned to that bitstring. Then:
+\formula{\Fxeb \;=\; \frac{N}{m}\sum_{i=1}^{m} p_{C_i}(x_i) \;-\; 1.}
+
+\noindent In plain English: take the probabilities the ideal quantum machine would assign to the strings the server actually returned; average those; multiply by $N$; subtract 1.
+
+\subsection*{What $\Fxeb$ means in four cases}
+
+The reason this formula is useful is that its expected value tells you, very cleanly, what's going on.
+
+\begin{enumerate}[leftmargin=2em, itemsep=4pt]
+\item \textbf{Uniform / flat / noise / spoof.} If the server returns bitstrings chosen uniformly at random (ignoring the circuit), then $\mathbb{E}[p_{C_i}(x_i)] = 1/N$, so
+\[
+\Fxeb \;=\; \frac{N}{m}\cdot m \cdot \frac{1}{N} - 1 \;=\; 1 - 1 \;=\; 0.
+\]
+Uniform sampling gives \textbf{score 0}.
+
+\item \textbf{Perfect quantum.} If the server is a perfect quantum computer sampling exactly from the ideal distribution, then $\mathbb{E}[p_{C_i}(x_i)] = \sum_x p(x)^2 = 2/N$, so
+\[
+\Fxeb \;=\; \frac{N}{m}\cdot m \cdot \frac{2}{N} - 1 \;=\; 2 - 1 \;=\; 1.
+\]
+Perfect quantum sampling gives \textbf{score 1}.
+
+\item \textbf{Real noisy quantum.} A real quantum device is partly perfect, partly noisy, with a \emph{fidelity} $\phi \in (0,1)$ that measures how close to ideal it is. In this case
+\[
+\Fxeb \;\approx\; \phi.
+\]
+A real machine gives a score between $0$ and $1$; Liu et al.'s threshold $\chi$ for acceptance is set somewhere in this band ($\chi = 0.3$ in the paper).
+
+\item \textbf{Cherry-picking cheater.} A clever cheater could classically compute the high-probability strings for each circuit (cheaper than full simulation in some regimes) and submit \emph{only} those. The strings they return have $p_{C_i}(x_i) \gg 2/N$, so
+\[
+\Fxeb \;\gg\; 1.
+\]
+A cherry-picking attack gives \textbf{a suspiciously high score}, $\geq 1$.
+\end{enumerate}
+
+\begin{aside}
+A precision worth pinning down here. Liu et al.\ themselves use a \emph{one-sided} check: the round passes iff $\Fxeb \geq \chi$. This works inside their security framework because their adversary model is \emph{compute-rational} --- the worst-case cheater wants to \emph{just barely} clear the threshold using as few honest quantum rounds as possible, so they won't score $\Fxeb \gg 1$ (which would require \emph{more} quantum content, not less). The certification bound $Q_{\min} = \min\{Q : \varepsilon_{\text{adv}}(Q, \chi) \geq 4\varepsilon_s\}$ is built around this one-sided test.
+
+Our implementation (from v0.1 onward) goes one step further and enforces a \emph{two-sided} check
+\[
+\chi_{\text{low}} \;\leq\; \Fxeb \;\leq\; \chi_{\text{high}}
+\]
+as a defence-in-depth measure against an adversary outside Liu's model --- one that wastefully scores $\gg 1$, or that somehow circumvents the compute-budget assumption and tries pure heavy-output generation. This is a strictly more conservative variant than Liu requires, adopted deliberately. The lower bound is the one that's load-bearing; the upper bound catches a different threat class than Liu's adversary model contemplates.
+\end{aside}
+
+So we now have a single number that, in expectation, separates the four big possibilities: cheater-by-noise ($\approx 0$), real machine ($\approx \phi$), perfect machine ($1$), cheater-by-cherrypicking ($\gg 1$). Pass-fail.
+
+\subsection*{Why one shot per circuit matters}
+
+There's a subtle but important design choice. The protocol uses $M$ \emph{distinct} circuits, each measured \emph{once}. Why not measure one circuit many times instead?
+
+Two reasons. First, the security argument turns into one neat one-shot-per-circuit lemma, instead of a complicated many-shots-on-one-circuit argument that's prone to amortization attacks (where a cheater simulates the one circuit once and then ``cheaply'' returns many fake samples from the same cache). Second, on trapped-ion hardware like Quantinuum H2, the per-circuit overhead is small, so doing $M$ one-shot circuits is comparable in time to doing $1$ circuit with $M$ shots --- and it's much harder to spoof.
+
+\section{Chapter 4: the clock --- why timing is half the proof}
+
+A high $\Fxeb$ score by itself doesn't prove quantumness. A patient cheater with a big enough classical supercomputer could simulate every circuit, compute the answers, and submit good ones. They would pass any score check. So what makes them \emph{infeasible}?
+
+\textbf{The deadline.} The server has only a short window (Liu et al.: a per-circuit response time of roughly a few seconds) to return each sample. A genuine quantum machine takes this time naturally --- it just measures. A classical simulator, on a $56$-qubit circuit, would take \emph{many hours} per circuit. The deadline closes off the classical route.
+
+So the proof of quantumness has two halves, and \emph{neither half alone is enough}:
+
+\begin{itemize}[leftmargin=2em, itemsep=2pt]
+\item \textbf{High $\Fxeb$} alone rules out ``fast but fake'' (random junk).
+\item \textbf{Fast response} alone rules out ``correct but slow classical'' (the patient simulator).
+\item \textbf{Both together} can only be done by a real quantum computer. Correct \emph{and} fast.
+\end{itemize}
+
+\begin{aside}
+Worth keeping in your back pocket: the verifier's classical check (simulating the circuits to compute the ideal probabilities) is \emph{itself} slow --- it takes hours or days. That's fine, because the verifier isn't on the deadline; only the server is. The asymmetry between ``the server is timed but the verifier isn't'' is what makes the protocol work: the expensive check is allowed to be expensive, because that expense doesn't help the cheater.
+\end{aside}
+
+The deadline doesn't just enable the proof; it sets a number called the \textbf{adversary's faking budget}. Let $A$ be the adversary's compute power (in floating-point operations per second), $t_{\text{threshold}}$ the deadline, and $B$ the classical cost (in operations) of faking one circuit's answer well. Then the maximum number of circuits a cheater could plausibly fake within the budget is
+\formula{\Phia \;\approx\; \frac{A \cdot t_{\text{threshold}}}{B}.}
+
+\noindent This number is going to drive everything in the next chapter.
+
+\section{Chapter 5: the worst-case floor --- $\Qmin$}
+
+We now have the two pieces we need to start counting how much real quantum work \emph{must} have happened: a score, $\Fxeb$, that the server passed; and the adversary's faking budget, $\Phia$, set by the deadline.
+
+Here is the central question, which Liu et al.'s Lemma 2 (a refinement of an earlier result of Aaronson and Hung) answers. Suppose the server returned $M$ samples and they passed the score check. Some of them \emph{might} have been faked by a clever cheater within their compute budget --- but not all of them. Some had to be genuine quantum measurements. How many, in the worst case?
+
+The answer is a single number called $\Qmin$ --- the \textbf{minimum number of circuits} that must have been faithfully quantum, given that the batch passed the test, even if we assume the most capable cheater possible.
+
+The derivation is technical (it's a hypergeometric-tail optimization with a smoothing parameter $\eps_2$, looking for the worst-case $\delta$-fraction of forced-quantum rounds consistent with the observed score), but the moral is simple: \textbf{the more the score exceeds the cheater's fakable score, the higher the $\Qmin$ floor.} A cheater can fake some circuits well enough to inflate the average score, but not so many that the whole batch hits Liu et al.'s threshold. The remainder --- the forced-quantum part --- is $\Qmin$.
+
+For Liu et al.'s published parameters ($n=56$, $M=30{,}010$, $\chi=0.3$, deadline $\sim$2 s, adversary at $1.1\times 10^{18}$ FLOPS), the paper reports
+\[
+\Qmin \;=\; 1297.
+\]
+That is: out of $30{,}010$ circuits, at least $1297$ \emph{must} have been honest quantum measurements. The rest \emph{could} have been faked. We don't get to know \emph{which} of the $30{,}010$ were genuine --- we only know that at least $1297$ of them were.
+
+\begin{aside}
+One honest note. The exact derivation of $\Qmin$ from the published parameters depends on a few conventions (the precise definition of $\Phia$, the optimization grid, the $\eps_2$ tail) that live in the authors' code, not in the paper. Our own implementation reproduces the entropy and extraction \emph{downstream} of $\Qmin$ exactly, but our $\Qmin$ derivation is currently only correct to order of magnitude. This is a known and deliberately flagged calibration item, not a math gap.
+\end{aside}
+
+\section{Chapter 6: how much randomness do we have? --- certified min-entropy}
+
+We now know that at least $\Qmin$ of the server's samples are genuine. The next question is: \emph{how much randomness is in each one of those genuine samples?}
+
+The answer is determined by the Porter-Thomas distribution. For the kind of randomness we'll certify --- randomness that's resistant to a sophisticated adversary, including one with quantum side information --- the right measure is not Shannon entropy but \textbf{collision entropy} (also called the 2-R\'enyi entropy), defined as
+\[
+H_2(P) \;=\; -\log_2 \sum_x p(x)^2.
+\]
+We have already computed $\sum_x p(x)^2$ for the Porter-Thomas distribution. It is $2/N$. Substituting:
+\[
+H_2 \;=\; -\log_2\!\left(\frac{2}{N}\right) \;=\; \log_2 N - \log_2 2 \;=\; n - 1.
+\]
+\formula{\text{Per-round collision entropy:} \quad H_2 \;=\; n - 1 \text{ bits.}}
+
+\noindent For Liu et al.'s $n=56$, that is $55$ bits of randomness per honest round.
+
+\begin{aside}
+One way to feel the $n-1$: a perfectly uniform distribution over $N$ strings would have $\sum p(x)^2 = N \cdot (1/N)^2 = 1/N$, giving $H_2 = n$. The Porter-Thomas distribution has \emph{twice} that sum-of-squares ($2/N$ instead of $1/N$), because it's lopsided. The factor of 2 inside the log becomes a single bit lost outside. So $n-1$ is exactly ``$n$ minus the one-bit cost of Porter-Thomas's lopsidedness.''
+\end{aside}
+
+So we have $\Qmin$ forced-quantum rounds, each contributing $n-1$ bits of guaranteed unpredictability. Multiplying gives the total: $\Qmin \cdot (n-1)$ raw bits.
+
+But we don't get to keep all of these as certified bits. The protocol has a target probability of failure --- a number called the \emph{smoothing parameter} $\epss$, the tiny chance that the certification is wrong by accident or by adversarial luck. To get a clean, formal bound on the entropy, we have to pay a small price in bits:
+\formula{\Hmin^{\text{cert}} \;=\; \Qmin \cdot (n-1) \;-\; \log_2\!\left(\frac{1}{\epss}\right).}
+
+\noindent This is Liu et al.'s Theorem 1.
+
+\subsection*{Plugging in the paper's numbers}
+
+For Liu et al., $\Qmin = 1297$, $n=56$, and $\epss = \epssou/4 = 2.5 \times 10^{-7}$:
+\[
+\Hmin^{\text{cert}}
+\;=\; 1297 \cdot 55 \;-\; \log_2\!\left(\frac{1}{2.5\times 10^{-7}}\right)
+\;=\; 71{,}335 - 21.9
+\;\approx\; \boxed{71{,}313 \text{ bits}}.
+\]
+That is the paper's headline number: \emph{at least $71{,}313$ bits of provably-unpredictable randomness} sit somewhere inside the $M \cdot n = 1{,}680{,}560$ raw bits the server returned.
+
+The trouble is, we don't know \emph{where} the unpredictability is. It's mixed with up to $1{,}600{,}000$-plus predictable or biased bits. The raw output is not yet usable. We need to purify it.
+
+\section{Chapter 7: turning ore into gold --- Toeplitz extraction}
+
+Here is the analogy that ties everything together. The server's raw quantum output is like raw \textbf{gold ore}. It does contain gold (the $71{,}313$ bits of certified entropy), but the gold is mixed with rock (the predictable, biased, or partly-known bits). You can't give someone raw ore and call it gold. You have to refine it.
+
+The refinement step --- the refinery --- is called \textbf{randomness extraction}. It takes the raw bits plus a small extra seed (an independent random value, in our protocol a fresh pulse from the \texttt{drand} beacon), and produces an output that's statistically \emph{indistinguishable from uniform}, even to an adversary with quantum side-information.
+
+The specific extractor we use is the \textbf{Toeplitz extractor}: a deterministic linear map over $\text{GF}(2)$ (the field of bits, with arithmetic mod 2). Pick a Toeplitz matrix $T$ of size $\ell \times (M \cdot n)$ --- a matrix whose entries are determined by its first row and first column, which makes it efficient to store and multiply. Seed the entries with a fresh independent random source. Then compute
+\formula{\mathbf{output} \;=\; T \cdot \mathbf{raw\_bits} \;\;(\bmod\; 2).}
+The output is an $\ell$-bit string.
+
+How large can $\ell$ be? The \textbf{Leftover Hash Lemma} (a foundational result in cryptography) tells us. To produce output that is $\epssou$-close to uniform against an adversary with quantum side information, we can extract up to
+\formula{\ell \;\leq\; \Qmin \cdot (n-1) \;-\; 3\log_2\!\left(\frac{1}{\epssou}\right) \;-\; 2 \text{ bits.}}
+This is Liu et al.'s Corollary 7.
+
+\subsection*{Where the formula's pieces come from}
+
+\begin{itemize}[leftmargin=2em, itemsep=4pt]
+\item \textbf{$\Qmin \cdot (n-1)$} --- the raw entropy budget, same as before.
+\item \textbf{$-3 \log_2(1/\epssou)$} --- the price of a \emph{quantum-secure} extractor. Against a purely classical adversary the price would be $2 \log_2(1/\epssou)$; the extra factor (the $3$) buys robustness against a quantum side-information attacker.
+\item \textbf{$-2$} --- a small additive constant from the LHL bound's exact statement.
+\end{itemize}
+
+\subsection*{Plugging in the paper's numbers, again}
+
+For $\epssou = 10^{-6}$:
+\[
+\ell \;\leq\; 1297 \cdot 55 \;-\; 3 \log_2(10^6) \;-\; 2
+\;=\; 71{,}335 - 59.8 - 2
+\;\approx\; \boxed{71{,}273 \text{ bits}}.
+\]
+This is Liu et al.'s second published number: \emph{$71{,}273$ bits of clean, uniform, certified randomness can be extracted from the batch.}
+
+The difference $71{,}313 - 71{,}273 = 40$ bits is the \textbf{cost of the refinery}: $\sim 40$ bits of certified entropy are spent on margins to guarantee that the output is statistically uniform even against a quantum-smart adversary. About $0.06\%$ of the gold is lost in refining. Modest, but real.
+
+\section{Chapter 8: the audit trail}
+
+There is one more leg, less mathematical but no less important: every step of the run --- the seed used, the circuits generated, the samples returned, the score computed, the $\Qmin$ value, the extractor seed, the final output --- is recorded in a tamper-evident audit log (hash-chained, so any after-the-fact modification breaks the chain). Anyone can later replay the log and re-verify that the round was honest end-to-end: same circuits from the same seed, same score from the same samples, same final bits from the same extractor.
+
+This is what makes the randomness \emph{publicly verifiable}, not just secretly believable. The client and the server and an outside auditor all see the same record.
+
+\section*{Epilogue: the full chain, in one diagram}
+
+Putting it all together, the math chain looks like this:
+
+\begin{center}
+\fbox{\parbox{0.92\textwidth}{
+\centering
+$\text{(small fresh classical seed)}$ \\[2pt]
+$\downarrow$ \;\; expand via SHAKE-256 \\[2pt]
+$M$ different Haar-random circuits \\[2pt]
+$\downarrow$ \;\; sent to untrusted quantum server, one shot per circuit \\[2pt]
+$M$ raw samples $x_1, \ldots, x_M$ \\[2pt]
+$\downarrow$ \;\; verifier classically simulates audit subset \\[2pt]
+$\displaystyle \Fxeb = \frac{N}{m}\sum_i p_{C_i}(x_i) - 1$ \;\; (and timing check passes) \\[6pt]
+$\downarrow$ \;\; Liu adversary model (Lemma 2) \\[2pt]
+$\Qmin$ forced-quantum rounds \\[2pt]
+$\downarrow$ \;\; multiply by per-round collision entropy $H_2 = n-1$ \\[2pt]
+$\Qmin (n-1)$ raw entropy bits \\[2pt]
+$\downarrow$ \;\; subtract smoothing margin $\log_2(1/\epss)$ (Theorem 1) \\[2pt]
+$\Hmin^{\text{cert}} \approx 71{,}313$ bits \\[2pt]
+$\downarrow$ \;\; subtract LHL margin $3\log_2(1/\epssou) + 2$ (Corollary 7) \\[2pt]
+$\ell \approx 71{,}273$ \emph{extractable} bits \\[2pt]
+$\downarrow$ \;\; Toeplitz extraction with fresh drand seed \\[2pt]
+$\ell$ certified-uniform, quantum-secure random bits
+}}
+\end{center}
+
+Every arrow in that diagram is one of the formulas we walked through:
+
+\begin{itemize}[leftmargin=2em, itemsep=2pt]
+\item Porter-Thomas: $f(p) = N e^{-Np}$, and $\sum_x p(x)^2 = 2/N$.
+\item $\Fxeb = (N/m)\sum_i p_{C_i}(x_i) - 1$.
+\item Cases: noise $\to 0$, real $\to \phi$, perfect $\to 1$, cherry-pick $\to \gg 1$.
+\item Adversary budget: $\Phia = A \cdot t_{\text{threshold}} / B$.
+\item Collision entropy of PT: $H_2 = -\log_2(2/N) = n-1$.
+\item Certified entropy (Liu Thm 1): $\Hmin^{\text{cert}} = \Qmin(n-1) - \log_2(1/\epss)$.
+\item Extracted bits (LHL, Cor.\ 7): $\ell \leq \Qmin(n-1) - 3\log_2(1/\epssou) - 2$.
+\item Toeplitz: $\mathbf{out} = T \cdot \mathbf{raw} \pmod 2$.
+\end{itemize}
+
+\section*{What's solid, and what's still owed}
+
+In the spirit of being honest about which links of this chain are nailed down and which are still being polished:
+
+\begin{description}[leftmargin=0pt, itemsep=4pt]
+\item[Solid, derived from first principles.] The collision entropy $H_2 = n - 1$ comes straight from the Porter-Thomas integral. Plugged into the certified-entropy and extraction formulas with the paper's $\Qmin = 1297$, our code reproduces the paper's $71{,}313$ and $71{,}273$ \emph{exactly}. A regression test locks these in so any future change that breaks the math fails the test the next time anyone runs it.
+\item[Still owed.] The \emph{derivation} of $\Qmin$ from the adversary model is the one upstream piece we currently reproduce only to order of magnitude. The exact conventions used in the paper (the precise form of $\Phia$, the optimization grid, the $\eps_2$ tail) live in the authors' supplementary code. Calibrating against those conventions is a bounded follow-up; we deliberately refuse to back-fit parameters to force $\Qmin = 1297$, because that would be fitting to the answer rather than reproducing it. The regression test marks this case as an honest, expected-to-fail (\texttt{xfail}) item.
+\end{description}
+
+\subsection*{One last picture, for the very end}
+
+\begin{aside}
+Imagine the whole protocol as a small factory. The seed is the ignition. The server is a foundry that smelts ore (raw quantum samples) according to recipes it can't see in advance. The verifier is the assayer, deciding how much gold was in the ore. The extractor is the refinery, melting the assayed ore into gold bars. The audit log is the ledger that lets any customer trace each bar back to its ore and its assay. And the deadline is the timed conveyor belt: a real foundry can keep up; a forger pretending to be one cannot.
+\end{aside}
+
+That is the entire story. Every number a customer ever sees --- ``$71{,}273$ certified random bits, with $\epssou = 10^{-6}$, on $n=56$ qubits'' --- comes from a chain of clear, derivable, checkable steps, each one designed to close a specific worry about a specific way the protocol could fail. Nothing magic, nothing mysterious: just one careful step after another, from a small seed of trust to a clean bag of certified gold.
+
+\end{document}
