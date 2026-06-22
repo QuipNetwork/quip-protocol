@@ -203,6 +203,37 @@ async def test_ensure_funded_permanent_error_is_not_retried(monkeypatch):
     assert len(posts) == 1, "permanent errors must fail fast, not retry"
 
 
+async def test_ensure_funded_already_funded_reconciles_via_balance(monkeypatch):
+    # 403 "already funded" must NOT crash: the re-read balance is the truth and
+    # shows we cleared min_balance, so funding succeeds on the next loop.
+    monkeypatch.setattr(mb.asyncio, "sleep", _no_sleep)
+    posts = []
+
+    def fake_post(_url, *, dest_hex, amount):
+        posts.append(1)
+        raise mb.FaucetAlreadyFunded(5000, "faucet returned 403: already funded")
+
+    monkeypatch.setattr(mb, "_post_faucet", fake_post)
+    # Initial check sees 0 (below min), then the post-403 re-read sees 5000.
+    bal = await mb.ensure_funded(_BalanceClient([0, 5000]), _stub_keystore(), _faucet_config())
+    assert bal == 5000
+    assert len(posts) == 1, "already-funded should reconcile, not fast-fail"
+
+
+async def test_ensure_funded_already_funded_below_min_bounds_not_crashes(monkeypatch):
+    # max_funded < min_balance: faucet keeps refusing and balance never clears.
+    # The funding budget must bound this into a single RuntimeError, not an
+    # immediate crash on the first 403.
+    monkeypatch.setattr(mb.asyncio, "sleep", _no_sleep)
+
+    def fake_post(_url, *, dest_hex, amount):
+        raise mb.FaucetAlreadyFunded(500, "faucet returned 403: already funded")
+
+    monkeypatch.setattr(mb, "_post_faucet", fake_post)
+    with pytest.raises(RuntimeError, match="did not fund within"):
+        await mb.ensure_funded(_BalanceClient([500]), _stub_keystore(), _faucet_config(budget=10.0))
+
+
 async def test_ensure_funded_gives_up_after_budget(monkeypatch):
     monkeypatch.setattr(mb.asyncio, "sleep", _no_sleep)
 
@@ -215,10 +246,10 @@ async def test_ensure_funded_gives_up_after_budget(monkeypatch):
         await mb.ensure_funded(_BalanceClient([0]), _stub_keystore(), _faucet_config(budget=10.0))
 
 
-def _http_error(code):
+def _http_error(code, body=b'{"error": "x"}'):
     return urllib.error.HTTPError(
         url="http://f/request", code=code, msg="m", hdrs=None,
-        fp=io.BytesIO(b'{"error": "x"}'),
+        fp=io.BytesIO(body),
     )
 
 
@@ -240,13 +271,37 @@ def test_post_faucet_classifies_429_as_transient(monkeypatch):
         mb._post_faucet("http://f", dest_hex="0x00", amount=1)
 
 
-def test_post_faucet_classifies_4xx_as_permanent(monkeypatch):
+def test_post_faucet_classifies_400_as_permanent(monkeypatch):
+    # 400 (malformed request) is the only fast-fail: retrying re-sends the
+    # same bad request, so the caller should not loop on it.
     monkeypatch.setattr(
         mb.urllib.request, "urlopen",
         lambda req, timeout=0: (_ for _ in ()).throw(_http_error(400)),
     )
     with pytest.raises(mb.FaucetPermanentError):
         mb._post_faucet("http://f", dest_hex="0x00", amount=1)
+
+
+def test_post_faucet_unexpected_4xx_is_transient(monkeypatch):
+    # An unexpected 4xx (e.g. 409) is NOT fast-failed — the default is to
+    # retry within the budget rather than kill a long-running miner.
+    monkeypatch.setattr(
+        mb.urllib.request, "urlopen",
+        lambda req, timeout=0: (_ for _ in ()).throw(_http_error(409)),
+    )
+    with pytest.raises(mb.FaucetTransientError):
+        mb._post_faucet("http://f", dest_hex="0x00", amount=1)
+
+
+def test_post_faucet_403_already_funded_carries_free_balance(monkeypatch):
+    body = b'{"error": "destination already funded", "free_balance_plancks": 42}'
+    monkeypatch.setattr(
+        mb.urllib.request, "urlopen",
+        lambda req, timeout=0: (_ for _ in ()).throw(_http_error(403, body)),
+    )
+    with pytest.raises(mb.FaucetAlreadyFunded) as excinfo:
+        mb._post_faucet("http://f", dest_hex="0x00", amount=1)
+    assert excinfo.value.free_balance == 42
 
 
 def test_post_faucet_connection_error_is_transient(monkeypatch):
