@@ -204,6 +204,14 @@ class QPUTimeManager:
                 max(0.0, config.initial_budget_seconds * 1_000_000),
             )
 
+        if config.min_block_budget_seconds > cap_s > 0:
+            logger.warning(
+                "min_block_budget (%.0fs) exceeds budget_cap (%.0fs): the pool "
+                "caps below the burst threshold, so a burst can NEVER start. "
+                "Set budget_cap >= min_block_budget (or lower min_block_budget).",
+                config.min_block_budget_seconds,
+                cap_s,
+            )
         if config.min_block_budget_seconds > config.daily_budget_seconds > 0:
             eta_days = config.min_block_budget_seconds / config.daily_budget_seconds
             logger.warning(

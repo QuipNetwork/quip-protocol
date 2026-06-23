@@ -52,12 +52,17 @@ retry_backoff_ms = 250
 [dwave]
 daily_budget                   = "30m"
 # min_block_budget: QPU runway (access seconds) that must accrue before a
-# burst starts. Mining then continues until the pool drains to 0. Must be
-# < daily_budget or the reservoir fills only across multiple days (a
-# startup warning fires). Default "90s".
+# burst starts. Mining then continues until the pool drains to 0. Two
+# constraints, each fires a startup warning if violated:
+#   - must be <= budget_cap, else the pool caps below the threshold and a
+#     burst can NEVER start (the pool plateaus forever);
+#   - should be < daily_budget, else the reservoir fills only across multiple
+#     days before the first burst.
+# Default "90s".
 min_block_budget               = "90s"
 # budget_cap: max banked pool size. Bounds a post-downtime catch-up burst.
-# Defaults to max(daily_budget, min_block_budget) when unset.
+# MUST be >= min_block_budget (see above). Defaults to
+# max(daily_budget, min_block_budget) when unset, which always satisfies that.
 # budget_cap                     = "30m"
 # qpu_initial_budget: reservoir balance seeded on process start, so a fresh
 # miner mines without waiting hours-to-days to accrue the buffer. Keywords:
