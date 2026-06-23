@@ -327,8 +327,45 @@ def _unique_rows(samples: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarra
     return contiguous[first_index], first_index, np.asarray(inverse).ravel()
 
 
+def gauge_canonicalize(samples: np.ndarray) -> np.ndarray:
+    """Collapse spin-flip (Z2) twins by fixing a gauge: anchor spin = +1.
+
+    With zero local field (``h = 0``) the Ising energy is exactly
+    flip-invariant, ``E(s) == E(-s)``, so every solution has an equal-energy
+    twin ``-s``. The raw row dedup in :func:`_unique_rows` treats ``s`` and
+    ``-s`` as distinct rows and double-counts the pair, inflating
+    ``n_unique_*`` by up to 2x. Negating each row whose anchor spin (column 0)
+    is ``-1`` maps both members of a twin pair to the same canonical
+    representative, so the unique-row set built downstream is flip-invariant.
+
+    Applied *before* dedup, this changes the set of unique rows — not just a
+    count: both ``n_unique_*`` (the intended fix) and the top-5 rows feeding
+    ``top_5_diversity`` then reflect distinct *physical* solutions. The
+    diversity metric is already flip-invariant
+    (:func:`calculate_hamming_distance`), so at ``h != 0`` — where twins are
+    vanishingly rare — canonicalization is a near-no-op; its effect is confined
+    to the ``h = 0`` class where twins actually appear. Sampler spins are
+    ``{-1, +1}`` so the anchor column is never ``0`` and the convention needs
+    no tie-break.
+
+    Args:
+        samples: 2D ``(n_reads, n_nodes)`` spin matrix of ``{-1, +1}`` values.
+
+    Returns:
+        A new array with each twin pair mapped to its anchor-``+1`` member.
+        Rows already in canonical form are copied unchanged.
+    """
+    contiguous = np.ascontiguousarray(samples)
+    if contiguous.size == 0:
+        return contiguous
+    # +1 keeps the row; -1 negates it. anchor==0 can't occur for ±1 spins,
+    # but treating it as "keep" is harmless and avoids a zero-multiply.
+    signs = np.where(contiguous[:, 0] < 0, -1, 1).astype(contiguous.dtype)
+    return contiguous * signs[:, None]
+
+
 def compute_solution_meta(
-    sampleset, threshold: float,
+    sampleset, threshold: float, gauge_fix: bool = False,
 ) -> Tuple[Dict[str, Any], List[List[int]], List[float]]:
     """Solution metadata + top-5 captures for one sampleset.
 
@@ -348,6 +385,20 @@ def compute_solution_meta(
     samples — the same K that the chain's ``min_solutions`` gate
     typically uses, so this measurement directly reflects whether the
     sampler is producing diverse enough below-target candidates.
+
+    Args:
+        sampleset: dimod-style sampleset exposing ``record.energy`` /
+            ``record.sample``.
+        threshold: Energy gate; ``n_unique_below_threshold`` counts unique
+            rows with minimum energy below this.
+        gauge_fix: When ``True``, gauge-canonicalize spin rows
+            (:func:`gauge_canonicalize`) before dedup so spin-flip twins
+            collapse — required for a flip-invariant count gate on zero-field
+            (``h = 0``) instances. Defaults to ``False``, leaving the raw-row
+            count unchanged. At ``h != 0`` twins are vanishingly rare, so the
+            flag is a near-no-op there (raw ≈ flip-invariant); its effect is
+            confined to the ``h = 0`` class, where it corrects both
+            ``n_unique_below_threshold`` and the top-5 used for diversity.
     """
     try:
         record = sampleset.record
@@ -364,6 +415,8 @@ def compute_solution_meta(
     # which defeated the streaming layer's reconstruction-skip. The byte-
     # view dedup runs in ~0.1ms at 112×4578.
     samples = np.asarray(record.sample)
+    if gauge_fix:
+        samples = gauge_canonicalize(samples)
     uniq, _, inverse = _unique_rows(samples)
     min_energy = np.full(uniq.shape[0], np.inf, dtype=np.float64)
     np.minimum.at(min_energy, inverse, energies)

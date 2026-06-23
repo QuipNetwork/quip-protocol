@@ -29,6 +29,7 @@ import weakref
 from concurrent.futures import ProcessPoolExecutor
 from typing import Iterator, List, Optional, Sequence
 
+from shared.allowed_value_spec import AllowedValueSpec
 from shared.ising_model import IsingModel
 from shared.quantum_proof_of_work import (
     derive_nonce,
@@ -63,6 +64,7 @@ def _generate_one_model(
     nodes: list,
     edges: list,
     salt: bytes,
+    allowed_h: Optional[AllowedValueSpec] = None,
 ) -> IsingModel:
     """Generate one IsingModel in a worker process.
 
@@ -71,9 +73,13 @@ def _generate_one_model(
     round-scoped seed that only changes when a new proof wins. Callers
     must supply the canonical miner identity
     (``blake2_256(SCALE(account))`` for substrate accounts).
+
+    ``allowed_h`` overrides the per-node field distribution (``None`` keeps the
+    chain's ternary default). It is a frozen ``AllowedValueSet`` and therefore
+    picklable across the spawn-context ``ProcessPoolExecutor``.
     """
     nonce = derive_nonce(last_proof_block_hash, miner_bytes, salt)
-    h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+    h, J = generate_ising_model_from_nonce(nonce, nodes, edges, allowed_h=allowed_h)
     return IsingModel(h=h, J=J, nonce=nonce, salt=salt)
 
 
@@ -152,6 +158,10 @@ class RandomIsingFeeder:
         buffer_size: Target number of ready + in-flight models.
         max_workers: Worker processes for model generation.
         seed: Optional seed for deterministic salt generation.
+        allowed_h: Optional per-node field distribution override forwarded to
+            ``generate_ising_model_from_nonce``. ``None`` keeps the chain's
+            ternary default (``h in {-1, 0, +1}``); pass
+            ``AllowedValueSet((0,))`` for the zero-field (J-only) problem class.
     """
 
     def __init__(
@@ -163,6 +173,7 @@ class RandomIsingFeeder:
         buffer_size: int = 8,
         max_workers: int = 2,
         seed: Optional[int] = None,
+        allowed_h: Optional[AllowedValueSpec] = None,
     ):
         _require_len("last_proof_block_hash", last_proof_block_hash)
         _require_len("miner_bytes", miner_bytes)
@@ -171,6 +182,7 @@ class RandomIsingFeeder:
         self._nodes = nodes
         self._edges = edges
         self._buffer_size = buffer_size
+        self._allowed_h = allowed_h
         self._rng = random.Random(seed) if seed is not None else None
         self._pool = ProcessPoolExecutor(
             max_workers=max_workers,
@@ -277,6 +289,7 @@ class RandomIsingFeeder:
                 self._nodes,
                 self._edges,
                 salt,
+                self._allowed_h,
             )
             self._futures.append(f)
             submitted += 1
