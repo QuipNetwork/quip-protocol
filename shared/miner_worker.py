@@ -113,20 +113,34 @@ def build_miner_from_spec(spec: Dict[str, Any]):
         # Build QPU time config if daily budget is specified
         time_config = None
         if cfg.get("daily_budget"):
-            from QPU.qpu_time_manager import QPUTimeConfig, parse_duration
+            from QPU.qpu_time_manager import (
+                QPUTimeConfig,
+                parse_duration,
+                resolve_initial_budget,
+            )
+
+            daily_budget_s = parse_duration(cfg["daily_budget"])
+            min_block_budget_s = parse_duration(cfg.get("min_block_budget", "90s"))
+            budget_cap_s = (
+                parse_duration(cfg["budget_cap"]) if cfg.get("budget_cap") else None
+            )
+            # Seed the reservoir on boot so a fresh process mines without
+            # waiting to accrue the buffer. Default "min" = one burst's worth;
+            # operators can set "daily", "cap", or an explicit duration.
+            initial_budget_s = resolve_initial_budget(
+                str(cfg.get("qpu_initial_budget", "min")),
+                daily_budget_s,
+                min_block_budget_s,
+                budget_cap_s,
+            )
 
             time_config = QPUTimeConfig(
-                daily_budget_seconds=parse_duration(cfg["daily_budget"]),
+                daily_budget_seconds=daily_budget_s,
                 min_blocks_for_estimation=cfg.get("qpu_min_blocks_for_estimation", 5),
                 ema_alpha=cfg.get("qpu_ema_alpha", 0.3),
-                min_block_budget_seconds=parse_duration(
-                    cfg.get("min_block_budget", "90s")
-                ),
-                budget_cap_seconds=(
-                    parse_duration(cfg["budget_cap"])
-                    if cfg.get("budget_cap")
-                    else None
-                ),
+                min_block_budget_seconds=min_block_budget_s,
+                budget_cap_seconds=budget_cap_s,
+                initial_budget_seconds=initial_budget_s,
             )
             # Remove time config keys from cfg to avoid passing them to miner
             cfg = {
@@ -139,6 +153,7 @@ def build_miner_from_spec(spec: Dict[str, Any]):
                     "qpu_ema_alpha",
                     "min_block_budget",
                     "budget_cap",
+                    "qpu_initial_budget",
                     "qpu_type",
                 )
             }

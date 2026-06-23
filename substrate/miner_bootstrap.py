@@ -147,10 +147,13 @@ FAUCET_FUNDING_TIMEOUT_SECONDS = 300.0  # 5 minutes
 _FAUCET_BACKOFF_START_SECONDS = 2.0
 _FAUCET_BACKOFF_MAX_SECONDS = 30.0
 
-# HTTP statuses worth retrying: rate-limit + the 5xx family the faucet
-# returns when a mint fails transiently. Any other 4xx means our request is
-# malformed and will fail identically on every retry.
-_RETRYABLE_FAUCET_STATUS = frozenset({429, 500, 502, 503, 504})
+# Statuses that fast-fail the caller because retrying genuinely cannot help:
+# a malformed request (400 — bad dest/amount) or an explicit ban, if the
+# faucet ever adds one. Everything else (429, the 5xx family, or any
+# unexpected code) is retried within the funding budget, because the on-chain
+# balance read — not the HTTP status — is the source of truth on whether we
+# cleared min_balance. 403 "already funded" is benign and handled separately.
+_PERMANENT_FAUCET_STATUS = frozenset({400})
 
 
 class FaucetTransientError(RuntimeError):
@@ -159,6 +162,17 @@ class FaucetTransientError(RuntimeError):
 
 class FaucetPermanentError(RuntimeError):
     """Faucet failure that retrying cannot fix (malformed request → 4xx)."""
+
+
+class FaucetAlreadyFunded(RuntimeError):
+    """Faucet refused because the account already exceeds its ``max_funded``
+    cap (HTTP 403). Not a failure: the account *has* money. Carries the
+    faucet-reported free balance so the caller can reconcile it against its
+    own ``min_balance`` threshold instead of crashing."""
+
+    def __init__(self, free_balance: Optional[int], detail: str) -> None:
+        super().__init__(detail)
+        self.free_balance = free_balance
 
 
 class Underfunded(RuntimeError):
@@ -558,6 +572,12 @@ async def _try_fund_once(
         # Includes 429: a mint to this dest is already in flight/done, so
         # don't treat re-requests as fatal — the balance read picks it up.
         note = str(exc)
+    except FaucetAlreadyFunded as exc:
+        # 403: the account is above the faucet's cap. Benign — the on-chain
+        # balance read below is the source of truth on whether we cleared our
+        # own min_balance. Note it (incl. the faucet-reported free balance) so
+        # the retry loop can log and reconcile rather than crash.
+        note = f"already funded (faucet free={exc.free_balance}): {exc}"
     balance = await client.query_balance(account)
     return balance, note
 
@@ -565,10 +585,14 @@ async def _try_fund_once(
 def _post_faucet(url: str, *, dest_hex: str, amount: int) -> dict:
     """POST the faucet ``/request`` contract, classifying failures for retry.
 
-    Raises :class:`FaucetTransientError` for failures that may clear on retry
-    (429 / 5xx / connection / timeout) and :class:`FaucetPermanentError` for
-    a malformed request (other 4xx). The contract is served by the standalone
-    faucet at ``gitlab.com/quip.network/faucet``.
+    Retries are the default: anything that isn't a known-permanent rejection
+    is raised as :class:`FaucetTransientError` (429 / 5xx / connection /
+    timeout / any unexpected status) so the caller backs off and re-reads the
+    balance. :class:`FaucetAlreadyFunded` is raised for 403 (the account is
+    already above the faucet cap), and :class:`FaucetPermanentError` only for
+    the genuinely unrecoverable statuses in ``_PERMANENT_FAUCET_STATUS`` (a
+    malformed request or ban). The contract is served by the standalone faucet
+    at ``gitlab.com/quip.network/faucet``.
     """
     body = json.dumps({"dest": dest_hex, "amount": amount}).encode()
     req = urllib.request.Request(
@@ -583,9 +607,22 @@ def _post_faucet(url: str, *, dest_hex: str, amount: int) -> dict:
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")
         msg = f"faucet returned {exc.code}: {detail}"
-        if exc.code in _RETRYABLE_FAUCET_STATUS:
-            raise FaucetTransientError(msg) from exc
-        raise FaucetPermanentError(msg) from exc
+        if exc.code == 403:
+            # "destination already funded" — the account is above the faucet's
+            # max_funded cap, so it has money even though we asked. Surface the
+            # reported free balance so the retry loop can reconcile, not crash.
+            free = None
+            try:
+                free = json.loads(detail).get("free_balance_plancks")
+            except (ValueError, AttributeError):
+                pass
+            raise FaucetAlreadyFunded(free, msg) from exc
+        if exc.code in _PERMANENT_FAUCET_STATUS:
+            # Malformed request / ban — retrying re-sends the same bad request.
+            raise FaucetPermanentError(msg) from exc
+        # Default to transient: 429, 5xx, and any unexpected status are worth
+        # retrying within the budget rather than killing a long-running miner.
+        raise FaucetTransientError(msg) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         # HTTPError is caught above; this is connection-refused / DNS /
         # socket timeout — the faucet may just be slow to come up.
@@ -640,6 +677,7 @@ __all__ = [
     "DEFAULT_MIN_BALANCE_PLANCKS",
     "DEFAULT_FAUCET_TOP_UP_PLANCKS",
     "FAUCET_FUNDING_TIMEOUT_SECONDS",
+    "FaucetAlreadyFunded",
     "FaucetPermanentError",
     "FaucetTransientError",
     "Underfunded",
