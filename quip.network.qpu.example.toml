@@ -59,6 +59,13 @@ min_block_budget               = "90s"
 # budget_cap: max banked pool size. Bounds a post-downtime catch-up burst.
 # Defaults to max(daily_budget, min_block_budget) when unset.
 # budget_cap                     = "30m"
+# qpu_initial_budget: reservoir balance seeded on process start, so a fresh
+# miner mines without waiting hours-to-days to accrue the buffer. Keywords:
+# "min" (one buffer — the default, bursts once on boot then re-accrues),
+# "daily" (a full day's budget), "cap" (fill the pool cap), or an explicit
+# duration like "10m". This is a per-process grant, not persisted accounting:
+# frequent restarts re-grant it, so prefer "min" unless overspend is fine.
+# qpu_initial_budget             = "min"
 # solver                         = "Advantage2_system1"
 # region                         = "na-west-1"   # D-Wave region NAME, not a URL
 # qpu_min_blocks_for_estimation  = 5

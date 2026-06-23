@@ -18,6 +18,7 @@ sys.modules["qpu_time_manager"] = _module
 _spec.loader.exec_module(_module)
 
 parse_duration = _module.parse_duration
+resolve_initial_budget = _module.resolve_initial_budget
 QPUTimeConfig = _module.QPUTimeConfig
 QPUTimeManager = _module.QPUTimeManager
 
@@ -270,3 +271,69 @@ class TestGetStatsAndWarnings:
             QPUTimeManager(QPUTimeConfig(daily_budget_seconds=1800.0,
                                          min_block_budget_seconds=90.0))
         assert not any("min_block_budget" in r.message for r in caplog.records)
+
+
+class TestInitialBudgetSeeding:
+    """Seeding the reservoir on boot so a fresh process mines immediately."""
+
+    def test_default_starts_dry(self):
+        # No initial_budget_seconds => historical behavior: pool starts at 0.
+        tm = _tm()
+        assert tm._pool_us == 0.0
+
+    def test_seed_to_buffer_mines_immediately(self):
+        # daily=40s/day would take ~2.25 days to accrue 90s; seeding skips that.
+        tm = QPUTimeManager(QPUTimeConfig(
+            daily_budget_seconds=40.0,
+            min_block_budget_seconds=90.0,
+            initial_budget_seconds=90.0,
+        ))
+        tm.reset_clock(1_000_000.0)
+        e = tm.should_mine_block(now=1_000_000.0)  # no accrual yet
+        assert e.should_mine is True
+        assert e.burst_active is True
+
+    def test_seed_clamps_to_cap(self):
+        tm = QPUTimeManager(QPUTimeConfig(
+            daily_budget_seconds=86400.0,
+            min_block_budget_seconds=90.0,
+            budget_cap_seconds=120.0,
+            initial_budget_seconds=10_000.0,  # far above cap
+        ))
+        assert abs(tm._pool_us / 1e6 - 120.0) < 1e-6
+
+    def test_negative_seed_floored_to_zero(self):
+        tm = QPUTimeManager(QPUTimeConfig(
+            daily_budget_seconds=86400.0,
+            initial_budget_seconds=-50.0,
+        ))
+        assert tm._pool_us == 0.0
+
+
+class TestResolveInitialBudget:
+    """Operator keyword/duration -> seed-seconds resolution."""
+
+    def test_min_keyword(self):
+        assert resolve_initial_budget("min", 40.0, 90.0) == 90.0
+
+    def test_daily_keyword(self):
+        assert resolve_initial_budget("daily", 600.0, 90.0) == 600.0
+
+    def test_cap_keyword_uses_explicit_cap(self):
+        assert resolve_initial_budget("cap", 600.0, 90.0, 1200.0) == 1200.0
+
+    def test_cap_keyword_derives_cap_when_none(self):
+        # Mirrors the manager's derived cap = max(daily, buffer).
+        assert resolve_initial_budget("cap", 600.0, 90.0, None) == 600.0
+        assert resolve_initial_budget("cap", 40.0, 90.0, None) == 90.0
+
+    def test_explicit_duration(self):
+        assert resolve_initial_budget("10m", 600.0, 90.0) == 600.0
+        assert resolve_initial_budget("300s", 600.0, 90.0) == 300.0
+
+    def test_case_insensitive_and_whitespace(self):
+        assert resolve_initial_budget("  Daily  ", 600.0, 90.0) == 600.0
+
+    def test_unknown_value_raises(self):
+        with pytest.raises(ValueError):
+            resolve_initial_budget("banana", 600.0, 90.0)

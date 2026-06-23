@@ -72,9 +72,9 @@ logger = logging.getLogger(__name__)
 # see quip.network.qpu.example.toml.
 _KNOWN_DWAVE_KEYS = frozenset({
     "type", "daily_budget", "min_block_budget", "budget_cap",
-    "qpu_min_blocks_for_estimation", "qpu_ema_alpha", "solver", "region",
-    "token", "num_reads", "annealing_time_us", "queue_depth",
-    "embedding_file", "drain_on_stop",
+    "qpu_initial_budget", "qpu_min_blocks_for_estimation", "qpu_ema_alpha",
+    "solver", "region", "token", "num_reads", "annealing_time_us",
+    "queue_depth", "embedding_file", "drain_on_stop",
 })
 
 # Recognized keys for the non-D-Wave QPU device types (token + daily budget).
@@ -621,6 +621,8 @@ def _build_qpu_specs(node_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
                 cfg_block["min_block_budget"] = dev["min_block_budget"]
             if dev.get("budget_cap") is not None:
                 cfg_block["budget_cap"] = dev["budget_cap"]
+            if dev.get("qpu_initial_budget") is not None:
+                cfg_block["qpu_initial_budget"] = dev["qpu_initial_budget"]
             # Other supported DWaveMiner __init__ knobs (forwarded as kwargs).
             if dev.get("queue_depth") is not None:
                 cfg_block["queue_depth"] = dev["queue_depth"]
