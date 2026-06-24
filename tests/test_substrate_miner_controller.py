@@ -639,6 +639,35 @@ def _chain_requires_hybrid_signer(url: str) -> bool:
         return False
 
 
+def _chain_has_per_topology_difficulty(url: str) -> bool:
+    """True if the chain's runtime exposes per-topology difficulty.
+
+    `quip-protocol-rs` MR !42 replaced the global `QuantumPow.Difficulty`
+    value with a per-topology `QuantumPow.Difficulties` storage map. The live
+    controller tests drive `_maybe_seed_chain`, which queries/sets difficulty
+    through that map; against an older runtime the seed path raises
+    `StorageFunctionNotFound` deep in bootstrap. Probe the metadata so those
+    tests skip cleanly (rather than hard-fail) until the runtime is deployed.
+    """
+    if not _chain_reachable(url):
+        return False
+    try:
+        from substrateinterface import SubstrateInterface
+        si = SubstrateInterface(url=url)
+        pallet = si.get_metadata().get_metadata_pallet("QuantumPow")
+        return (
+            pallet is not None
+            and pallet.get_storage_function("Difficulties") is not None
+        )
+    except Exception:
+        return False
+
+
+# Evaluated once at collection time; the live controller tests below gate on
+# it so they skip cleanly against a pre-MR!42 runtime.
+_CHAIN_HAS_PER_TOPOLOGY_DIFFICULTY = _chain_has_per_topology_difficulty(DEFAULT_URL)
+
+
 @asynccontextmanager
 async def _live_controller(
     tmp_path: Path,
@@ -794,6 +823,10 @@ async def _live_controller(
     not _chain_reachable(DEFAULT_URL),
     reason=f"substrate chain not reachable at {DEFAULT_URL}",
 )
+@pytest.mark.skipif(
+    not _CHAIN_HAS_PER_TOPOLOGY_DIFFICULTY,
+    reason="chain runtime lacks per-topology QuantumPow.Difficulties (pre-MR!42)",
+)
 @pytest.mark.timeout(180)
 async def test_controller_submits_proof_end_to_end(tmp_path):
     """Smoke test: spin up a controller against the live chain, mine one proof.
@@ -825,6 +858,10 @@ async def test_controller_submits_proof_end_to_end(tmp_path):
 @pytest.mark.skipif(
     not _chain_reachable(DEFAULT_URL),
     reason=f"substrate chain not reachable at {DEFAULT_URL}",
+)
+@pytest.mark.skipif(
+    not _CHAIN_HAS_PER_TOPOLOGY_DIFFICULTY,
+    reason="chain runtime lacks per-topology QuantumPow.Difficulties (pre-MR!42)",
 )
 @pytest.mark.timeout(360)
 async def test_controller_long_haul_multi_block(tmp_path):
