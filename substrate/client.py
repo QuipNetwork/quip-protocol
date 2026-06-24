@@ -396,8 +396,8 @@ class SubstrateClient:
     async def has_call(self, module: str, function: str) -> bool:
         """Return True iff the runtime metadata exposes ``module.function``.
 
-        Used by the ``identify`` flow to prefer ``System.remark_with_event``
-        over plain ``System.remark`` when the runtime supports it.
+        Used by compatibility commands that need to branch on live runtime
+        metadata before composing a call.
         substrate-interface raises ``ValueError`` from
         ``get_metadata_call_function`` when the call is absent — we treat
         any exception as "not present" so an unreachable metadata cache
@@ -985,6 +985,16 @@ class SubstrateClient:
                 "WinningSolutions",
             )
         )
+
+    async def query_latest_qblock_id(self) -> Optional[int]:
+        """Return ``QuantumPow.LatestQBlockId`` or ``None`` before the first win."""
+        result = await self._run(
+            lambda: self._iface.query("QuantumPow", "LatestQBlockId")
+        )
+        v = _storage_value(result, check_found=True)
+        if v is None:
+            return None
+        return int(v)
 
     async def query_balance(self, account: bytes) -> int:
         if len(account) != 32:

@@ -50,7 +50,7 @@ signer_key = "~/.quip-miner/signing.json"
 # port   = 8086
 
 # Identification metadata — published on every miner startup as a
-# signed NodeDescriptor remark (System.remark_with_event). Dashboards
+# signed MinerRegistry NodeDescriptor. Dashboards
 # index miners by AccountId; these fields are the human-readable
 # overlay. Failures log a warning and never block mining.
 #

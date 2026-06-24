@@ -142,6 +142,9 @@ class PoolClient:
         """
         return await self._pool.send("query_winning_solution_count", {})
 
+    async def query_latest_qblock_id(self):
+        return await self._pool.send("query_latest_qblock_id", {})
+
     async def query_balance(self, account: bytes) -> int:
         return await self._pool.send("query_balance", {"account": account})
 

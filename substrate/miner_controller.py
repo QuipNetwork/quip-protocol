@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import multiprocessing as mp
 import os
 import queue as _queue
@@ -62,6 +61,7 @@ from shared.signer import Signer
 from shared.stats_snapshot import StatsSnapshotWriter, snapshot_filename_for
 from substrate.telemetry_process import telemetry_main
 from substrate.client import SubstrateClient
+from substrate.miner_registry import participation_call_params
 from substrate.pool import ValidatorPool
 from substrate.pool_client import PoolClient
 from substrate.decay_timing import TimingTracker
@@ -227,6 +227,20 @@ _CLOSED_WORK_KEYS_CAP = 16
 # to absorb late results from a few cancelled dispatches without ever
 # losing the immutable mapping for an in-flight one.
 _DISPATCH_CONTEXT_RETENTION = 4
+
+# Upper bound on the write-once participation dedup map. Generous because
+# solution numbers are monotonic and eviction is oldest-first, so a still-active
+# solution is never dropped (which would let its marker re-fire).
+_PARTICIPATION_RETENTION = 2048
+
+# Participation marker retry budget. The node submits one MinerRegistry
+# participate extrinsic per solution # from the same signer account the win
+# submission uses, so it can lose a nonce race and be rejected with
+# ``1010 Transaction is outdated``;
+# each retry re-composes (reading a fresh nonce) before giving up. ``RETRIES``
+# is the number of *additional* attempts after the first (total ≤ RETRIES + 1).
+_PARTICIPATION_REMARK_RETRIES = 3
+_PARTICIPATION_REMARK_BACKOFF_S = 0.25
 
 
 # How far ahead (in blocks) the anticipatory predictor looks for the
@@ -516,6 +530,12 @@ class SubstrateMinerController:
         # ``{"op": "budget"}`` pushes). Surfaced in the telemetry snapshot so
         # operators can see live daily-budget usage; never drives submission.
         self._latest_budget: dict[str, Any] = {}
+        # Write-once participation dedup: solution #s the node has already
+        # published a participation marker for. Node-level (one marker per solution#),
+        # keyed by solution# alone — not by per-instance miner id. Insertion-
+        # ordered so the retention bound evicts the OLDEST entry, never an
+        # arbitrary still-active solution (which would re-fire its marker).
+        self._participated: "OrderedDict[int, None]" = OrderedDict()
         # Anticipatory-submission state (Task 6b).
         # ``_pow_constants`` caches the four decay constants
         # (epoch_length + curve c-triple) for the session — they only
@@ -1783,6 +1803,127 @@ class SubstrateMinerController:
             logger.debug("qpu spend sum failed (ignored): %s", exc)
             return None
 
+    def _mark_participating(self, msg: dict) -> None:
+        """Submit a write-once participation extrinsic for this node + solution #.
+
+        Node-level: dedups on ``solution_number`` alone, so the node publishes
+        at most one marker per solution # however many miner instances report
+        it. The marker identifies the node (our on-chain signer account), not
+        the per-instance worker — one marker per solution avoids N miner
+        instances racing the signer nonce (the ``1010 Transaction is outdated``
+        rejections). Spawns a best-effort, supervised task to submit the marker
+        (never blocks the drain loop; participation is observability, not
+        consensus).
+        """
+        try:
+            solution_number = int(msg.get("solution_number", 0))
+        except (TypeError, ValueError):
+            return
+        if solution_number in self._participated:
+            return
+        # Resolve the node identity BEFORE recording dedup or spawning the task.
+        # This runs unguarded on the drain loop, so a signer failure must not
+        # propagate (the loop's broad except would shut the controller down —
+        # an observability failure crashing mining); and pre-marking the
+        # solution done before a transient failure would permanently suppress
+        # its marker. Resolve first, bail cleanly, mark done only on success.
+        try:
+            miner = self.signer.ss58_address()
+        except Exception as exc:  # noqa: BLE001 — observability path
+            logger.warning(
+                "participation marker skipped for solution %s: signer address "
+                "unavailable (%s: %s); mining continues",
+                solution_number, type(exc).__name__, exc,
+            )
+            return
+        self._participated[solution_number] = None
+        while len(self._participated) > _PARTICIPATION_RETENTION:
+            self._participated.popitem(last=False)  # evict oldest
+
+        payload: dict[str, Any] = {
+            "schema": "quip-participation",
+            "solution": solution_number,
+            "miner": miner,
+            "kind": msg.get("kind"),
+        }
+        if "budget_seconds" in msg:
+            payload["budget_seconds"] = msg["budget_seconds"]
+        asyncio.create_task(
+            supervise(
+                self._submit_participation_remark(payload),
+                name=f"participate-{solution_number}",
+                on_failure=lambda: None,
+            ),
+            name=f"participate-{solution_number}",
+        )
+
+    async def _submit_participation_remark(
+        self,
+        payload: dict,
+        *,
+        sleeper: Optional[Callable[[float], Awaitable[None]]] = None,
+    ) -> None:
+        """Submit one participation extrinsic (best-effort, retried, never raises).
+
+        Submission goes through the parent ``build_client``, the same signer
+        account as the win submission, so it can lose a nonce race and be
+        rejected with ``1010 Transaction is outdated``. Each attempt re-reads
+        ``QuantumPow.LatestQBlockId`` and re-composes ``MinerRegistry.participate``
+        for the current candidate qblock id, so stale-nonce and block-boundary
+        races can clear on retry. Retries transient submit exceptions up to
+        ``_PARTICIPATION_REMARK_RETRIES`` times with linear backoff, then logs
+        and swallows the final failure so mining continues. ``sleeper`` is
+        injected so tests run with zero real delay (defaults to :func:`asyncio.sleep`).
+        """
+        if self.build_client is None or self.pool_client is None:
+            return
+        sleep = sleeper if sleeper is not None else asyncio.sleep
+        total_attempts = _PARTICIPATION_REMARK_RETRIES + 1
+        for attempt in range(1, total_attempts + 1):
+            try:
+                latest_qblock_id = await self.pool_client.query_latest_qblock_id()
+                call_params = participation_call_params(
+                    latest_qblock_id=latest_qblock_id,
+                    kind=payload.get("kind"),
+                    budget_seconds=payload.get("budget_seconds"),
+                )
+                receipt = await self.build_client.submit_extrinsic(
+                    "MinerRegistry",
+                    "participate",
+                    call_params,
+                    self.signer,
+                    wait_for="inblock",
+                )
+            except Exception as exc:  # noqa: BLE001 — observability path; retry then swallow
+                if attempt < total_attempts:
+                    logger.debug(
+                        "participation marker transient failure for %s on "
+                        "attempt %d/%d (%s: %s); retrying",
+                        payload.get("miner"), attempt, total_attempts,
+                        type(exc).__name__, exc,
+                    )
+                    await sleep(_PARTICIPATION_REMARK_BACKOFF_S * attempt)
+                    continue
+                logger.warning(
+                    "participation marker failed for %s after %d attempts "
+                    "(%s: %s); mining continues",
+                    payload.get("miner"), total_attempts,
+                    type(exc).__name__, exc,
+                )
+                return
+            if receipt.error:
+                logger.warning(
+                    "participation marker rejected for %s (%s); mining continues",
+                    payload.get("miner"), receipt.error,
+                )
+                return
+            logger.info(
+                "participation marker submitted: miner=%s solution=%s budget=%s",
+                payload.get("miner"), payload.get("solution"),
+                payload.get("budget_seconds"),
+            )
+            return
+
     def _store_preview(self, handle: MinerHandle, msg: dict) -> None:
         """Stash a worker best-candidate preview keyed by work key.
 
@@ -2472,6 +2613,11 @@ class SubstrateMinerController:
                 # latest per-miner stats so the telemetry snapshot can surface
                 # live usage; never blocks, never submits.
                 self._store_budget(handle, msg)
+            elif op == "participating":
+                # Write-once participation marker for a solution #. Node-level
+                # (deduped per solution#, identified by our signer account, not
+                # this worker) + best-effort MinerRegistry.participate; never blocks drain.
+                self._mark_participating(msg)
             elif op == "stats":
                 # Stats responses are pulled directly by callers of
                 # handle.get_stats(); if one lands here it just means

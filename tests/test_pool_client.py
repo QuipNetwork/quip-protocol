@@ -101,6 +101,7 @@ async def test_query_methods_forward_single_kwarg():
     pool.scripted["query_balance"] = 1234
     pool.scripted["query_solver"] = "solver"
     pool.scripted["query_job_order"] = "order"
+    pool.scripted["query_latest_qblock_id"] = 9
     pool.scripted["get_events_at"] = [{"event": "x"}]
     client = PoolClient(pool)
 
@@ -109,6 +110,7 @@ async def test_query_methods_forward_single_kwarg():
     assert await client.query_balance(b"\x01" * 32) == 1234
     assert await client.query_solver(b"\x01" * 32) == "solver"
     assert await client.query_job_order(7) == "order"
+    assert await client.query_latest_qblock_id() == 9
     assert await client.get_events_at(b"\x02" * 32) == [{"event": "x"}]
 
     assert pool.calls == [
@@ -117,6 +119,7 @@ async def test_query_methods_forward_single_kwarg():
         ("query_balance", {"account": b"\x01" * 32}),
         ("query_solver", {"account": b"\x01" * 32}),
         ("query_job_order", {"order_id": 7}),
+        ("query_latest_qblock_id", {}),
         ("get_events_at", {"block_hash": b"\x02" * 32}),
     ]
 

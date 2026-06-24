@@ -9,11 +9,10 @@ summary derived from ``MinerCore.miner_handles``. The output schema
 matches the v0.1 ``telemetry/nodes.json`` entries so existing dashboards
 continue to parse it without change.
 
-The on-chain ``identify`` flow canonicalizes this descriptor to UTF-8
-JSON (sorted keys, compact separators) and posts it as a signed
-``System.remark_with_event`` so indexers can map AccountId → descriptor
-without trusting any unsigned channel. ``schema`` is a discriminator
-that lets remark-scanning indexers select the right parser.
+The on-chain ``identify`` flow stores a compact typed projection of this
+descriptor via ``MinerRegistry.set_descriptor`` so indexers can map AccountId
+→ descriptor without trusting any unsigned channel. ``schema`` is kept in the
+JSON form used by dry-run previews and the local REST/dashboard surface.
 
 The forbidden-substring scrubber is defense-in-depth: even if a future
 contributor leaks a secret-bearing key through the per-miner whitelist,
@@ -886,8 +885,8 @@ def to_canonical_json(descriptor: NodeDescriptor) -> bytes:
     """Serialize the descriptor as deterministic UTF-8 JSON bytes.
 
     Sorted keys (recursively), compact separators, no trailing newline.
-    The output is what gets posted as the ``System.remark`` body — and
-    what the indexer hashes / compares against when deduplicating.
+    The output is the rich JSON preview used by dry-run and local REST
+    surfaces. Live chain submission uses a compact typed projection.
     """
     payload = descriptor.to_dict()
     return json.dumps(
