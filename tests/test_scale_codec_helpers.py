@@ -203,3 +203,104 @@ async def test_query_difficulty_for_bad_topology_hash_length():
     client = SubstrateClient.__new__(SubstrateClient)
     with pytest.raises(ValueError, match="32 bytes"):
         await client.query_difficulty_for(b"\xab" * 16)
+
+
+# ---------------------------------------------------------------------------
+# Malformed-response decode branches — these are the defenses the two read
+# methods were written for, so they get explicit coverage.
+# ---------------------------------------------------------------------------
+
+
+def _state_call_returning(value):
+    """Build a fake ``_state_call`` coroutine that always yields ``value``."""
+
+    async def _fake(method, param, block_hash):
+        return value
+
+    return _fake
+
+
+@pytest.mark.asyncio
+async def test_query_mineable_topologies_no_result_raises(monkeypatch):
+    """A ``None`` from ``_state_call`` (RPC error) surfaces as RuntimeError."""
+    from substrate.client import SubstrateClient
+
+    client = SubstrateClient.__new__(SubstrateClient)
+    monkeypatch.setattr(client, "_state_call", _state_call_returning(None))
+    with pytest.raises(RuntimeError, match="returned no result"):
+        await client.query_mineable_topologies()
+
+
+@pytest.mark.asyncio
+async def test_query_mineable_topologies_trailing_bytes_raises(monkeypatch):
+    """Extra bytes after the Vec<H256> are rejected, not silently ignored."""
+    from substrate.client import SubstrateClient
+
+    raw_hex = "0x" + (_build_h256_vec_bytes([bytes([0x11] * 32)]) + b"\xde\xad").hex()
+    client = SubstrateClient.__new__(SubstrateClient)
+    monkeypatch.setattr(client, "_state_call", _state_call_returning(raw_hex))
+    with pytest.raises(ValueError, match="trailing bytes after mineable_topologies"):
+        await client.query_mineable_topologies()
+
+
+@pytest.mark.asyncio
+async def test_query_difficulty_for_no_result_raises(monkeypatch):
+    """A ``None`` from ``_state_call`` (RPC error) surfaces as RuntimeError."""
+    from substrate.client import SubstrateClient
+
+    client = SubstrateClient.__new__(SubstrateClient)
+    monkeypatch.setattr(client, "_state_call", _state_call_returning(None))
+    with pytest.raises(RuntimeError, match="returned no result"):
+        await client.query_difficulty_for(b"\xab" * 32)
+
+
+@pytest.mark.asyncio
+async def test_query_difficulty_for_empty_response_raises(monkeypatch):
+    """An empty (tagless) response is rejected rather than decoded as None."""
+    from substrate.client import SubstrateClient
+
+    client = SubstrateClient.__new__(SubstrateClient)
+    monkeypatch.setattr(client, "_state_call", _state_call_returning("0x"))
+    with pytest.raises(ValueError, match="empty response"):
+        await client.query_difficulty_for(b"\xab" * 32)
+
+
+@pytest.mark.asyncio
+async def test_query_difficulty_for_unknown_tag_raises(monkeypatch):
+    """An Option tag other than 0x00/0x01 (e.g. 0x02) is rejected."""
+    from substrate.client import SubstrateClient
+
+    client = SubstrateClient.__new__(SubstrateClient)
+    monkeypatch.setattr(client, "_state_call", _state_call_returning("0x02"))
+    with pytest.raises(ValueError, match="unknown Option variant tag"):
+        await client.query_difficulty_for(b"\xab" * 32)
+
+
+@pytest.mark.asyncio
+async def test_query_difficulty_for_trailing_after_none_raises(monkeypatch):
+    """Bytes after an Option::None tag are rejected."""
+    from substrate.client import SubstrateClient
+
+    client = SubstrateClient.__new__(SubstrateClient)
+    monkeypatch.setattr(client, "_state_call", _state_call_returning("0x00dead"))
+    with pytest.raises(ValueError, match="trailing bytes after difficulty_for Option::None"):
+        await client.query_difficulty_for(b"\xab" * 32)
+
+
+@pytest.mark.asyncio
+async def test_query_difficulty_for_trailing_after_some_raises(monkeypatch):
+    """Bytes after a fully-decoded Option::Some(DifficultyConfig) are rejected."""
+    from substrate.client import SubstrateClient
+
+    inner = (
+        b"\x01"  # Option::Some tag
+        + (3).to_bytes(4, "little")
+        + (-500).to_bytes(8, "little", signed=True)
+        + (200).to_bytes(4, "little")
+        + b"\xde\xad"  # unexpected trailing bytes
+    )
+    raw_hex = "0x" + inner.hex()
+    client = SubstrateClient.__new__(SubstrateClient)
+    monkeypatch.setattr(client, "_state_call", _state_call_returning(raw_hex))
+    with pytest.raises(ValueError, match="trailing bytes after difficulty_for decode"):
+        await client.query_difficulty_for(b"\xcd" * 32)

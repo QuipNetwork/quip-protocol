@@ -1912,6 +1912,12 @@ class SubstrateMinerController:
                 )
                 return
             if receipt.error:
+                # An included-but-rejected marker is terminal: it landed in a
+                # block and the call logic failed (e.g. ExtrinsicFailed), so
+                # resubmitting the same call can't fix it — retrying would just
+                # be a resubmission storm. Nonce/outdated races are pre-inclusion
+                # pool rejections that raise during submit and are retried by the
+                # except branch above, not here.
                 logger.warning(
                     "participation marker rejected for %s (%s); mining continues",
                     payload.get("miner"), receipt.error,

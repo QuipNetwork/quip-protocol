@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+import warnings
 
 import pytest
 
@@ -56,7 +57,17 @@ def _chain_has_per_topology_difficulty(url: str) -> bool:
             pallet is not None
             and pallet.get_storage_function("Difficulties") is not None
         )
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        # The chain was reachable a moment ago (checked above), so a failure
+        # here is a transport/metadata fault, NOT evidence of an older
+        # runtime. Surface it as a warning so a flaky node isn't silently
+        # mislabeled "pre-MR!42" and the dependent tests skipped under a
+        # misleading reason.
+        warnings.warn(
+            f"per-topology difficulty probe failed unexpectedly "
+            f"(treating as absent): {type(exc).__name__}: {exc}",
+            stacklevel=2,
+        )
         return False
 
 

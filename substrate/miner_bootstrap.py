@@ -604,7 +604,7 @@ async def _try_fund_once(
     return balance, note
 
 
-def _post_faucet(url: str, *, dest_hex: str, amount: int) -> dict:
+def _post_faucet(url: str, *, dest_hex: str, amount: int) -> None:
     """POST the faucet ``/request`` contract, classifying failures for retry.
 
     Retries are the default: anything that isn't a known-permanent rejection
@@ -624,8 +624,13 @@ def _post_faucet(url: str, *, dest_hex: str, amount: int) -> dict:
         method="POST",
     )
     try:
+        # The success body is discarded — the caller treats the on-chain
+        # balance read as the source of truth — so don't parse it. A 2xx with
+        # a non-JSON body (proxy splash page, half-written response) must not
+        # crash the retry loop with a JSONDecodeError it can't classify.
         with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
+            resp.read()
+        return
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")
         msg = f"faucet returned {exc.code}: {detail}"

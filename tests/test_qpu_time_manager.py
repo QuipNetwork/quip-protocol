@@ -272,6 +272,30 @@ class TestGetStatsAndWarnings:
                                          min_block_budget_seconds=90.0))
         assert not any("min_block_budget" in r.message for r in caplog.records)
 
+    def test_startup_warns_when_buffer_exceeds_cap(self, caplog):
+        # budget_cap below min_block_budget: the pool caps under the burst
+        # threshold, so a burst can never start — the most dangerous of the
+        # two misconfigurations (total stall, not just slow fill).
+        with caplog.at_level(logging.WARNING):
+            QPUTimeManager(QPUTimeConfig(daily_budget_seconds=86400.0,
+                                         min_block_budget_seconds=90.0,
+                                         budget_cap_seconds=30.0))
+        assert any("min_block_budget" in r.message and "NEVER start" in r.message
+                   for r in caplog.records)
+
+    def test_burst_never_starts_when_cap_below_buffer(self):
+        # Behavioral counterpart to the warning: even after unbounded accrual
+        # the pool clamps at the cap (30s) below the burst threshold (90s), so
+        # should_mine_block never authorizes a burst.
+        tm = QPUTimeManager(QPUTimeConfig(daily_budget_seconds=86400.0,
+                                          min_block_budget_seconds=90.0,
+                                          budget_cap_seconds=30.0))
+        tm.reset_clock(1_000_000.0)
+        # Far in the future — the reservoir has long since filled to its cap.
+        e = tm.should_mine_block(now=1_000_000.0 + 10 * 86400.0)
+        assert e.should_mine is False
+        assert e.burst_active is False
+
 
 class TestInitialBudgetSeeding:
     """Seeding the reservoir on boot so a fresh process mines immediately."""

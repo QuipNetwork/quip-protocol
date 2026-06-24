@@ -1966,8 +1966,14 @@ class BaseMiner(ABC):
         # Compute solution_meta scalars + capture top-5 solutions. Meta is
         # always embedded in the attempt log; top-5 spins go to disk only
         # when this iter is stored or submitted (see write below).
+        # gauge_fix collapses spin-flip (Z2) twins before dedup so the
+        # uniqueness/diversity diagnostics aren't inflated up to 2x on
+        # zero-field (h=0) instances. At h!=0 twins are vanishingly rare, so
+        # it's a near-no-op (one vectorized sign-multiply); enabled
+        # unconditionally to keep the metric honest across all field
+        # distributions.
         sol_meta, top_5_sols, top_5_es = compute_solution_meta(
-            sampleset, state.requirements.difficulty_energy,
+            sampleset, state.requirements.difficulty_energy, gauge_fix=True,
         )
         attempt_log_kwargs["solution_meta"] = sol_meta
         state.attempt_log.record(**attempt_log_kwargs)
