@@ -29,6 +29,7 @@ invoke `--seed-chain`: chainspec ships with topology + difficulty
 baked in, and ad-hoc runtime config goes through ops tooling that
 holds the real sudo key.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -122,8 +123,8 @@ DEFAULT_SEED_TOPOLOGY: Tuple[int, int] = (2, 2)
 # operators should tune via `quip-miner set-difficulty` once that lands.
 DEFAULT_SEED_DIFFICULTY = SubstrateDifficulty(
     min_solutions=5,
-    max_energy_milli=-2_500_000,   # -2500.0
-    min_diversity_milli=200,        # 0.2
+    max_energy_milli=-2_500_000,  # -2500.0
+    min_diversity_milli=200,  # 0.2
 )
 
 # Minimum balance before bootstrap considers the account funded. Miner
@@ -249,9 +250,7 @@ async def bootstrap(config: BootstrapConfig) -> BootstrapResult:
         topology_seeded = False
         difficulty_seeded = False
         if config.seed_chain:
-            topology_seeded, difficulty_seeded = await _maybe_seed_chain(
-                client, config
-            )
+            topology_seeded, difficulty_seeded = await _maybe_seed_chain(client, config)
 
         balance = await ensure_funded(client, keystore, config)
         # Idempotent: returns whether it *newly* registered; either way the
@@ -300,45 +299,21 @@ async def _maybe_seed_chain(
 
     Idempotent: returns `(topology_seeded, difficulty_seeded)` reflecting
     whether *this* call did the seeding. Both are False on re-runs.
+
+    Order matters: topology MUST be registered before set_difficulty because
+    the runtime's `set_difficulty` now `ensure!`s the topology hash is in
+    `RegisteredTopologies`. The topology hash is resolved from the snapshot
+    after registration (or from the existing snapshot if already present).
     """
     await _assert_dev_chain(client)
     sudo_signer = _resolve_dev_signer(config.sudo_key_uri)
 
-    difficulty_seeded = False
-    needs_seed = (
-        await client.query_difficulty() is None or config.force_reseed_difficulty
-    )
-    if needs_seed:
-        if config.force_reseed_difficulty:
-            # Defense in depth: `_assert_dev_chain` above already refused
-            # non-dev chains, but log a loud warning when we're about to
-            # overwrite an existing on-chain difficulty so the action is
-            # never invisible. Production CLI doesn't expose the flag.
-            logger.warning(
-                "force-reseeding QuantumPow.Difficulty via sudo: "
-                "min_solutions=%d max_energy_milli=%d min_diversity_milli=%d",
-                config.seed_difficulty.min_solutions,
-                config.seed_difficulty.max_energy_milli,
-                config.seed_difficulty.min_diversity_milli,
-            )
-        else:
-            logger.info("seeding QuantumPow.Difficulty via sudo (first time)")
-        await _sudo_call(
-            client,
-            sudo_signer,
-            "QuantumPow",
-            "set_difficulty",
-            {"difficulty": _difficulty_to_dict(config.seed_difficulty)},
-        )
-        difficulty_seeded = True
-    else:
-        logger.info("QuantumPow.Difficulty already set; skipping seed")
-
+    # --- Step 1: register topology (must precede set_difficulty) -----------
     topology_seeded = False
     # Probe whether DefaultTopology is set by asking for the snapshot. If the
-    # runtime API returns None despite Difficulty being set, that's the
-    # missing-topology case — see pallets/quantum-pow/src/lib.rs:457 where
-    # mining_snapshot bails on DefaultTopology::get()? returning None.
+    # runtime API returns None, that's the missing-topology case — see
+    # pallets/quantum-pow/src/lib.rs:457 where mining_snapshot bails on
+    # DefaultTopology::get()? returning None.
     snapshot = await client.get_mining_snapshot(
         miner_account_bytes=b"\x00" * 32,  # placeholder; we just want the call
     )
@@ -369,11 +344,57 @@ async def _maybe_seed_chain(
             },
         )
         topology_seeded = True
+        # Fetch the snapshot again so we have the topology hash for set_difficulty.
+        snapshot = await client.get_mining_snapshot(
+            miner_account_bytes=b"\x00" * 32,
+        )
+        if snapshot is None:
+            raise RuntimeError(
+                "register_topology succeeded but mining_snapshot is still None; "
+                "the topology may have failed inner-call validation."
+            )
     else:
         logger.info(
             "QuantumPow topology already registered (hash=0x%s); skipping seed",
             snapshot.topology_hash.hex(),
         )
+
+    seed_topology_hash = snapshot.topology_hash
+
+    # --- Step 2: seed difficulty (topology must already be registered) -----
+    difficulty_seeded = False
+    needs_seed = (
+        await client.query_difficulty(seed_topology_hash) is None
+        or config.force_reseed_difficulty
+    )
+    if needs_seed:
+        if config.force_reseed_difficulty:
+            # Defense in depth: `_assert_dev_chain` above already refused
+            # non-dev chains, but log a loud warning when we're about to
+            # overwrite an existing on-chain difficulty so the action is
+            # never invisible. Production CLI doesn't expose the flag.
+            logger.warning(
+                "force-reseeding QuantumPow.Difficulty via sudo: "
+                "min_solutions=%d max_energy_milli=%d min_diversity_milli=%d",
+                config.seed_difficulty.min_solutions,
+                config.seed_difficulty.max_energy_milli,
+                config.seed_difficulty.min_diversity_milli,
+            )
+        else:
+            logger.info("seeding QuantumPow.Difficulty via sudo (first time)")
+        await _sudo_call(
+            client,
+            sudo_signer,
+            "QuantumPow",
+            "set_difficulty",
+            {
+                "topology_hash": "0x" + seed_topology_hash.hex(),
+                "difficulty": _difficulty_to_dict(config.seed_difficulty),
+            },
+        )
+        difficulty_seeded = True
+    else:
+        logger.info("QuantumPow.Difficulty already set; skipping seed")
 
     return topology_seeded, difficulty_seeded
 
@@ -417,7 +438,9 @@ def _difficulty_to_dict(d: SubstrateDifficulty) -> dict:
     }
 
 
-def _build_seed_topology(mt: Tuple[int, int]) -> Tuple[List[int], List[Tuple[int, int]]]:
+def _build_seed_topology(
+    mt: Tuple[int, int],
+) -> Tuple[List[int], List[Tuple[int, int]]]:
     """Generate a Zephyr Z(m,t) graph using sampler-compatible node labels.
 
     The labels are whatever `dwave_networkx.zephyr_graph` assigns (linear ints,
@@ -437,10 +460,7 @@ def _build_seed_topology(mt: Tuple[int, int]) -> Tuple[List[int], List[Tuple[int
     m, t = mt
     g = dnx.zephyr_graph(m=m, t=t)
     nodes = sorted(int(n) for n in g.nodes())
-    edges = sorted(
-        (min(int(u), int(v)), max(int(u), int(v)))
-        for u, v in g.edges()
-    )
+    edges = sorted((min(int(u), int(v)), max(int(u), int(v))) for u, v in g.edges())
     return nodes, edges
 
 
@@ -495,9 +515,7 @@ async def ensure_funded_via_faucet(
     account = keystore.signer.account_id_bytes()
     balance = await client.query_balance(account)
     if balance >= min_balance:
-        logger.info(
-            "miner account already funded: balance=%d plancks", balance
-        )
+        logger.info("miner account already funded: balance=%d plancks", balance)
         return balance
 
     if faucet_url is None:
@@ -528,7 +546,8 @@ async def ensure_funded_via_faucet(
         if balance >= min_balance:
             logger.info(
                 "faucet funded after %d attempt(s): balance=%d plancks",
-                attempt, balance,
+                attempt,
+                balance,
             )
             return balance
         if budget <= 0:
@@ -537,7 +556,10 @@ async def ensure_funded_via_faucet(
         logger.warning(
             "faucet not funded yet (%s); attempt %d, retrying in %.1fs "
             "(%.0fs budget left)",
-            last_note, attempt, wait, budget,
+            last_note,
+            attempt,
+            wait,
+            budget,
         )
         await asyncio.sleep(wait)
         budget -= wait
