@@ -37,9 +37,39 @@ def _chain_reachable(url: str) -> bool:
         return False
 
 
+def _chain_has_per_topology_difficulty(url: str) -> bool:
+    """True if the chain's runtime exposes per-topology difficulty.
+
+    `quip-protocol-rs` MR !42 (rc4) replaced the global `QuantumPow.Difficulty`
+    value with a per-topology `QuantumPow.Difficulties` storage map. Tests that
+    read difficulty/snapshot through that map raise `StorageFunctionNotFound`
+    against an older runtime, so probe the metadata and skip cleanly until the
+    new runtime is deployed.
+    """
+    if not _chain_reachable(url):
+        return False
+    try:
+        from substrateinterface import SubstrateInterface
+        si = SubstrateInterface(url=url)
+        pallet = si.get_metadata().get_metadata_pallet("QuantumPow")
+        return (
+            pallet is not None
+            and pallet.get_storage_function("Difficulties") is not None
+        )
+    except Exception:
+        return False
+
+
 pytestmark = pytest.mark.skipif(
     not _chain_reachable(DEFAULT_URL),
     reason=f"substrate chain not reachable at {DEFAULT_URL}",
+)
+
+# Evaluated once; tests that need the per-topology difficulty runtime gate on it.
+_CHAIN_HAS_PER_TOPOLOGY_DIFFICULTY = _chain_has_per_topology_difficulty(DEFAULT_URL)
+_skip_pre_mr42 = pytest.mark.skipif(
+    not _CHAIN_HAS_PER_TOPOLOGY_DIFFICULTY,
+    reason="chain runtime lacks per-topology QuantumPow.Difficulties (pre-MR!42)",
 )
 
 
@@ -78,6 +108,7 @@ async def test_get_finalized_head(client):
     assert nf <= nh, "finalized head should not exceed best head"
 
 
+@_skip_pre_mr42
 async def test_mining_snapshot_either_returns_or_none(client):
     head = await client.get_head()
     alice = Sr25519Signer.from_uri("//Alice")
@@ -116,6 +147,7 @@ async def test_query_miner_unregistered_account(client):
     assert miner_info is None
 
 
+@_skip_pre_mr42
 async def test_query_difficulty_either_returns_or_none(client):
     """`query_difficulty` reads ``QuantumPow.Difficulties[DefaultTopology]``.
 
