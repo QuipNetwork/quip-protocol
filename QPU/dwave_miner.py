@@ -411,17 +411,6 @@ class DWaveMiner(BaseMiner):
             self._inloop_pacing_rl.reset()
         return MidstreamBudget(should_mine=should_mine, stats=stats)
 
-    def _participation_extra(self) -> Dict[str, Any]:
-        """QPU adds the reservoir pool at dispatch to the participation marker.
-
-        The snapshot is the QPU runway on hand when mining began for this
-        solution # (>= ``min_block_budget``). Returns ``{}`` when no budget is
-        configured.
-        """
-        if self.time_manager is None:
-            return {}
-        return {"budget_seconds": self.time_manager.get_stats()["pool_seconds"]}
-
     def _adapt_mining_params(
         self,
         current_requirements: BlockRequirements,

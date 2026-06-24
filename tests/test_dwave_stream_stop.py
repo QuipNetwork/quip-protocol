@@ -1,4 +1,4 @@
-"""Unit tests for DWaveMiner budget-gate and participation helpers.
+"""Unit tests for DWaveMiner budget-gate helpers.
 
 The legacy DWaveMiner.sample_ising_streaming (diagnostic path) was removed
 when QPU switched to the generic StreamContext + DWaveSamplerWrapper.
@@ -51,17 +51,6 @@ def _dwave_with_time_manager(tm) -> DWaveMiner:
 def test_midstream_budget_ok_returns_none_without_time_manager():
     miner = _dwave_with_time_manager(None)
     assert miner._midstream_budget_ok(solution_number=1) is None
-
-
-def test_participation_extra_carries_pool_budget():
-    miner = _dwave_with_time_manager(_FakeTimeManager(should_mine=True))
-    extra = miner._participation_extra()
-    assert extra == {"budget_seconds": 5.0}  # pool_seconds from the stub
-
-
-def test_participation_extra_empty_without_time_manager():
-    miner = _dwave_with_time_manager(None)
-    assert miner._participation_extra() == {}
 
 
 def test_midstream_budget_ok_passes_when_budget_available():

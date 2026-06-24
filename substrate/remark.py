@@ -9,9 +9,9 @@ answer ``has_call`` "yes" while the active runtime rejects the call at compose
 time; when that happens the eventful variant's failure is reported via
 ``on_fallback`` and a plain ``System.remark`` is submitted instead.
 
-Three call sites share this dance — the descriptor remark and the ``identify``
-command in ``quip_cli``, and the controller's participation remark — so the
-chain semantics live here rather than being copy-pasted into each.
+Two call sites share this dance — the descriptor remark and the ``identify``
+command in ``quip_cli`` — so the chain semantics live here rather than being
+copy-pasted into each.
 """
 from __future__ import annotations
 
