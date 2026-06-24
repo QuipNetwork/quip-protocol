@@ -84,8 +84,7 @@ _STARTUP_LOGGER = logging.getLogger("quip_miner.startup")
 # 5,10,20,40,45,45,45s ≈ 3.5 minutes) before failing the startup hard. The
 # node descriptor is filed right after register_miner, so its remark can race
 # the registration extrinsic's nonce (stale `accountNextIndex` for ~a block);
-# the retry rides that out. The per-round "participating" remark is separate
-# and stays best-effort — it is not gated here.
+# the retry rides that out.
 _STARTUP_RETRY_ATTEMPTS = 8
 _STARTUP_RETRY_BASE_DELAY_SECONDS = 5.0
 _STARTUP_RETRY_MAX_DELAY_SECONDS = 45.0
@@ -227,10 +226,9 @@ async def _auto_identify(
     fatal startup requirement: a descriptor that can't be built/validated
     fails immediately (operator misconfiguration), and submission is retried
     over several minutes before failing hard via the ``descriptor-failed`` CLI
-    code. The per-round "participating" remark is a separate, best-effort
-    signal and is not gated here. The descriptor's `miners` block is built
-    from the same TOML-shaped dict that `MinerCore` used to spawn worker
-    handles, so the descriptor always reflects the actual launched topology.
+    code. The descriptor's `miners` block is built from the same TOML-shaped
+    dict that `MinerCore` used to spawn worker handles, so the descriptor
+    always reflects the actual launched topology.
     """
     effective_name = (node_name or _default_node_name())[:64]
     # When the operator did not configure public_host, query

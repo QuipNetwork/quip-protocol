@@ -15,6 +15,7 @@ Signing stays in the calling process: callers pair this submit path
 with ``SubstrateClient.build_signed_extrinsic`` so key material never
 crosses the mp.Queue IPC boundary.
 """
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
@@ -100,12 +101,20 @@ class PoolClient:
         """
         return await self._pool.send("query_proofs_submitted", {"account": account})
 
-    async def query_difficulty(self):
-        return await self._pool.send("query_difficulty", {})
+    async def query_difficulty(self, topology_hash=None):
+        return await self._pool.send(
+            "query_difficulty", {"topology_hash": topology_hash}
+        )
 
     async def query_current_difficulty(self, at_block: Optional[int] = None):
+        return await self._pool.send("query_current_difficulty", {"at_block": at_block})
+
+    async def query_mineable_topologies(self) -> list:
+        return await self._pool.send("query_mineable_topologies", {})
+
+    async def query_difficulty_for(self, topology_hash: bytes):
         return await self._pool.send(
-            "query_current_difficulty", {"at_block": at_block}
+            "query_difficulty_for", {"topology_hash": topology_hash}
         )
 
     async def query_last_proof_block_number(self):

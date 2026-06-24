@@ -17,6 +17,7 @@ Non-connection errors (e.g. a `RuntimeError` from the chain RPC
 saying "no topology registered") pass through unchanged. The pool
 only swaps on connection-class failures.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -45,25 +46,29 @@ _CONNECTION_ERRORS: tuple[type[BaseException], ...] = (
 
 # Idempotent operations the pool may auto-retry across swaps.
 # Anything not in this set raises ValidatorSwapped to the caller instead.
-_IDEMPOTENT_OPS = frozenset({
-    "ensure_connected",
-    "get_head",
-    "get_block_number",
-    "get_finalized_head",
-    "get_mining_snapshot",
-    "query_miner",
-    "query_proofs_submitted",
-    "query_difficulty",
-    "query_current_difficulty",
-    "query_last_proof_block_number",
-    "query_pow_constants",
-    "query_balance",
-    "query_solver",
-    "query_job_order",
-    "query_winning_solution",
-    "query_winning_solution_count",
-    "get_events_at",
-})
+_IDEMPOTENT_OPS = frozenset(
+    {
+        "ensure_connected",
+        "get_head",
+        "get_block_number",
+        "get_finalized_head",
+        "get_mining_snapshot",
+        "query_miner",
+        "query_proofs_submitted",
+        "query_difficulty",
+        "query_current_difficulty",
+        "query_mineable_topologies",
+        "query_difficulty_for",
+        "query_last_proof_block_number",
+        "query_pow_constants",
+        "query_balance",
+        "query_solver",
+        "query_job_order",
+        "query_winning_solution",
+        "query_winning_solution_count",
+        "get_events_at",
+    }
+)
 
 
 class ValidatorPool:
@@ -89,17 +94,17 @@ class ValidatorPool:
         # Accept tuples/lists; normalise to list for internal mutation.
         urls_list = list(urls) if urls is not None else []
         if not urls_list:
-            raise ValueError(
-                "ValidatorPool requires at least one validator URL"
-            )
+            raise ValueError("ValidatorPool requires at least one validator URL")
         self._urls = urls_list
         # Sensible defaults so legacy callers `ValidatorPool(urls=...)` keep
         # working. Tests inject custom failover/handle_factory for isolation.
         if failover is None:
             failover = SubstrateUrlFailover(urls_list)
         if handle_factory is None:
+
             def handle_factory(url: str) -> ValidatorHandle:  # noqa: E306
                 return ValidatorHandle(url=url)
+
         self._failover = failover
         self._handle_factory = handle_factory
         self._max_swap_retries = max_swap_retries
@@ -150,7 +155,9 @@ class ValidatorPool:
             except _CONNECTION_ERRORS as conn_exc:
                 logger.warning(
                     "pool: connection-class error on %s op=%s: %s; swapping",
-                    handle.url, op, conn_exc,
+                    handle.url,
+                    op,
+                    conn_exc,
                 )
                 all_down = await self._swap_after_failure(handle.url)
                 if op not in _IDEMPOTENT_OPS:
@@ -161,7 +168,9 @@ class ValidatorPool:
                 if all_down or attempts >= self._max_swap_retries:
                     logger.error(
                         "pool: idempotent op %s exhausted retries (all_down=%s attempts=%d)",
-                        op, all_down, attempts,
+                        op,
+                        all_down,
+                        attempts,
                     )
                     raise
                 # loop and try on the new active handle
