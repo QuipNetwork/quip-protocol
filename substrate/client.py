@@ -47,6 +47,7 @@ our model of chain state. Consumers of `get_events_at` and
 (`module_id` / `pallet_name`, etc.) so a future renaming on the
 chain-side surfaces as "no match" rather than a crash.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -62,6 +63,7 @@ from websocket import WebSocketException
 
 from shared.hybrid_signer import HybridSigner
 from shared.logging_config import get_logger
+
 # Aliased: `topology_hash` is also a local param/field name throughout this
 # module, so import the canonical-hash function under a distinct name.
 from shared.topology_hash import topology_hash as compute_topology_hash
@@ -89,6 +91,7 @@ from substrate.scale_codec import (
     _build_hybrid_signed_extrinsic,
     _decode_account_id,
     _decode_difficulty_config,
+    _decode_h256_vec,
     _decode_hash,
     _decode_job_mode,
     _decode_mining_snapshot,
@@ -170,8 +173,11 @@ _KEYS_PAGE_SIZE = 1000
 
 
 def _count_map_keys(
-    iface, storage_module: str, storage_function: str,
-    *, page_size: int = _KEYS_PAGE_SIZE,
+    iface,
+    storage_module: str,
+    storage_function: str,
+    *,
+    page_size: int = _KEYS_PAGE_SIZE,
 ) -> int:
     """Count the keys of a storage map via ``state_getKeysPaged``.
 
@@ -180,7 +186,8 @@ def _count_map_keys(
     in ``_run``. Returns ``0`` for an empty map.
     """
     prefix = iface.generate_storage_hash(
-        storage_module=storage_module, storage_function=storage_function,
+        storage_module=storage_module,
+        storage_function=storage_function,
     )
     total = 0
     start = None
@@ -342,11 +349,14 @@ class SubstrateClient:
             await self.connect()
             return False
         try:
-            await self._raw_run(
-                lambda: self._iface.rpc_request("system_health", [])
-            )
+            await self._raw_run(lambda: self._iface.rpc_request("system_health", []))
             return True
-        except (WebSocketException, ConnectionError, OSError, json.JSONDecodeError) as exc:
+        except (
+            WebSocketException,
+            ConnectionError,
+            OSError,
+            json.JSONDecodeError,
+        ) as exc:
             logger.warning(
                 "ensure_connected: health probe failed on %s (%s: %s); "
                 "reconnecting before submit",
@@ -393,12 +403,14 @@ class SubstrateClient:
         any exception as "not present" so an unreachable metadata cache
         falls back rather than crashing the caller.
         """
+
         def _probe() -> bool:
             try:
                 self._iface.get_metadata_call_function(module, function)
                 return True
             except Exception:
                 return False
+
         return await self._run(_probe)
 
     async def has_storage(self, module: str, function: str) -> bool:
@@ -409,11 +421,16 @@ class SubstrateClient:
         "not present". Used to pick the right winning-solution counter across the
         ``WinningSolutions``→``QBlockCount`` rename (quip-protocol-rs MR !35).
         """
+
         def _probe() -> bool:
             try:
-                return self._iface.get_metadata_storage_function(module, function) is not None
+                return (
+                    self._iface.get_metadata_storage_function(module, function)
+                    is not None
+                )
             except Exception:
                 return False
+
         return await self._run(_probe)
 
     async def get_finalized_head(self) -> bytes:
@@ -551,7 +568,8 @@ class SubstrateClient:
         """
         head = await self.get_head()
         snapshot = await self.get_mining_snapshot(
-            at=head, miner_account_bytes=miner_account_bytes,
+            at=head,
+            miner_account_bytes=miner_account_bytes,
         )
         if snapshot is None:
             raise NoRegisteredTopology("chain has no registered topology")
@@ -602,19 +620,45 @@ class SubstrateClient:
             return None
         return info.proofs_submitted
 
-    async def query_difficulty(self) -> Optional[SubstrateDifficulty]:
-        """Return the raw `QuantumPow.Difficulty` storage value.
+    async def query_difficulty(
+        self, topology_hash: Optional[bytes] = None
+    ) -> Optional[SubstrateDifficulty]:
+        """Return the raw ``QuantumPow.Difficulties[topology_hash]`` map entry.
 
-        This is the *post-adjust baseline* — the value set after the most
-        recent winning proof, **without** decay applied. Use
-        :meth:`query_current_difficulty` for the live threshold a fresh
-        proof would have to clear right now.
+        This is the *post-adjust baseline* — the value recorded after the most
+        recent winning proof for the given topology, **without** decay applied.
+        Use :meth:`query_current_difficulty` for the live threshold a fresh
+        proof would have to clear right now, or :meth:`query_difficulty_for`
+        for the decayed value from the runtime API.
 
-        Suitable for "is the chain seeded?" checks and historical
-        comparisons; not suitable for deciding what difficulty a miner
-        currently faces.
+        When ``topology_hash`` is ``None``, the chain's ``DefaultTopology``
+        storage value is read first; if that is also absent the method returns
+        ``None`` without querying the map.
+
+        Suitable for "is the chain seeded?" checks and historical comparisons;
+        not suitable for deciding what difficulty a miner currently faces.
+
+        Args:
+            topology_hash: 32-byte topology hash to look up, or ``None`` to
+                resolve from ``QuantumPow.DefaultTopology``.
+
+        Returns:
+            The stored difficulty config, or ``None`` if the map entry is
+            absent or no default topology has been set.
         """
-        result = await self._run(lambda: self._iface.query("QuantumPow", "Difficulty"))
+        if topology_hash is None:
+            default_result = await self._run(
+                lambda: self._iface.query("QuantumPow", "DefaultTopology")
+            )
+            resolved = _storage_value(default_result, check_found=True)
+            if resolved is None:
+                return None
+            topology_hash = _decode_hash(resolved)
+        result = await self._run(
+            lambda: self._iface.query(
+                "QuantumPow", "Difficulties", ["0x" + topology_hash.hex()]
+            )
+        )
         v = _storage_value(result, check_found=True)
         if v is None:
             return None
@@ -644,9 +688,7 @@ class SubstrateClient:
             "QuantumPowApi_current_difficulty", "0x", block_hash
         )
         if encoded is None:
-            raise RuntimeError(
-                "state_call current_difficulty returned no result"
-            )
+            raise RuntimeError("state_call current_difficulty returned no result")
         data = ScaleBytes(encoded)
         difficulty = _decode_difficulty_config(data)
         if data.get_remaining_length() != 0:
@@ -655,6 +697,163 @@ class SubstrateClient:
                 f"{data.get_remaining_length()} bytes"
             )
         return difficulty
+
+    async def query_mineable_topologies(
+        self, *, at: Optional[bytes] = None
+    ) -> list[bytes]:
+        """Call ``QuantumPowApi_mineable_topologies`` for the set of mineable hashes.
+
+        Returns the full list of topology hashes that are currently whitelisted
+        for mining. On a fresh chain with no topologies registered this is an
+        empty list (not an error).
+
+        Args:
+            at: Optional 32-byte block hash to query at. ``None`` uses the
+                current best head.
+
+        Returns:
+            List of 32-byte topology hashes, in the order the runtime returns them.
+        """
+        block_hash = _hex(at) if at is not None else None
+        encoded = await self._state_call(
+            "QuantumPowApi_mineable_topologies", "0x", block_hash
+        )
+        if encoded is None:
+            raise RuntimeError(
+                "state_call QuantumPowApi_mineable_topologies returned no result"
+            )
+        data = ScaleBytes(encoded)
+        hashes = _decode_h256_vec(data)
+        if data.get_remaining_length() != 0:
+            raise ValueError(
+                "trailing bytes after mineable_topologies decode: "
+                f"{data.get_remaining_length()} bytes"
+            )
+        return hashes
+
+    async def query_difficulty_for(
+        self, topology_hash: bytes, *, at: Optional[bytes] = None
+    ) -> Optional[SubstrateDifficulty]:
+        """Call ``QuantumPowApi_difficulty_for(topology_hash)`` for the decayed value.
+
+        Unlike :meth:`query_difficulty`, which reads the raw map entry, this
+        method calls the runtime API so decay is applied for elapsed blocks
+        since the last winning proof. Returns ``None`` when the topology is
+        not registered.
+
+        The SCALE parameter is the raw 32-byte H256 topology hash (no compact
+        prefix — the runtime API receives it as a fixed-size value).
+
+        Args:
+            topology_hash: 32-byte topology hash to query.
+            at: Optional 32-byte block hash to query at. ``None`` uses the
+                current best head.
+
+        Returns:
+            Decayed difficulty config, or ``None`` if the topology is absent.
+        """
+        if len(topology_hash) != 32:
+            raise ValueError(
+                f"topology_hash must be 32 bytes, got {len(topology_hash)}"
+            )
+        block_hash = _hex(at) if at is not None else None
+        encoded = await self._state_call(
+            "QuantumPowApi_difficulty_for",
+            "0x" + topology_hash.hex(),
+            block_hash,
+        )
+        if encoded is None:
+            raise RuntimeError(
+                "state_call QuantumPowApi_difficulty_for returned no result"
+            )
+        data = ScaleBytes(encoded)
+        tag = data.get_next_bytes(1)
+        if not tag:
+            raise ValueError("empty response from QuantumPowApi_difficulty_for")
+        if tag[0] == 0x00:
+            if data.get_remaining_length() != 0:
+                raise ValueError(
+                    "trailing bytes after difficulty_for Option::None: "
+                    f"{data.get_remaining_length()} bytes"
+                )
+            return None
+        if tag[0] != 0x01:
+            raise ValueError(
+                f"unknown Option variant tag for difficulty_for: 0x{tag[0]:02x}"
+            )
+        difficulty = _decode_difficulty_config(data)
+        if data.get_remaining_length() != 0:
+            raise ValueError(
+                "trailing bytes after difficulty_for decode: "
+                f"{data.get_remaining_length()} bytes"
+            )
+        return difficulty
+
+    async def add_mineable_topology(
+        self,
+        topology_hash: bytes,
+        signer: "Signer",
+        *,
+        wait_for: "WaitFor" = "inblock",
+    ) -> "ExtrinsicReceipt":
+        """Submit ``QuantumPow.add_mineable_topology(topology_hash)`` via sudo.
+
+        Adds ``topology_hash`` to the on-chain whitelist of mineable topologies.
+        Requires a root/sudo key.
+
+        Args:
+            topology_hash: 32-byte hash of the topology to whitelist.
+            signer: Root/sudo signer for the extrinsic.
+            wait_for: Submission stage — ``"sent"``, ``"inblock"``, or
+                ``"finalized"``.
+
+        Returns:
+            Extrinsic receipt at the requested stage.
+        """
+        if len(topology_hash) != 32:
+            raise ValueError(
+                f"topology_hash must be 32 bytes, got {len(topology_hash)}"
+            )
+        return await self.submit_extrinsic(
+            call_module="QuantumPow",
+            call_function="add_mineable_topology",
+            call_params={"topology_hash": "0x" + topology_hash.hex()},
+            signer=signer,
+            wait_for=wait_for,
+        )
+
+    async def remove_mineable_topology(
+        self,
+        topology_hash: bytes,
+        signer: "Signer",
+        *,
+        wait_for: "WaitFor" = "inblock",
+    ) -> "ExtrinsicReceipt":
+        """Submit ``QuantumPow.remove_mineable_topology(topology_hash)`` via sudo.
+
+        Removes ``topology_hash`` from the on-chain whitelist of mineable
+        topologies. Requires a root/sudo key.
+
+        Args:
+            topology_hash: 32-byte hash of the topology to remove.
+            signer: Root/sudo signer for the extrinsic.
+            wait_for: Submission stage — ``"sent"``, ``"inblock"``, or
+                ``"finalized"``.
+
+        Returns:
+            Extrinsic receipt at the requested stage.
+        """
+        if len(topology_hash) != 32:
+            raise ValueError(
+                f"topology_hash must be 32 bytes, got {len(topology_hash)}"
+            )
+        return await self.submit_extrinsic(
+            call_module="QuantumPow",
+            call_function="remove_mineable_topology",
+            call_params={"topology_hash": "0x" + topology_hash.hex()},
+            signer=signer,
+            wait_for=wait_for,
+        )
 
     async def query_pow_constants(self) -> PowConstants:
         """Read the four ``pallet_quantum_pow`` constants needed for decay.
@@ -700,9 +899,7 @@ class SubstrateClient:
         clients from running BLAKE3 over `(parent_hash, miner, block, salt)`.
         """
         if not 0 <= block_number < 2**32:
-            raise ValueError(
-                f"block_number must fit in u32, got {block_number}"
-            )
+            raise ValueError(f"block_number must fit in u32, got {block_number}")
         block_hash = _hex(at) if at is not None else None
         scale_param = "0x" + block_number.to_bytes(4, "little").hex()
         encoded = await self._state_call(
@@ -783,7 +980,9 @@ class SubstrateClient:
             return int(value) if value is not None else 0
         return await self._run(
             lambda: _count_map_keys(
-                self._iface, "QuantumPow", "WinningSolutions",
+                self._iface,
+                "QuantumPow",
+                "WinningSolutions",
             )
         )
 
@@ -807,9 +1006,7 @@ class SubstrateClient:
         if len(account) != 32:
             raise ValueError(f"account must be 32 bytes, got {len(account)}")
         result = await self._run(
-            lambda: self._iface.query(
-                "QuantumComputeMempool", "Solvers", [account]
-            )
+            lambda: self._iface.query("QuantumComputeMempool", "Solvers", [account])
         )
         v = _storage_value(result)
         if v is None:
@@ -858,9 +1055,7 @@ class SubstrateClient:
         without a follow-on query.
         """
         result = await self._run(
-            lambda: self._iface.query(
-                "QuantumComputeMempool", "JobOrders", [order_id]
-            )
+            lambda: self._iface.query("QuantumComputeMempool", "JobOrders", [order_id])
         )
         v = _storage_value(result)
         if v is None:
@@ -922,7 +1117,9 @@ class SubstrateClient:
         out: list[dict] = []
         for er in raw or []:
             value = getattr(er, "value", er)
-            event_field = value.get("event", value) if isinstance(value, dict) else value
+            event_field = (
+                value.get("event", value) if isinstance(value, dict) else value
+            )
             if not isinstance(event_field, dict):
                 logger.debug(
                     "get_events_at: skipping non-dict event record: %s",
@@ -942,13 +1139,16 @@ class SubstrateClient:
             if attrs is None and module_id:
                 logger.debug(
                     "get_events_at: no attributes/params for %s.%s",
-                    module_id, event_id,
+                    module_id,
+                    event_id,
                 )
-            out.append({
-                "module_id": str(module_id) if module_id is not None else "",
-                "event_id": str(event_id) if event_id is not None else "",
-                "attributes": attrs,
-            })
+            out.append(
+                {
+                    "module_id": str(module_id) if module_id is not None else "",
+                    "event_id": str(event_id) if event_id is not None else "",
+                    "attributes": attrs,
+                }
+            )
         return out
 
     # ------------------------------------------------------------------
@@ -971,7 +1171,10 @@ class SubstrateClient:
         ship the hex through ``ValidatorPool`` — see ``PoolClient``.
         """
         ext_hex = await self.build_signed_extrinsic(
-            call_module, call_function, call_params, signer,
+            call_module,
+            call_function,
+            call_params,
+            signer,
         )
         return await self.submit_signed_extrinsic(ext_hex, wait_for=wait_for)
 
@@ -1009,11 +1212,19 @@ class SubstrateClient:
         kind = signer.signature_kind()
         if kind == "Sr25519":
             return await self._build_sr25519_extrinsic_hex(
-                call_module, call_function, call_params, signer, tip=tip,
+                call_module,
+                call_function,
+                call_params,
+                signer,
+                tip=tip,
             )
         if kind == "Hybrid":
             return await self._build_hybrid_extrinsic_hex(
-                call_module, call_function, call_params, signer, tip=tip,
+                call_module,
+                call_function,
+                call_params,
+                signer,
+                tip=tip,
             )
         raise NotImplementedError(
             f"build_signed_extrinsic does not support signature_kind={kind}"
@@ -1037,7 +1248,9 @@ class SubstrateClient:
                 call_params=call_params,
             )
             extrinsic: GenericExtrinsic = self._iface.create_signed_extrinsic(
-                call=call, keypair=keypair, tip=tip,
+                call=call,
+                keypair=keypair,
+                tip=tip,
             )
             return extrinsic.data.to_hex()
 
@@ -1193,7 +1406,6 @@ class SubstrateClient:
             is_finalized=bool(result.get("finalized", False)),
             error=error_msg,
         )
-
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1432,9 +1644,7 @@ def _fetch_extrinsic_dispatch_error(
             continue
         event = v.get("event") or v
         module_id = (
-            event.get("module_id")
-            or event.get("pallet")
-            or event.get("pallet_name")
+            event.get("module_id") or event.get("pallet") or event.get("pallet_name")
         )
         event_id = (
             event.get("event_id")

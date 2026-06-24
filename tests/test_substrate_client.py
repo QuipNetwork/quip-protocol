@@ -8,6 +8,7 @@ Phase 1 only verifies the read paths (head queries, mining_snapshot,
 storage). Extrinsic submission is covered by Phase 2's bootstrap tests
 because it requires a funded signing account.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -116,20 +117,24 @@ async def test_query_miner_unregistered_account(client):
 
 
 async def test_query_difficulty_either_returns_or_none(client):
-    """`StorageValue<_, DifficultyConfig>` quirks: substrate-interface returns
-    the `Default::default()` value (all zeros) when storage is empty rather
-    than `None`. `query_difficulty` must honor `meta_info[result_found]`
-    so the bootstrap idempotency check stays correct on a fresh chain."""
+    """`query_difficulty` reads ``QuantumPow.Difficulties[DefaultTopology]``.
+
+    On a fresh chain with no ``DefaultTopology`` set, it returns ``None``.
+    After bootstrap the map entry is populated and a real
+    ``SubstrateDifficulty`` is returned. Either outcome is correct, but we
+    must never see an all-zeros struct (the pre-map-query default-masking bug).
+    """
     difficulty = await client.query_difficulty()
-    # On a freshly-built chain `Difficulty` is unset and we expect None. After
-    # Phase 2 bootstrap (or any prior sudo set_difficulty) the storage is
-    # populated and we expect a real SubstrateDifficulty. Either is correct,
-    # but we must never see the all-zeros default-struct case.
+    # On a freshly-built chain DefaultTopology is unset → None. After Phase 2
+    # bootstrap or any prior sudo set_difficulty the map entry is populated.
+    # Both are correct; we just must never see the all-zeros default-struct.
     if difficulty is not None:
         # If we got a value, at least one field must be non-zero — otherwise
         # we're back to the "default returned for empty storage" bug.
-        assert any([
-            difficulty.min_solutions,
-            difficulty.max_energy_milli,
-            difficulty.min_diversity_milli,
-        ]), "query_difficulty returned all-zeros struct; storage is empty"
+        assert any(
+            [
+                difficulty.min_solutions,
+                difficulty.max_energy_milli,
+                difficulty.min_diversity_milli,
+            ]
+        ), "query_difficulty returned all-zeros struct; storage is empty"

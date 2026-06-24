@@ -5,6 +5,7 @@ routes each call through a ValidatorPool. Its only job is to forward
 ``(method_name, kwargs)`` correctly; everything interesting happens in
 the pool.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -126,7 +127,17 @@ async def test_query_difficulty_forwards_no_args():
     pool.scripted["query_difficulty"] = "diff"
     client = PoolClient(pool)
     assert await client.query_difficulty() == "diff"
-    assert pool.calls == [("query_difficulty", {})]
+    assert pool.calls == [("query_difficulty", {"topology_hash": None})]
+
+
+@pytest.mark.asyncio
+async def test_query_difficulty_forwards_topology_hash():
+    pool = _RecordingPool()
+    pool.scripted["query_difficulty"] = "diff-topo"
+    client = PoolClient(pool)
+    h = b"\xab" * 32
+    assert await client.query_difficulty(h) == "diff-topo"
+    assert pool.calls == [("query_difficulty", {"topology_hash": h})]
 
 
 @pytest.mark.asyncio
@@ -162,7 +173,8 @@ async def test_submit_signed_extrinsic_forwards_hex_and_wait_for():
     pool.scripted["submit_signed_extrinsic"] = "receipt-sentinel"
     client = PoolClient(pool)
     result = await client.submit_signed_extrinsic(
-        "0xdeadbeef", wait_for="finalized",
+        "0xdeadbeef",
+        wait_for="finalized",
     )
     assert result == "receipt-sentinel"
     assert pool.calls == [

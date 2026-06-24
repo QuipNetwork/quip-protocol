@@ -8,6 +8,7 @@ hex into typed values, and build the hybrid-signed extrinsic wire bytes. Keeping
 them out of ``client.py`` lets that module stay focused on RPC/session concerns.
 ``SubstrateClient`` and the decode-path tests import these helpers directly.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -59,7 +60,7 @@ def _decode_job_mode(value) -> JobMode:
             return JobMode.open()
         raise ValueError(f"unrecognized JobMode variant: {value!r}")
     if isinstance(value, dict) and len(value) == 1:
-        (tag, inner), = value.items()
+        ((tag, inner),) = value.items()
         if tag == "Open":
             return JobMode.open()
         if tag == "Bid":
@@ -86,7 +87,7 @@ def _decode_result_delivery(value) -> ResultDelivery:
             return ResultDelivery.on_chain_only()
         raise ValueError(f"unrecognized ResultDelivery variant: {value!r}")
     if isinstance(value, dict) and len(value) == 1:
-        (tag, inner), = value.items()
+        ((tag, inner),) = value.items()
         if tag == "OnChainOnly":
             return ResultDelivery.on_chain_only()
         endpoint = inner.get("endpoint") if isinstance(inner, dict) else inner
@@ -198,33 +199,33 @@ def _build_hybrid_signed_extrinsic(
     #    (AuthorizeCall / CheckNonZeroSender / CheckSpecVersion / CheckTxVersion /
     #    CheckGenesis / CheckWeight / WeightReclaim) encode to 0 bytes.
     extra = (
-        b""                                  # AuthorizeCall
-        + b""                                # CheckNonZeroSender
-        + b""                                # CheckSpecVersion
-        + b""                                # CheckTxVersion
-        + b""                                # CheckGenesis
-        + b"\x00"                            # CheckMortality: Era::immortal
-        + _encode_compact_u32(int(nonce))    # CheckNonce
-        + b""                                # CheckWeight
-        + _encode_compact_u128(tip)          # ChargeTransactionPayment tip
-        + b"\x00"                            # CheckMetadataHash: Mode::Disabled
-        + b""                                # WeightReclaim
+        b""  # AuthorizeCall
+        + b""  # CheckNonZeroSender
+        + b""  # CheckSpecVersion
+        + b""  # CheckTxVersion
+        + b""  # CheckGenesis
+        + b"\x00"  # CheckMortality: Era::immortal
+        + _encode_compact_u32(int(nonce))  # CheckNonce
+        + b""  # CheckWeight
+        + _encode_compact_u128(tip)  # ChargeTransactionPayment tip
+        + b"\x00"  # CheckMetadataHash: Mode::Disabled
+        + b""  # WeightReclaim
     )
 
     # 4. Signed-extension additional_signed, in metadata order. CheckMortality
     #    with an immortal era uses the genesis hash here.
     additional = (
-        b""                                  # AuthorizeCall
-        + b""                                # CheckNonZeroSender
-        + spec_version.to_bytes(4, "little") # CheckSpecVersion
-        + tx_version.to_bytes(4, "little")   # CheckTxVersion
-        + genesis_bytes                      # CheckGenesis
-        + genesis_bytes                      # CheckMortality (immortal -> genesis)
-        + b""                                # CheckNonce
-        + b""                                # CheckWeight
-        + b""                                # ChargeTransactionPayment
-        + b"\x00"                            # CheckMetadataHash: Option::None
-        + b""                                # WeightReclaim
+        b""  # AuthorizeCall
+        + b""  # CheckNonZeroSender
+        + spec_version.to_bytes(4, "little")  # CheckSpecVersion
+        + tx_version.to_bytes(4, "little")  # CheckTxVersion
+        + genesis_bytes  # CheckGenesis
+        + genesis_bytes  # CheckMortality (immortal -> genesis)
+        + b""  # CheckNonce
+        + b""  # CheckWeight
+        + b""  # ChargeTransactionPayment
+        + b"\x00"  # CheckMetadataHash: Option::None
+        + b""  # WeightReclaim
     )
 
     # 5. Sign payload = call || extra || additional. Blake2_256 if > 256 bytes
@@ -242,9 +243,9 @@ def _build_hybrid_signed_extrinsic(
 
     # 7. Assemble the wire body and length-prefix the whole extrinsic.
     body = (
-        bytes([0x84])                        # v4 | 0x80 signed flag
-        + b"\x00"                            # MultiAddress::Id discriminator
-        + account                            # AccountId32 (32 bytes)
+        bytes([0x84])  # v4 | 0x80 signed flag
+        + b"\x00"  # MultiAddress::Id discriminator
+        + account  # AccountId32 (32 bytes)
         + hybrid_sig_scale
         + extra
         + call_bytes
@@ -266,9 +267,7 @@ def _read_exact(data: ScaleBytes, n: int) -> bytes:
     """
     chunk = data.get_next_bytes(n)
     if len(chunk) != n:
-        raise ValueError(
-            f"short read: wanted {n} bytes, got {len(chunk)}"
-        )
+        raise ValueError(f"short read: wanted {n} bytes, got {len(chunk)}")
     return bytes(chunk)
 
 
@@ -354,11 +353,28 @@ def _decode_compact_u32(data: ScaleBytes) -> int:
     if mode == 0:
         return first >> 2
     if mode == 1:
-        return ((first >> 2) | (_read_exact(data, 1)[0] << 6))
+        return (first >> 2) | (_read_exact(data, 1)[0] << 6)
     if mode == 2:
         rest = _read_exact(data, 3)
         return (first >> 2) | (rest[0] << 6) | (rest[1] << 14) | (rest[2] << 22)
     raise ValueError("compact big-integer mode not valid for u32 length prefix")
+
+
+def _decode_h256_vec(data: ScaleBytes) -> list[bytes]:
+    """Decode a SCALE ``Vec<H256>`` (compact-u32 length + N×32-byte hashes).
+
+    Each element is a raw 32-byte hash. The compact length prefix is decoded
+    with :func:`_decode_compact_u32`; each hash is read with
+    :func:`_read_exact` so a truncated buffer surfaces immediately.
+
+    Args:
+        data: SCALE buffer positioned at the start of the compact length prefix.
+
+    Returns:
+        List of raw 32-byte hash blobs, in order.
+    """
+    n = _decode_compact_u32(data)
+    return [_read_exact(data, 32) for _ in range(n)]
 
 
 def _decode_mining_snapshot(encoded_hex: str) -> Optional[dict]:
@@ -395,10 +411,13 @@ def _decode_mining_snapshot(encoded_hex: str) -> Optional[dict]:
             "last_proof_block_hash", data, lambda d: _read_exact(d, 32)
         )
         difficulty = _decode_difficulty_config(data)
-        topology_hash = _decode_field("topology_hash", data, lambda d: _read_exact(d, 32))
+        topology_hash = _decode_field(
+            "topology_hash", data, lambda d: _read_exact(d, 32)
+        )
         nodes_len = _decode_field("nodes_len", data, _decode_compact_u32)
-        nodes = [_decode_field("nodes[%d]" % i, data, _decode_u32)
-                 for i in range(nodes_len)]
+        nodes = [
+            _decode_field("nodes[%d]" % i, data, _decode_u32) for i in range(nodes_len)
+        ]
         edges_len = _decode_field("edges_len", data, _decode_compact_u32)
         edges = [
             (
