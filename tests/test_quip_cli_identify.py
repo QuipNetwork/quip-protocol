@@ -186,7 +186,10 @@ def test_submit_posts_miner_registry_descriptor(tmp_path, monkeypatch):
     module, function, params, _wait = client.calls[0]
     assert (module, function) == ("MinerRegistry", "set_descriptor")
     body = params["descriptor"]["V1"]
-    assert body["node_id"] == b"rig-01"
-    assert body["node_name"] == b"rig-01"
-    assert body["miners"][0]["kind"] == "Cpu"
+    # BoundedVec fields are 1-tuple-wrapped to match the runtime composite
+    # shape scalecodec needs (see test_miner_registry for the rationale).
+    assert body["node_id"] == (b"rig-01",)
+    assert body["node_name"] == (b"rig-01",)
+    (miners,) = body["miners"]
+    assert miners[0]["kind"] == "Cpu"
     assert "MinerRegistry.set_descriptor" in res.output

@@ -659,9 +659,12 @@ def test_auto_identify_submits_miner_registry_descriptor(monkeypatch, caplog):
     module, call, params = client.calls[0]
     assert (module, call) == ("MinerRegistry", "set_descriptor")
     body = params["descriptor"]["V1"]
-    assert body["node_id"] == b"test-rig"
-    assert body["node_name"] == b"test-rig"
-    assert body["miners"][0]["kind"] == "Cpu"
+    # BoundedVec fields are 1-tuple-wrapped for the runtime composite shape
+    # (see test_miner_registry for the rationale).
+    assert body["node_id"] == (b"test-rig",)
+    assert body["node_name"] == (b"test-rig",)
+    (miners,) = body["miners"]
+    assert miners[0]["kind"] == "Cpu"
 
 
 # ----------------------------------------------------------------------
@@ -1133,9 +1136,11 @@ def test_auto_identify_does_not_leak_tokens_from_toml_loaded_miners_config(
 
     # The vendor entries DID make it into the descriptor as backend labels
     # (the legitimate signal indexers need); just without credentials.
-    miners = params["descriptor"]["V1"]["miners"]
+    # miners is a BoundedVec (1-tuple-wrapped); each backend is an
+    # Option<BoundedVec> wrapped as (bytes,) when present.
+    (miners,) = params["descriptor"]["V1"]["miners"]
     backends = {
-        m["backend"].decode("utf-8")
+        m["backend"][0].decode("utf-8")
         for m in miners
         if m.get("backend") is not None
     }

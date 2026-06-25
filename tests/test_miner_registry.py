@@ -28,15 +28,25 @@ def test_descriptor_call_params_encodes_bounded_runtime_shape():
     params = descriptor_call_params(descriptor, node_id="rig")
     body = params["descriptor"]["V1"]
 
-    assert body["node_id"] == b"rig"
-    assert body["node_name"] == b"rig"
-    assert body["public_host"] == b"rig.example.com"
+    # Every BoundedVec field is wrapped in a 1-tuple: the runtime metadata
+    # describes BoundedVec as a composite with a single inner Vec field and
+    # scalecodec (1.2.x) does not flatten it. Passing the bare bytes/list
+    # fails to encode with "Element count of value (0) doesn't match
+    # type_definition (1)", so the wrapping is load-bearing — assert it
+    # explicitly rather than the flat shape that never encoded.
+    assert body["node_id"] == (b"rig",)
+    assert body["node_name"] == (b"rig",)
+    assert body["public_host"] == (b"rig.example.com",)
     assert body["public_port"] == 20050
-    assert body["rpc_endpoints"] == [b"https://rig.example.com/rpc"]
+    assert body["rpc_endpoints"] == ([b"https://rig.example.com/rpc"],)
     assert body["auto_mine"] is True
     assert body["log_level"] == "Info"
-    assert [m["kind"] for m in body["miners"]] == ["Cpu", "Gpu", "QpuIbm"]
-    assert body["miners"][0]["label"] == b"cpu"
+
+    # miners is itself a BoundedVec, so the spec list is wrapped too.
+    (miners,) = body["miners"]
+    assert [m["kind"] for m in miners] == ["Cpu", "Gpu", "QpuIbm"]
+    assert miners[0]["label"] == (b"cpu",)
+    assert miners[0]["device_id"] == (b"rig-CPU-1",)
 
 
 def test_participation_call_params_targets_candidate_qblock():
