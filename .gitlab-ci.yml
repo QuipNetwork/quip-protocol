@@ -61,8 +61,12 @@ check-version:
     - |
       PKG_VERSION=$(python3 -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
       TAG_VERSION="${CI_COMMIT_TAG#v}"
-      if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
-        echo "ERROR: tag $CI_COMMIT_TAG has version v${PKG_VERSION} in pyproject.toml (expected v${TAG_VERSION})"
+      # Git tags use SemVer hyphenated pre-releases (0.2.1-rc17); pyproject uses
+      # PEP 440 (0.2.1rc17). Normalize the tag to PEP 440 before comparing so the
+      # numeric parts + rc number must still match. See docs/VERSIONING.md.
+      TAG_VERSION_NORM=$(echo "$TAG_VERSION" | sed -E 's/-(rc|alpha|beta)/\1/')
+      if [ "$PKG_VERSION" != "$TAG_VERSION_NORM" ]; then
+        echo "ERROR: tag $CI_COMMIT_TAG (PEP440 ${TAG_VERSION_NORM}) != pyproject.toml version ${PKG_VERSION}"
         exit 1
       fi
       echo "OK: tag $CI_COMMIT_TAG matches pyproject.toml version $PKG_VERSION"
