@@ -8,6 +8,7 @@ fail loud on topology mismatch.
 """
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -56,6 +57,8 @@ def controller():
     ctrl._highest_handled_block = 0
     ctrl._dispatch_contexts = {}
     ctrl.topology_hash = None
+    ctrl.rebind_requested = False
+    ctrl._shutdown_event = asyncio.Event()
     ctrl.core = None
     # Anticipatory-submission state. on_new_head no longer fires (the
     # free-running cadence timer owns that); it only stores previews and a
@@ -197,18 +200,20 @@ async def test_on_new_head_none_snapshot_is_no_op(controller):
 
 
 @pytest.mark.asyncio
-async def test_on_new_head_topology_mismatch_fails_loud(controller):
-    """Configured topology_hash != snapshot.topology_hash → _OperatorFailLoud."""
-    from substrate.miner_controller import _OperatorFailLoud
-
+async def test_on_new_head_topology_change_requests_rebind(controller):
+    """Bound topology_hash != snapshot.topology_hash → request rebind + shut
+    down gracefully (the supervisor rebuilds against the new chain topology),
+    instead of crashing the process."""
     ctrl, handle = controller
-    ctrl.topology_hash = b"\xab" * 32  # expected
+    ctrl.topology_hash = b"\xab" * 32  # bound at startup
     ctx = _make_context(
         threshold_milli=-5000,
-        topology_hash=b"\xcd" * 32,  # snapshot mismatches
+        topology_hash=b"\xcd" * 32,  # chain changed its DefaultTopology
     )
-    with pytest.raises(_OperatorFailLoud, match="does not match snapshot"):
-        await ctrl.on_new_head(ctx)
+    assert ctrl.rebind_requested is False
+    await ctrl.on_new_head(ctx)  # must not raise
+    assert ctrl.rebind_requested is True
+    assert ctrl._shutdown_event.is_set()
 
 
 @pytest.mark.asyncio

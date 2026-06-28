@@ -1435,3 +1435,60 @@ def test_guard_d_registration_retries_then_succeeds(monkeypatch, capsys):
 
     assert flaky.await_count == 2
     assert "registered miner: 5Test" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Chain-pull topology (replaces --topology on the live path)
+# ---------------------------------------------------------------------------
+
+import asyncio  # noqa: E402
+
+from dwave_topologies.topologies.json_loader import topology_from_nodes_edges  # noqa: E402
+
+
+def test_topology_from_nodes_edges_builds_minimal_object():
+    """The chain-built topology exposes the nodes/edges/solver surface
+    consumers read, identical to a file-loaded topology."""
+    topo = topology_from_nodes_edges([2, 0, 1], [(0, 1), (1, 2)], "SolverX")
+    assert topo.solver_name == "SolverX"
+    assert topo.num_nodes == 3
+    assert topo.num_edges == 2
+    assert topo.nodes == [2, 0, 1]            # order preserved (hash canonicalizes)
+    assert topo.edges == [(0, 1), (1, 2)]     # tuples, as consumers expect
+
+
+def test_solver_name_from_config_reads_qpu_device():
+    assert quip_cli._solver_name_from_config(
+        {"qpu": {"devices": [{"type": "dwave", "solver": "Advantage2_system1"}]}}
+    ) == "Advantage2_system1"
+
+
+def test_solver_name_from_config_none_for_cpu():
+    assert quip_cli._solver_name_from_config({"cpu": {"num_cpus": 4}}) is None
+    assert quip_cli._solver_name_from_config({}) is None
+
+
+def test_run_concurrent_miner_rejects_topology_on_live_path():
+    """--topology is tools-only; passing it to live mining errors (exit 2)
+    before any chain connection is attempted."""
+    code = asyncio.run(quip_cli._run_concurrent_miner(
+        mode="pow",
+        miner_kind="cpu",
+        validators=("ws://unused:9944",),
+        signer_key_path="/nonexistent",
+        faucet_url=None,
+        rest_port=0,
+        rest_host="127.0.0.1",
+        topology_spec="advantage2_system1",   # offending flag
+        miner_config={"cpu": {"num_cpus": 1}},
+    ))
+    assert code == 2
+
+
+def test_run_concurrent_miner_still_passes_topology_to_controllers():
+    """Guard the chain-pull wiring: the topology built from the chain is still
+    threaded to the controllers (keyword `topology=topology`)."""
+    import inspect
+    src = inspect.getsource(quip_cli._run_concurrent_miner)
+    assert "_topology_from_chain(" in src
+    assert "topology=topology" in src

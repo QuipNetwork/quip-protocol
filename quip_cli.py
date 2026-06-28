@@ -25,7 +25,10 @@ from typing import Any, Callable, Optional, Tuple
 
 import click
 
-from dwave_topologies.topologies.json_loader import load_topology
+from dwave_topologies.topologies.json_loader import (
+    load_topology,
+    topology_from_nodes_edges,
+)
 from dwave_topologies.topologies.zephyr import zephyr
 from shared.keystore_hybrid import generate, load
 from shared.logging_config import setup_logging
@@ -332,11 +335,11 @@ _CONFIG_HELP = (
 )
 _SIGNER_KEY_HELP = "Path to the signing keystore (created by `quip-miner keygen`)"
 _TOPOLOGY_HELP = (
-    "Topology for the miner's sampler. Either a hardware name like "
-    "'advantage2_system1' (default — the real QPU graph the chain "
-    "registers) or 'zephyr:M,T' for a synthetic Zephyr Z(M,T) graph "
-    "(dev / benchmark chains). Must hash to the chain's registered "
-    "topology — mismatch fails fast at startup."
+    "DO NOT USE for live mining. The live miner pulls its topology from the "
+    "chain's registered DefaultTopology automatically (and re-binds when the "
+    "chain changes it), so passing --topology to a mining command is an error. "
+    "This flag exists only for standalone tools / isolated analysis that run "
+    "without a chain (e.g. 'zephyr:M,T' synthetic graphs or a hardware name)."
 )
 _REST_PORT_HELP = (
     "Telemetry REST API port (default 8086). Falls back to --config `rest_port`."
@@ -1160,14 +1163,14 @@ def quip_miner_deregister_solver(
 
 # --------------------------------------------------------------------------
 # Mining subcommands: cpu / gpu / qpu spawn the controller end-to-end.
-# Topology binding is explicit via --topology. The default is the
-# Advantage2_system1 hardware topology (the project-wide DEFAULT_TOPOLOGY),
-# which matches what the chain registers. The synthetic 'zephyr:M,T' form
-# stays available for benchmarks and dev chains seeded with a perfect
-# Zephyr graph. The CLI verifies at startup that the sampler's topology
-# hash matches the chain's snapshot; mismatch fails fast with the
-# registered hash printed so the operator can fix --topology or re-seed
-# the chain.
+# The live miner binds its topology to the chain's registered DefaultTopology
+# — it reads the snapshot's nodes/edges after connecting and builds the sampler
+# from them (see _topology_from_chain), so the miner's graph can never skew
+# from the chain's. When the chain changes its DefaultTopology, the controller
+# signals a rebind and the supervisor re-fetches and rebuilds (no restart).
+# `--topology` is therefore NOT valid for mining commands (it raises); it stays
+# only for standalone tools / isolated analysis that run without a chain
+# (handled by `_parse_topology`, kept for those callers).
 # --------------------------------------------------------------------------
 
 
@@ -1210,6 +1213,51 @@ def _parse_topology(spec: str):
         raise click.BadParameter(
             f"--topology {spec!r}: {exc}"
         ) from exc
+
+
+def _solver_name_from_config(miner_config: dict) -> Optional[str]:
+    """Return the first configured D-Wave solver name, or ``None``.
+
+    The chain stores the topology graph but not the D-Wave solver to connect to
+    (a hardware/account detail), so the QPU solver name comes from the miner
+    config's ``qpu`` device block. CPU/GPU backends have no solver; ``None`` is
+    fine there (the topology's ``solver_name`` is informational for them).
+    """
+    qpu = miner_config.get("qpu") if isinstance(miner_config, dict) else None
+    if not isinstance(qpu, dict):
+        return None
+    for dev in qpu.get("devices", []) or []:
+        if isinstance(dev, dict) and dev.get("solver"):
+            return str(dev["solver"])
+    if qpu.get("solver"):
+        return str(qpu["solver"])
+    return None
+
+
+async def _topology_from_chain(client: SubstrateClient, *, account_bytes: bytes,
+                               miner_config: dict):
+    """Build the sampler topology from the chain's registered DefaultTopology.
+
+    Reads the mining snapshot (nodes/edges) and constructs a topology object
+    from it, so the miner's graph is the chain's by construction — no local
+    file, no hash skew. Raises :class:`_MiningStartupError` (code 3) when the
+    chain has no registered topology yet. ``solver_name`` comes from config.
+    """
+    snapshot = await client.get_mining_snapshot(miner_account_bytes=account_bytes)
+    if snapshot is None:
+        raise _MiningStartupError(
+            3,
+            "chain has no registered topology; run "
+            "`quip-miner bootstrap --seed-chain` first",
+        )
+    solver_name = (
+        _solver_name_from_config(miner_config)
+        or f"chain:0x{snapshot.topology_hash.hex()[:12]}"
+    )
+    topology = topology_from_nodes_edges(
+        snapshot.nodes, snapshot.edges, solver_name,
+    )
+    return topology, snapshot
 
 
 # Seconds to wait for a controller to drain after signalling shutdown.
@@ -1417,14 +1465,19 @@ async def _run_startup_guards(
     )
 
 
-async def _orchestrate_controllers(pow_controller, mempool_controller) -> int:
+async def _orchestrate_controllers(
+    pow_controller, mempool_controller
+) -> Tuple[bool, int]:
     """Run the PoW + mempool controllers until one exits, then drain.
 
     Installs SIGINT/SIGTERM handlers that signal both controllers to stop,
     waits for the first to finish (one failing brings the whole process down
     so operators can re-spawn), then gives the other up to
-    ``_SHUTDOWN_GRACE_SECONDS`` to drain before cancelling. Returns the process
-    exit code. Extracted from :func:`_run_concurrent_miner`.
+    ``_SHUTDOWN_GRACE_SECONDS`` to drain before cancelling. Returns
+    ``(rebind_requested, exit_code)`` — ``rebind_requested`` is True when a
+    controller asked to rebind to a changed chain topology (the supervisor
+    rebuilds the stack rather than exiting). Extracted from
+    :func:`_run_concurrent_miner`.
     """
     loop = asyncio.get_running_loop()
 
@@ -1451,7 +1504,7 @@ async def _orchestrate_controllers(pow_controller, mempool_controller) -> int:
 
     if not tasks:
         click.echo("internal error: no controller tasks created", err=True)
-        return 2
+        return (False, 2)
 
     exit_code = 0
     # Wait until any controller exits (one failing should bring down
@@ -1500,7 +1553,12 @@ async def _orchestrate_controllers(pow_controller, mempool_controller) -> int:
                 err=True,
             )
 
-    return exit_code
+    rebind = any(
+        getattr(c, "rebind_requested", False)
+        for c in (pow_controller, mempool_controller)
+        if c is not None
+    )
+    return (rebind, exit_code)
 
 
 class _MiningStartupError(Exception):
@@ -1558,7 +1616,6 @@ async def _build_controllers(
     core: MinerCore,
     keystore,
     topology,
-    topology_spec: str,
     miner_kind: str,
     pow_handles: list,
     mempool_handles: list,
@@ -1600,11 +1657,16 @@ async def _build_controllers(
         # DefaultTopology (the chain validates this in `submit_proof` via
         # `InvalidTopology`).
         if not binding.matches:
+            # Defensive: the topology is built from this same chain snapshot, so
+            # this should never fire. If it does, the chain changed its topology
+            # between the snapshot read and this binding — surface it as a
+            # startup error; the next launch (or rebind) picks up the new one.
             raise _MiningStartupError(
                 4,
-                f"PoW mode topology mismatch: --topology {topology_spec} "
-                f"hashes to 0x{binding.expected_hash.hex()} but chain has "
-                f"0x{binding.chain_hash.hex()}",
+                "topology binding race: sampler hashes to "
+                f"0x{binding.expected_hash.hex()} but chain now has "
+                f"0x{binding.chain_hash.hex()} (chain topology changed during "
+                "startup; retry)",
             )
         pow_controller = SubstrateMinerController(
             pool=pool,
@@ -1660,18 +1722,18 @@ def _announce_and_load(
     faucet_url: Optional[str],
     rest_port: int,
     rest_host: str,
-    topology_spec: str,
     miner_config: dict,
     node_name: Optional[str],
     node_log: Optional[str],
     submission_config: SubmissionConfig,
-) -> Tuple[object, object]:
-    """Print the startup banner and load the keystore + topology.
+) -> object:
+    """Print the startup banner and load the keystore.
 
     Attaches the optional rotating file log, loads the hybrid keystore
-    (Guard A — raises ``click.ClickException`` when missing/unreadable), parses
-    the topology, and echoes the resolved runtime config. Returns
-    ``(keystore, topology)``.
+    (Guard A — raises ``click.ClickException`` when missing/unreadable), and
+    echoes the resolved runtime config. The topology is no longer loaded here:
+    the live miner pulls it from the chain's registered DefaultTopology after
+    connecting (see :func:`_topology_from_chain`). Returns the keystore.
     """
     click.echo(
         f"quip-miner version {get_version()} (protocol {PROTOCOL_VERSION})"
@@ -1685,11 +1747,6 @@ def _announce_and_load(
         )
     keystore = _load_keystore_or_fail(signer_key_path)
     click.echo(f"signer: {keystore.signer.ss58_address()} (hybrid) mode={mode}")
-    topology = _parse_topology(topology_spec)
-    click.echo(
-        f"topology: {topology_spec} ({topology.num_nodes} nodes, "
-        f"{topology.num_edges} edges)"
-    )
     _echo_runtime_config(
         validators=validators,
         faucet_url=faucet_url,
@@ -1700,7 +1757,7 @@ def _announce_and_load(
         miner_config=miner_config,
         submission_config=submission_config,
     )
-    return keystore, topology
+    return keystore
 
 
 async def _run_concurrent_miner(
@@ -1734,17 +1791,29 @@ async def _run_concurrent_miner(
         click.echo(f"invalid --mode {mode!r}", err=True)
         return 2
 
+    # --topology is tools-only. The live miner always binds to the chain's
+    # registered DefaultTopology; accepting a locally-sourced graph here is what
+    # let the miner's graph skew from the chain's, so reject it loudly.
+    if topology_spec is not None:
+        click.echo(
+            f"--topology {topology_spec!r} is not valid for live mining: the "
+            "miner binds to the chain's registered DefaultTopology and "
+            "re-binds automatically when it changes. The flag exists only for "
+            "standalone tools / isolated analysis run without a chain.",
+            err=True,
+        )
+        return 2
+
     # Submission tuning (tip + retry bounds). Defaults reproduce pre-tip
     # behavior, so an old config or a caller that omits this is unchanged.
     submission_config = submission_config or SubmissionConfig()
-    keystore, topology = _announce_and_load(
+    keystore = _announce_and_load(
         mode=mode,
         validators=validators,
         signer_key_path=signer_key_path,
         faucet_url=faucet_url,
         rest_port=rest_port,
         rest_host=rest_host,
-        topology_spec=topology_spec,
         miner_config=miner_config,
         node_name=node_name,
         node_log=node_log,
@@ -1755,26 +1824,14 @@ async def _run_concurrent_miner(
     # clean up whatever was partially constructed on setup failure.
     core: Optional[MinerCore] = None
     pool: Optional[ValidatorPool] = None
-    pow_controller = None
-    mempool_controller = None
     setup_client: Optional[SubstrateClient] = None
     try:
-        core, pow_handles, mempool_handles = _prepare_core(
-            mode, miner_kind, miner_config, topology
-        )
-
         pool = ValidatorPool(urls=tuple(validators))
-        # Guard B — validators reachable. The setup client is a direct
-        # SubstrateClient used for the startup sequence (Guards B/C/D/E and
-        # the initial topology-snapshot read). It's closed before controllers
-        # start; the controllers each own their own in-parent build_client and
-        # route reads + submissions through the swap-aware pool.
-        client = setup_client = await _connect_or_fail(tuple(validators))
-        # Guards C/D/E — funded, registered, descriptor filed. Each raises a
-        # CLI error code on ultimate failure; all three pass before any
-        # controller starts.
+        # Guards C/D/E run once: a direct setup client connects, then
+        # funded/registered/descriptor-filed are verified before any mining.
+        setup_client = await _connect_or_fail(tuple(validators))
         await _run_startup_guards(
-            client,
+            setup_client,
             keystore,
             faucet_url=faucet_url,
             node_name=node_name,
@@ -1782,51 +1839,81 @@ async def _run_concurrent_miner(
             public_port=public_port,
             miner_config=miner_config,
         )
+        await setup_client.close()
+        setup_client = None
 
         # Resolve telemetry port. The sibling process is unconditional;
         # any non-positive `rest_port` (legacy `-1` default, `0`, `None`)
         # collapses to 8086.
         telemetry_port = rest_port if rest_port and rest_port > 0 else 8086
+        account_bytes = keystore.signer.account_id_bytes()
 
-        pow_controller, mempool_controller = await _build_controllers(
-            client=client,
-            pool=pool,
-            core=core,
-            keystore=keystore,
-            topology=topology,
-            topology_spec=topology_spec,
-            miner_kind=miner_kind,
-            pow_handles=pow_handles,
-            mempool_handles=mempool_handles,
-            telemetry_port=telemetry_port,
-            submission_config=submission_config,
-        )
+        # Bind-and-run loop: build the mining stack against the chain's current
+        # DefaultTopology, run it, and rebuild from scratch when the controller
+        # signals the chain changed its topology — no process restart needed.
+        while True:
+            setup_client = await _connect_or_fail(tuple(validators))
+            topology, snapshot = await _topology_from_chain(
+                setup_client,
+                account_bytes=account_bytes,
+                miner_config=miner_config,
+            )
+            click.echo(
+                "topology (from chain): "
+                f"0x{snapshot.topology_hash.hex()[:16]}... "
+                f"({topology.num_nodes} nodes, {topology.num_edges} edges)"
+            )
+            core, pow_handles, mempool_handles = _prepare_core(
+                mode, miner_kind, miner_config, topology
+            )
+            pow_controller = None
+            mempool_controller = None
+            try:
+                pow_controller, mempool_controller = await _build_controllers(
+                    client=setup_client,
+                    pool=pool,
+                    core=core,
+                    keystore=keystore,
+                    topology=topology,
+                    miner_kind=miner_kind,
+                    pow_handles=pow_handles,
+                    mempool_handles=mempool_handles,
+                    telemetry_port=telemetry_port,
+                    submission_config=submission_config,
+                )
+                click.echo(
+                    f"telemetry api: http://{rest_host}:{telemetry_port}"
+                    "/api/v1/status (sibling process)"
+                )
+                # Controllers own the live parent-side connections (via the
+                # pool) from here; close the direct setup client.
+                await setup_client.close()
+                setup_client = None
 
-        click.echo(
-            f"telemetry api: http://{rest_host}:{telemetry_port}/api/v1/status "
-            "(sibling process)"
-        )
+                rebind, exit_code = await _orchestrate_controllers(
+                    pow_controller, mempool_controller
+                )
+            finally:
+                if pow_controller is not None:
+                    click.echo(f"  pow stats:     {pow_controller.stats}")
+                if mempool_controller is not None:
+                    click.echo(f"  mempool stats: {mempool_controller.stats}")
+                if core is not None:
+                    core.close()
+                    core = None
 
-        # Setup done — close the direct client so controllers own the
-        # only live parent-side connections from here on.
-        await setup_client.close()
-        setup_client = None
-
-        return await _orchestrate_controllers(
-            pow_controller, mempool_controller
-        )
+            if not rebind:
+                return exit_code
+            click.echo(
+                "chain DefaultTopology changed; rebinding to the new chain "
+                "topology and rebuilding the mining stack..."
+            )
 
     except _MiningStartupError as exc:
         click.echo(exc.message, err=True)
         return exc.code
     finally:
-        if pow_controller is not None:
-            click.echo(f"  pow stats:     {pow_controller.stats}")
-        if mempool_controller is not None:
-            click.echo(f"  mempool stats: {mempool_controller.stats}")
         if setup_client is not None:
-            # Setup failed before the controllers took over; clean up
-            # the standalone connection.
             await setup_client.close()
         if pool is not None:
             await pool.shutdown()
@@ -1901,8 +1988,8 @@ def _mining_common_options(f):
         help=_REST_PORT_HELP,
     )(f)
     f = click.option(
-        "--topology", "topology_spec", default="advantage2_system1",
-        show_default=True, help=_TOPOLOGY_HELP,
+        "--topology", "topology_spec", default=None,
+        show_default=False, help=_TOPOLOGY_HELP,
     )(f)
     f = click.option(
         "--mode",

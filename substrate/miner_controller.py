@@ -200,20 +200,6 @@ def build_stats_snapshot_for_telemetry(controller) -> dict[str, Any]:
     }
 
 
-class _OperatorFailLoud(RuntimeError):
-    """Marker exception for ``on_new_head`` paths the operator must see.
-
-    Raised explicitly in ``on_new_head`` for misconfiguration / stuck-chain
-    conditions that the controller cannot recover from without operator
-    intervention (consecutive-None-snapshot escalation, topology-hash
-    mismatch).
-
-    Inherits from `RuntimeError` for compatibility with existing tests
-    that use `pytest.raises(RuntimeError)` — the controller's
-    `except _OperatorFailLoud` clause still only matches this subclass.
-    """
-
-
 # Cap on how many recently-won work keys we remember. Sized for the
 # expected window of late results: a miner with N handles can in the
 # worst case have N-1 pending results land after an OK on the same key,
@@ -464,6 +450,10 @@ class SubstrateMinerController:
         # fire loop reads `max_retries` / `retry_backoff_ms` from here.
         self.submission_config = submission_config or SubmissionConfig()
         self.topology_hash = topology_hash
+        # Set by on_new_head when the chain's DefaultTopology changes; the CLI
+        # supervisor reads it after run() returns to rebuild the mining stack
+        # against the new chain topology instead of exiting the process.
+        self.rebind_requested = False
         self.on_proof_submitted = on_proof_submitted
         self.stats = ControllerStats()
 
@@ -922,8 +912,9 @@ class SubstrateMinerController:
             1. ``None`` snapshot → bump ``stats.none_snapshots_seen``
                and return. Persistent None is handled by the event
                manager's watchdog (force_swap on no state change).
-            2. Topology hash mismatch vs ``self.topology_hash`` → fail
-               loud via ``_OperatorFailLoud``.
+            2. Topology change vs ``self.topology_hash`` → set
+               ``rebind_requested`` and shut down so the supervisor
+               rebuilds against the new chain topology.
             3. Push ``live_threshold_milli`` to each handle if changed.
             4. Zero-seed guard (chain transient between win + round-roll).
             5. Closed-work-key short-circuit (we already won this round).
@@ -946,18 +937,24 @@ class SubstrateMinerController:
             )
             return
 
-        # 2. Topology mismatch — operator configured a different topology
-        # than the chain is using. Fail loud rather than silently mining
-        # the wrong puzzle.
+        # 2. Topology change — the chain's DefaultTopology differs from the one
+        # this controller bound to at startup. Signal a rebind and shut down
+        # gracefully so the CLI supervisor re-fetches the new chain topology and
+        # rebuilds the mining stack, rather than crashing the process. (The
+        # miner always binds to the chain's topology now, so this is a chain
+        # governance change, not operator misconfiguration.)
         if (
             self.topology_hash is not None
             and ctx.topology_hash != self.topology_hash
         ):
-            raise _OperatorFailLoud(
-                "configured --topology-hash does not match snapshot: "
-                f"expected 0x{self.topology_hash.hex()}, got "
-                f"0x{ctx.topology_hash.hex()}"
+            logger.warning(
+                "chain DefaultTopology changed: bound 0x%s, chain now 0x%s; "
+                "requesting rebind",
+                self.topology_hash.hex(), ctx.topology_hash.hex(),
             )
+            self.rebind_requested = True
+            self.shutdown()
+            return
 
         # 3. Live threshold push (decay-driven; only when changed).
         live_threshold = int(ctx.difficulty.max_energy_milli)
