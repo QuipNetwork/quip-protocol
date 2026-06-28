@@ -92,7 +92,16 @@ check-version:
     - if: $CI_COMMIT_BRANCH == "v0.2"
       variables:
         MUTABLE_TAGS: v0.2
-    # Pre-release tag (rc/alpha/beta): roll :v0.2 + pin :<tag>, never :latest.
+    # Pre-release tag — STANDARD form: SemVer hyphenated (vX.Y.Z-rcN), e.g.
+    # v0.2.1-rc17. This is the only pre-release form quip-node-manager's SemVer
+    # parser (parse_semver) recognizes, so all releases MUST use it — see
+    # docs/VERSIONING.md. Rolls :v0.2 + pins :<tag>, never :latest.
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+-(rc|alpha|beta)[0-9]*$/
+      variables:
+        MUTABLE_TAGS: "v0.2 $CI_COMMIT_TAG"
+    # Legacy pre-release tag — PEP 440 no-hyphen (vX.Y.ZrcN). Still builds + pins
+    # so old tags don't break, but quip-node-manager CANNOT parse it for native
+    # binary updates (it collapses to vX.Y.0). Do NOT cut new releases this way.
     - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(rc|alpha|beta)[0-9]*$/
       variables:
         MUTABLE_TAGS: "v0.2 $CI_COMMIT_TAG"
