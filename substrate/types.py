@@ -195,6 +195,7 @@ class SubstrateMiningContext:
             nodes=list(nodes),
             edges=list(edges),
             buffer_size=buffer_size,
+            allowed_h=self.allowed_h_values,
         )
 
     def uses_decay_ratchet(self) -> bool:

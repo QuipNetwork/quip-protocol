@@ -56,6 +56,7 @@ class StreamContext:
         feeder_buffer_size: int,
         num_reads: int,
         num_sweeps: int,
+        allowed_h: Optional[Any] = None,
         sampler_kwargs: Optional[Dict[str, Any]] = None,
         feeder_builder: Optional[Callable] = None,
         stop_event: Optional[multiprocessing.synchronize.Event] = None,
@@ -63,6 +64,12 @@ class StreamContext:
         self._sampler = sampler
         self._nodes = nodes
         self._edges = edges
+        # The problem's per-node field spec (chain ``allowed_h_values``). It is
+        # topology-bound like nodes/edges, so it is fixed for the driver's
+        # lifetime and forwarded to the PoW feeder. ``None`` would make the
+        # feeder silently build a ternary h model the chain scores as h=0, so
+        # ``build_feeder`` rejects a None on the PoW path.
+        self._allowed_h = allowed_h
         self._feeder_buffer_size = feeder_buffer_size
         self._num_reads = num_reads
         self._num_sweeps = num_sweeps
@@ -120,6 +127,7 @@ class StreamContext:
                     pass
             self._feeder = self._feeder_builder(
                 spec, self._nodes, self._edges, self._feeder_buffer_size,
+                allowed_h=self._allowed_h,
             )
             self._feeder_kind = skind
 

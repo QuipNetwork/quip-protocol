@@ -1134,6 +1134,11 @@ class BaseMiner(ABC):
             "cur_index": bridge_prev_block.header.index,
             "nodes": nodes,
             "edges": edges,
+            # The chain topology's per-node field spec. Topology-bound like
+            # nodes/edges; the stream driver forwards it to the PoW feeder so
+            # the sampler optimizes the SAME h distribution the chain scores
+            # (None here would let the feeder silently fall back to ternary).
+            "allowed_h_values": getattr(requirements, "allowed_h_values", None),
             "num_reads": num_reads,
             "num_sweeps": current_num_sweeps,
             "extra": extra_params,

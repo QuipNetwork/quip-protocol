@@ -551,7 +551,7 @@ class FixedIsingFeeder:
         """No-op for API parity with :class:`RandomIsingFeeder`."""
 
 
-def build_feeder(spec, nodes, edges, buffer_size):
+def build_feeder(spec, nodes, edges, buffer_size, allowed_h=None):
     """Build an IsingFeeder from a switch ``feeder_spec`` tuple.
 
     ``("pow", last_proof_block_hash, miner_bytes)`` -> ``RandomIsingFeeder``.
@@ -563,16 +563,31 @@ def build_feeder(spec, nodes, edges, buffer_size):
         nodes: Topology node list passed through to the feeder.
         edges: Topology edge list passed through to the feeder.
         buffer_size: Target number of ready + in-flight models.
+        allowed_h: The chain topology's ``allowed_h_values`` spec. Required on
+            the PoW path: a ``None`` would make ``RandomIsingFeeder`` fall back
+            to the legacy ternary spec, so the sampler optimizes ``h in
+            {-1,0,+1}`` while the chain scores the registered spec (e.g. h=0),
+            yielding 0 valid solutions. Ignored for the mempool path (fixed
+            h/J come from the ProblemView).
 
     Returns:
         A configured feeder implementing the pop/stop interface.
 
     Raises:
+        ValueError: If ``spec[0] == "pow"`` and ``allowed_h`` is None.
         NotImplementedError: If ``spec[0]`` is neither ``"pow"`` nor
             ``"mempool"``.
     """
     kind = spec[0]
     if kind == "pow":
+        if allowed_h is None:
+            raise ValueError(
+                "build_feeder('pow', ...) requires allowed_h (the chain "
+                "topology's allowed_h_values). None silently builds a ternary "
+                "h model the chain scores as the registered spec, producing 0 "
+                "valid solutions. Thread requirements.allowed_h_values through "
+                "sample_ctx -> _stream_factory_kwargs -> build_persistent_context."
+            )
         _, last_proof_block_hash, miner_bytes = spec
         return RandomIsingFeeder(
             last_proof_block_hash=last_proof_block_hash,
@@ -580,6 +595,7 @@ def build_feeder(spec, nodes, edges, buffer_size):
             nodes=nodes,
             edges=edges,
             buffer_size=buffer_size,
+            allowed_h=allowed_h,
         )
     elif kind == "mempool":
         from shared.ring_views import ProblemView

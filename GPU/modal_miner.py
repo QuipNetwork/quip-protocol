@@ -55,6 +55,7 @@ class ModalMiner(BaseMiner):
             "miner_id": self.miner_id,
             "nodes": nodes,
             "edges": sample_ctx["edges"],
+            "allowed_h": sample_ctx.get("allowed_h_values"),
             "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
             "num_reads": sample_ctx["num_reads"],
             "num_sweeps": sample_ctx["num_sweeps"],
