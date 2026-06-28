@@ -59,6 +59,6 @@ def build_fake_context(
         feeder_buffer_size=4,
         num_reads=1,
         num_sweeps=8,
-        feeder_builder=lambda spec, nodes, edges, buffer_size: FakeFeeder(),
+        feeder_builder=lambda spec, nodes, edges, buffer_size, allowed_h=None: FakeFeeder(),
         stop_event=stop_event,
     )
