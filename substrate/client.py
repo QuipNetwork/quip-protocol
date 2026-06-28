@@ -987,14 +987,18 @@ class SubstrateClient:
         )
 
     async def query_latest_qblock_id(self) -> Optional[int]:
-        """Return ``QuantumPow.LatestQBlockId`` or ``None`` before the first win."""
-        result = await self._run(
-            lambda: self._iface.query("QuantumPow", "LatestQBlockId")
-        )
-        v = _storage_value(result, check_found=True)
-        if v is None:
-            return None
-        return int(v)
+        """Return the latest assigned qblock id, or ``None`` before the first win.
+
+        The runtime exposes no ``LatestQBlockId`` storage. Because qblock ids are
+        1-based ordinals, the accepted-qblock count *is* the latest assigned id
+        when non-zero — quip-protocol-rs MR !35 documents ``QBlockCount`` exactly
+        this way. Reuse :meth:`query_winning_solution_count` (which already
+        handles the ``QBlockCount``/legacy-``WinningSolutions`` layouts) and map a
+        count of 0 to ``None`` so the participation path targets candidate
+        qblock 1 on a fresh chain.
+        """
+        count = await self.query_winning_solution_count()
+        return count if count > 0 else None
 
     async def query_balance(self, account: bytes) -> int:
         if len(account) != 32:
