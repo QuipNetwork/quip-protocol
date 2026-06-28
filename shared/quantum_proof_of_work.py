@@ -778,9 +778,33 @@ def _ising_from_requirements(
     nodes: List[int],
     edges: List[Tuple[int, int]],
 ) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float]]:
-    """Generate (h, J) from requirements, respecting per-block allowed value specs."""
-    allowed_h = getattr(requirements, "allowed_h_values", DEFAULT_ALLOWED_H)
-    allowed_j = getattr(requirements, "allowed_j_values", DEFAULT_ALLOWED_J)
+    """Generate (h, J) from a COMPLETE topology reference, or crash.
+
+    A complete reference requires non-empty ``nodes``/``edges`` and explicit
+    ``allowed_h_values`` *and* ``allowed_j_values`` on ``requirements``. There
+    is deliberately NO ternary fallback: a missing allowed-value spec means the
+    chain's per-topology problem definition was not threaded through to this
+    code path (e.g. an h=0 snapshot whose spec was dropped). Silently
+    substituting the ternary default makes the miner score a *different* Ising
+    than the chain validates — the exact failure this guard exists to prevent —
+    so fail loud instead.
+    """
+    allowed_h = getattr(requirements, "allowed_h_values", None)
+    allowed_j = getattr(requirements, "allowed_j_values", None)
+    if allowed_h is None or allowed_j is None:
+        raise ValueError(
+            "incomplete topology reference for Ising generation: "
+            f"allowed_h_values={allowed_h!r}, allowed_j_values={allowed_j!r}. "
+            "The chain's per-topology allowed-value spec was not threaded "
+            "through to mining/validation; refusing to fall back to the ternary "
+            "default because it would score a different problem than the chain "
+            "validates."
+        )
+    if not nodes or not edges:
+        raise ValueError(
+            "incomplete topology reference for Ising generation: "
+            f"nodes={len(nodes)} edges={len(edges)} (both must be non-empty)."
+        )
     return generate_ising_model_from_nonce(
         nonce, nodes, edges, allowed_h=allowed_h, allowed_j=allowed_j,
     )

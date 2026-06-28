@@ -488,6 +488,8 @@ def test_mine_work_item_handles_mempool_context(cpu_miner):
         top_k_cap=5,
         top_k=[],
         previewed_wintime=(10**9, 10**9),
+        ising_h=h,
+        ising_j=J,
     )
     result = cpu_miner._run_mempool_eval(
         state, sampleset, nonce, b"\x00" * 32, time.time(),

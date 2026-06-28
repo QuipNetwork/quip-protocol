@@ -217,6 +217,12 @@ class _MiningLoopState:
     decay_schedule: Optional[List[int]] = None
     last_proof_block: int = 0
     epoch_length: int = 0
+    # Mempool only: the order's fixed (h, J) Ising model, resolved once at
+    # dispatch setup. Passed to ``evaluate_sampleset`` so the mempool path
+    # validates against the order's actual problem instead of regenerating a
+    # nonce-derived one (PoW leaves these None and regenerates per attempt).
+    ising_h: Optional[Dict[int, float]] = None
+    ising_j: Optional[Dict[Tuple[int, int], float]] = None
 
     @property
     def is_decay_ranked(self) -> bool:
@@ -1081,6 +1087,16 @@ class BaseMiner(ABC):
         solution_number_for_log = int(solution_number) if solution_number is not None else 0
         dispatch_id_for_log = int(getattr(self, '_current_dispatch_id', 0))
 
+        # Mempool jobs carry a fixed (h, J) in the order; resolve it once here
+        # so the eval path validates against the order's actual problem instead
+        # of regenerating a nonce-derived Ising (the fixed-model context ignores
+        # the salt). PoW leaves these None and regenerates per attempt from the
+        # chain's allowed-value spec.
+        mempool_h: Optional[Dict[int, float]] = None
+        mempool_j: Optional[Dict[Tuple[int, int], float]] = None
+        if not is_substrate:
+            mempool_h, mempool_j, _ = context.resolve_ising(b"\x00" * 32, nodes, edges)
+
         loop_state = _MiningLoopState(
             requirements=requirements,
             nodes=nodes,
@@ -1098,6 +1114,8 @@ class BaseMiner(ABC):
             decay_schedule=getattr(context, "decay_schedule", None),
             last_proof_block=int(getattr(context, "last_proof_block", 0) or 0),
             epoch_length=int(getattr(context, "epoch_length", 0) or 0),
+            ising_h=mempool_h,
+            ising_j=mempool_j,
         )
 
         # The stream-driver process builds its own feeder (RandomIsingFeeder
@@ -1907,6 +1925,7 @@ class BaseMiner(ABC):
         result = self.evaluate_sampleset(
             sampleset, state.requirements, state.nodes, state.edges,
             nonce, salt, state.prev_timestamp, state.start_time,
+            h=state.ising_h, J=state.ising_j,
         )
 
         self.timing_stats['postprocessing'].append(
@@ -2240,7 +2259,7 @@ class BaseMiner(ABC):
         })
         return stats
 
-    def evaluate_sampleset(self, sampleset: dimod.SampleSet, requirements: BlockRequirements, nodes: List[int], edges: List[Tuple[int, int]], nonce: int, salt: bytes, prev_timestamp: int, start_time: float, *, strict_energy: bool = True, live_threshold_energy: Optional[float] = None) -> Optional[MiningResult]:
+    def evaluate_sampleset(self, sampleset: dimod.SampleSet, requirements: BlockRequirements, nodes: List[int], edges: List[Tuple[int, int]], nonce: int, salt: bytes, prev_timestamp: int, start_time: float, *, h: Optional[Dict[int, float]] = None, J: Optional[Dict[Tuple[int, int], float]] = None, strict_energy: bool = True, live_threshold_energy: Optional[float] = None) -> Optional[MiningResult]:
         """Convert a sample set into a mining result if it meets requirements, otherwise return None.
 
         ``strict_energy=False`` enables the substrate ratchet's lenient
@@ -2255,7 +2274,7 @@ class BaseMiner(ABC):
         chain-recomputed energy clears that live target (rather than
         the snapshot ``difficulty_energy``).
         """
-        return evaluate_sampleset(sampleset, requirements, nodes, edges, nonce, salt, prev_timestamp, start_time, self.miner_id, self.miner_type, strict_energy=strict_energy, live_threshold_energy=live_threshold_energy)
+        return evaluate_sampleset(sampleset, requirements, nodes, edges, nonce, salt, prev_timestamp, start_time, self.miner_id, self.miner_type, h=h, J=J, strict_energy=strict_energy, live_threshold_energy=live_threshold_energy)
 
 
 # ----------------------------------------------------------------------
