@@ -526,6 +526,9 @@ def test_auto_identify_submission_failure_is_fatal(monkeypatch):
         async def submit_extrinsic(self, *_a, **_kw):
             raise RuntimeError("validator rejected extrinsic")
 
+        async def descriptor_schema_version(self):
+            return 2
+
     class FakeSigner:
         def ss58_address(self):
             return "5FakeAccountId00000000000000000000000000000000000"
@@ -582,6 +585,9 @@ def test_auto_identify_retries_then_posts(monkeypatch, caplog):
                 raise RuntimeError("Priority is too low")  # stale-nonce shape
             return FakeReceipt()
 
+        async def descriptor_schema_version(self):
+            return 2
+
     class FakeSigner:
         def ss58_address(self):
             return "5FakeAccountId00000000000000000000000000000000000"
@@ -631,6 +637,9 @@ def test_auto_identify_submits_miner_registry_descriptor(monkeypatch, caplog):
             self.calls.append((module, call, args))
             return FakeReceipt()
 
+        async def descriptor_schema_version(self):
+            return 2
+
     class FakeSigner:
         def ss58_address(self):
             return "5FakeAccountId00000000000000000000000000000000000"
@@ -658,7 +667,11 @@ def test_auto_identify_submits_miner_registry_descriptor(monkeypatch, caplog):
     assert len(client.calls) == 1
     module, call, params = client.calls[0]
     assert (module, call) == ("MinerRegistry", "set_descriptor")
-    body = params["descriptor"]["V1"]
+    # Stub runtime advertises descriptor schema V2, so the miner posts V2
+    # (system_info + runtime) — the richest the chain accepts.
+    body = params["descriptor"]["V2"]
+    assert body["system_info"] is not None
+    assert body["runtime"] is not None
     # BoundedVec fields are 1-tuple-wrapped for the runtime composite shape
     # (see test_miner_registry for the rationale).
     assert body["node_id"] == (b"test-rig",)
@@ -773,6 +786,9 @@ def test_auto_identify_uses_detected_public_ip_when_unset(monkeypatch):
         async def submit_extrinsic(self, *_a, **_kw):
             return FakeReceipt()
 
+        async def descriptor_schema_version(self):
+            return 2
+
     class FakeSigner:
         def ss58_address(self):
             return "5FakeAccountId00000000000000000000000000000000000"
@@ -822,6 +838,9 @@ def test_auto_identify_skips_detection_when_public_host_set(monkeypatch):
     class FakeClient:
         async def submit_extrinsic(self, *_a, **_kw):
             return FakeReceipt()
+
+        async def descriptor_schema_version(self):
+            return 2
 
     class FakeSigner:
         def ss58_address(self):
@@ -1065,6 +1084,9 @@ def _capture_auto_identify_params(monkeypatch, miners_config: Dict[str, Any]) ->
             captured["params"] = args
             return FakeReceipt()
 
+        async def descriptor_schema_version(self):
+            return 2
+
     class FakeSigner:
         def ss58_address(self):
             return "5FakeAccount" + "0" * 38
@@ -1138,7 +1160,7 @@ def test_auto_identify_does_not_leak_tokens_from_toml_loaded_miners_config(
     # (the legitimate signal indexers need); just without credentials.
     # miners is a BoundedVec (1-tuple-wrapped); each backend is an
     # Option<BoundedVec> wrapped as (bytes,) when present.
-    (miners,) = params["descriptor"]["V1"]["miners"]
+    (miners,) = params["descriptor"]["V2"]["miners"]
     backends = {
         m["backend"][0].decode("utf-8")
         for m in miners

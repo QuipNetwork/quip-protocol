@@ -268,8 +268,14 @@ async def _auto_identify(
             f"error={type(exc).__name__}: {exc}"
         ) from exc
 
+    # Post the richest descriptor the live runtime accepts: V2 (system_info +
+    # runtime) where available, V1 on older runtimes. The chain upgrades
+    # runtime-first, so this picks up V2 automatically once it's deployed.
+    schema_version = await client.descriptor_schema_version()
     try:
-        call_params = descriptor_call_params(descriptor, node_id=effective_name)
+        call_params = descriptor_call_params(
+            descriptor, node_id=effective_name, schema_version=schema_version,
+        )
     except ValueError as exc:
         raise click.ClickException(
             f"descriptor-invalid ss58={keystore.signer.ss58_address()} "
@@ -2476,14 +2482,18 @@ def quip_miner_identify(
         click.echo(f"# payload_size_bytes : {len(payload)}", err=True)
         return
 
-    try:
-        call_params = descriptor_call_params(descriptor, node_id=node_id)
-    except ValueError as exc:
-        raise click.ClickException(f"descriptor-invalid {exc}") from exc
-
     async def _do() -> int:
         client = await _connect_or_fail(tuple(merged["validators"]))
         try:
+            # Post V2 (system_info + runtime) where the runtime supports it,
+            # else V1 — probed from live metadata after connecting.
+            schema_version = await client.descriptor_schema_version()
+            try:
+                call_params = descriptor_call_params(
+                    descriptor, node_id=node_id, schema_version=schema_version,
+                )
+            except ValueError as exc:
+                raise click.ClickException(f"descriptor-invalid {exc}") from exc
             receipt = await client.submit_extrinsic(
                 "MinerRegistry",
                 "set_descriptor",

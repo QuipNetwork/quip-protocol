@@ -413,6 +413,44 @@ class SubstrateClient:
 
         return await self._run(_probe)
 
+    async def descriptor_schema_version(self) -> int:
+        """Highest ``MinerRegistry`` descriptor schema the runtime accepts.
+
+        Returns ``2`` when ``set_descriptor``'s ``NodeDescriptorInput`` enum
+        exposes a ``V2`` variant (system_info + runtime block), else ``1``
+        (the always-present V1). Any metadata hiccup degrades to ``1`` so
+        descriptor filing falls back to the compatible variant rather than
+        crashing on the probe. The chain upgrades runtime-first, so a miner
+        sees V2 only once the runtime carrying it is live.
+        """
+
+        def _probe() -> int:
+            try:
+                call = self._iface.get_metadata_call_function(
+                    "MinerRegistry", "set_descriptor",
+                )
+                # set_descriptor takes one arg (the NodeDescriptorInput enum);
+                # resolve its variant names from the portable type registry.
+                field = call["fields"][0]
+                type_id = field.value["type"] if hasattr(field, "value") else field["type"]
+                names = self._enum_variant_names(type_id)
+                return 2 if "V2" in names else 1
+            except Exception:
+                return 1
+
+        return await self._run(_probe)
+
+    def _enum_variant_names(self, type_id: int) -> set:
+        """Return the variant names of the portable-registry enum ``type_id``."""
+        for entry in self._iface.metadata.portable_registry["types"]:
+            ident = entry["id"].value if hasattr(entry["id"], "value") else entry["id"]
+            if ident != type_id:
+                continue
+            defn = entry["type"]["def"]
+            d = defn.value if hasattr(defn, "value") else defn
+            return {v["name"] for v in d["variant"]["variants"]}
+        return set()
+
     async def has_storage(self, module: str, function: str) -> bool:
         """Return True iff the runtime metadata exposes storage ``module.function``.
 

@@ -130,6 +130,9 @@ class _StubClient:
     def __init__(self):
         self.calls: list = []
 
+    async def descriptor_schema_version(self):
+        return 2
+
     async def submit_extrinsic(self, module, function, params, signer, wait_for):  # noqa: ARG002
         self.calls.append((module, function, params, wait_for))
         return ExtrinsicReceipt(
@@ -185,7 +188,7 @@ def test_submit_posts_miner_registry_descriptor(tmp_path, monkeypatch):
     assert len(client.calls) == 1
     module, function, params, _wait = client.calls[0]
     assert (module, function) == ("MinerRegistry", "set_descriptor")
-    body = params["descriptor"]["V1"]
+    body = params["descriptor"]["V2"]
     # BoundedVec fields are 1-tuple-wrapped to match the runtime composite
     # shape scalecodec needs (see test_miner_registry for the rationale).
     assert body["node_id"] == (b"rig-01",)
