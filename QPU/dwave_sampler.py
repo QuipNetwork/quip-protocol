@@ -909,6 +909,13 @@ class DWaveSamplerWrapper:
         submit_total_s: float = 0.0
         submit_n: int = 0
         submit_max_s: float = 0.0
+        # Decode-cost profiling: ``future.sampleset`` parses the QPU wire
+        # response into a SampleSet inline on this (single-GIL) thread, the same
+        # thread that pops+unpickles feeder models and harvests submissions. If
+        # decode dominates, it — not generation — is what pegs the stream-driver
+        # core and starves the feeder's result pipe. Reported as decode_mean.
+        decode_total_s: float = 0.0
+        decode_n: int = 0
 
         def _stopped() -> bool:
             return stop_event is not None and stop_event.is_set()
@@ -1005,7 +1012,7 @@ class DWaveSamplerWrapper:
             logger.info(
                 "[QPU] stream depth: in_flight=%d/%d submitting=%d "
                 "feeder_ready=%d/%d drained=%d wait_total=%.2fs "
-                "submit_mean=%.0fms submit_max=%.0fms",
+                "submit_mean=%.0fms submit_max=%.0fms decode_mean=%.0fms",
                 len(pending), queue_depth, len(submitting),
                 fstats.get("ready", 0),
                 fstats.get("buffer_size", 0),
@@ -1013,6 +1020,7 @@ class DWaveSamplerWrapper:
                 fstats.get("pop_wait_total_s", 0.0),
                 (submit_total_s / submit_n * 1000.0) if submit_n else 0.0,
                 submit_max_s * 1000.0,
+                (decode_total_s / decode_n * 1000.0) if decode_n else 0.0,
             )
 
         submit_workers = _default_submit_workers(queue_depth)
@@ -1065,7 +1073,10 @@ class DWaveSamplerWrapper:
                     if completed_id is None:
                         continue
                     model, future, defect_info, _ = pending.pop(completed_id)
+                    _t_dec = time.monotonic()
                     raw_ss = future.sampleset
+                    decode_total_s += time.monotonic() - _t_dec
+                    decode_n += 1
                     # Attach defect_info so the consumer can reconstruct survivors.
                     raw_ss.info["defect_info"] = defect_info
                     if job_index % 50 == 0:
