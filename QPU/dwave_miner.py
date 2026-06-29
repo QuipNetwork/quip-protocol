@@ -6,9 +6,7 @@ import multiprocessing
 import multiprocessing.synchronize
 import signal
 import time
-from typing import Dict, List, Optional, Tuple, Any
-
-init_logger = logging.getLogger(__name__)
+from typing import List, Optional, Tuple, Any
 
 from QPU.dwave_sampler import DWaveSamplerWrapper
 from QPU.qpu_time_manager import QPUTimeManager, QPUTimeConfig
@@ -19,6 +17,8 @@ from shared.miner_types import BlockRequirements
 from shared.stream_context import StreamContext
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies.dwave_topology import DWaveTopology
+
+init_logger = logging.getLogger(__name__)
 
 
 def build_persistent_context(
