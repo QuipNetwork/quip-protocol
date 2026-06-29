@@ -184,6 +184,46 @@ def test_attempt_logger_qpu_access_time_defaults_to_none(tmp_path: Path) -> None
     assert record["qpu_access_time_us"] is None
 
 
+def test_attempt_log_shows_live_decay_threshold_not_base(caplog) -> None:
+    """The per-attempt console line must report the live decayed target (what
+    ``num_valid`` is computed against and the chain enforces at submit), not the
+    snapshot base difficulty. They diverge once decay eases the live target, so
+    logging the base made ``Valid: 0`` look inconsistent with the stated bar.
+    """
+    import logging
+
+    import dimod
+
+    from shared.allowed_value_spec import AllowedValueSet
+    from shared.miner_types import BlockRequirements
+    from shared.quantum_proof_of_work import evaluate_sampleset
+
+    nodes = [0, 1, 2]
+    edges = [(0, 1), (1, 2)]
+    ss = dimod.SampleSet.from_samples(
+        [{0: -1, 1: 1, 2: -1}, {0: 1, 1: -1, 2: 1}], "SPIN", energy=[-4.0, -2.0],
+    )
+    req = BlockRequirements(
+        difficulty_energy=-5000.0,  # base (snapshot)
+        min_diversity=0.0,
+        min_solutions=1,
+        timeout_to_difficulty_adjustment_decay=2**31 - 1,
+        allowed_h_values=AllowedValueSet((0,)),
+        allowed_j_values=AllowedValueSet((-1000, 1000)),
+    )
+    with caplog.at_level(logging.INFO):
+        evaluate_sampleset(
+            ss, req, nodes, edges, nonce=1, salt=b"\x00" * 32,
+            prev_timestamp=0, start_time=0.0, miner_id="t", miner_type="CPU",
+            h={0: 0.0, 1: 0.0, 2: 0.0}, J={(0, 1): 1.0, (1, 2): 1.0},
+            skip_validation=True, strict_energy=False,
+            live_threshold_energy=-3000.0,  # live decayed target
+        )
+    log = "\n".join(r.getMessage() for r in caplog.records)
+    assert "energy<=-3000" in log, log
+    assert "energy<=-5000" not in log
+
+
 def test_query_by_solution_id_joins_attempts_and_submission(
     tmp_path: Path,
 ) -> None:

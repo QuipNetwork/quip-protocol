@@ -1164,6 +1164,16 @@ def evaluate_sampleset(sampleset, requirements, nodes: List[int], edges: List[Tu
         # Use module logger for consistency
         logger.debug(f"Failed to meet requirements: {e}")
     finally:
-        # Log every mining attempt (successful or not) for analysis
-        logger.info(f"[{miner_id}] Mining attempt - Energy: {best_energy:.0f}, Valid: {num_valid} (best {min_solutions} diversity: {diversity:.3f}) (requirements: energy<={difficulty_energy:.0f}, valid>={min_solutions}, diversity>={min_diversity:.3f})")
+        # Show the threshold the Valid count is actually computed against: the
+        # live decayed target in ratchet mode (what the chain enforces at
+        # submit time), not the snapshot base. They differ once decay has eased
+        # the live target, so logging the base made "Valid: 0" look inconsistent
+        # with the stated bar. Falls back to the base difficulty when no live
+        # threshold was supplied (mempool / strict / tests).
+        threshold_for_log = (
+            live_threshold_energy
+            if live_threshold_energy is not None
+            else difficulty_energy
+        )
+        logger.info(f"[{miner_id}] Mining attempt - Energy: {best_energy:.0f}, Valid: {num_valid} (best {min_solutions} diversity: {diversity:.3f}) (requirements: energy<={threshold_for_log:.0f}, valid>={min_solutions}, diversity>={min_diversity:.3f})")
     return result
