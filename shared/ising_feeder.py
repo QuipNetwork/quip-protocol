@@ -47,6 +47,18 @@ def _require_len(name: str, value: bytes, n: int = 32) -> None:
         raise ValueError(f"{name} must be {n} bytes, got {len(value)}")
 
 
+def _default_max_workers() -> int:
+    """Generator-process count to use when the caller passes ``max_workers=None``.
+
+    Scales to the node: one worker per core minus one reserved for the
+    consuming process (the QPU submit-pool / GPU / CPU sampler all run there),
+    with a floor of 2. Workers only run when ``_fill`` needs to refill the
+    buffer, so over-provisioning on a many-core box is harmless — surplus
+    workers idle rather than burning CPU.
+    """
+    return max(2, (os.cpu_count() or 4) - 1)
+
+
 def _empty_feeder_counters() -> dict:
     """Fresh zeroed cumulative-counter dict for RandomIsingFeeder stats."""
     return {
@@ -156,7 +168,11 @@ class RandomIsingFeeder:
         nodes: Topology node list.
         edges: Topology edge list.
         buffer_size: Target number of ready + in-flight models.
-        max_workers: Worker processes for model generation.
+        max_workers: Worker processes for model generation. ``None``
+            (the default) auto-scales to the node via
+            :func:`_default_max_workers` (``max(2, cpu_count - 1)``) so a
+            fast submit/consume path can't out-drain a fixed 2-worker pool
+            on a multi-core box.
         seed: Optional seed for deterministic salt generation.
         allowed_h: Optional per-node field distribution override forwarded to
             ``generate_ising_model_from_nonce``. ``None`` keeps the chain's
@@ -171,7 +187,7 @@ class RandomIsingFeeder:
         nodes: list,
         edges: list,
         buffer_size: int = 8,
-        max_workers: int = 2,
+        max_workers: Optional[int] = None,
         seed: Optional[int] = None,
         allowed_h: Optional[AllowedValueSpec] = None,
     ):
@@ -184,8 +200,9 @@ class RandomIsingFeeder:
         self._buffer_size = buffer_size
         self._allowed_h = allowed_h
         self._rng = random.Random(seed) if seed is not None else None
+        workers = max_workers if max_workers is not None else _default_max_workers()
         self._pool = ProcessPoolExecutor(
-            max_workers=max_workers,
+            max_workers=workers,
             mp_context=_SPAWN_CTX,
         )
         # Backstop: shut down the pool even if stop() is never called (the

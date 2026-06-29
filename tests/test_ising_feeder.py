@@ -9,7 +9,11 @@ import weakref
 import pytest
 
 from shared.allowed_value_spec import AllowedValueSet
-from shared.ising_feeder import FixedIsingFeeder, RandomIsingFeeder
+from shared.ising_feeder import (
+    FixedIsingFeeder,
+    RandomIsingFeeder,
+    _default_max_workers,
+)
 from shared.ising_model import IsingModel
 from shared.quantum_proof_of_work import (
     generate_ising_model_from_nonce,
@@ -36,6 +40,25 @@ def _make_feeder(**kwargs):
 
 
 _NONCE_BYTES_42 = (42).to_bytes(32, "big")
+
+
+class TestDefaultMaxWorkers:
+    """Auto-scaling of the generator pool to the node's core count."""
+
+    @pytest.mark.parametrize(
+        "cpu,expected",
+        [(1, 2), (2, 2), (3, 2), (4, 3), (8, 7)],
+    )
+    def test_scales_to_cpu_minus_one_with_floor_of_two(
+        self, cpu, expected, monkeypatch
+    ):
+        monkeypatch.setattr("os.cpu_count", lambda: cpu)
+        assert _default_max_workers() == expected
+
+    def test_unknown_cpu_count_falls_back_to_four(self, monkeypatch):
+        # os.cpu_count() can return None; the default must still be sane.
+        monkeypatch.setattr("os.cpu_count", lambda: None)
+        assert _default_max_workers() == 3
 
 
 class TestIsingModel:

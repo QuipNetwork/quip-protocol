@@ -17,7 +17,34 @@ from typing import Any, List, Optional, Tuple
 import dimod
 import pytest
 
-from QPU.dwave_sampler import DefectInfo, DWaveSamplerWrapper
+from QPU.dwave_sampler import (
+    DefectInfo,
+    DWaveSamplerWrapper,
+    _default_submit_workers,
+)
+
+
+class TestDefaultSubmitWorkers:
+    """Submit-pool sizing scales with the node but never exceeds queue_depth."""
+
+    @pytest.mark.parametrize(
+        "cpu,queue_depth,expected",
+        [
+            (4, 30, 8),   # the deployed 4-core node: 16->8, frees CPU for gen
+            (8, 30, 16),  # bigger box keeps full concurrency
+            (4, 4, 4),    # shallow queue caps below cpu*2
+            (1, 30, 2),   # single-core floor
+        ],
+    )
+    def test_scales_with_cpu_capped_at_queue_depth(
+        self, cpu, queue_depth, expected, monkeypatch
+    ):
+        monkeypatch.setattr("os.cpu_count", lambda: cpu)
+        assert _default_submit_workers(queue_depth) == expected
+
+    def test_unknown_cpu_count_falls_back_to_eight(self, monkeypatch):
+        monkeypatch.setattr("os.cpu_count", lambda: None)
+        assert _default_submit_workers(30) == 16
 
 
 @pytest.fixture(autouse=True)
