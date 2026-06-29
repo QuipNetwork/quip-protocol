@@ -105,12 +105,16 @@ class _FakeSamplerWrapper:
         self._results = list(results)
         self._call_count = 0
         self._reconstruct_calls = 0
+        # The pump now submits concurrently on a thread pool, so this is
+        # called from multiple threads — guard the counter + result list.
+        self._lock = __import__("threading").Lock()
 
     def sample_ising_async(
         self, h: Any, J: Any, **kwargs: Any
     ) -> Tuple[_FakeFuture, Optional[DefectInfo]]:
-        self._call_count += 1
-        return self._results.pop(0)
+        with self._lock:
+            self._call_count += 1
+            return self._results.pop(0)
 
     def reconstruct_full_sampleset(
         self, ss: dimod.SampleSet, defect_info: DefectInfo
