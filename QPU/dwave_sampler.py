@@ -2,6 +2,7 @@
 
 import logging
 import os
+import time
 from typing import (
     Dict, Iterator, List, Optional, Sequence, Tuple,
     Any, Union, Mapping, cast,
@@ -881,6 +882,14 @@ class DWaveSamplerWrapper:
         pending: Dict[int, Tuple[Any, Any, Optional[DefectInfo], int]] = {}
         job_index: int = 0
         feeder_exhausted: bool = False
+        # Submission-cost profiling: how long sample_ising_async takes to
+        # return. The pump's fill loop calls it serially, so if it blocks (a
+        # synchronous encode/upload in the SDK), submission serializes here
+        # regardless of queue_depth. ~tens of ms = async handoff (healthy);
+        # seconds = the fill loop is the bottleneck.
+        submit_total_s: float = 0.0
+        submit_n: int = 0
+        submit_max_s: float = 0.0
 
         def _stopped() -> bool:
             return stop_event is not None and stop_event.is_set()
@@ -907,6 +916,7 @@ class DWaveSamplerWrapper:
         def _try_submit_one() -> None:
             """Submit one model; sets feeder_exhausted on StopIteration."""
             nonlocal job_index, feeder_exhausted
+            nonlocal submit_total_s, submit_n, submit_max_s
             pop = getattr(models, "pop_blocking", None)
             try:
                 model = pop() if callable(pop) else next(models)  # type: ignore[call-overload]
@@ -921,9 +931,14 @@ class DWaveSamplerWrapper:
             }
             if annealing_time is not None:
                 submit_kwargs["annealing_time"] = annealing_time
+            _t = time.monotonic()
             future, defect_info = self.sample_ising_async(
                 model.h, model.J, **submit_kwargs
             )
+            _dt = time.monotonic() - _t
+            submit_total_s += _dt
+            submit_n += 1
+            submit_max_s = max(submit_max_s, _dt)
             pending[id(future)] = (model, future, defect_info, job_index)
             job_index += 1
 
@@ -989,12 +1004,15 @@ class DWaveSamplerWrapper:
                         fstats = pop_stats()
                         logger.info(
                             "[QPU] stream depth: in_flight=%d/%d "
-                            "feeder_ready=%d/%d drained=%d wait_total=%.2fs",
+                            "feeder_ready=%d/%d drained=%d wait_total=%.2fs "
+                            "submit_mean=%.0fms submit_max=%.0fms",
                             len(pending), queue_depth,
                             fstats.get("ready", 0),
                             fstats.get("buffer_size", 0),
                             fstats.get("drained_count", 0),
                             fstats.get("pop_wait_total_s", 0.0),
+                            (submit_total_s / submit_n * 1000.0) if submit_n else 0.0,
+                            submit_max_s * 1000.0,
                         )
 
                 yield model, raw_ss
