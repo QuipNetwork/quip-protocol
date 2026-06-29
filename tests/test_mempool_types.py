@@ -34,6 +34,13 @@ def test_miner_type_from_kind_cpu_gpu_qpu():
     assert MinerType.from_kind("dwave") == MinerType.QPU_DWAVE
 
 
+def test_miner_type_from_kind_gpu_backends_collapse_to_gpu():
+    # The participation marker reports the running sampler backend, but the
+    # on-chain taxonomy is cpu/gpu/qpu — every GPU backend maps to GPU.
+    for backend in ("metal", "cuda", "cuda-gibbs", "modal", "METAL"):
+        assert MinerType.from_kind(backend) == MinerType.GPU
+
+
 def test_miner_type_from_kind_unknown_raises():
     with pytest.raises(ValueError, match="unknown miner kind"):
         MinerType.from_kind("fpga")
