@@ -167,6 +167,20 @@ class ProblemView(_RingView):
         return {"slots": self._ring.slots, "n_nodes": self.n_nodes,
                 "n_edges": self.n_edges, "names": self._ring.names}
 
+    def recycling_attach_args(self) -> dict:
+        """Attach kwargs INCLUDING the shared free-list, for a recycling ring.
+
+        The QPU submitter split uses ProblemView as a recycling transport: the
+        feeder driver (A) claims slots, the submitter (B) releases them back.
+        Both must share the owner's free-list, so unlike :meth:`attach_args`
+        (write-once, free-q omitted) this carries ``free_q``. Only valid to send
+        via ``Process(args=...)`` spawn inheritance — an ``mp.Queue`` can't ride
+        a live ``Queue.put``.
+        """
+        return {"slots": self._ring.slots, "n_nodes": self.n_nodes,
+                "n_edges": self.n_edges, "names": self._ring.names,
+                "free_q": self._ring.free_q}
+
     # ── problem layout ───────────────────────────────────────────────────
     def write(self, slot: int, h: np.ndarray, j: np.ndarray) -> None:
         """Copy the ``h`` (f64) + ``J`` (f64) vectors into the slot.

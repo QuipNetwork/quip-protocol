@@ -40,7 +40,8 @@ class _FakeSampler:
         pass
 
 
-def _fake_builder(spec, nodes, edges, buffer_size, allowed_h=None):
+def _fake_builder(spec, nodes, edges, buffer_size, allowed_h=None,
+                  prep_fn=None, prep_args=()):
     return _FakeFeeder()
 
 
@@ -112,7 +113,8 @@ def test_sampler_kwargs_must_not_shadow_round_params():
 def test_kind_change_rebuilds_and_stops_old_feeder():
     built = []
 
-    def _builder(spec, nodes, edges, buffer_size, allowed_h=None):
+    def _builder(spec, nodes, edges, buffer_size, allowed_h=None,
+                 prep_fn=None, prep_args=()):
         f = _FakeFeeder()
         built.append(f)
         return f

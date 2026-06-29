@@ -42,6 +42,42 @@ def _make_feeder(**kwargs):
 _NONCE_BYTES_42 = (42).to_bytes(32, "big")
 
 
+class TestFeederPrepHook:
+    """The prep_fn hook runs in the spawn worker and replaces the buffered item."""
+
+    def test_pow_feeder_with_prepare_reduced_yields_reduced_problem(self):
+        from shared.problem_prep import (
+            ReducedProblem,
+            live_topology,
+            prepare_reduced,
+        )
+
+        live_nodes, live_edges = live_topology(_NODES, _EDGES, [], set())
+        feeder = _make_feeder(
+            prep_fn=prepare_reduced,
+            prep_args=([], set(), live_nodes, live_edges),
+        )
+        try:
+            item = feeder.pop_blocking()
+        finally:
+            feeder.stop()
+
+        # The worker post-processed the IsingModel into a ReducedProblem.
+        assert isinstance(item, ReducedProblem)
+        assert item.h_vec.shape == (len(_NODES),)
+        assert item.j_vec.shape == (len(_EDGES),)
+        assert item.defect_info is None          # no defects in this topology
+        assert len(item.nonce) == 32 and len(item.salt) == 32
+
+    def test_no_prep_fn_yields_plain_ising_model(self):
+        feeder = _make_feeder()
+        try:
+            item = feeder.pop_blocking()
+        finally:
+            feeder.stop()
+        assert isinstance(item, IsingModel)
+
+
 class TestDefaultMaxWorkers:
     """Auto-scaling of the generator pool to the node's core count."""
 
