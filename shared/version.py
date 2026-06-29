@@ -39,7 +39,7 @@ def get_version() -> str:
             # Keep in lockstep with pyproject.toml's version so a source-run
             # miner advertises the same major.minor and isn't rejected by the
             # version-compat gate.
-            __version__ = "0.2.1rc20"
+            __version__ = "0.2.1rc21"
 
     return __version__
 

@@ -45,8 +45,11 @@ from substrate.types import SubstrateDifficulty
 
 # Mirrors `pallets/quantum-pow/src/difficulty.rs`.
 DECAY_RATE_MILLI: int = 25
-MIN_DECAY_DELTA_MILLI: int = 3
-MIN_HARDENING_DELTA_MILLI: int = 5
+# Unified floor (runtime 110 `MIN_ENERGY_DELTA_MILLI`): one energy unit in milli.
+# The geometric step `room * rate` rounds toward zero near a bound; the floor
+# guarantees forward progress (and, for hardening past the hard cap, carries the
+# threshold one step further down).
+MIN_ENERGY_DELTA_MILLI: int = 1000
 
 # i64 saturation bounds. Used so ``saturating_add``/``saturating_sub``
 # match the Rust exactly; in practice ``max_energy_milli`` lives in the
@@ -122,56 +125,46 @@ def adjust_energy_along_curve(
     curve: EnergyCurve,
     min_delta_milli: int,
 ) -> int:
-    """Move ``current_milli`` along the curve by ``rate_milli`` per-mille.
+    """Move ``current_milli`` toward the bound implied by ``direction`` by a
+    geometric fraction of the distance *remaining* to that bound.
 
-    Mirrors ``adjust_energy_along_curve`` in
-    ``pallets/quantum-pow/src/difficulty.rs`` (Phase 1 port for the
-    Python miner). Behaviour at boundaries / degenerate inputs / the
-    ``min_delta_milli`` floor matches the Rust to the milli.
+    Mirrors the runtime-110 ``adjust_energy_along_curve`` in
+    ``pallets/quantum-pow/src/difficulty.rs`` to the milli. The step is
+    ``round(room * rate)`` floored at ``min_delta_milli``, where ``room`` is the
+    gap to the target bound. Because ``rate < 1`` the threshold *walks* toward
+    the bound a fraction of the remaining gap at a time — a single fast win can
+    no longer slam across the whole range and pin the cap.
 
-    A degenerate curve (``total_range <= 0``) leaves ``current`` alone.
-    A current value outside ``[min, max]`` falls back to linear motion
-    (``total_range * rate``). Otherwise the curve compresses motion
-    near the boundaries and peaks at the knee, per the same sqrt
-    schedule.
+    The two directions are deliberately asymmetric (the curve bounds are GSE
+    *estimates*, not hard limits):
+
+    - ``HARDER`` references ``min_milli`` but is **uncapped**: once at/past it
+      (``room <= 0``) the geometric term vanishes and the floor carries the
+      threshold one further step down, so it keeps tracking a
+      stronger-than-calibrated field.
+    - ``EASIER`` references ``max_milli`` and is **capped** there: the step is
+      clamped to the remaining gap and is a no-op once at/past the easy cap.
+
+    A degenerate curve (``max_milli <= min_milli``) leaves ``current`` alone.
     """
-    min_f = float(curve.min_milli)
-    max_f = float(curve.max_milli)
-    knee_f = float(curve.knee_milli)
-    cur_f = float(current_milli)
-    total_range = max_f - min_f
+    if curve.max_milli <= curve.min_milli:
+        return current_milli
     rate = float(rate_milli) / 1000.0
 
-    if total_range <= 0.0:
-        return current_milli
-
-    if cur_f < min_f or cur_f > max_f:
-        raw_delta_f = total_range * rate
-    else:
-        normalized = (cur_f - min_f) / total_range
-        knee_pos = (knee_f - min_f) / total_range
-        if knee_pos <= 0.0 or knee_pos >= 1.0:
-            curve_factor = 1.0
-        elif normalized <= knee_pos:
-            curve_factor = 0.1 + 0.9 * math.sqrt(normalized / knee_pos)
-        else:
-            curve_factor = 1.0 - 0.9 * math.sqrt(
-                (normalized - knee_pos) / (1.0 - knee_pos)
-            )
-        raw_delta_f = total_range * rate * curve_factor
-
-    delta = _libm_round(raw_delta_f)
-    # Floor on the raw float, not the rounded int — see Rust comment:
-    # a raw_delta_f in (0, 0.5) rounds to 0, which would skip the floor
-    # and stall difficulty progress.
-    if raw_delta_f > 0.0 and delta < min_delta_milli:
-        delta = min_delta_milli
-    if delta == 0:
-        return current_milli
+    def geometric_floored(room: int) -> int:
+        # round(room * rate) saturated to i64, then floored at min_delta_milli.
+        return max(_to_i64(_libm_round(room * rate)), min_delta_milli)
 
     if direction is Direction.HARDER:
-        return _saturating_sub(current_milli, delta)
-    return _saturating_add(current_milli, delta)
+        # Uncapped: room may be <= 0 below the hard estimate, where the floor
+        # alone advances the threshold one step further down.
+        room = _saturating_sub(current_milli, curve.min_milli)
+        return _saturating_sub(current_milli, geometric_floored(room))
+    # EASIER: capped at the easy cap — never ease past max_milli.
+    room = _saturating_sub(curve.max_milli, current_milli)
+    if room <= 0:
+        return current_milli
+    return _saturating_add(current_milli, min(geometric_floored(room), room))
 
 
 def apply_decay(
@@ -193,7 +186,7 @@ def apply_decay(
             DECAY_RATE_MILLI,
             Direction.EASIER,
             curve,
-            MIN_DECAY_DELTA_MILLI,
+            MIN_ENERGY_DELTA_MILLI,
         )
     return SubstrateDifficulty(
         min_solutions=current.min_solutions,
@@ -248,7 +241,7 @@ def build_decay_schedule(
     cur = base_max_energy_milli
     for _ in range(horizon):
         cur = adjust_energy_along_curve(
-            cur, DECAY_RATE_MILLI, Direction.EASIER, curve, MIN_DECAY_DELTA_MILLI,
+            cur, DECAY_RATE_MILLI, Direction.EASIER, curve, MIN_ENERGY_DELTA_MILLI,
         )
         sched.append(cur)
     return sched
@@ -288,6 +281,20 @@ def _saturating_add(a: int, b: int) -> int:
 
 def _saturating_sub(a: int, b: int) -> int:
     return _saturating_add(a, -b)
+
+
+def _to_i64(x: int) -> int:
+    """Saturating cast to i64, matching Rust's ``f64 as i64`` clamp.
+
+    The geometric step rounds a float then casts; for realistic curves the
+    value is tiny, but the genesis ``i64::MAX`` sentinel and extreme curves
+    must clamp rather than overflow.
+    """
+    if x > _I64_MAX:
+        return _I64_MAX
+    if x < _I64_MIN:
+        return _I64_MIN
+    return x
 
 
 # Empirical SA alignment-efficiency factor for the field term, calibrated
@@ -383,8 +390,7 @@ def _expected_gse_with_c(num_nodes: int, num_edges: int, c: float) -> int:
 
 __all__ = [
     "DECAY_RATE_MILLI",
-    "MIN_DECAY_DELTA_MILLI",
-    "MIN_HARDENING_DELTA_MILLI",
+    "MIN_ENERGY_DELTA_MILLI",
     "Direction",
     "EnergyCurve",
     "adjust_energy_along_curve",
