@@ -31,10 +31,10 @@ class TestDefaultSubmitWorkers:
     @pytest.mark.parametrize(
         "cpu,queue_depth,expected",
         [
-            (4, 30, 8),   # the deployed 4-core node: 16->8, frees CPU for gen
-            (8, 30, 16),  # bigger box keeps full concurrency
-            (4, 4, 4),    # shallow queue caps below cpu*2
-            (1, 30, 2),   # single-core floor
+            (4, 30, 4),   # the deployed 4-core node: capped at cpu, frees gen cores
+            (8, 30, 8),   # bigger box: more submit threads
+            (4, 2, 2),    # shallow queue caps below cpu
+            (1, 30, 1),   # single-core floor
         ],
     )
     def test_scales_with_cpu_capped_at_queue_depth(
@@ -45,7 +45,7 @@ class TestDefaultSubmitWorkers:
 
     def test_unknown_cpu_count_falls_back_to_eight(self, monkeypatch):
         monkeypatch.setattr("os.cpu_count", lambda: None)
-        assert _default_submit_workers(30) == 16
+        assert _default_submit_workers(30) == 8
 
 
 @pytest.fixture(autouse=True)

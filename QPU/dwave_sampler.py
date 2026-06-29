@@ -1,5 +1,6 @@
 """D-Wave QPU sampler wrapper and configuration for quantum blockchain mining."""
 
+import base64
 import logging
 import os
 import time
@@ -13,7 +14,9 @@ from typing import (
 import collections.abc
 import numpy as np
 import dimod
+import orjson
 from dwave.cloud.computation import Future
+from dwave.cloud.concurrency import Present
 from dwave.embedding import embed_bqm, unembed_sampleset
 from dwave.system import DWaveSampler, FixedEmbeddingComposite
 from dwave_topologies.embedding_loader import get_embedding_dict, embedding_exists
@@ -35,20 +38,17 @@ from shared.problem_prep import (  # noqa: F401  (DefectInfo re-exported)
 logger = logging.getLogger(__name__)
 
 def _default_submit_workers(queue_depth: int) -> int:
-    """Concurrent in-flight submissions, scaled to the node.
+    """Concurrent submit threads, scaled to the node.
 
-    On CPU-constrained nodes the SDK's ``sample_bqm`` blocks ~seconds per call
-    (synchronous encode/upload); running those on a pool lets many proceed at
-    once (threads release the GIL during the SDK's socket I/O) instead of the
-    pump's single fill loop serializing them.
-
-    Capped at ``cpu_count * 2`` (never above ``queue_depth``): a fixed 16
-    threads on a 4-core node out-scheduled the feeder's generator *processes*,
-    starving model generation (``ready=0``, multi-second ``pop_blocking``
-    waits). Scaling the cap with the node keeps submission concurrent without
-    crowding out generation.
+    With the vectorized ``_submit_qp`` path the per-submit work is ~ms (encode +
+    orjson + an enqueue-only ``client._submit``), not the old ~seconds of
+    dimod/dict building, so only a little concurrency is needed to overlap it.
+    Capped at ``cpu_count`` (never above ``queue_depth``) rather than the old
+    ``cpu_count * 2``: on a 4-core node, fewer submit threads leave cores for the
+    feeder driver's generator processes (which were starving — ``ready=0``,
+    multi-second ``pop_blocking`` waits — while 8 submit threads thrashed).
     """
-    return max(1, min(queue_depth, (os.cpu_count() or 8) * 2))
+    return max(1, min(queue_depth, os.cpu_count() or 8))
 
 
 def _wait_for_completions(futures, *, min_done, timeout):
@@ -140,6 +140,68 @@ class EmbeddedFuture:
 
 # Type definitions to match base_miner
 Variable = collections.abc.Hashable
+
+
+class QPEncoder:
+    """Vectorized D-Wave ``qp`` encoder for a fixed (solver, live-topology).
+
+    Reproduces ``dwave.cloud.coders.encode_problem_as_qp`` **byte-for-byte** for
+    the native (no-embedding) Ising path, but straight from the feeder's dense
+    ``float64`` arrays — no per-submit Python dict / dimod object building. That
+    object building (``rebuild_ising`` + ``from_ising`` + the SDK's dict
+    extraction + its ~46k-term comprehensions, all GIL-held) was ~35ms+/submit on
+    a fast box and stacked to ~11s across the submit threads on the slow node.
+    This precomputes the encoding-order index maps once; :meth:`encode` is then a
+    couple of vectorized numpy gathers + base64 (~0.5ms), so it no longer
+    bottlenecks on CPU.
+
+    The arrays come in ``live_nodes``/``live_edges`` order (the feeder's reduced
+    layout); the wire wants ``solver._encoding_qubits``/``_encoding_couplers``
+    order with NaN for inactive (non-live) qubits and 0 for live coupler pairs
+    that aren't problem edges. ``test_qp_encoder`` asserts byte-identity against
+    the SDK encoder so this can never silently diverge from consensus.
+    """
+
+    def __init__(self, encoding_qubits, encoding_couplers, live_nodes, live_edges):
+        active = set(live_nodes)
+        live_pos = {int(n): i for i, n in enumerate(live_nodes)}
+        # lin: encoding-qubit order; active qubit -> its h_vec slot, else NaN.
+        self._n_qubits = len(encoding_qubits)
+        active_enc = [i for i, q in enumerate(encoding_qubits) if q in active]
+        self._lin_dst = np.array(active_enc, dtype=np.intp)
+        self._lin_src = np.array(
+            [live_pos[int(encoding_qubits[i])] for i in active_enc], dtype=np.intp,
+        )
+        # quad: active-active encoding_couplers in order; problem edge -> its
+        # j_vec slot, else -1 (encoded as 0.0). Matches the SDK's undirected get.
+        edge_pos: Dict[Tuple[int, int], int] = {}
+        for k, (u, v) in enumerate(live_edges):
+            edge_pos[(int(u), int(v))] = k
+            edge_pos[(int(v), int(u))] = k
+        quad_src = [
+            edge_pos.get((int(q1), int(q2)), -1)
+            for (q1, q2) in encoding_couplers
+            if q1 in active and q2 in active
+        ]
+        self._quad_src = np.array(quad_src, dtype=np.intp)
+        self._n_quad = len(quad_src)
+        self._quad_mask = self._quad_src >= 0
+
+    def encode(self, h_vec: np.ndarray, j_vec: np.ndarray, offset: float = 0.0) -> dict:
+        """Return the SAPI ``qp`` data dict for the given reduced arrays."""
+        lin = np.full(self._n_qubits, np.nan, dtype="<f8")
+        lin[self._lin_dst] = np.asarray(h_vec, dtype=np.float64)[self._lin_src]
+        quad = np.zeros(self._n_quad, dtype="<f8")
+        if self._n_quad:
+            quad[self._quad_mask] = np.asarray(
+                j_vec, dtype=np.float64
+            )[self._quad_src[self._quad_mask]]
+        return {
+            "format": "qp",
+            "lin": base64.b64encode(lin.astype("<f8").tobytes()).decode("utf-8"),
+            "quad": base64.b64encode(quad.astype("<f8").tobytes()).decode("utf-8"),
+            "offset": offset,
+        }
 
 
 class DWaveSamplerWrapper:
@@ -379,6 +441,21 @@ class DWaveSamplerWrapper:
         self.live_nodes, self.live_edges = live_topology(
             self.nodes, self.edges, self._defective_qubits, self._defective_edges
         )
+
+        # Fast-submit encoder for the native (no-embedding) path: precompute the
+        # live->encoding-order maps so each streaming submit skips dimod/dict
+        # building entirely. Only built when there's no embedding (the deployed
+        # native-topology case) and the cloud solver exposes its encoding order;
+        # otherwise _submit_prepared falls back to the dimod path.
+        self._qp_encoder: Optional[QPEncoder] = None
+        if self.embedding is None:
+            solver = getattr(self.qpu_solver, "solver", None)
+            enc_q = getattr(solver, "_encoding_qubits", None)
+            enc_c = getattr(solver, "_encoding_couplers", None)
+            if enc_q is not None and enc_c is not None:
+                self._qp_encoder = QPEncoder(
+                    enc_q, enc_c, self.live_nodes, self.live_edges,
+                )
 
     def close(self):
         """Release QPU connection resources.
@@ -827,6 +904,13 @@ class DWaveSamplerWrapper:
             kwargs['label'] = self.job_label
         chain_strength_multiplier = kwargs.pop('chain_strength_multiplier', 1.5)
 
+        # Fast path (native topology): encode the reduced arrays straight to the
+        # SAPI wire and submit — no dimod/dict object building (the GIL-bound
+        # ~35ms+/submit that stacked to ~11s across submit threads on the slow
+        # node). Byte-identical to the dimod path (see QPEncoder / test_qp_encoder).
+        if self.embedding is None and self._qp_encoder is not None:
+            return self._submit_qp(h_vec, j_vec, **kwargs)
+
         h, J = rebuild_ising(h_vec, j_vec, self.live_nodes, self.live_edges)
         bqm = dimod.BinaryQuadraticModel.from_ising(h, J)
 
@@ -844,6 +928,57 @@ class DWaveSamplerWrapper:
                 chain_strength=chain_strength,
             )
         return self.qpu_solver.solver.sample_bqm(bqm, **kwargs)
+
+    def _submit_qp(
+        self,
+        h_vec: np.ndarray,
+        j_vec: np.ndarray,
+        *,
+        num_reads: int,
+        answer_mode: str = "raw",
+        annealing_time: Optional[float] = None,
+        label: Optional[str] = None,
+        offset: float = 0.0,
+        **extra: Any,
+    ) -> 'Future':
+        """Submit a reduced problem via the vectorized ``qp`` encoder.
+
+        Replicates ``StructuredSolver._sample`` (body + params + Future +
+        ``client._submit``) but with :class:`QPEncoder` producing the ``data``
+        dict from numpy arrays — skipping ``check_problem`` and all dict/dimod
+        building. ``client._submit`` only enqueues, so this returns in ~ms. The
+        offset stays 0: the defect-clamp energy offset is applied later during
+        reconstruction (it never goes on the wire), matching the dimod path.
+
+        Returns:
+            The cloud :class:`~dwave.cloud.computation.Future` (raw, no embedding
+            — this path runs only when ``self.embedding is None``).
+        """
+        solver = self.qpu_solver.solver
+        params: Dict[str, Any] = {"num_reads": int(num_reads), "answer_mode": answer_mode}
+        if annealing_time is not None:
+            params["annealing_time"] = annealing_time
+        params.update(extra)
+        combined = dict(solver._params)
+        combined.update(params)
+        solver._format_params("ising", combined)
+
+        body_dict: Dict[str, Any] = {
+            "solver": solver.identity.dict(),
+            "data": self._qp_encoder.encode(h_vec, j_vec, offset),
+            "type": "ising",
+            "params": combined,
+        }
+        if label is not None:
+            body_dict["label"] = label
+        body_data = orjson.dumps(body_dict, option=orjson.OPT_SERIALIZE_NUMPY)
+        body = Present(result=body_data)
+        computation = Future(
+            solver=solver, id_=None, return_matrix=solver.return_matrix,
+        )
+        computation._offset = offset
+        solver.client._submit(body, computation)
+        return computation
 
     def sample_ising_streaming(
         self,
