@@ -22,6 +22,13 @@ if TYPE_CHECKING:
     from shared.miner_types import BlockRequirements
 
 
+# GPU sampler backends collapse to the GPU hardware class. The on-chain
+# ``MinerKind`` taxonomy is cpu/gpu/qpu — not the sampler backend the miner
+# runs (metal/cuda/cuda-gibbs/modal). Keep in sync with
+# ``shared.miner_survey._GPU_KINDS`` (plus the canonical ``"gpu"``).
+_GPU_BACKEND_KINDS = frozenset({"gpu", "cuda", "cuda-gibbs", "metal", "modal"})
+
+
 class MinerType(IntEnum):
     """Solver hardware family. Matches `types::MinerType` SCALE enum order."""
 
@@ -40,11 +47,15 @@ class MinerType(IntEnum):
         Used by the `register-solver` subcommand so operators don't need
         to know about the QPU vendor variants — `qpu` defaults to
         QpuDwave to match the legacy CPU/GPU/QPU triplet.
+
+        Sampler backends (`metal`/`cuda`/`cuda-gibbs`/`modal`) collapse to
+        the GPU class: the participation marker reports the running backend,
+        but the on-chain taxonomy only distinguishes cpu/gpu/qpu.
         """
         normalized = kind.lower()
         if normalized == "cpu":
             return cls.CPU
-        if normalized == "gpu":
+        if normalized in _GPU_BACKEND_KINDS:
             return cls.GPU
         if normalized in ("qpu", "qpu_dwave", "dwave"):
             return cls.QPU_DWAVE
