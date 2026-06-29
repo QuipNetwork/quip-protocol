@@ -11,11 +11,35 @@ pump contract (queue depth, defect_info attachment, cancel-on-close).
 from __future__ import annotations
 
 import multiprocessing as mp
+import time as _time
 from typing import Any, List, Optional, Tuple
 
 import dimod
+import pytest
 
 from QPU.dwave_sampler import DefectInfo, DWaveSamplerWrapper
+
+
+@pytest.fixture(autouse=True)
+def _patch_wait_for_completions(monkeypatch):
+    """Drive the pump's wait seam with a done()-poll over the fake futures.
+
+    Production blocks via ``Future.wait_multiple``, which needs real cloud
+    Future event machinery the fakes don't have. This emulates its
+    ``(done, remaining)`` contract: block up to ``timeout``, returning early
+    once ``min_done`` fakes report ``done()``.
+    """
+    def _fake_wait(futures, *, min_done, timeout):
+        deadline = _time.time() + (timeout or 0.0)
+        while True:
+            done = [f for f in futures if f.done()]
+            if len(done) >= (min_done or 1) or _time.time() >= deadline:
+                return done, [f for f in futures if not f.done()]
+            _time.sleep(0.005)
+
+    monkeypatch.setattr(
+        "QPU.dwave_sampler._wait_for_completions", _fake_wait
+    )
 
 
 # ---------------------------------------------------------------------------

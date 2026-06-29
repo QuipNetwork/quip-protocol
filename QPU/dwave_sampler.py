@@ -2,14 +2,14 @@
 
 import logging
 import os
-import time
 from typing import (
-    Dict, Iterator, List, Optional, Sequence, Tuple, TYPE_CHECKING,
+    Dict, Iterator, List, Optional, Sequence, Tuple,
     Any, Union, Mapping, cast,
 )
 import collections.abc
 import numpy as np
 import dimod
+from dwave.cloud.computation import Future
 from dwave.embedding import embed_bqm, unembed_sampleset
 from dwave.system import DWaveSampler, FixedEmbeddingComposite
 from dwave_topologies.embedding_loader import get_embedding_dict, embedding_exists
@@ -18,8 +18,27 @@ from dwave_topologies.topologies.dwave_topology import DWaveTopology
 
 logger = logging.getLogger(__name__)
 
-if TYPE_CHECKING:
-    from dwave.cloud.computation import Future
+
+def _wait_for_completions(futures, *, min_done, timeout):
+    """Block until at least ``min_done`` of ``futures`` complete.
+
+    Thin wrapper over :meth:`dwave.cloud.computation.Future.wait_multiple` so
+    the streaming pump blocks on an event (releasing the GIL) instead of
+    busy-polling ``future.done()`` — a spin loop here starves the dwave-client's
+    single-threaded problem encoder on CPU-constrained nodes, serializing
+    submission. Isolated as a module function so unit tests can substitute a
+    ``done()``-poll over lightweight fake futures.
+
+    Args:
+        futures: Raw cloud Future objects to await.
+        min_done: Return once this many have completed.
+        timeout: Maximum seconds to block before returning (bounds stop-event
+            responsiveness; does not spin).
+
+    Returns:
+        ``(done, remaining)`` lists, as ``Future.wait_multiple`` returns.
+    """
+    return Future.wait_multiple(futures, min_done=min_done, timeout=timeout)
 
 
 class EmbeddedFuture:
@@ -926,18 +945,34 @@ class DWaveSamplerWrapper:
                 ):
                     _try_submit_one()
 
-                # Poll for the next completed future.
+                # Wait (without spinning) for the next completion. A 5ms
+                # busy-poll here pins the GIL/CPU and starves the dwave-client's
+                # single-threaded problem encoder on CPU-constrained nodes, so
+                # problems trickle to the QPU ~serially instead of filling the
+                # queue. ``Future.wait_multiple`` blocks on an event and
+                # releases the GIL, letting the encode/submit/poll threads run.
+                # ``timeout`` only bounds stop-event responsiveness; it does not
+                # spin. ``pending`` keys on the (possibly EmbeddedFuture)
+                # wrapper, but wait_multiple needs the raw cloud Future, so map
+                # raw -> pending key and unwrap.
                 completed_id: Optional[int] = None
                 while completed_id is None and not _stopped():
+                    raw_to_pending: Dict[int, int] = {}
+                    raw_futures = []
                     for fid, (_, fut, _, _) in pending.items():
-                        if fut.done():
-                            completed_id = fid
+                        raw = getattr(fut, "_future", fut)
+                        raw_to_pending[id(raw)] = fid
+                        raw_futures.append(raw)
+                    done, _remaining = _wait_for_completions(
+                        raw_futures, min_done=1, timeout=0.5,
+                    )
+                    for finished in done:
+                        completed_id = raw_to_pending.get(id(finished))
+                        if completed_id is not None:
                             break
-                    if completed_id is None:
-                        time.sleep(0.005)
 
                 if completed_id is None:
-                    # stop_event fired while polling.
+                    # stop_event fired while waiting.
                     _cancel_all()
                     return
 
