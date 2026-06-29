@@ -22,11 +22,21 @@ from dwave_topologies.topologies.dwave_topology import DWaveTopology
 
 logger = logging.getLogger(__name__)
 
-# Concurrent in-flight submissions. On CPU-constrained nodes the SDK's
-# sample_bqm blocks ~seconds per call (synchronous encode/upload); running
-# those on a pool lets many proceed at once (threads release the GIL during
-# the SDK's socket I/O) instead of the pump's single fill loop serializing them.
-_SUBMIT_WORKER_COUNT = 16
+def _default_submit_workers(queue_depth: int) -> int:
+    """Concurrent in-flight submissions, scaled to the node.
+
+    On CPU-constrained nodes the SDK's ``sample_bqm`` blocks ~seconds per call
+    (synchronous encode/upload); running those on a pool lets many proceed at
+    once (threads release the GIL during the SDK's socket I/O) instead of the
+    pump's single fill loop serializing them.
+
+    Capped at ``cpu_count * 2`` (never above ``queue_depth``): a fixed 16
+    threads on a 4-core node out-scheduled the feeder's generator *processes*,
+    starving model generation (``ready=0``, multi-second ``pop_blocking``
+    waits). Scaling the cap with the node keeps submission concurrent without
+    crowding out generation.
+    """
+    return max(1, min(queue_depth, (os.cpu_count() or 8) * 2))
 
 
 def _wait_for_completions(futures, *, min_done, timeout):
@@ -1005,7 +1015,7 @@ class DWaveSamplerWrapper:
                 submit_max_s * 1000.0,
             )
 
-        submit_workers = max(1, min(queue_depth, _SUBMIT_WORKER_COUNT))
+        submit_workers = _default_submit_workers(queue_depth)
         submit_pool = ThreadPoolExecutor(
             max_workers=submit_workers, thread_name_prefix="qpu-submit",
         )
