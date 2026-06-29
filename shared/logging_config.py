@@ -207,6 +207,36 @@ def init_component_logger(component: str, identifier: str) -> logging.Logger:
     return logger
 
 
+def setup_child_process_logging(log_queue=None) -> None:
+    """Configure the root logger inside a spawned child process.
+
+    Spawn-context children start with a fresh interpreter and no inherited
+    handlers, so without this their root logger falls back to ``lastResort``
+    (WARNING+ only) and every INFO diagnostic is silently dropped. Every
+    long-lived child (miner worker, QPU stream driver) must call this at entry.
+
+    Args:
+        log_queue: Shared multiprocessing queue drained by ``log_writer_main``.
+            When provided, records route there via ``QueueHandler`` at DEBUG so
+            the central writer owns formatting/rotation. When ``None``, attach a
+            local ``StreamHandler`` with ``QuipFormatter`` at INFO (standalone
+            tooling without a central writer).
+    """
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    if log_queue is not None:
+        queue_handler = logging.handlers.QueueHandler(log_queue)
+        root_logger.addHandler(queue_handler)
+        root_logger.setLevel(logging.DEBUG)
+    else:
+        handler = logging.StreamHandler()
+        handler.setFormatter(QuipFormatter())
+        root_logger.addHandler(handler)
+        root_logger.setLevel(logging.INFO)
+
+
 def log_writer_main(log_queue, stop_event, log_file_path, level) -> None:
     """Sole owner of the file/console log handlers; drains the shared queue.
 

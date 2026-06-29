@@ -367,6 +367,20 @@ class DWaveMiner(BaseMiner):
             )
         return True
 
+    def _participation_extra(self) -> dict:
+        """Record the QPU runway committed to this solution in the marker.
+
+        Called once per accepted dispatch (the budget gate has already passed,
+        so the pool holds at least the configured buffer). Returns the current
+        pool in whole seconds as ``budget_seconds`` so the controller's
+        participation extrinsic carries the QPU time backing this solution.
+        Returns ``{}`` when no budget is configured (the base no-op).
+        """
+        if self.time_manager is None:
+            return {}
+        pool_seconds = self.time_manager.get_stats().get("pool_seconds", 0.0)
+        return {"budget_seconds": int(pool_seconds)}
+
     def _midstream_budget_ok(
         self, solution_number: int,
     ) -> Optional[MidstreamBudget]:

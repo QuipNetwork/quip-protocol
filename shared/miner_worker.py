@@ -13,32 +13,14 @@ It constructs the correct concrete miner from a simple picklable spec dict:
 from __future__ import annotations
 
 import logging
-import logging.handlers
 import multiprocessing as mp
 import multiprocessing.synchronize as mpsync
 import traceback
 from typing import Any, Dict, Optional
 
-from shared.logging_config import QuipFormatter
+from shared.logging_config import setup_child_process_logging
 
 logger = logging.getLogger(__name__)
-
-
-def _setup_child_process_logging(log_queue=None):
-    """Set up logging for child processes to use QuipFormatter and optionally queue logging."""
-    root_logger = logging.getLogger()
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-
-    if log_queue is not None:
-        queue_handler = logging.handlers.QueueHandler(log_queue)
-        root_logger.addHandler(queue_handler)
-        root_logger.setLevel(logging.DEBUG)
-    else:
-        handler = logging.StreamHandler()
-        handler.setFormatter(QuipFormatter())
-        root_logger.addHandler(handler)
-        root_logger.setLevel(logging.INFO)
 
 # NOTE: the legacy `_signal_aware_mining_worker` (a dedicated per-attempt
 # child process used by `MinerHandle.mine_with_timeout`) was removed in
@@ -204,7 +186,7 @@ def miner_worker_main(
     ``substrate/miner_controller.py`` for the write site.
     """
     # Set up logging for child process
-    _setup_child_process_logging(log_queue)
+    setup_child_process_logging(log_queue)
     logger.info(f"Building miner: kind={spec.get('kind')}, id={spec.get('id')}")
     try:
         miner = build_miner_from_spec(spec)
@@ -215,6 +197,9 @@ def miner_worker_main(
     # Expose the shared threshold to the miner instance so mine_work_item
     # can read it each iteration without a queue round-trip.
     miner._live_max_energy_milli = live_max_energy_milli
+    # Forward the same log queue to the persistent stream-driver process so its
+    # producer-side diagnostics (stream depth, feeder pop-wait) aren't dropped.
+    miner._log_queue = log_queue
 
     while True:
         msg = req_q.get()

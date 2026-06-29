@@ -65,6 +65,18 @@ def test_midstream_budget_ok_passes_when_budget_available():
     assert status.stats["daily_budget_seconds"] == 1800.0
 
 
+def test_participation_extra_empty_without_time_manager():
+    miner = _dwave_with_time_manager(None)
+    assert miner._participation_extra() == {}
+
+
+def test_participation_extra_reports_pool_seconds_as_budget():
+    # Pool of 5.0s at dispatch must surface as the marker's budget_seconds so
+    # the participation extrinsic records the QPU runway backing this solution.
+    miner = _dwave_with_time_manager(_FakeTimeManager(should_mine=True))
+    assert miner._participation_extra() == {"budget_seconds": 5}
+
+
 def test_midstream_budget_ok_stalls_and_logs_when_exhausted(caplog):
     tm = _FakeTimeManager(should_mine=False)
     miner = _dwave_with_time_manager(tm)

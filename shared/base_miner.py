@@ -155,6 +155,9 @@ class _DispatchSetup:
     # Round generation this dispatch accepts; descriptors tagged with any
     # other generation are stale and dropped by the consumer.
     generation: int = 0
+    # Anneal duration (µs) for QPU dispatches; ``None`` for sweep-based
+    # backends (SA/Metal). Drives the backend-aware progress log knob.
+    anneal_time: Optional[float] = None
 
 
 @dataclass
@@ -362,6 +365,10 @@ class BaseMiner(ABC):
         self._ctl_q: Optional[Any] = None
         self._driver_stop: Optional[Any] = None
         self._driver_proc: Optional[Any] = None
+        # Shared log queue forwarded to the spawned stream-driver process so its
+        # producer-side INFO diagnostics route to the central writer instead of
+        # being dropped. Set by miner_worker_main; None for standalone tooling.
+        self._log_queue: Optional[Any] = None
         # ProblemView written by _mempool_feeder_spec for the current mempool
         # order. The worker owns the shared memory; the driver reads it on the
         # switch. Replaced (and previous freed) on each mempool dispatch;
@@ -886,19 +893,25 @@ class BaseMiner(ABC):
                     budget = self._midstream_budget_ok(
                         loop_state.solution_number_for_log,
                     )
+                    # Backend-aware knob: QPU dispatches anneal (no sweeps);
+                    # SA/Metal sweep. Showing sweeps=64 for QPU was a stale
+                    # default leaking from the SA-centric format.
+                    knob = self._progress_knob(
+                        setup.anneal_time, setup.num_sweeps,
+                    )
                     if budget is None:
                         self.logger.info(
                             "mine_work_item progress: %d attempts | "
-                            "sweeps=%d reads=%d",
-                            progress, setup.num_sweeps, setup.num_reads,
+                            "%s reads=%d",
+                            progress, knob, setup.num_reads,
                         )
                     else:
                         s = budget.stats
                         self.logger.info(
                             "mine_work_item progress: %d attempts | "
-                            "sweeps=%d reads=%d | qpu_pool=%.2fs/%.2fs cap "
+                            "%s reads=%d | qpu_pool=%.2fs/%.2fs cap "
                             "(buffer %.0fs) burst=%s used=%.2fs skipped=%d",
-                            progress, setup.num_sweeps, setup.num_reads,
+                            progress, knob, setup.num_reads,
                             s.get("pool_seconds", 0.0),
                             s.get("pool_cap_seconds", 0.0),
                             s.get("min_block_budget_seconds", 0.0),
@@ -924,6 +937,19 @@ class BaseMiner(ABC):
             return None
         finally:
             self._teardown_dispatch()
+
+    @staticmethod
+    def _progress_knob(anneal_time: Optional[float], num_sweeps: int) -> str:
+        """Format the backend-specific tuning knob for the progress log.
+
+        QPU dispatches carry an anneal duration and never sweep, so reporting
+        ``sweeps=N`` for them is misleading (it's a stale SA-centric default).
+        Returns ``anneal=<µs>us`` when an anneal time is set, else
+        ``sweeps=<n>`` for sweep-based backends (SA/Metal).
+        """
+        if anneal_time is not None:
+            return f"anneal={anneal_time:.0f}us"
+        return f"sweeps={num_sweeps}"
 
     @staticmethod
     def _init_attempt_log_kwargs(
@@ -1200,6 +1226,7 @@ class BaseMiner(ABC):
             desc_q=self._desc_q,
             driver_proc=self._driver_proc,
             generation=generation,
+            anneal_time=sample_ctx["annealing_time"],
         )
 
     def _stream_factory_kwargs(
@@ -1248,7 +1275,7 @@ class BaseMiner(ABC):
         driver_proc = spawn_worker(
             stream_driver_main,
             (ring.attach_args(), desc_q, ctl_q, driver_stop,
-             self.STREAM_FACTORY_DOTTED, factory_kwargs),
+             self.STREAM_FACTORY_DOTTED, factory_kwargs, self._log_queue),
             name=f"qpu-stream-driver-{self.miner_id}",
             # Non-daemon: the driver's RandomIsingFeeder forks pool children,
             # which a daemon process is forbidden from doing. _close_driver
