@@ -3,6 +3,9 @@
 import logging
 import os
 import time
+from concurrent.futures import (
+    FIRST_COMPLETED, ThreadPoolExecutor, wait as futures_wait,
+)
 from typing import (
     Dict, Iterator, List, Optional, Sequence, Tuple,
     Any, Union, Mapping, cast,
@@ -18,6 +21,12 @@ from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies.dwave_topology import DWaveTopology
 
 logger = logging.getLogger(__name__)
+
+# Concurrent in-flight submissions. On CPU-constrained nodes the SDK's
+# sample_bqm blocks ~seconds per call (synchronous encode/upload); running
+# those on a pool lets many proceed at once (threads release the GIL during
+# the SDK's socket I/O) instead of the pump's single fill loop serializing them.
+_SUBMIT_WORKER_COUNT = 16
 
 
 def _wait_for_completions(futures, *, min_done, timeout):
@@ -913,109 +922,146 @@ class DWaveSamplerWrapper:
                 _best_effort_cancel_future(fut, fidx)
             pending.clear()
 
-        def _try_submit_one() -> None:
-            """Submit one model; sets feeder_exhausted on StopIteration."""
-            nonlocal job_index, feeder_exhausted
-            nonlocal submit_total_s, submit_n, submit_max_s
+        # Submission tasks running on the pool (each yields one QPU future).
+        submitting: set = set()
+
+        def _pop_model() -> Optional[Any]:
+            """Pop one model in the main thread; None when the feeder drained."""
+            nonlocal feeder_exhausted
             pop = getattr(models, "pop_blocking", None)
             try:
-                model = pop() if callable(pop) else next(models)  # type: ignore[call-overload]
+                return pop() if callable(pop) else next(models)  # type: ignore[call-overload]
             except StopIteration:
                 feeder_exhausted = True
-                return
-            submit_kwargs: Dict[str, Any] = {
+                return None
+
+        def _submit_job(model: Any, idx: int):
+            """Run the (possibly blocking) async-submit on a pool thread.
+
+            Returns ``(model, qpu_future, defect_info, idx, submit_seconds)``.
+            On CPU-constrained nodes ``sample_bqm`` blocks ~seconds in the
+            caller; running it here lets queue_depth submissions overlap.
+            """
+            kw: Dict[str, Any] = {
                 "num_reads": num_reads,
                 "answer_mode": "raw",
-                "label": f"{self.job_label}_s{job_index}",
+                "label": f"{self.job_label}_s{idx}",
                 "nonce_seed": model.nonce,
             }
             if annealing_time is not None:
-                submit_kwargs["annealing_time"] = annealing_time
-            _t = time.monotonic()
-            future, defect_info = self.sample_ising_async(
-                model.h, model.J, **submit_kwargs
+                kw["annealing_time"] = annealing_time
+            t = time.monotonic()
+            future, defect_info = self.sample_ising_async(model.h, model.J, **kw)
+            return model, future, defect_info, idx, time.monotonic() - t
+
+        def _harvest_submissions() -> None:
+            """Move finished submission tasks into pending; record submit cost."""
+            nonlocal submit_total_s, submit_n, submit_max_s
+            for tf in [t for t in submitting if t.done()]:
+                submitting.discard(tf)
+                if tf.cancelled():
+                    continue
+                try:
+                    model, future, defect_info, _idx, dt = tf.result()
+                except Exception as exc:  # noqa: BLE001 — one bad submit must not kill the pump
+                    logger.warning("QPU submission failed (dropped): %s", exc)
+                    continue
+                pending[id(future)] = (model, future, defect_info, _idx)
+                submit_total_s += dt
+                submit_n += 1
+                submit_max_s = max(submit_max_s, dt)
+
+        def _drain_submissions() -> None:
+            """On teardown, cancel queued submits and cancel any QPU futures the
+            running ones already produced (a running submit can't be interrupted,
+            so harvest + cancel its future to avoid leaking a submitted problem).
+            """
+            for tf in list(submitting):
+                tf.cancel()
+            futures_wait(submitting, timeout=2.0)
+            for tf in submitting:
+                if tf.done() and not tf.cancelled():
+                    try:
+                        _m, qf, _d, _i, _dt = tf.result()
+                        _best_effort_cancel_future(qf, -1)
+                    except Exception:  # noqa: BLE001 — best-effort cleanup
+                        pass
+
+        def _emit_diagnostic() -> None:
+            pop_stats = getattr(models, "stats", None)
+            if not callable(pop_stats):
+                return
+            fstats = pop_stats()
+            logger.info(
+                "[QPU] stream depth: in_flight=%d/%d submitting=%d "
+                "feeder_ready=%d/%d drained=%d wait_total=%.2fs "
+                "submit_mean=%.0fms submit_max=%.0fms",
+                len(pending), queue_depth, len(submitting),
+                fstats.get("ready", 0),
+                fstats.get("buffer_size", 0),
+                fstats.get("drained_count", 0),
+                fstats.get("pop_wait_total_s", 0.0),
+                (submit_total_s / submit_n * 1000.0) if submit_n else 0.0,
+                submit_max_s * 1000.0,
             )
-            _dt = time.monotonic() - _t
-            submit_total_s += _dt
-            submit_n += 1
-            submit_max_s = max(submit_max_s, _dt)
-            pending[id(future)] = (model, future, defect_info, job_index)
-            job_index += 1
 
+        submit_workers = max(1, min(queue_depth, _SUBMIT_WORKER_COUNT))
+        submit_pool = ThreadPoolExecutor(
+            max_workers=submit_workers, thread_name_prefix="qpu-submit",
+        )
         try:
-            # Fill to queue_depth before entering the poll loop.
-            while len(pending) < queue_depth and not _stopped() and not feeder_exhausted:
-                _try_submit_one()
-
-            while pending:
-                if _stopped():
-                    _cancel_all()
-                    return
-
-                # Fill any open slots (after a completion was popped below).
+            while not _stopped():
+                # Keep queue_depth problems in flight, counting both already
+                # submitted (pending) and in-progress submissions (submitting).
                 while (
-                    len(pending) < queue_depth
+                    len(pending) + len(submitting) < queue_depth
                     and not _stopped()
                     and not feeder_exhausted
                 ):
-                    _try_submit_one()
+                    model = _pop_model()
+                    if model is None:
+                        break
+                    submitting.add(submit_pool.submit(_submit_job, model, job_index))
+                    job_index += 1
 
-                # Wait (without spinning) for the next completion. A 5ms
-                # busy-poll here pins the GIL/CPU and starves the dwave-client's
-                # single-threaded problem encoder on CPU-constrained nodes, so
-                # problems trickle to the QPU ~serially instead of filling the
-                # queue. ``Future.wait_multiple`` blocks on an event and
-                # releases the GIL, letting the encode/submit/poll threads run.
-                # ``timeout`` only bounds stop-event responsiveness; it does not
-                # spin. ``pending`` keys on the (possibly EmbeddedFuture)
-                # wrapper, but wait_multiple needs the raw cloud Future, so map
-                # raw -> pending key and unwrap.
-                completed_id: Optional[int] = None
-                while completed_id is None and not _stopped():
-                    raw_to_pending: Dict[int, int] = {}
-                    raw_futures = []
-                    for fid, (_, fut, _, _) in pending.items():
-                        raw = getattr(fut, "_future", fut)
-                        raw_to_pending[id(raw)] = fid
-                        raw_futures.append(raw)
-                    done, _remaining = _wait_for_completions(
-                        raw_futures, min_done=1, timeout=0.5,
-                    )
-                    for finished in done:
-                        completed_id = raw_to_pending.get(id(finished))
-                        if completed_id is not None:
-                            break
+                _harvest_submissions()
 
-                if completed_id is None:
-                    # stop_event fired while waiting.
-                    _cancel_all()
-                    return
+                if not pending and not submitting:
+                    if feeder_exhausted:
+                        break
+                    continue
+                if not pending:
+                    # Only submissions in flight — wait for one to land, then
+                    # loop to harvest it (no QPU futures to wait on yet).
+                    futures_wait(submitting, timeout=0.5, return_when=FIRST_COMPLETED)
+                    continue
 
-                model, future, defect_info, _ = pending.pop(completed_id)
-                raw_ss = future.sampleset
-
-                # Attach defect_info so the consumer can reconstruct survivors.
-                raw_ss.info["defect_info"] = defect_info
-
-                # Periodic throughput diagnostic (operator observability).
-                if job_index % 50 == 0:
-                    pop_stats = getattr(models, "stats", None)
-                    if callable(pop_stats):
-                        fstats = pop_stats()
-                        logger.info(
-                            "[QPU] stream depth: in_flight=%d/%d "
-                            "feeder_ready=%d/%d drained=%d wait_total=%.2fs "
-                            "submit_mean=%.0fms submit_max=%.0fms",
-                            len(pending), queue_depth,
-                            fstats.get("ready", 0),
-                            fstats.get("buffer_size", 0),
-                            fstats.get("drained_count", 0),
-                            fstats.get("pop_wait_total_s", 0.0),
-                            (submit_total_s / submit_n * 1000.0) if submit_n else 0.0,
-                            submit_max_s * 1000.0,
-                        )
-
-                yield model, raw_ss
-
+                # Wait (GIL-released) for the next QPU completion. ``pending``
+                # keys on the (possibly EmbeddedFuture) wrapper, but
+                # wait_multiple needs the raw cloud Future, so map raw -> key.
+                raw_to_pending: Dict[int, int] = {}
+                raw_futures = []
+                for fid, (_, fut, _, _) in pending.items():
+                    raw = getattr(fut, "_future", fut)
+                    raw_to_pending[id(raw)] = fid
+                    raw_futures.append(raw)
+                done, _remaining = _wait_for_completions(
+                    raw_futures, min_done=1, timeout=0.5,
+                )
+                if _stopped():
+                    break
+                for finished in done:
+                    completed_id = raw_to_pending.get(id(finished))
+                    if completed_id is None:
+                        continue
+                    model, future, defect_info, _ = pending.pop(completed_id)
+                    raw_ss = future.sampleset
+                    # Attach defect_info so the consumer can reconstruct survivors.
+                    raw_ss.info["defect_info"] = defect_info
+                    if job_index % 50 == 0:
+                        _emit_diagnostic()
+                    yield model, raw_ss
         finally:
             _cancel_all()
+            _drain_submissions()
+            submit_pool.shutdown(wait=False)
