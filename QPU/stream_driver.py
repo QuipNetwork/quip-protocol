@@ -13,9 +13,12 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
+import os
 import pickle
 import queue as _queue
-from typing import Any, Dict
+import threading
+import time
+from typing import Any, Callable, Dict
 
 import numpy as np
 
@@ -28,6 +31,74 @@ log = logging.getLogger(__name__)
 def _resolve(dotted: str):
     module_name, _, attr = dotted.partition(":")
     return getattr(importlib.import_module(module_name), attr)
+
+
+def _parent_death_watchdog(
+    stop_event,
+    *,
+    original_ppid: int,
+    getppid: Callable[[], int] = os.getppid,
+    poll_s: float = 2.0,
+    grace_s: float = 5.0,
+    sleep: Callable[[float], None] = time.sleep,
+    hard_exit: Callable[[], None] = lambda: os._exit(0),
+) -> None:
+    """Stop the driver when its parent dies (orphan → keeps burning QPU).
+
+    The stream driver is a non-daemon spawn child holding a live D-Wave
+    connection. If the parent (miner worker) dies ungracefully — SIGKILL,
+    crash, ``pkill`` that misses the spawn child — nothing else sets the
+    driver's ``stop_event``, so it keeps the pump submitting jobs forever.
+
+    This loop polls the parent pid; a change from ``original_ppid`` means the
+    parent died and we were reparented (to init/launchd or a subreaper). It
+    sets ``stop_event`` so the main loop tears down the pump (cancelling
+    in-flight futures) and closes the connection. ``hard_exit`` is a backstop:
+    if graceful teardown wedges (e.g. the pump blocked on a slow D-Wave poll),
+    force-exit after ``grace_s`` so we never linger as an orphan. On a normal
+    shutdown ``stop_event`` is set elsewhere and this returns quietly.
+
+    All timing/exit hooks are injectable so the logic is unit-testable without
+    a real reparent.
+
+    Note: the loop times itself with a plain ``sleep`` and only does a brief
+    ``stop_event.is_set()`` check — it must never *block* on the mp.Event from
+    this side thread (e.g. ``wait(timeout)``), because holding the Event's
+    cross-process lock when the process exits would deadlock the parent's
+    ``set()``.
+    """
+    while not stop_event.is_set():
+        if getppid() != original_ppid:
+            log.warning(
+                "stream driver: parent %d died (now reparented to %d); "
+                "stopping to release the D-Wave connection",
+                original_ppid, getppid(),
+            )
+            stop_event.set()
+            # Give the main loop time to cancel in-flight work and close the
+            # connection; in production the process exits during this sleep and
+            # kills this daemon thread before the hard exit is reached.
+            sleep(grace_s)
+            log.warning(
+                "stream driver: teardown exceeded %.0fs after parent death; "
+                "forcing exit", grace_s,
+            )
+            hard_exit()
+            return
+        sleep(poll_s)
+
+
+def _start_parent_death_watchdog(stop_event) -> threading.Thread:
+    """Spawn the daemon watchdog thread; returns it (for tests/introspection)."""
+    t = threading.Thread(
+        target=_parent_death_watchdog,
+        args=(stop_event,),
+        kwargs={"original_ppid": os.getppid()},
+        name="parent-death-watchdog",
+        daemon=True,
+    )
+    t.start()
+    return t
 
 
 def _maybe_with_stop(fn, kwargs: Dict[str, Any], stop_event) -> Dict[str, Any]:
@@ -149,6 +220,9 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, ctl_q, stop_event,
     silently dropped.
     """
     setup_child_process_logging(log_queue)
+    # Orphan guard: if the parent dies ungracefully, stop instead of burning
+    # QPU forever as a reparented orphan.
+    _start_parent_death_watchdog(stop_event)
     ring = SampleView(**ring_args)
     ctx = None
     dropped = 0
