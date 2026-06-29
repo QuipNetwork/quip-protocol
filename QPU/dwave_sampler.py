@@ -19,6 +19,18 @@ from dwave.system import DWaveSampler, FixedEmbeddingComposite
 from dwave_topologies.embedding_loader import get_embedding_dict, embedding_exists
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies.dwave_topology import DWaveTopology
+# DefectInfo + the defect-clamp / array-reduction transforms live in shared/ (no
+# D-Wave SDK) so the feeder's spawn workers can run prepare_reduced without
+# importing this module. Re-exported here for back-compat (tests + base_miner
+# import DefectInfo from QPU.dwave_sampler).
+from shared.problem_prep import (  # noqa: F401  (DefectInfo re-exported)
+    DefectInfo,
+    ReducedProblem,
+    clamp_fixed_variables,
+    live_topology,
+    prepare_reduced,
+    rebuild_ising,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -125,32 +137,6 @@ class EmbeddedFuture:
         if isinstance(other, EmbeddedFuture):
             return self._future is other._future
         return False
-
-class DefectInfo:
-    """Lightweight metadata for reconstructing clamped QPU results.
-
-    Attached to futures returned by sample_ising_async when defects are
-    present. The caller decides when (and whether) to reconstruct — most
-    samples won't meet the energy threshold and never need reconstruction.
-
-    Attributes:
-        fixed_spins: {qubit_id: spin_value} for clamped qubits.
-        energy_offset: Constant energy from clamped qubits (h + J_fixed_fixed).
-        removed_edges: J values for defective couplers between live qubits.
-    """
-
-    __slots__ = ('fixed_spins', 'energy_offset', 'removed_edges')
-
-    def __init__(
-        self,
-        fixed_spins: Dict[int, int],
-        energy_offset: float,
-        removed_edges: Dict[Tuple[int, int], float],
-    ):
-        self.fixed_spins = fixed_spins
-        self.energy_offset = energy_offset
-        self.removed_edges = removed_edges
-
 
 # Type definitions to match base_miner
 Variable = collections.abc.Hashable
@@ -385,6 +371,15 @@ class DWaveSamplerWrapper:
         self.nodes: List[int] = cast(List[int], self.nodelist)
         self.edges: List[Tuple[int, int]] = cast(List[Tuple[int, int]], self.edgelist)
 
+        # Live (non-defective) topology ordering — the single source of truth
+        # shared with the feeder workers (passed as prepare_reduced prep_args) so
+        # a reduced-problem array position maps back to the same label on both
+        # the producer (feeder) and consumer (submit) sides. Fixed for the QPU
+        # session. With no defects these equal nodes/edges.
+        self.live_nodes, self.live_edges = live_topology(
+            self.nodes, self.edges, self._defective_qubits, self._defective_edges
+        )
+
     def close(self):
         """Release QPU connection resources.
 
@@ -476,68 +471,14 @@ class DWaveSamplerWrapper:
             - removed_edges: {(u, v): val} for live-qubit coupler pairs whose
               hardware coupler is offline; excluded from J_reduced and offset,
               computed per-sample in _reconstruct_full_sampleset
+
+        Thin instance wrapper over :func:`shared.problem_prep.clamp_fixed_variables`
+        (the SDK-free transform the feeder workers also call), binding this
+        sampler's ``_defective_qubits``/``_defective_edges``.
         """
-        defective_set = set(self._defective_qubits)
-        # numpy's SeedSequence rejects bytes ("expects int or sequence of
-        # ints for entropy"). Post-MR-!20, `derive_nonce` returns 32 bytes
-        # rather than an int, so the seed needs explicit conversion at
-        # the QPU boundary. big-endian matches the U256 wire encoding.
-        if isinstance(nonce_seed, (bytes, bytearray)):
-            nonce_seed = int.from_bytes(nonce_seed, "big")
-        rng = np.random.default_rng(nonce_seed)
-
-        # Assign deterministic ±1 spins to defective qubits
-        fixed_spins: Dict[int, int] = {}
-        for qubit in self._defective_qubits:
-            fixed_spins[qubit] = int(2 * rng.integers(2) - 1)
-
-        # Copy h, remove defective qubits, adjust neighbors
-        h_reduced = {k: v for k, v in h.items() if k not in defective_set}
-
-        for (u, v), j_val in J.items():
-            if u in defective_set and v not in defective_set:
-                # u is clamped, absorb into v's h-field
-                h_reduced[v] = h_reduced.get(v, 0.0) + j_val * fixed_spins[u]
-            elif v in defective_set and u not in defective_set:
-                # v is clamped, absorb into u's h-field
-                h_reduced[u] = h_reduced.get(u, 0.0) + j_val * fixed_spins[v]
-            # If both are defective, energy is constant — skip
-
-        # Remove edges involving defective qubits AND defective couplers.
-        # Defective couplers are edges between two live qubits whose
-        # coupler is offline on the hardware — the QPU would reject them.
-        # Their energy contribution is still captured in reconstruction
-        # (full_J is used to recompute energy on the complete topology).
-        J_reduced = {
-            (u, v): val for (u, v), val in J.items()
-            if u not in defective_set
-            and v not in defective_set
-            and (u, v) not in self._defective_edges
-        }
-
-        # Compute constant energy offset from clamped qubits:
-        #   1. h-field of clamped qubits: sum(h[k] * s_k)
-        #   2. J between two clamped qubits: sum(J[k,l] * s_k * s_l)
-        # These are constant for this nonce — add once to each QPU energy.
-        energy_offset = 0.0
-        for k, s_k in fixed_spins.items():
-            energy_offset += h.get(k, 0.0) * s_k
-        for (u, v), j_val in J.items():
-            if u in defective_set and v in defective_set:
-                energy_offset += j_val * fixed_spins[u] * fixed_spins[v]
-
-        # Defective edges (between two live qubits, coupler offline) are
-        # NOT included in the offset — their contribution depends on the
-        # QPU solution and must be computed per-sample during reconstruction.
-        # Store them for _reconstruct_full_sampleset.
-        removed_edges = {
-            (u, v): val for (u, v), val in J.items()
-            if u not in defective_set
-            and v not in defective_set
-            and (u, v) in self._defective_edges
-        }
-
-        return h_reduced, J_reduced, fixed_spins, energy_offset, removed_edges
+        return clamp_fixed_variables(
+            h, J, nonce_seed, self._defective_qubits, self._defective_edges
+        )
 
     @staticmethod
     def reconstruct_full_sampleset(
@@ -859,6 +800,51 @@ class DWaveSamplerWrapper:
             bqm = dimod.BinaryQuadraticModel.from_ising(h, J)
             return self.qpu_solver.solver.sample_bqm(bqm, **kwargs)
 
+    def _submit_prepared(
+        self,
+        h_vec: np.ndarray,
+        j_vec: np.ndarray,
+        **kwargs,
+    ) -> Union['Future', EmbeddedFuture]:
+        """Lean streaming submit for a feeder-reduced problem.
+
+        The defect-clamp + array reduction already happened in the feeder
+        workers (off this path); this only rebuilds the dimod model from the
+        ``ProblemView`` arrays and dispatches ``sample_bqm``. The reduced arrays
+        are laid out in ``self.live_nodes``/``self.live_edges`` order — the same
+        ordering the feeder used (both from ``live_topology``) — so the rebuilt
+        labels are exact and the consensus-energy reconstruction is unaffected.
+
+        Args:
+            h_vec: float64 reduced linear biases (``ProblemView`` h vector).
+            j_vec: float64 reduced couplings (``ProblemView`` j vector).
+            **kwargs: forwarded to ``solver.sample_bqm`` (num_reads, label, …).
+
+        Returns:
+            A raw cloud ``Future`` (no embedding) or an :class:`EmbeddedFuture`.
+        """
+        if 'label' not in kwargs:
+            kwargs['label'] = self.job_label
+        chain_strength_multiplier = kwargs.pop('chain_strength_multiplier', 1.5)
+
+        h, J = rebuild_ising(h_vec, j_vec, self.live_nodes, self.live_edges)
+        bqm = dimod.BinaryQuadraticModel.from_ising(h, J)
+
+        if self.embedding is not None:
+            chain_strength = self._chain_strength(bqm, chain_strength_multiplier)
+            target_bqm = embed_bqm(
+                bqm, self.embedding, self.qpu_solver.adjacency,
+                chain_strength=chain_strength,
+            )
+            raw_future = self.qpu_solver.solver.sample_bqm(target_bqm, **kwargs)
+            return EmbeddedFuture(
+                future=raw_future,
+                source_bqm=bqm,
+                embedding=self.embedding,
+                chain_strength=chain_strength,
+            )
+        return self.qpu_solver.solver.sample_bqm(bqm, **kwargs)
+
     def sample_ising_streaming(
         self,
         models: Any,
@@ -953,23 +939,23 @@ class DWaveSamplerWrapper:
                 return None
 
         def _submit_job(model: Any, idx: int):
-            """Run the (possibly blocking) async-submit on a pool thread.
+            """Submit one feeder-reduced problem on a pool thread.
 
-            Returns ``(model, qpu_future, defect_info, idx, submit_seconds)``.
-            On CPU-constrained nodes ``sample_bqm`` blocks ~seconds in the
-            caller; running it here lets queue_depth submissions overlap.
+            ``model`` is a :class:`~shared.problem_prep.ReducedProblem`: the
+            defect-clamp + array reduction already ran in the feeder workers, so
+            this only rebuilds + dispatches. Returns
+            ``(model, qpu_future, defect_info, idx, submit_seconds)``.
             """
             kw: Dict[str, Any] = {
                 "num_reads": num_reads,
                 "answer_mode": "raw",
                 "label": f"{self.job_label}_s{idx}",
-                "nonce_seed": model.nonce,
             }
             if annealing_time is not None:
                 kw["annealing_time"] = annealing_time
             t = time.monotonic()
-            future, defect_info = self.sample_ising_async(model.h, model.J, **kw)
-            return model, future, defect_info, idx, time.monotonic() - t
+            future = self._submit_prepared(model.h_vec, model.j_vec, **kw)
+            return model, future, model.defect_info, idx, time.monotonic() - t
 
         def _harvest_submissions() -> None:
             """Move finished submission tasks into pending; record submit cost."""

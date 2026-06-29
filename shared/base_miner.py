@@ -365,6 +365,12 @@ class BaseMiner(ABC):
         self._ctl_q: Optional[Any] = None
         self._driver_stop: Optional[Any] = None
         self._driver_proc: Optional[Any] = None
+        # Submitter-split handles (QPU only, when ``USES_SUBMITTER_SPLIT``).
+        # The feeder driver (process A) reuses ``_driver_proc``; the isolated
+        # D-Wave submitter (process B) and the ProblemView ring carrying reduced
+        # problems A→B are tracked here. All ``None`` on the single-driver path.
+        self._submitter_proc: Optional[Any] = None
+        self._prob_ring: Optional[Any] = None
         # Shared log queue forwarded to the spawned stream-driver process so its
         # producer-side INFO diagnostics route to the central writer instead of
         # being dropped. Set by miner_worker_main; None for standalone tooling.
@@ -500,6 +506,18 @@ class BaseMiner(ABC):
     # the consumer has headroom equal to what the cloud holds; on full the
     # pump drops the newest result (rare safety valve) and counts it.
     RESULT_QUEUE_MAXSIZE: int = 32
+
+    # --- Submitter split (QPU only) ---
+    # When True, ``_ensure_driver`` spawns TWO processes instead of one: a
+    # connection-less feeder driver (``shared.feeder_driver``) that reduces
+    # problems into a ProblemView ring, and an isolated submitter
+    # (``SAMPLER_FACTORY_DOTTED``) that owns the D-Wave connection and does
+    # ``sample_bqm`` off the contended GIL. CPU/GPU keep the single driver
+    # (their sampling is local — no slow SDK encode to isolate).
+    USES_SUBMITTER_SPLIT: bool = False
+    # Dotted factory the submitter process resolves to build ONLY the connected
+    # sampler (no feeder). Unused unless ``USES_SUBMITTER_SPLIT``.
+    SAMPLER_FACTORY_DOTTED: str = "QPU.dwave_miner:build_sampler"
 
     # --- Adaptive parameter bounds (override in subclasses) ---
     # SA/GPU miners use sweeps + reads; QPU miners use annealing_time + reads.
@@ -1258,12 +1276,16 @@ class BaseMiner(ABC):
         nodes = sample_ctx["nodes"]
         dims = (int(sample_ctx["num_reads"]), len(nodes))
         alive = self._driver_proc is not None and self._driver_proc.is_alive()
+        if self.USES_SUBMITTER_SPLIT:
+            alive = alive and (
+                self._submitter_proc is not None
+                and self._submitter_proc.is_alive()
+            )
         if alive and self._ring_dims == dims:
-            return True  # reuse the running driver
+            return True  # reuse the running driver(s)
         # Dead, first-time, or dims changed: tear down any stale driver, spawn.
         self._close_driver()
         import multiprocessing as _mp
-        from QPU.stream_driver import stream_driver_main
         ctx = _mp.get_context("spawn")
         ring = SampleView(
             slots=self.RESULT_QUEUE_MAXSIZE, max_rows=dims[0], max_cols=dims[1],
@@ -1272,24 +1294,89 @@ class BaseMiner(ABC):
         ctl_q = ctx.Queue()
         driver_stop = ctx.Event()
         factory_kwargs = self._stream_factory_kwargs(sample_ctx, nodes)
-        driver_proc = spawn_worker(
-            stream_driver_main,
-            (ring.attach_args(), desc_q, ctl_q, driver_stop,
-             self.STREAM_FACTORY_DOTTED, factory_kwargs, self._log_queue),
-            name=f"qpu-stream-driver-{self.miner_id}",
-            # Non-daemon: the driver's RandomIsingFeeder forks pool children,
-            # which a daemon process is forbidden from doing. _close_driver
-            # reaps it explicitly so it never blocks interpreter shutdown.
-            daemon=False,
-        )
+        if self.USES_SUBMITTER_SPLIT:
+            self._spawn_split_driver(
+                ctx, ring, desc_q, ctl_q, driver_stop, factory_kwargs,
+                sample_ctx, nodes,
+            )
+        else:
+            from QPU.stream_driver import stream_driver_main
+            self._driver_proc = spawn_worker(
+                stream_driver_main,
+                (ring.attach_args(), desc_q, ctl_q, driver_stop,
+                 self.STREAM_FACTORY_DOTTED, factory_kwargs, self._log_queue),
+                name=f"qpu-stream-driver-{self.miner_id}",
+                # Non-daemon: the driver's RandomIsingFeeder forks pool children,
+                # which a daemon process is forbidden from doing. _close_driver
+                # reaps it explicitly so it never blocks interpreter shutdown.
+                daemon=False,
+            )
         self._ring = ring
         self._desc_q = desc_q
         self._ctl_q = ctl_q
         self._driver_stop = driver_stop
-        self._driver_proc = driver_proc
         self._ring_dims = dims
         self._last_forwarded_threshold_milli = None
         return True
+
+    def _spawn_split_driver(
+        self, ctx: Any, ring: Any, desc_q: Any, ctl_q: Any, driver_stop: Any,
+        factory_kwargs: Dict[str, Any], sample_ctx: Dict[str, Any], nodes: list,
+    ) -> None:
+        """Spawn the QPU submitter split: feeder driver (A) + submitter (B).
+
+        A (``shared.feeder_driver``) holds no connection — it owns the feeder and
+        relays reduced problems into a ProblemView ring. B
+        (``SAMPLER_FACTORY_DOTTED``) owns the D-Wave connection and submits. The
+        ProblemView is FULL-topology-sized and created here (before B knows the
+        live count) so its shared free-list rides spawn inheritance to both
+        children — an mp.Queue can't ride a live queue.put. B ships the live
+        topology to A over ``handshake_q`` (plain data). Sets ``_driver_proc``
+        (A), ``_submitter_proc`` (B), and ``_prob_ring``.
+        """
+        from QPU.dwave_submitter import dwave_submitter_main
+        from shared.feeder_driver import feeder_driver_main
+        from shared.ring_views import ProblemView
+
+        edges = sample_ctx["edges"]
+        slots = max(int(self.queue_depth) + 8, 16)
+        prob_ring = ProblemView(
+            slots=slots, n_nodes=len(nodes), n_edges=len(edges),
+        )
+        prob_desc_q = ctx.Queue(maxsize=slots)
+        handshake_q = ctx.Queue()
+
+        submitter_factory_kwargs = {
+            "miner_id": factory_kwargs["miner_id"],
+            "queue_depth": factory_kwargs["queue_depth"],
+            "solver_name": factory_kwargs.get("solver_name"),
+            "region": factory_kwargs.get("region"),
+            "token": factory_kwargs.get("token"),
+            "topology": factory_kwargs.get("topology"),
+        }
+        # B: isolated submitter (owns the connection + does sample_bqm).
+        # recycling_attach_args carries the shared free-list (A claims, B
+        # releases) — valid because it rides spawn inheritance, not a live queue.
+        self._submitter_proc = spawn_worker(
+            dwave_submitter_main,
+            (self.SAMPLER_FACTORY_DOTTED, submitter_factory_kwargs,
+             prob_ring.recycling_attach_args(), prob_desc_q,
+             ring.attach_args(), desc_q, handshake_q, driver_stop,
+             factory_kwargs["num_reads"], factory_kwargs["queue_depth"],
+             factory_kwargs["annealing_time"], self._log_queue),
+            name=f"qpu-submitter-{self.miner_id}",
+            daemon=False,
+        )
+        # A: connection-less feeder driver (owns the feeder, writes ProblemView).
+        self._driver_proc = spawn_worker(
+            feeder_driver_main,
+            (prob_ring.recycling_attach_args(), prob_desc_q, ctl_q, driver_stop,
+             handshake_q, nodes, edges, factory_kwargs.get("allowed_h"),
+             factory_kwargs["feeder_buffer_size"], self._log_queue),
+            name=f"qpu-feeder-driver-{self.miner_id}",
+            daemon=False,
+        )
+        self._prob_ring = prob_ring
 
     def _close_driver(self) -> None:
         """Reap the persistent driver and close+unlink the ring (shutdown only).
@@ -1309,6 +1396,20 @@ class BaseMiner(ABC):
         if self._driver_proc is not None:
             terminate_join(self._driver_proc, 5.0)
             self._driver_proc = None
+        # Submitter split: reap process B (the feeder driver A is _driver_proc,
+        # already joined above) and release the ProblemView ring. getattr-guarded
+        # so minimal test miners that bypass __init__ still tear down cleanly.
+        submitter_proc = getattr(self, "_submitter_proc", None)
+        if submitter_proc is not None:
+            terminate_join(submitter_proc, 5.0)
+            self._submitter_proc = None
+        prob_ring = getattr(self, "_prob_ring", None)
+        if prob_ring is not None:
+            try:
+                prob_ring.close_unlink()
+            except Exception:  # noqa: BLE001 — best-effort; small problem ring
+                pass
+            self._prob_ring = None
         if self._ring is not None:
             import gc
             gc.collect()

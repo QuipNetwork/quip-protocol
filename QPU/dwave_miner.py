@@ -14,6 +14,7 @@ from shared.base_miner import (
     BaseMiner, MidstreamBudget, _SharedSampleSet, _energy_to_milli,
 )
 from shared.miner_types import BlockRequirements
+from shared.problem_prep import prepare_reduced
 from shared.stream_context import StreamContext
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies.dwave_topology import DWaveTopology
@@ -70,8 +71,20 @@ def build_persistent_context(
         token=token,
         topology=topology,
     )
+    sampler = miner.sampler
+    # The feeder workers run prepare_reduced (defect-clamp + array reduction) off
+    # the submit path. They need the QPU's defect set and the live-topology
+    # ordering — taken from the connected sampler so producer and consumer share
+    # exactly one ordering (sampler.live_nodes/live_edges derive from the same
+    # live_topology call). With no defects this reduces to the full topology.
+    feeder_prep_args = (
+        sampler._defective_qubits,
+        sampler._defective_edges,
+        sampler.live_nodes,
+        sampler.live_edges,
+    )
     return StreamContext(
-        sampler=miner.sampler,
+        sampler=sampler,
         nodes=nodes,
         edges=edges,
         allowed_h=allowed_h,
@@ -83,8 +96,52 @@ def build_persistent_context(
             "annealing_time": annealing_time,
             "energy_threshold_milli": energy_threshold_milli,
         },
+        feeder_prep_fn=prepare_reduced,
+        feeder_prep_args=feeder_prep_args,
         stop_event=stop_event,
     )
+
+
+def build_sampler(
+    *,
+    miner_id: str,
+    queue_depth: int,
+    solver_name: Optional[str] = None,
+    region: Optional[str] = None,
+    token: Optional[str] = None,
+    topology: Optional[DWaveTopology] = None,
+) -> Any:
+    """Build ONLY the connected D-Wave sampler (for the isolated submitter).
+
+    The :mod:`QPU.dwave_submitter` process owns the keys/connection but not the
+    feeder, so it needs the bare :class:`~QPU.dwave_sampler.DWaveSamplerWrapper`
+    (with ``sample_ising_streaming`` + ``live_nodes``/``live_edges``), not a full
+    :class:`~shared.stream_context.StreamContext`. Mirrors the connect in
+    :func:`build_persistent_context`. Runs ONLY in the submitter process.
+
+    Args:
+        topology: The chain topology for the QPU (required).
+
+    Returns:
+        A connected :class:`~QPU.dwave_sampler.DWaveSamplerWrapper`.
+
+    Raises:
+        ValueError: If topology is None.
+    """
+    if topology is None:
+        raise ValueError(
+            "the QPU submitter requires a topology; the chain topology was not "
+            "wired to build_sampler"
+        )
+    miner = DWaveMiner(
+        miner_id=miner_id,
+        queue_depth=queue_depth,
+        solver_name=solver_name,
+        region=region,
+        token=token,
+        topology=topology,
+    )
+    return miner.sampler
 
 
 # Default interval between repeated pacing log lines (seconds).
@@ -148,9 +205,14 @@ class DWaveMiner(BaseMiner):
     # Keep that headroom so the streaming sampler can saturate the
     # D-Wave cloud queue without blocking on Python-side derivation.
     FEEDER_BUFFER_SIZE = 60
-    # The sampler + feeder live in the persistent stream-driver process (see
-    # QPU/stream_driver.py + build_persistent_context); _ensure_driver
-    # spawns/reuses that process and the worker keeps no feeder.
+    # Run the two-process submitter split: the SDK's GIL-held encode inside
+    # sample_bqm was the streaming bottleneck (submit_mean ~11s under
+    # contention), so the connection + submit live in their own process
+    # (shared.feeder_driver feeds reduced problems over a ProblemView ring to
+    # QPU.dwave_submitter). CPU/GPU keep the single stream driver.
+    USES_SUBMITTER_SPLIT = True
+    # The sampler + feeder live in separate stream-driver processes; the worker
+    # keeps no feeder. _ensure_driver spawns/reuses them.
 
     def __init__(
         self,

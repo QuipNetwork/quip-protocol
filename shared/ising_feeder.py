@@ -27,7 +27,7 @@ import signal as _signal
 import time
 import weakref
 from concurrent.futures import ProcessPoolExecutor
-from typing import Iterator, List, Optional, Sequence
+from typing import Any, Callable, Iterator, List, Optional, Sequence
 
 from shared.allowed_value_spec import AllowedValueSpec
 from shared.ising_model import IsingModel
@@ -77,8 +77,10 @@ def _generate_one_model(
     edges: list,
     salt: bytes,
     allowed_h: Optional[AllowedValueSpec] = None,
-) -> IsingModel:
-    """Generate one IsingModel in a worker process.
+    prep_fn: Optional[Callable] = None,
+    prep_args: tuple = (),
+) -> Any:
+    """Generate one model in a worker process, optionally post-processing it.
 
     ``last_proof_block_hash`` and ``miner_bytes`` are fixed 32-byte inputs to
     ``derive_nonce``. The hash is ``block_hash(LastProofBlock)`` — the
@@ -89,10 +91,19 @@ def _generate_one_model(
     ``allowed_h`` overrides the per-node field distribution (``None`` keeps the
     chain's ternary default). It is a frozen ``AllowedValueSet`` and therefore
     picklable across the spawn-context ``ProcessPoolExecutor``.
+
+    ``prep_fn`` (with ``prep_args``) runs in this worker on the fresh model and
+    its return value is what the feeder buffers — used by the QPU PoW path to do
+    the GIL-held defect-clamp + array reduction here (off the submit path)
+    instead of in the consuming process. Must be a module-level picklable
+    callable. ``None`` returns the raw :class:`IsingModel`.
     """
     nonce = derive_nonce(last_proof_block_hash, miner_bytes, salt)
     h, J = generate_ising_model_from_nonce(nonce, nodes, edges, allowed_h=allowed_h)
-    return IsingModel(h=h, J=J, nonce=nonce, salt=salt)
+    model = IsingModel(h=h, J=J, nonce=nonce, salt=salt)
+    if prep_fn is not None:
+        return prep_fn(model, *prep_args)
+    return model
 
 
 def _force_shutdown_pool(pool: ProcessPoolExecutor) -> None:
@@ -190,6 +201,8 @@ class RandomIsingFeeder:
         max_workers: Optional[int] = None,
         seed: Optional[int] = None,
         allowed_h: Optional[AllowedValueSpec] = None,
+        prep_fn: Optional[Callable] = None,
+        prep_args: tuple = (),
     ):
         _require_len("last_proof_block_hash", last_proof_block_hash)
         _require_len("miner_bytes", miner_bytes)
@@ -199,6 +212,8 @@ class RandomIsingFeeder:
         self._edges = edges
         self._buffer_size = buffer_size
         self._allowed_h = allowed_h
+        self._prep_fn = prep_fn
+        self._prep_args = prep_args
         self._rng = random.Random(seed) if seed is not None else None
         workers = max_workers if max_workers is not None else _default_max_workers()
         self._pool = ProcessPoolExecutor(
@@ -216,7 +231,9 @@ class RandomIsingFeeder:
             self._pool,
         )
         self._futures: list = []
-        self._queue: queue.Queue[IsingModel] = queue.Queue()
+        # Holds IsingModel by default, or whatever ``prep_fn`` returns (e.g. a
+        # ReducedProblem on the QPU PoW path).
+        self._queue: queue.Queue[Any] = queue.Queue()
         self._stopped = False
         # Throughput diagnostics: continuously updated in _fill() and
         # pop_blocking(). Read by telemetry to confirm the buffer stays
@@ -307,6 +324,8 @@ class RandomIsingFeeder:
                 self._edges,
                 salt,
                 self._allowed_h,
+                self._prep_fn,
+                self._prep_args,
             )
             self._futures.append(f)
             submitted += 1
@@ -568,7 +587,8 @@ class FixedIsingFeeder:
         """No-op for API parity with :class:`RandomIsingFeeder`."""
 
 
-def build_feeder(spec, nodes, edges, buffer_size, allowed_h=None):
+def build_feeder(spec, nodes, edges, buffer_size, allowed_h=None,
+                 prep_fn=None, prep_args=()):
     """Build an IsingFeeder from a switch ``feeder_spec`` tuple.
 
     ``("pow", last_proof_block_hash, miner_bytes)`` -> ``RandomIsingFeeder``.
@@ -613,6 +633,8 @@ def build_feeder(spec, nodes, edges, buffer_size, allowed_h=None):
             edges=edges,
             buffer_size=buffer_size,
             allowed_h=allowed_h,
+            prep_fn=prep_fn,
+            prep_args=prep_args,
         )
     elif kind == "mempool":
         from shared.ring_views import ProblemView

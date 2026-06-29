@@ -15,6 +15,7 @@ import time as _time
 from typing import Any, List, Optional, Tuple
 
 import dimod
+import numpy as np
 import pytest
 
 from QPU.dwave_sampler import (
@@ -120,11 +121,18 @@ def _make_defect(offset: float = 10.0) -> DefectInfo:
 class _FakeSamplerWrapper:
     """Minimal stand-in for DWaveSamplerWrapper.
 
-    Each ``sample_ising_async`` call consumes one entry from ``_results``, a
-    list of ``(FakeFuture, Optional[DefectInfo])`` tuples to return in order.
+    Each ``_submit_prepared`` call consumes one entry from ``_results`` and
+    returns its future. ``_results`` stays a list of ``(FakeFuture,
+    Optional[DefectInfo])`` tuples for construction convenience, but the pump
+    now reads ``defect_info`` from the model (ReducedProblem), so the tuple's
+    second element is ignored here.
     """
 
     job_label = "test_label"
+    # The pump rebuilds via the real _submit_prepared in production; the fake
+    # bypasses rebuild_ising entirely, so these are never read.
+    live_nodes: List[int] = [0, 1]
+    live_edges: List[Tuple[int, int]] = [(0, 1)]
 
     def __init__(
         self, results: List[Tuple[_FakeFuture, Optional[DefectInfo]]]
@@ -132,16 +140,16 @@ class _FakeSamplerWrapper:
         self._results = list(results)
         self._call_count = 0
         self._reconstruct_calls = 0
-        # The pump now submits concurrently on a thread pool, so this is
-        # called from multiple threads — guard the counter + result list.
+        # The pump submits concurrently on a thread pool, so this is called from
+        # multiple threads — guard the counter + result list.
         self._lock = __import__("threading").Lock()
 
-    def sample_ising_async(
-        self, h: Any, J: Any, **kwargs: Any
-    ) -> Tuple[_FakeFuture, Optional[DefectInfo]]:
+    def _submit_prepared(
+        self, h_vec: Any, j_vec: Any, **kwargs: Any
+    ) -> _FakeFuture:
         with self._lock:
             self._call_count += 1
-            return self._results.pop(0)
+            return self._results.pop(0)[0]
 
     def reconstruct_full_sampleset(
         self, ss: dimod.SampleSet, defect_info: DefectInfo
@@ -155,12 +163,19 @@ class _FakeSamplerWrapper:
 
 
 class _FakeModel:
-    """Minimal IsingModel stand-in."""
+    """Minimal ReducedProblem stand-in.
 
-    def __init__(self, idx: int) -> None:
-        self.h = {0: float(idx), 1: -float(idx)}
-        self.J = {(0, 1): -1.0}
+    Carries the array payload + provenance + per-nonce defect_info the pump now
+    reads off the model. The fake ``_submit_prepared`` ignores the arrays, so
+    their values don't matter — only the attributes must exist.
+    """
+
+    def __init__(self, idx: int, defect_info: Optional[DefectInfo] = None) -> None:
+        self.h_vec = np.zeros(2, dtype=np.float64)
+        self.j_vec = np.zeros(1, dtype=np.float64)
+        self.defect_info = defect_info
         self.nonce = idx
+        self.salt = b""
 
 
 class _ListFeeder:
@@ -223,7 +238,7 @@ def test_defect_info_attached_to_sampleset_info():
     defect = _make_defect(offset=42.0)
     results = _build_results(2, defect=defect)
     sampler = _FakeSamplerWrapper(results)
-    models = _ListFeeder([_FakeModel(i) for i in range(2)])
+    models = _ListFeeder([_FakeModel(i, defect) for i in range(2)])
 
     gen = sampler.sample_ising_streaming(models, num_reads=8, queue_depth=2)
     _, ss = next(gen)
@@ -476,8 +491,8 @@ def test_raw_energies_not_shifted():
     defect = _make_defect(offset=offset)
 
     ss = _make_ss(energy=raw_energy)
-    sampler = _FakeSamplerWrapper([((_FakeFuture(ss, 0), defect))])
-    models = _ListFeeder([_FakeModel(0)])
+    sampler = _FakeSamplerWrapper([(_FakeFuture(ss, 0), defect)])
+    models = _ListFeeder([_FakeModel(0, defect)])
 
     gen = sampler.sample_ising_streaming(models, num_reads=8, queue_depth=1)
     _, yielded_ss = next(gen)
