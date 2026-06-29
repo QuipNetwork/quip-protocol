@@ -23,8 +23,6 @@ from shared.allowed_value_spec import (
 )
 from shared.chacha8 import ChaCha8Rng
 from shared.quantum_proof_of_work import (
-    DEFAULT_ALLOWED_H,
-    DEFAULT_ALLOWED_J,
     derive_nonce,
     generate_ising_model_from_nonce,
     _to_nonce_bytes,
@@ -92,10 +90,10 @@ class IsingTopologyCache:
     def greedy_descent_fast(
         self,
         nonce: Union[int, bytes],
+        allowed_h: AllowedValueSpec,
+        allowed_j: AllowedValueSpec,
         num_passes: int = 3,
         num_starts: int = 4,
-        allowed_h: AllowedValueSpec = DEFAULT_ALLOWED_H,
-        allowed_j: AllowedValueSpec = DEFAULT_ALLOWED_J,
     ) -> float:
         """Run greedy descent using array-based Ising generation.
 
@@ -107,6 +105,11 @@ class IsingTopologyCache:
         ``nonce`` may be either a 32-byte buffer (canonical) or an int that
         fits in 256 bits (convenience for tools / benchmarks that don't go
         through :func:`shared.quantum_proof_of_work.derive_nonce`).
+
+        ``allowed_h`` / ``allowed_j`` are required: the score is only
+        meaningful against the SAME field/coupling distribution the chain
+        registered, so the spec must be passed explicitly rather than
+        defaulting to the legacy ternary class.
         """
         n = self.n
         rng = ChaCha8Rng.from_seed(_to_nonce_bytes(nonce))
@@ -258,6 +261,8 @@ def batch_score_nonces(
     miner_bytes: bytes,
     nodes: List[int],
     edges: List[Tuple[int, int]],
+    allowed_h: AllowedValueSpec,
+    allowed_j: AllowedValueSpec,
     batch_size: int = 16,
     keep: int = 4,
 ) -> List[Tuple[bytes, bytes, dict, dict, float]]:
@@ -271,6 +276,11 @@ def batch_score_nonces(
     the canonical fixed-width inputs to
     :func:`shared.quantum_proof_of_work.derive_nonce`.
 
+    ``allowed_h`` / ``allowed_j`` are required and must match the chain
+    topology's registered specs; both the scoring pass and the top-K dict
+    build use them, so scores and the returned h/J reflect the SAME problem
+    the chain validates (never the legacy ternary default).
+
     Returns:
         Sorted list of ``(salt, nonce_bytes, h, J, greedy_energy)``,
         lowest energy first. Length = ``min(keep, batch_size)``.
@@ -282,7 +292,7 @@ def batch_score_nonces(
     for _ in range(batch_size):
         salt = random.randbytes(32)
         nonce = derive_nonce(last_proof_block_hash, miner_bytes, salt)
-        energy = cache.greedy_descent_fast(nonce)
+        energy = cache.greedy_descent_fast(nonce, allowed_h, allowed_j)
         scored.append((salt, nonce, energy))
 
     scored.sort(key=lambda c: c[2])
@@ -291,7 +301,9 @@ def batch_score_nonces(
     top = scored[:keep]
     candidates = []
     for salt, nonce, energy in top:
-        h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+        h, J = generate_ising_model_from_nonce(
+            nonce, nodes, edges, allowed_h=allowed_h, allowed_j=allowed_j,
+        )
         candidates.append((salt, nonce, h, J, energy))
 
     return candidates
