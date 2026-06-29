@@ -933,3 +933,13 @@ def test_stash_entry_and_loop_state_decay_fields(tmp_path):
     assert st2.decay_schedule is None
     assert st2.last_proof_block == 0
     assert st2.epoch_length == 0
+
+
+def test_progress_knob_qpu_shows_anneal_not_sweeps():
+    # QPU dispatch: anneal_time set -> show anneal, never the bogus sweeps=64.
+    assert BaseMiner._progress_knob(80.0, 64) == "anneal=80us"
+
+
+def test_progress_knob_sweep_backend_shows_sweeps():
+    # SA/Metal: no anneal time -> show the sweep count.
+    assert BaseMiner._progress_knob(None, 128) == "sweeps=128"

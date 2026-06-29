@@ -19,6 +19,7 @@ from typing import Any, Dict
 
 import numpy as np
 
+from shared.logging_config import setup_child_process_logging
 from shared.ring_views import SampleView
 
 log = logging.getLogger(__name__)
@@ -131,7 +132,8 @@ def _wait_for_first_switch(ctx, ctl_q, stop_event) -> bool:
 
 def stream_driver_main(ring_args: Dict[str, Any], desc_q, ctl_q, stop_event,
                        stream_factory_dotted: str,
-                       factory_kwargs: Dict[str, Any]) -> None:
+                       factory_kwargs: Dict[str, Any],
+                       log_queue: Any = None) -> None:
     """Long-lived stream driver: persist the context, switch rounds via ctl_q.
 
     ``stream_factory_dotted`` resolves to a context factory
@@ -140,7 +142,13 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, ctl_q, stop_event,
     Descriptor tuple:
     ``(slot, n_rows, n_cols, nonce, salt, qpu_us, generation)``. A trailing
     ``None`` on ``desc_q`` signals end-of-stream (driver exit).
+
+    ``log_queue`` is the shared queue drained by ``log_writer_main``; this is a
+    spawned process with no inherited handlers, so without configuring it here
+    every producer-side INFO diagnostic (stream depth, feeder pop-wait) is
+    silently dropped.
     """
+    setup_child_process_logging(log_queue)
     ring = SampleView(**ring_args)
     ctx = None
     dropped = 0

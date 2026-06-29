@@ -68,6 +68,7 @@ import multiprocessing  # noqa: E402 — after sys.path / load_dotenv setup abov
 from QPU.dwave_miner import DWaveMiner  # noqa: E402
 from QPU.stream_driver import qpu_access_time_us  # noqa: E402
 from dwave_topologies import DEFAULT_TOPOLOGY  # noqa: E402
+from shared.allowed_value_spec import AllowedValueSet  # noqa: E402
 from shared.base_miner import (  # noqa: E402
     _ACQUIRE_CONTINUE,
     _ACQUIRE_DONE,
@@ -205,6 +206,10 @@ def _make_sample_ctx(nodes, edges, args: argparse.Namespace) -> Dict[str, Any]:
         "last_proof_block_hash": os.urandom(32),
         "miner_bytes": os.urandom(32),
         "feeder_buffer_size": args.feeder_buffer_size,
+        # Post-rc19 the pow feeder rejects a None allowed_h (it would silently
+        # build a ternary model the chain scores as h=0). Mirror the chain's
+        # zero-field spec so the driver's feeder build matches production.
+        "allowed_h_values": AllowedValueSet((0,)),
         "extra": {},
     }
 
@@ -223,11 +228,17 @@ def _open_round(consumer: DWaveMiner, sample_ctx: Dict[str, Any]) -> tuple:
     consumer._generation += 1
     gen = consumer._generation
     threshold_milli = _energy_to_milli(sample_ctx["energy_threshold"])
+    # 9-element switch tuple, matching BaseMiner._setup_dispatch: the driver's
+    # StreamContext reads num_sweeps at [7] and the feeder spec at [8].
+    feeder_spec = (
+        "pow", sample_ctx["last_proof_block_hash"], sample_ctx["miner_bytes"],
+    )
     consumer._ctl_q.put((
         "switch", gen,
         sample_ctx["last_proof_block_hash"], sample_ctx["miner_bytes"],
         threshold_milli,
         int(sample_ctx["num_reads"]), float(sample_ctx["annealing_time"]),
+        int(sample_ctx["num_sweeps"]), feeder_spec,
     ))
     consumer._last_forwarded_threshold_milli = threshold_milli
     return consumer._driver_proc, gen
@@ -273,7 +284,7 @@ def _consume(consumer, desc_q, driver_proc, sample_ctx, nodes, edges,
     for i in range(args.n):
         t0 = time.perf_counter()
         acquired = consumer._acquire_result(
-            stop, desc_q, t0, sample_ctx=sample_ctx, driver_proc=driver_proc,
+            stop, desc_q, t0, driver_proc=driver_proc,
             generation=generation)
         if acquired.action == _ACQUIRE_DONE:
             ended_early = True
