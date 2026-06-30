@@ -92,18 +92,19 @@ def _generate_one_model(
     chain's ternary default). It is a frozen ``AllowedValueSet`` and therefore
     picklable across the spawn-context ``ProcessPoolExecutor``.
 
-    ``prep_fn`` (with ``prep_args``) runs in this worker on the fresh model and
-    its return value is what the feeder buffers — used by the QPU PoW path to do
-    the GIL-held defect-clamp + array reduction here (off the submit path)
-    instead of in the consuming process. Must be a module-level picklable
-    callable. ``None`` returns the raw :class:`IsingModel`.
+    ``prep_fn`` (with ``prep_args``), when given, OWNS derivation: it is called
+    as ``prep_fn(nonce, salt, nodes, edges, allowed_h, *prep_args)`` and its
+    return value is what the feeder buffers. The QPU PoW path uses this to derive
+    + reduce straight to arrays (vectorized, off the submit path) — skipping the
+    expensive scalar dict build below. Must be a module-level picklable callable.
+    ``None`` returns the raw :class:`IsingModel` (the CPU/GPU path, which needs
+    the h/J dicts).
     """
     nonce = derive_nonce(last_proof_block_hash, miner_bytes, salt)
-    h, J = generate_ising_model_from_nonce(nonce, nodes, edges, allowed_h=allowed_h)
-    model = IsingModel(h=h, J=J, nonce=nonce, salt=salt)
     if prep_fn is not None:
-        return prep_fn(model, *prep_args)
-    return model
+        return prep_fn(nonce, salt, nodes, edges, allowed_h, *prep_args)
+    h, J = generate_ising_model_from_nonce(nonce, nodes, edges, allowed_h=allowed_h)
+    return IsingModel(h=h, J=J, nonce=nonce, salt=salt)
 
 
 def _force_shutdown_pool(pool: ProcessPoolExecutor) -> None:
