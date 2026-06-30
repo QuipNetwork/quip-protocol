@@ -27,8 +27,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-from shared.ising_model import IsingModel
-
 
 class DefectInfo:
     """Lightweight metadata for reconstructing clamped QPU results.
@@ -299,37 +297,61 @@ class ReducedProblem:
 
 
 def prepare_reduced(
-    model: IsingModel,
+    nonce: bytes,
+    salt: bytes,
+    nodes: Sequence[int],
+    edges: Sequence[Tuple[int, int]],
+    allowed_h: Any,
     defective_qubits: Sequence[int],
     defective_edges: "set[Tuple[int, int]]",
     live_nodes: Sequence[int],
     live_edges: Sequence[Tuple[int, int]],
 ) -> ReducedProblem:
-    """Feeder-worker entry point: reduce a raw Ising model to a ReducedProblem.
+    """Feeder-worker entry point: derive + reduce a problem to a ReducedProblem.
 
-    Runs off the submit path, in the feeder's parallel generator workers. Picks
-    up the model's own nonce as the deterministic clamp seed.
+    Generates the Ising arrays straight from the nonce via the vectorized
+    :func:`~shared.quantum_proof_of_work.generate_ising_arrays_from_nonce` (no
+    ~46k-element Python dict building — the feeder's old throughput wall), then
+    reduces. With no defects the full arrays ARE the reduced arrays (live order
+    equals ``nodes``/``edges`` order), so it's a pure passthrough; the rare
+    defect case reuses the proven dict clamp.
 
     Args:
-        model: Freshly derived Ising model from the feeder.
+        nonce: 32-byte derivation nonce.
+        salt: 32-byte salt (provenance).
+        nodes / edges: Full topology, in canonical order.
+        allowed_h: Per-node field spec (chain ``allowed_h_values``).
         defective_qubits: Offline qubit ids (empty when the QPU has none).
         defective_edges: Offline couplers between live qubits (empty when none).
-        live_nodes: Canonical live-node order from :func:`live_topology`.
-        live_edges: Canonical live-edge order from :func:`live_topology`.
+        live_nodes / live_edges: Canonical live order from :func:`live_topology`.
 
     Returns:
         A :class:`ReducedProblem` ready for the ``ProblemView`` transport.
     """
+    # Imported lazily to avoid a heavy import at module load for the (many)
+    # cheap importers of problem_prep; the feeder workers already import
+    # quantum_proof_of_work for derive_nonce.
+    from shared.quantum_proof_of_work import generate_ising_arrays_from_nonce
+
+    h_full, j_full = generate_ising_arrays_from_nonce(
+        nonce, nodes, edges, allowed_h,
+    )
+    if not defective_qubits and not defective_edges:
+        # No defects: live order == nodes/edges order — no clamp, pure passthrough.
+        return ReducedProblem(
+            h_vec=h_full, j_vec=j_full, defect_info=None, nonce=nonce, salt=salt,
+        )
+    # Defect path (rare): reuse the proven dict-based clamp.
+    h_dict = {int(n): float(h_full[i]) for i, n in enumerate(nodes)}
+    j_dict = {
+        (int(u), int(v)): float(j_full[k]) for k, (u, v) in enumerate(edges)
+    }
     h_vec, j_vec, defect_info = reduce_to_arrays(
-        model.h, model.J, model.nonce,
-        defective_qubits, defective_edges, live_nodes, live_edges,
+        h_dict, j_dict, nonce, defective_qubits, defective_edges,
+        live_nodes, live_edges,
     )
     return ReducedProblem(
-        h_vec=h_vec,
-        j_vec=j_vec,
-        defect_info=defect_info,
-        nonce=model.nonce,
-        salt=model.salt,
+        h_vec=h_vec, j_vec=j_vec, defect_info=defect_info, nonce=nonce, salt=salt,
     )
 
 

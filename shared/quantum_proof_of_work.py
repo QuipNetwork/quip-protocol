@@ -33,7 +33,7 @@ from shared.allowed_value_spec import (
     MILLI_SCALE,
     sample as _sample_spec,
 )
-from shared.chacha8 import ChaCha8Rng
+from shared.chacha8 import ChaCha8Rng, keystream_words
 from shared.logging_config import get_logger
 from shared.miner_types import MiningResult
 from dwave_topologies import DEFAULT_TOPOLOGY
@@ -167,6 +167,72 @@ def generate_ising_model_from_nonce(
         j[(int(u), int(v))] = _sample_spec(allowed_j, rng) / MILLI_SCALE
 
     return h, j
+
+
+def generate_ising_arrays_from_nonce(
+    nonce: Union[int, bytes],
+    nodes: List[int],
+    edges: List[Tuple[int, int]],
+    allowed_h: Optional[AllowedValueSpec] = None,
+    allowed_j: Optional[AllowedValueSpec] = None,
+    *,
+    h_values: Optional[List[float]] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Vectorized :func:`generate_ising_model_from_nonce` returning dense arrays.
+
+    Produces ``(h_arr, j_arr)`` float64 arrays in ``nodes`` / ``edges`` order,
+    byte-identical in value to the scalar dict version but ~100x faster: the
+    whole ChaCha8 keystream is generated as one numpy array
+    (:func:`shared.chacha8.keystream_words`) and the per-element sampling is
+    vectorized, skipping the ~46k-iteration Python loop that was the feeder's
+    throughput wall. ``sample`` consumes exactly one ``next_u32`` per element, so
+    words ``[0:len(nodes)]`` map to h and ``[len(nodes):]`` to j, in order.
+
+    Only the ``AllowedValueSet`` spec (the chain's ternary-h / binary-j default)
+    is vectorized; any other spec falls back to the scalar path. See
+    ``test_generate_ising_arrays`` for the byte-identity guarantee.
+    """
+    if not nodes:
+        raise ValueError("nodes must be non-empty for Ising model generation")
+
+    if h_values is not None:
+        if allowed_h is not None:
+            raise ValueError("pass either `allowed_h` or legacy `h_values`, not both")
+        allowed_h = AllowedValueSet(
+            tuple(int(round(float(v) * MILLI_SCALE)) for v in h_values)
+        )
+    if allowed_h is None:
+        allowed_h = DEFAULT_ALLOWED_H
+    if allowed_j is None:
+        allowed_j = DEFAULT_ALLOWED_J
+
+    # Fast path only for the value-set spec; other specs are rare — defer to the
+    # scalar implementation and materialize its dicts into arrays.
+    if not (isinstance(allowed_h, AllowedValueSet)
+            and isinstance(allowed_j, AllowedValueSet)):
+        h, j = generate_ising_model_from_nonce(
+            nonce, nodes, edges, allowed_h, allowed_j,
+        )
+        h_arr = np.fromiter(
+            (h[int(n)] for n in nodes), dtype=np.float64, count=len(nodes),
+        )
+        j_arr = np.fromiter(
+            (j[(int(u), int(v))] for (u, v) in edges),
+            dtype=np.float64, count=len(edges),
+        )
+        return h_arr, j_arr
+
+    n_nodes = len(nodes)
+    n_edges = len(edges)
+    words = keystream_words(_to_nonce_bytes(nonce), n_nodes + n_edges)
+    h_vals = np.array(allowed_h.values, dtype=np.int64)
+    j_vals = np.array(allowed_j.values, dtype=np.int64)
+    # ``sample``: values[next_u32() % len(values)] — vectorized index select.
+    h_idx = (words[:n_nodes] % len(h_vals)).astype(np.intp)
+    j_idx = (words[n_nodes:] % len(j_vals)).astype(np.intp)
+    h_arr = h_vals[h_idx].astype(np.float64) / MILLI_SCALE
+    j_arr = j_vals[j_idx].astype(np.float64) / MILLI_SCALE
+    return h_arr, j_arr
 
 
 def energy_of_solution(solution: List[int], h: Dict[int, float], J: Dict[Tuple[int, int], float], nodes: List[int]) -> float:
