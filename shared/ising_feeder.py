@@ -295,13 +295,11 @@ class RandomIsingFeeder:
         if self._stopped:
             return
         still_pending = []
-        failures = 0
         for f in self._futures:
             if f.done():
                 try:
                     self._queue.put_nowait(f.result())
                 except Exception as exc:
-                    failures += 1
                     logger.warning(
                         "RandomIsingFeeder worker failed: %s (pending=%d, "
                         "queue=%d, buffer_size=%d)",
@@ -314,7 +312,6 @@ class RandomIsingFeeder:
                 still_pending.append(f)
         self._futures = still_pending
 
-        submitted = 0
         while len(self._futures) + self._queue.qsize() < self._buffer_size:
             salt = self._make_salt()
             f = self._pool.submit(
@@ -329,23 +326,11 @@ class RandomIsingFeeder:
                 self._prep_args,
             )
             self._futures.append(f)
-            submitted += 1
 
-        # Buffer state visibility: log when the feeder is drained
-        # (callers fighting for queue slots) or when workers failed.
-        ready = self._queue.qsize()
-        pending = len(self._futures)
-        self._record_depth(ready)
-        if failures or ready == 0:
-            logger.info(
-                "RandomIsingFeeder state: ready=%d pending=%d "
-                "buffer_size=%d submitted=%d failures=%d",
-                ready,
-                pending,
-                self._buffer_size,
-                submitted,
-                failures,
-            )
+        # Depth tracking feeds the consolidated "[QPU] stream depth" line
+        # (feeder_ready / drained / wait_total) and the structured attempt
+        # log. Per-worker failures are logged individually above.
+        self._record_depth(self._queue.qsize())
 
     def _record_depth(self, ready: int) -> None:
         s = self._stats

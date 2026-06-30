@@ -939,9 +939,9 @@ def main() -> int:
 
     # Route every Python logger through stderr — this is what makes
     # production miner output visible (DWaveMiner's "[QPU] stream
-    # depth: ..." line every 100 completions from Phase 1,
-    # RandomIsingFeeder state messages, DWave SDK info logs). Without
-    # this the canary tool runs the production pipeline silently.
+    # depth: ..." line every 100 completions from Phase 1, DWave SDK
+    # info logs). Without this the canary tool runs the production
+    # pipeline silently.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s: %(message)s",
