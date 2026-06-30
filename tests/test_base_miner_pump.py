@@ -943,3 +943,40 @@ def test_progress_knob_qpu_shows_anneal_not_sweeps():
 def test_progress_knob_sweep_backend_shows_sweeps():
     # SA/Metal: no anneal time -> show the sweep count.
     assert BaseMiner._progress_knob(None, 128) == "sweeps=128"
+
+
+class TestBestCandidateSummary:
+    """_best_candidate_summary surfaces the current best stash entry for progress."""
+
+    @staticmethod
+    def _entry(decay_num, valid_at_block, floor, energy):
+        from types import SimpleNamespace
+
+        from shared.base_miner import StashEntry
+        return StashEntry(
+            decay_num=decay_num,
+            valid_at_block=valid_at_block,
+            result=SimpleNamespace(effective_floor=floor, energy=energy),
+        )
+
+    def test_empty_stash_is_na(self):
+        assert BaseMiner._best_candidate_summary([], True) == "n/a"
+
+    def test_decay_ranked_picks_earliest_then_lowest_energy(self):
+        # decay #2 wins over decay #3 even though #3 has lower energy.
+        top_k = [
+            self._entry(3, 999, floor=-14600, energy=-14620),
+            self._entry(2, 487225, floor=-14475, energy=-14493),
+        ]
+        out = BaseMiner._best_candidate_summary(top_k, is_decay_ranked=True)
+        assert out == (
+            "floor=-14475 energy=-14493 submittable@block=487225 (decay #2)"
+        )
+
+    def test_legacy_ranked_picks_lowest_energy(self):
+        top_k = [
+            self._entry(0, 0, floor=-14400, energy=-14410),
+            self._entry(0, 0, floor=-14500, energy=-14520),
+        ]
+        out = BaseMiner._best_candidate_summary(top_k, is_decay_ranked=False)
+        assert out.startswith("floor=-14500 energy=-14520")

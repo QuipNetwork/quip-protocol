@@ -906,8 +906,6 @@ class BaseMiner(ABC):
 
                 progress += 1
                 if progress % PROGRESS_LOG_INTERVAL == 0:
-                    # `self.top_attempts` is intentionally not maintained in
-                    # substrate mode — no best-energy field to surface here.
                     budget = self._midstream_budget_ok(
                         loop_state.solution_number_for_log,
                     )
@@ -917,19 +915,26 @@ class BaseMiner(ABC):
                     knob = self._progress_knob(
                         setup.anneal_time, setup.num_sweeps,
                     )
+                    # Current best stashed candidate + when it's submittable
+                    # (same selection as the "Best Solution" line). ``n/a`` until
+                    # the first stash (or on the mempool path).
+                    best_disp = self._best_candidate_summary(
+                        loop_state.top_k, loop_state.is_decay_ranked,
+                    )
                     if budget is None:
                         self.logger.info(
                             "mine_work_item progress: %d attempts | "
-                            "%s reads=%d",
-                            progress, knob, setup.num_reads,
+                            "%s reads=%d | best: %s",
+                            progress, knob, setup.num_reads, best_disp,
                         )
                     else:
                         s = budget.stats
                         self.logger.info(
                             "mine_work_item progress: %d attempts | "
-                            "%s reads=%d | qpu_pool=%.2fs/%.2fs cap "
+                            "%s reads=%d | best: %s | "
+                            "qpu_pool=%.2fs/%.2fs cap "
                             "(buffer %.0fs) burst=%s used=%.2fs skipped=%d",
-                            progress, knob, setup.num_reads,
+                            progress, knob, setup.num_reads, best_disp,
                             s.get("pool_seconds", 0.0),
                             s.get("pool_cap_seconds", 0.0),
                             s.get("min_block_budget_seconds", 0.0),
@@ -1768,6 +1773,31 @@ class BaseMiner(ABC):
         if len(state.top_k) >= state.top_k_cap:
             return state.top_k[-1].result.energy
         return float("inf")
+
+    @staticmethod
+    def _best_candidate_summary(
+        top_k: List["StashEntry"], is_decay_ranked: bool,
+    ) -> str:
+        """One-line summary of the current best stashed candidate for progress.
+
+        Selects the same entry as the "Best Solution" line — earliest win-time
+        then lowest energy on the decay path, lowest energy on the legacy path —
+        and reports its floor, energy, and when it becomes submittable. Returns
+        ``"n/a"`` when nothing is stashed yet (before the first stash, or the
+        mempool path, which doesn't use this stash).
+        """
+        if not top_k:
+            return "n/a"
+        if is_decay_ranked:
+            best = min(top_k, key=lambda e: (e.decay_num, e.result.energy))
+        else:
+            best = min(top_k, key=lambda e: e.result.energy)
+        return (
+            "floor=%.0f energy=%.0f submittable@block=%d (decay #%d)" % (
+                best.result.effective_floor, best.result.energy,
+                best.valid_at_block, best.decay_num,
+            )
+        )
 
     def _reconstruct_or_skip(
         self, sampleset: Any, defect_info: Any, state: _MiningLoopState,
