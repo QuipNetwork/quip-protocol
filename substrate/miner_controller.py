@@ -23,8 +23,10 @@ telemetry API so a single CLI entry point can spin everything up.
 Key behaviors:
   - Fail-fast at startup if the signer's account isn't in `QuantumPow.Miners`.
   - Fail-fast if `--topology-hash` is set and doesn't match the snapshot.
-  - On every new best head: cancel current work, fetch snapshot at the new
-    head hash, dispatch a fresh context to every handle.
+  - On every new best head: fetch snapshot at the new head hash. A head
+    whose work key matches the in-flight one is skipped (the current
+    mining attempt keeps running); only a work-key change cancels current
+    work and dispatches a fresh context to every handle.
   - On every `MiningResult`: encode and submit. Classify the receipt error
     into stale (continue) or fatal (exit) buckets.
   - On shutdown: cancel all handles, drain pending results, return.
@@ -1507,16 +1509,16 @@ class SubstrateMinerController:
         cleaning up.
 
         On timeout we proceed anyway. This is logged at DEBUG, not
-        WARNING: under steady SA load the worker is inside an
-        uninterruptible ``sample_ising`` call that takes 30-45s, so
-        it physically cannot ack within the 0.5s budget. The downstream
-        guards (``dispatch_id`` check in ``_handle_result`` + the
-        ``_closed_work_keys`` short-circuit) make the cancel→clear race
-        harmless — stale results from the old dispatch land, get
-        dropped, and the new dispatch proceeds. The wait remains as a
-        fast-path optimization for the rare case where the worker IS
-        between SA calls (buffer refill, attempt boundary) and can
-        ack within a millisecond.
+        WARNING: the worker is a pure stream consumer that polls the
+        descriptor queue with ``desc_q.get(timeout=0.1)``, so it
+        observes the stop_event within ~0.1s and acks after at most
+        one in-flight evaluation pass — the 0.5s budget exists to
+        cover that eval-pass tail. When even that fires (a dense-graph
+        eval running long), the drainer's ``(handle_id, dispatch_id)``
+        → context pairing plus the stale work-key drop in
+        ``_handle_result`` and the ``_closed_work_keys`` short-circuit
+        make the cancel→clear race harmless — stale results from the
+        old dispatch land, get dropped, and the new dispatch proceeds.
         """
         sentinel_queue = self._done_queues.get(handle.miner_id)
         if sentinel_queue is None:
