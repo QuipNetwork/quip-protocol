@@ -223,6 +223,83 @@ def test_load_only_alias_present_no_canonical(tmp_path):
 
 
 # ----------------------------------------------------------------------
+# [miner] mempool / mempool_min_reward validation
+# ----------------------------------------------------------------------
+
+
+def test_load_mempool_true_and_false_accepted(tmp_path):
+    for literal, expected in (("true", True), ("false", False)):
+        p = tmp_path / f"mempool-{literal}.toml"
+        p.write_text(
+            f'[miner]\nvalidators = ["ws://a:9944"]\nmempool = {literal}\n'
+        )
+        assert load_miner_config(p)["mempool"] is expected
+
+
+def test_load_mempool_string_false_rejected(tmp_path):
+    """`mempool = "false"` is a truthy TOML string — reject loudly instead
+    of silently enabling mempool."""
+    p = tmp_path / "config.toml"
+    p.write_text('[miner]\nvalidators = ["ws://a:9944"]\nmempool = "false"\n')
+    with pytest.raises(MinerConfigError, match=r"mempool.*boolean"):
+        load_miner_config(p)
+
+
+def test_load_mempool_int_rejected(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text('[miner]\nvalidators = ["ws://a:9944"]\nmempool = 1\n')
+    with pytest.raises(MinerConfigError, match=r"mempool.*boolean"):
+        load_miner_config(p)
+
+
+def test_load_mempool_keys_absent_stay_absent(tmp_path):
+    """No default is injected at load time — effective-default resolution
+    is per backend group and happens downstream."""
+    p = tmp_path / "config.toml"
+    p.write_text('[miner]\nvalidators = ["ws://a:9944"]\n')
+    cfg = load_miner_config(p)
+    assert "mempool" not in cfg
+    assert "mempool_min_reward" not in cfg
+
+
+def test_load_mempool_min_reward_zero_and_positive_accepted(tmp_path):
+    for value in (0, 12345):
+        p = tmp_path / f"reward-{value}.toml"
+        p.write_text(
+            f'[miner]\nvalidators = ["ws://a:9944"]\nmempool_min_reward = {value}\n'
+        )
+        assert load_miner_config(p)["mempool_min_reward"] == value
+
+
+def test_load_mempool_min_reward_negative_rejected(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\nmempool_min_reward = -1\n'
+    )
+    with pytest.raises(MinerConfigError, match="non-negative"):
+        load_miner_config(p)
+
+
+def test_load_mempool_min_reward_bool_rejected(tmp_path):
+    # bool is an int subclass; reject so `mempool_min_reward = true` fails loud.
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\nmempool_min_reward = true\n'
+    )
+    with pytest.raises(MinerConfigError, match="integer"):
+        load_miner_config(p)
+
+
+def test_load_mempool_min_reward_string_rejected(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\nmempool_min_reward = "5"\n'
+    )
+    with pytest.raises(MinerConfigError, match="integer"):
+        load_miner_config(p)
+
+
+# ----------------------------------------------------------------------
 # load_backend_config — v0.1-shape hardware inventory tables
 # ----------------------------------------------------------------------
 

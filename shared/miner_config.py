@@ -31,6 +31,15 @@ keystore + identification.
     log_level   = "INFO"                    # optional, DEBUG/INFO/WARNING/ERROR
     node_log    = "/var/log/quip-miner.log" # optional rotating file handler
 
+    # Mempool participation. `mempool` must be an unquoted TOML boolean —
+    # the string "false" is truthy and is rejected at load time.
+    # `mempool_min_reward` drops orders paying less (0 = accept all).
+    mempool     = true                      # optional bool
+    mempool_min_reward = 0                  # optional non-negative int
+
+    # Work-source mode — slated for removal in favor of `mempool` above.
+    mode        = "pow"                     # optional, "pow"|"mempool"|"both"
+
     # v0.1 compatibility aliases — `listen` → `rest_host`, `port` → `rest_port`.
     # These are convenience for v0.1 migrants; if both an alias and its
     # canonical key are present, the canonical key wins and the alias is
@@ -94,6 +103,8 @@ def load_miner_config(
         )
     miner_dict = dict(miner)
     _validate_validators_field(miner_dict.get("validators"))
+    _validate_mempool_field(miner_dict.get("mempool"))
+    _validate_mempool_min_reward_field(miner_dict.get("mempool_min_reward"))
     _apply_v01_aliases(miner_dict)
     return miner_dict
 
@@ -547,6 +558,35 @@ def _apply_v01_aliases(miner_dict: dict[str, Any]) -> None:
         if canonical not in miner_dict:
             miner_dict[canonical] = miner_dict[alias]
         del miner_dict[alias]
+
+
+def _validate_mempool_field(value: Any) -> None:
+    """Reject a non-bool `mempool` early — the TOML string `"false"` is
+    truthy and would silently enable mempool participation."""
+    if value is None:
+        return
+    if not isinstance(value, bool):
+        raise MinerConfigError(
+            f"miner config: [miner].mempool must be a TOML boolean "
+            f"(true/false, unquoted), got {type(value).__name__} ({value!r})"
+        )
+
+
+def _validate_mempool_min_reward_field(value: Any) -> None:
+    """Reject a non-int or negative `mempool_min_reward` at load time."""
+    if value is None:
+        return
+    # bool is an int subclass; reject so `mempool_min_reward = true` fails loud.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise MinerConfigError(
+            f"miner config: [miner].mempool_min_reward must be a "
+            f"non-negative integer, got {type(value).__name__} ({value!r})"
+        )
+    if value < 0:
+        raise MinerConfigError(
+            f"miner config: [miner].mempool_min_reward must be non-negative, "
+            f"got {value}"
+        )
 
 
 def _validate_validators_field(value: Any) -> None:
