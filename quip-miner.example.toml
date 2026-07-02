@@ -32,6 +32,11 @@ validators = [
 # CLI: --signer-key PATH
 signer_key = "~/.quip-miner/signing.json"
 
+# Work source: "pow" (chain heads, default), "mempool"
+# (QuantumComputeMempool jobs), or "both" (split workers; needs ≥2
+# handles). CLI: --mode overrides.
+# mode = "pow"
+
 # Optional. When set, an underfunded wallet is topped up through this
 # faucet bot at startup instead of failing fast. Leave commented out
 # in production (the faucet is dev-only).

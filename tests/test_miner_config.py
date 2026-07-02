@@ -610,9 +610,10 @@ def test_resolve_modes_both_mode_multi_backend_rejected():
 
 
 def test_resolve_modes_mempool_case_insensitive():
-    """`MEMPOOL` / `Both` / etc. all trigger the guard. Bash callers
-    may pass through whatever the operator set in QUIP_MINE_MODE; the
-    guard normalises rather than insisting on lowercase."""
+    """`MEMPOOL` / `Both` / etc. all trigger the guard. Callers may pass
+    through whatever casing the operator wrote in the TOML `mode` key or
+    --mine-mode flag; the guard normalises rather than insisting on
+    lowercase."""
     backends = {"cpu": {}, "dwave": {}}
     for variant in ("MEMPOOL", "Mempool", "MeMpOoL", "BOTH", "Both"):
         with pytest.raises(ModeResolutionError) as excinfo:

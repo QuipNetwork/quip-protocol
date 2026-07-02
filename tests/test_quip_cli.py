@@ -1,6 +1,8 @@
 """Unit tests for quip_cli helpers: topology parsing, injection, hashing, and subcommands."""
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict
 
 import click
@@ -469,6 +471,71 @@ def test_quip_miner_cpu_identification_via_toml(monkeypatch, tmp_path):
     assert captured.get("node_log") == "/var/log/quip-miner.log"
 
 
+def test_quip_miner_cpu_mode_falls_back_to_toml(monkeypatch, tmp_path):
+    """`mode` in the [miner] table drives the work source when --mode is
+    not passed — config.toml is the single source of truth in docker."""
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[miner]\n'
+        'validators = ["ws://localhost:9944"]\n'
+        'signer_key = "~/.quip-miner/signing.json"\n'
+        'mode = "mempool"\n'
+    )
+    captured: Dict[str, Any] = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mode") == "mempool"
+
+
+def test_quip_miner_cpu_mode_flag_beats_toml(monkeypatch, tmp_path):
+    """An explicit --mode wins over the TOML `mode` key."""
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[miner]\n'
+        'validators = ["ws://localhost:9944"]\n'
+        'signer_key = "~/.quip-miner/signing.json"\n'
+        'mode = "mempool"\n'
+    )
+    captured: Dict[str, Any] = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
+    result = CliRunner().invoke(
+        quip_cli.quip_miner_cpu, ["--config", str(p), "--mode", "pow"]
+    )
+    assert result.exit_code == 0, result.output
+    assert captured.get("mode") == "pow"
+
+
+def test_quip_miner_cpu_mode_defaults_to_pow(monkeypatch, tmp_path):
+    """No --mode and no TOML `mode` → pow (unchanged default)."""
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[miner]\n'
+        'validators = ["ws://localhost:9944"]\n'
+        'signer_key = "~/.quip-miner/signing.json"\n'
+    )
+    captured: Dict[str, Any] = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mode") == "pow"
+
+
 def test_quip_miner_cpu_listen_port_aliased_to_rest(monkeypatch, tmp_path):
     """TOML alias resolution: listen → rest_host, port → rest_port. CLI
     receives the canonical values."""
@@ -529,6 +596,12 @@ def test_auto_identify_submission_failure_is_fatal(monkeypatch):
         async def descriptor_schema_version(self):
             return 2
 
+        async def encode_call_args(self, _module, _call, _params):
+            return b"scale-args"
+
+        async def query_descriptor_payload_hash(self, _account):
+            return None  # nothing filed — startup must submit
+
     class FakeSigner:
         def ss58_address(self):
             return "5FakeAccountId00000000000000000000000000000000000"
@@ -578,15 +651,25 @@ def test_auto_identify_retries_then_posts(monkeypatch, caplog):
     class FakeClient:
         def __init__(self):
             self.attempts = 0
+            self.posted = False
 
         async def submit_extrinsic(self, _module, _call, _args, _signer, **_kw):
             self.attempts += 1
             if self.attempts == 1:
                 raise RuntimeError("Priority is too low")  # stale-nonce shape
+            self.posted = True
             return FakeReceipt()
 
         async def descriptor_schema_version(self):
             return 2
+
+        async def encode_call_args(self, _module, _call, _params):
+            return b"scale-args"
+
+        async def query_descriptor_payload_hash(self, _account):
+            from substrate.miner_registry import descriptor_payload_hash
+
+            return descriptor_payload_hash(b"scale-args") if self.posted else None
 
     class FakeSigner:
         def ss58_address(self):
@@ -640,6 +723,14 @@ def test_auto_identify_submits_miner_registry_descriptor(monkeypatch, caplog):
         async def descriptor_schema_version(self):
             return 2
 
+        async def encode_call_args(self, _module, _call, _params):
+            return b"scale-args"
+
+        async def query_descriptor_payload_hash(self, _account):
+            from substrate.miner_registry import descriptor_payload_hash
+
+            return descriptor_payload_hash(b"scale-args") if self.calls else None
+
     class FakeSigner:
         def ss58_address(self):
             return "5FakeAccountId00000000000000000000000000000000000"
@@ -678,6 +769,113 @@ def test_auto_identify_submits_miner_registry_descriptor(monkeypatch, caplog):
     assert body["node_name"] == (b"test-rig",)
     (miners,) = body["miners"]
     assert miners[0]["kind"] == "Cpu"
+
+
+# ----------------------------------------------------------------------
+# _auto_identify chain-state check: skip when current, verify after submit
+# ----------------------------------------------------------------------
+
+
+class _FakeIdentifySigner:
+    def ss58_address(self):
+        return "5FakeAccountId00000000000000000000000000000000000"
+
+    def account_id_bytes(self):
+        return b"\x00" * 32
+
+
+class _FakeIdentifyKeystore:
+    signer = _FakeIdentifySigner()
+
+
+class _FakeIdentifyClient:
+    """Client stub modelling the descriptor round-trip.
+
+    ``encode_call_args`` returns fixed SCALE bytes; the chain "shows" the
+    matching payload hash only once ``submits >= visible_after_submits``
+    (before that, ``query_descriptor_payload_hash`` returns ``chain_hash``
+    — ``None`` models a fresh miner, a different digest a stale record).
+    """
+
+    ENCODED = b"scale-encoded-descriptor-args"
+
+    def __init__(self, *, chain_hash=None, visible_after_submits=1):
+        self.chain_hash = chain_hash
+        self.visible_after_submits = visible_after_submits
+        self.submits = 0
+        self.calls = []
+
+    async def descriptor_schema_version(self):
+        return 2
+
+    async def encode_call_args(self, _module, _call, _params):
+        return self.ENCODED
+
+    async def query_descriptor_payload_hash(self, _account):
+        from substrate.miner_registry import descriptor_payload_hash
+
+        if self.submits >= self.visible_after_submits:
+            return descriptor_payload_hash(self.ENCODED)
+        return self.chain_hash
+
+    async def submit_extrinsic(self, module, call, args, _signer, **_kw):
+        self.submits += 1
+        self.calls.append((module, call, args))
+        return SimpleNamespace(error=None, extrinsic_hash="0xabc", block_hash="0xdef")
+
+
+def _run_auto_identify(client):
+    import asyncio
+
+    asyncio.run(quip_cli._auto_identify(
+        client,
+        _FakeIdentifyKeystore(),
+        node_name="test-rig",
+        public_host="rig.example.com",
+        public_port=None,
+        log_level=None,
+        miners_config={"cpu": {"num_cpus": 1}},
+    ))
+
+
+def test_auto_identify_skips_submit_when_chain_record_matches():
+    """When the on-chain payload_hash already equals what we would submit,
+    startup files nothing — the descriptor is current."""
+    from substrate.miner_registry import descriptor_payload_hash
+
+    client = _FakeIdentifyClient(
+        chain_hash=descriptor_payload_hash(_FakeIdentifyClient.ENCODED),
+    )
+    _run_auto_identify(client)
+    assert client.submits == 0
+
+
+def test_auto_identify_submits_when_no_descriptor_on_chain():
+    """A fresh miner (no NodeDescriptors entry) files the descriptor."""
+    client = _FakeIdentifyClient(chain_hash=None)
+    _run_auto_identify(client)
+    assert client.submits == 1
+    assert client.calls[0][:2] == ("MinerRegistry", "set_descriptor")
+
+
+def test_auto_identify_submits_update_when_chain_record_differs():
+    """A stale on-chain record (different payload_hash) triggers an update."""
+    client = _FakeIdentifyClient(chain_hash=b"\x11" * 32)
+    _run_auto_identify(client)
+    assert client.submits == 1
+
+
+def test_auto_identify_resubmits_until_descriptor_visible_on_chain(monkeypatch):
+    """An in-block receipt is not enough: if chain state never shows our
+    payload_hash (e.g. the block was orphaned), the attempt is retried
+    until the descriptor is actually readable from storage."""
+    async def _no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(quip_cli.asyncio, "sleep", _no_sleep)
+    client = _FakeIdentifyClient(chain_hash=None, visible_after_submits=2)
+    _run_auto_identify(client)
+    assert client.submits == 2
 
 
 # ----------------------------------------------------------------------
@@ -777,30 +975,9 @@ def test_auto_identify_uses_detected_public_ip_when_unset(monkeypatch):
         return real_build(**kwargs)
     monkeypatch.setattr(quip_cli, "build_descriptor", fake_build)
 
-    class FakeReceipt:
-        error = None
-        extrinsic_hash = "0xabc"
-        block_hash = "0xdef"
-
-    class FakeClient:
-        async def submit_extrinsic(self, *_a, **_kw):
-            return FakeReceipt()
-
-        async def descriptor_schema_version(self):
-            return 2
-
-    class FakeSigner:
-        def ss58_address(self):
-            return "5FakeAccountId00000000000000000000000000000000000"
-        def account_id_bytes(self):
-            return b"\x00" * 32
-
-    class FakeKeystore:
-        signer = FakeSigner()
-
     asyncio.run(quip_cli._auto_identify(
-        FakeClient(),
-        FakeKeystore(),
+        _FakeIdentifyClient(),
+        _FakeIdentifyKeystore(),
         node_name="test-rig",
         public_host=None,
         public_port=None,
@@ -830,30 +1007,9 @@ def test_auto_identify_skips_detection_when_public_host_set(monkeypatch):
         return real_build(**kwargs)
     monkeypatch.setattr(quip_cli, "build_descriptor", fake_build)
 
-    class FakeReceipt:
-        error = None
-        extrinsic_hash = "0xabc"
-        block_hash = "0xdef"
-
-    class FakeClient:
-        async def submit_extrinsic(self, *_a, **_kw):
-            return FakeReceipt()
-
-        async def descriptor_schema_version(self):
-            return 2
-
-    class FakeSigner:
-        def ss58_address(self):
-            return "5FakeAccountId00000000000000000000000000000000000"
-        def account_id_bytes(self):
-            return b"\x00" * 32
-
-    class FakeKeystore:
-        signer = FakeSigner()
-
     asyncio.run(quip_cli._auto_identify(
-        FakeClient(),
-        FakeKeystore(),
+        _FakeIdentifyClient(),
+        _FakeIdentifyKeystore(),
         node_name="test-rig",
         public_host="miner.example.com",
         public_port=None,
@@ -1072,29 +1228,12 @@ def _capture_auto_identify_params(monkeypatch, miners_config: Dict[str, Any]) ->
     import asyncio
     captured: Dict[str, Any] = {}
 
-    class FakeReceipt:
-        error = None
-        extrinsic_hash = "0xabc"
-        block_hash = "0xdef"
-
-    class FakeClient:
+    class FakeClient(_FakeIdentifyClient):
         async def submit_extrinsic(self, module, call, args, _signer, **_kw):
             captured["module"] = module
             captured["call"] = call
             captured["params"] = args
-            return FakeReceipt()
-
-        async def descriptor_schema_version(self):
-            return 2
-
-    class FakeSigner:
-        def ss58_address(self):
-            return "5FakeAccount" + "0" * 38
-        def account_id_bytes(self):
-            return b"\x00" * 32
-
-    class FakeKeystore:
-        signer = FakeSigner()
+            return await super().submit_extrinsic(module, call, args, _signer, **_kw)
 
     async def _no_probe():
         return None
@@ -1102,7 +1241,7 @@ def _capture_auto_identify_params(monkeypatch, miners_config: Dict[str, Any]) ->
 
     asyncio.run(quip_cli._auto_identify(
         FakeClient(),
-        FakeKeystore(),
+        _FakeIdentifyKeystore(),
         node_name="rig",
         public_host="rig.example.com",
         public_port=None,
@@ -1193,6 +1332,182 @@ def test_auto_identify_blocks_credential_smuggled_through_solver(
     text = repr(params)
     assert "DWAVE_API_KEY" not in text
     assert "smuggle-via-solver-1234" not in text
+
+
+# ── top-level production supervisor: quip-miner --config ─────────────
+
+
+def _write_supervisor_toml(tmp_path, extra_miner="", backend="[cpu]\nnum_cpus = 1\n"):
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://localhost:9944"]\n'
+        'signer_key = "/data/keystore.json"\n'
+        'rest_port = 8086\n'
+        f'{extra_miner}'
+        f'{backend}'
+    )
+    return p
+
+
+def test_plan_processes_spawns_telemetry_and_backend_children(monkeypatch, tmp_path):
+    """A config with rest_port > 0 and one backend group plans a telemetry
+    aggregator plus one miner child, all driven by --config only."""
+    monkeypatch.setattr(quip_cli, "_detect_image_supports", lambda: ["cpu", "qpu"])
+    cfg = _write_supervisor_toml(tmp_path)
+    runtime_dir, procs = quip_cli._plan_processes(cfg)
+    assert runtime_dir == cfg.resolve().parent / "runtime"
+    argvs = [p["args"] for p in procs]
+    assert argvs[0][:1] == ["telemetry"]
+    assert "--snapshot-dir" in argvs[0] and str(runtime_dir) in argvs[0]
+    assert argvs[1] == ["cpu", "--config", str(cfg)]
+    # miner children get the internal aggregator glue via env, invisibly
+    assert procs[1]["env"] == {
+        "QUIP_RUNTIME_DIR": str(runtime_dir),
+        "QUIP_TELEMETRY_EXTERNAL": "1",
+    }
+
+
+def test_plan_processes_omits_telemetry_when_rest_disabled(monkeypatch, tmp_path):
+    """rest_port = -1 → no aggregator process (and no external-glue env)."""
+    monkeypatch.setattr(quip_cli, "_detect_image_supports", lambda: ["cpu"])
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[miner]\nvalidators = ["ws://localhost:9944"]\nrest_port = -1\n'
+        '[cpu]\nnum_cpus = 1\n'
+    )
+    _runtime_dir, procs = quip_cli._plan_processes(cfg)
+    assert [p["args"][0] for p in procs] == ["cpu"]
+    assert procs[0]["env"] == {}
+
+
+def test_plan_processes_rejects_backend_without_library(monkeypatch, tmp_path):
+    """[cuda.0] on an install without gpu libraries fails with the
+    unsupported-mode error, before any process starts."""
+    monkeypatch.setattr(quip_cli, "_detect_image_supports", lambda: ["cpu", "qpu"])
+    cfg = _write_supervisor_toml(tmp_path, backend="[cuda.0]\n")
+    with pytest.raises(click.ClickException, match="unsupported-mode"):
+        quip_cli._plan_processes(cfg)
+
+
+def test_detect_image_supports_probes_imports(monkeypatch):
+    """cpu is always supported; gpu/qpu depend on importable libraries."""
+    available = {"dwave.system"}
+    monkeypatch.setattr(
+        quip_cli, "_importable", lambda name: name in available
+    )
+    assert quip_cli._detect_image_supports() == ["cpu", "qpu"]
+    available.update({"cupy"})
+    assert quip_cli._detect_image_supports() == ["cpu", "gpu", "qpu"]
+
+
+def test_bare_quip_miner_with_config_runs_supervisor(monkeypatch, tmp_path):
+    """`quip-miner --config x.toml` (no subcommand) is the production
+    entry: it hands off to the supervisor."""
+    cfg = _write_supervisor_toml(tmp_path)
+    called: Dict[str, Any] = {}
+    monkeypatch.setattr(
+        quip_cli, "_run_supervisor",
+        lambda path: called.setdefault("path", path) and 0 or 0,
+    )
+    result = CliRunner().invoke(quip_cli.quip_miner, ["--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert called["path"] == Path(cfg).expanduser()
+
+
+def test_bare_quip_miner_without_config_shows_help():
+    """Bare `quip-miner` (no subcommand, no --config) prints help, not an
+    error traceback."""
+    result = CliRunner().invoke(quip_cli.quip_miner, [])
+    assert result.exit_code == 0, result.output
+    assert "Usage" in result.output
+
+
+# ── telemetry aggregator: --config fallback ───────────────────────────
+
+
+def _capture_telemetry_main(monkeypatch):
+    """Stub substrate.telemetry_process.telemetry_main; return capture dict."""
+    import substrate.telemetry_process as tp
+
+    captured: Dict[str, Any] = {}
+
+    def fake_main(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(tp, "telemetry_main", fake_main)
+    return captured
+
+
+def test_telemetry_reads_rest_and_validators_from_config(monkeypatch, tmp_path):
+    """`telemetry --config` picks up rest_host/rest_port/validators from
+    the [miner] table — same file that configures the miner children."""
+    cfg = tmp_path / "miner.toml"
+    cfg.write_text(
+        '[miner]\n'
+        'validators = ["ws://a:9944", "ws://b:9944"]\n'
+        'rest_host = "127.0.0.5"\n'
+        'rest_port = 9001\n'
+    )
+    captured = _capture_telemetry_main(monkeypatch)
+    result = CliRunner().invoke(
+        quip_cli.quip_miner,
+        ["telemetry", "--snapshot-dir", str(tmp_path), "--config", str(cfg)],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["listen_host"] == "127.0.0.5"
+    assert captured["listen_port"] == 9001
+    assert captured["validator_urls"] == ["ws://a:9944", "ws://b:9944"]
+
+
+def test_telemetry_flags_beat_config(monkeypatch, tmp_path):
+    """Explicit --rest-host/--rest-port/--validator override the TOML."""
+    cfg = tmp_path / "miner.toml"
+    cfg.write_text(
+        '[miner]\n'
+        'validators = ["ws://toml:9944"]\n'
+        'rest_host = "127.0.0.5"\n'
+        'rest_port = 9001\n'
+    )
+    captured = _capture_telemetry_main(monkeypatch)
+    result = CliRunner().invoke(
+        quip_cli.quip_miner,
+        [
+            "telemetry", "--snapshot-dir", str(tmp_path), "--config", str(cfg),
+            "--rest-host", "0.0.0.0", "--rest-port", "8099",
+            "--validator", "ws://flag:9944",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["listen_host"] == "0.0.0.0"
+    assert captured["listen_port"] == 8099
+    assert captured["validator_urls"] == ["ws://flag:9944"]
+
+
+def test_telemetry_disabled_rest_port_collapses_to_8086(monkeypatch, tmp_path):
+    """A legacy `rest_port = -1` (children-disabled sentinel) must not
+    break the aggregator — it serves on the 8086 default instead."""
+    cfg = tmp_path / "miner.toml"
+    cfg.write_text('[miner]\nrest_port = -1\n')
+    captured = _capture_telemetry_main(monkeypatch)
+    result = CliRunner().invoke(
+        quip_cli.quip_miner,
+        ["telemetry", "--snapshot-dir", str(tmp_path), "--config", str(cfg)],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["listen_port"] == 8086
+    assert captured["listen_host"] == "0.0.0.0"
+
+
+def test_telemetry_defaults_without_config(monkeypatch, tmp_path):
+    """No --config, no flags → the documented 0.0.0.0:8086 defaults."""
+    captured = _capture_telemetry_main(monkeypatch)
+    result = CliRunner().invoke(
+        quip_cli.quip_miner, ["telemetry", "--snapshot-dir", str(tmp_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["listen_host"] == "0.0.0.0"
+    assert captured["listen_port"] == 8086
+    assert captured["validator_urls"] == []
 
 
 # ── resolve-mode / resolve-modes CLI subcommands ──────────────────────
@@ -1347,6 +1662,38 @@ def test_resolve_modes_mempool_multi_backend_cli_errors(tmp_path):
     )
     assert result.exit_code != 0
     assert "multi-backend-not-allowed-in-mempool-mode" in result.output
+
+
+def test_resolve_modes_reads_mode_from_miner_table(tmp_path):
+    """`mode` in the [miner] table acts as the --mine-mode fallback, so a
+    config-only docker launch still gets the mempool multi-backend guard."""
+    cfg = tmp_path / "miner.toml"
+    cfg.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\nmode = "mempool"\n'
+        '[cpu]\nnum_cpus = 2\n'
+        '[dwave]\ndaily_budget = "60s"\n'
+    )
+    result = CliRunner().invoke(
+        quip_cli.quip_miner, ["resolve-modes", "--config", str(cfg)],
+    )
+    assert result.exit_code != 0
+    assert "multi-backend-not-allowed-in-mempool-mode" in result.output
+
+
+def test_resolve_modes_mine_mode_flag_beats_miner_table(tmp_path):
+    """--mine-mode pow overrides a TOML mode = "mempool"."""
+    cfg = tmp_path / "miner.toml"
+    cfg.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\nmode = "mempool"\n'
+        '[cpu]\nnum_cpus = 2\n'
+        '[dwave]\ndaily_budget = "60s"\n'
+    )
+    result = CliRunner().invoke(
+        quip_cli.quip_miner,
+        ["resolve-modes", "--config", str(cfg), "--mine-mode", "pow"],
+    )
+    assert result.exit_code == 0, result.output
+    assert result.output.strip().splitlines() == ["cpu", "qpu"]
 
 
 def test_resolve_modes_pow_multi_backend_cli_ok(tmp_path):

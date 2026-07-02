@@ -3,9 +3,9 @@
 # Run:  docker compose -f docker/docker-compose.yml up cpu-miner
 #       docker compose -f docker/docker-compose.yml up gpu-miner
 #
-# Configure validators via env or by editing the volume's config.toml
-# after first run:
-#   QUIP_VALIDATORS=ws://validator-1:9944,ws://validator-2:9944
+# All miner configuration lives in the volume's config.toml (seeded
+# from the image template on first run) — validators, mode, identity,
+# backend inventory. Edit it and `docker compose restart`.
 #
 # File ownership: the container drops from root to the in-container
 # `quip` user (uid 1000 by default) before launching the miner, so
@@ -23,12 +23,6 @@ services:
       dockerfile: docker/Dockerfile.cpu
     image: registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu:latest
     container_name: quip-miner-cpu
-    environment:
-      - QUIP_VALIDATORS=
-      - QUIP_FAUCET_URL=
-      - QUIP_MINE_MODE=pow
-      - QUIP_REST_PORT=-1
-      - QUIP_REST_HOST=0.0.0.0
     volumes:
       - cpu-miner-data:/data
     networks:
@@ -40,12 +34,6 @@ services:
       dockerfile: docker/Dockerfile.cuda
     image: registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:latest
     container_name: quip-miner-gpu
-    environment:
-      - QUIP_VALIDATORS=
-      - QUIP_FAUCET_URL=
-      - QUIP_MINE_MODE=pow
-      - QUIP_REST_PORT=-1
-      - QUIP_REST_HOST=0.0.0.0
     volumes:
       - gpu-miner-data:/data
     deploy:
