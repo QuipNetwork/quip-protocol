@@ -10,6 +10,7 @@ stands in for the persistent stream-driver context.
 """
 from __future__ import annotations
 
+import logging
 import multiprocessing as mp
 
 import numpy as np
@@ -735,6 +736,166 @@ def test_ensure_driver_forwards_topology_in_factory_kwargs():
         assert captured["factory_kwargs"]["topology"] is sentinel
     finally:
         bm.spawn_worker = _orig
+        miner._close_driver()
+
+
+# ----------------------------------------------------------------------
+# Ring-reuse gate: _ring_can_host + _ensure_driver respawn policy
+# ----------------------------------------------------------------------
+
+
+class TestRingCanHost:
+    """_ring_can_host: reuse-when-compatible gate over the persistent ring."""
+
+    @staticmethod
+    def _miner(ring_dims):
+        miner = _RingConsumer()
+        miner._ring_dims = ring_dims
+        return miner
+
+    def test_no_ring_yet_cannot_host(self):
+        assert self._miner(None)._ring_can_host((8, 3)) is False
+
+    def test_equal_dims_reuse(self):
+        assert self._miner((8, 3))._ring_can_host((8, 3)) is True
+
+    def test_smaller_num_reads_reuse(self):
+        assert self._miner((8, 3))._ring_can_host((4, 3)) is True
+
+    def test_larger_num_reads_respawn(self):
+        assert self._miner((8, 3))._ring_can_host((16, 3)) is False
+
+    def test_node_count_change_respawn(self):
+        assert self._miner((8, 3))._ring_can_host((8, 4)) is False
+        assert self._miner((8, 3))._ring_can_host((4, 2)) is False
+
+
+def _driver_sample_ctx(num_reads=8, nodes=(0, 1, 2)):
+    """Minimal sample_ctx for driving _ensure_driver directly."""
+    return {
+        "num_reads": num_reads, "nodes": list(nodes), "edges": [],
+        "annealing_time": 80.0, "energy_threshold": -1.0,
+        "last_proof_block_hash": b"\xab" * 32, "miner_bytes": b"\x42" * 32,
+    }
+
+
+def test_ensure_driver_reuses_ring_for_smaller_num_reads():
+    """A smaller-num_reads dispatch reuses the driver: same pid, same ring.
+
+    The per-dispatch num_reads rides the ('switch', ...) command, so the ring
+    only needs CAPACITY for it — capacity stays at the spawn-time size.
+    """
+    miner = _DriverMiner()
+    try:
+        assert miner._ensure_driver(_driver_sample_ctx(num_reads=8)) is True
+        pid = miner._driver_proc.pid
+        assert miner._ensure_driver(_driver_sample_ctx(num_reads=4)) is True
+        assert miner._driver_proc.pid == pid
+        assert miner._ring_dims == (8, 3)
+        assert miner._ring.max_rows == 8
+    finally:
+        miner._close_driver()
+
+
+def test_ensure_driver_respawns_and_grows_on_larger_num_reads(caplog):
+    """num_reads > ring capacity respawns, sized to the LARGER num_reads —
+    monotonic growth, so alternating pow<->mempool dims settle into reuse."""
+    miner = _DriverMiner()
+    try:
+        assert miner._ensure_driver(_driver_sample_ctx(num_reads=8)) is True
+        pid = miner._driver_proc.pid
+        with caplog.at_level(logging.INFO, logger=miner.logger.name):
+            assert miner._ensure_driver(_driver_sample_ctx(num_reads=16)) is True
+        assert miner._driver_proc.pid != pid
+        assert miner._ring_dims == (16, 3)
+        assert miner._ring.max_rows == 16
+        assert "dims-grew" in caplog.text
+        # Monotonic growth: the original smaller round now reuses the big ring.
+        pid_grown = miner._driver_proc.pid
+        assert miner._ensure_driver(_driver_sample_ctx(num_reads=8)) is True
+        assert miner._driver_proc.pid == pid_grown
+    finally:
+        miner._close_driver()
+
+
+def test_ensure_driver_respawns_on_node_count_change(caplog):
+    """A different node count never reuses (sample columns are topology-bound)."""
+    miner = _DriverMiner()
+    try:
+        assert miner._ensure_driver(_driver_sample_ctx(nodes=(0, 1, 2))) is True
+        pid = miner._driver_proc.pid
+        with caplog.at_level(logging.INFO, logger=miner.logger.name):
+            assert miner._ensure_driver(
+                _driver_sample_ctx(nodes=(0, 1, 2, 3)),
+            ) is True
+        assert miner._driver_proc.pid != pid
+        assert miner._ring_dims == (8, 4)
+        assert "node-count-changed" in caplog.text
+    finally:
+        miner._close_driver()
+
+
+def test_ensure_driver_respawns_dead_driver_with_reason(caplog):
+    """A dead driver respawns even on identical dims, logged as dead-driver."""
+    miner = _DriverMiner()
+    try:
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        pid = miner._driver_proc.pid
+        terminate_join(miner._driver_proc, 5.0)
+        assert not miner._driver_proc.is_alive()
+        with caplog.at_level(logging.INFO, logger=miner.logger.name):
+            assert miner._ensure_driver(_driver_sample_ctx()) is True
+        assert miner._driver_proc.pid != pid
+        assert miner._driver_proc.is_alive()
+        assert "dead-driver" in caplog.text
+    finally:
+        miner._close_driver()
+
+
+class _VariableReadsMiner(_DriverMiner):
+    """Driver miner whose adapted num_reads follows ``reads_next`` per dispatch."""
+
+    def __init__(self):
+        super().__init__(factory=_FAKE_CTX)
+        self.reads_next = 8
+
+    def _adapt_mining_params(self, requirements, nodes, edges) -> dict:
+        return {
+            "num_reads": self.reads_next,
+            "annealing_time": 80.0,
+            "energy_threshold": requirements.difficulty_energy,
+        }
+
+
+def test_mine_work_item_ring_reuse_across_num_reads_changes():
+    """End-to-end: a smaller-num_reads dispatch keeps the driver pid; a
+    larger one respawns (the pow<->mempool flip cost model)."""
+    import threading
+    import time as _t
+
+    ctx = _streaming_context()
+    miner = _VariableReadsMiner()
+    try:
+        pids = []
+        for gen, reads in enumerate((8, 4, 16), start=1):
+            miner.reads_next = reads
+            stop = mp.Event()
+            t = threading.Thread(target=lambda s=stop: miner.mine_work_item(ctx, s))
+            t.start()
+            # The generation bumps right after _ensure_driver succeeds, so
+            # polling it is race-free (no fixed sleep).
+            deadline = _t.monotonic() + 10.0
+            while miner._generation < gen and _t.monotonic() < deadline:
+                _t.sleep(0.02)
+            assert miner._generation == gen, f"dispatch {gen} never set up"
+            pids.append(miner._driver_proc.pid)
+            stop.set()
+            t.join(timeout=15.0)
+            assert not t.is_alive()
+        assert pids[0] == pids[1], "smaller num_reads must reuse the driver"
+        assert pids[1] != pids[2], "larger num_reads must respawn the driver"
+        assert miner._ring_dims == (16, 3)
+    finally:
         miner._close_driver()
 
 
