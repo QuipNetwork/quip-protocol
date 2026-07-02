@@ -131,3 +131,18 @@ def test_participation_call_params_targets_candidate_qblock():
         "kind": "QpuDwave",
         "budget_seconds": 90,
     }
+
+
+def test_descriptor_payload_hash_matches_runtime_blake2_256():
+    """The pallet stores blake2_256(SCALE(NodeDescriptorInput)) as
+    payload_hash; the local helper must produce the identical digest so
+    startup can compare its would-be submission against chain state.
+    Verified against the well-known blake2b-256 empty-input vector."""
+    from substrate.miner_registry import descriptor_payload_hash
+
+    assert descriptor_payload_hash(b"") == bytes.fromhex(
+        "0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8"
+    )
+    digest = descriptor_payload_hash(b"quip")
+    assert len(digest) == 32
+    assert digest != descriptor_payload_hash(b"quip2")

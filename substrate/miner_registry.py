@@ -8,7 +8,8 @@ SCALE-friendly call params expected by ``MinerRegistry.set_descriptor`` and
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import hashlib
+from typing import Any, Optional
 
 from shared.system_info import NodeDescriptor
 from substrate.mempool_types import MinerType
@@ -77,6 +78,18 @@ def descriptor_call_params(
         body["runtime"] = _runtime_params(descriptor.runtime)
         return {"descriptor": {"V2": body}}
     return {"descriptor": {"V1": body}}
+
+
+def descriptor_payload_hash(encoded_args: bytes) -> bytes:
+    """Digest the SCALE-encoded ``set_descriptor`` call args the way the
+    runtime does.
+
+    The pallet stores ``blake2_256(NodeDescriptorInput.encode())`` as the
+    descriptor's ``payload_hash``, so hashing the same encoded argument
+    bytes locally lets startup compare its would-be submission against
+    chain state byte-for-byte (skip when current, verify after submit).
+    """
+    return hashlib.blake2b(encoded_args, digest_size=32).digest()
 
 
 def _system_info_params(system_info: Any) -> Optional[dict[str, Any]]:

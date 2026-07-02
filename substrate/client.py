@@ -646,6 +646,52 @@ class SubstrateClient:
             rewards_earned=int(v["rewards_earned"]),
         )
 
+    async def query_descriptor_payload_hash(self, account: bytes) -> Optional[bytes]:
+        """Return ``MinerRegistry.NodeDescriptors[account].payload_hash``, or ``None``.
+
+        The runtime stores ``blake2_256`` of the SCALE-encoded
+        ``set_descriptor`` argument, so comparing this against a locally
+        computed digest (:func:`substrate.miner_registry.descriptor_payload_hash`
+        over :meth:`encode_call_args`) tells whether the on-chain record
+        already matches what this node would submit. ``None`` means no
+        descriptor is filed.
+        """
+        if len(account) != 32:
+            raise ValueError(f"account must be 32 bytes, got {len(account)}")
+        result = await self._run(
+            lambda: self._iface.query("MinerRegistry", "NodeDescriptors", [account])
+        )
+        v = _storage_value(result)
+        if v is None:
+            return None
+        stored = v.get("payload_hash")
+        if not isinstance(stored, str) or not stored.startswith("0x"):
+            return None
+        return bytes.fromhex(stored[2:])
+
+    async def encode_call_args(
+        self, module: str, function: str, call_params: dict
+    ) -> bytes:
+        """Return the SCALE encoding of ``call_params`` for ``module.function``.
+
+        Composes the call against live metadata and strips the 2-byte call
+        index, leaving exactly the concatenated encoded arguments — the bytes
+        the runtime sees as the extrinsic's parameters (and, for
+        ``set_descriptor``, the input to its stored ``payload_hash``).
+        """
+
+        def _encode() -> bytes:
+            call = self._iface.compose_call(
+                call_module=module,
+                call_function=function,
+                call_params=call_params,
+            )
+            # ``call.data`` is a ScaleBytes wrapper (not bytes-convertible);
+            # its ``.data`` bytearray holds the raw encoding.
+            return bytes(call.data.data)[2:]
+
+        return await self._run(_encode)
+
     async def query_proofs_submitted(self, account: bytes) -> Optional[int]:
         """Return ``QuantumPow.Miners[account].proofs_submitted``, or ``None``.
 
