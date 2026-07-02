@@ -72,6 +72,7 @@ from substrate.client import (
 )
 from substrate.miner_controller import SubstrateMinerController
 from substrate.miner_registry import descriptor_call_params, descriptor_payload_hash
+from substrate.solver_registration import SolverGuardOutcome, ensure_solver_registered
 from shared.system_info import (
     DescriptorValidationError,
     _scrub,
@@ -1365,36 +1366,31 @@ def quip_miner_register_solver(
 
     async def _do() -> int:
         # One-shot CLI: skip the pool — direct client over the URL list
-        # is enough.
+        # is enough. Guard D+ does the query-first/race-tolerant work;
+        # this command only maps its outcome to exit codes (details such
+        # as the registered type and extrinsic hash land in the log).
         client = await _connect_or_fail(tuple(merged["validators"]))
         try:
-            existing = await client.query_solver(keystore.signer.account_id_bytes())
-            if existing is not None:
-                if existing.solver_type != mt:
-                    click.echo(
-                        f"solver already registered as {existing.solver_type.name}; "
-                        f"deregister first to change to {mt.name}",
-                        err=True,
-                    )
-                    return 4
-                click.echo(
-                    f"already registered as {mt.name} "
-                    f"(submitted={existing.solutions_submitted}, "
-                    f"earned={existing.rewards_earned} plancks)"
-                )
-                return 0
-
-            receipt = await client.register_solver(keystore.signer, mt)
-            if receipt.error:
-                click.echo(f"register_solver failed: {receipt.error}", err=True)
-                return 3
-            click.echo(
-                f"registered as {mt.name} "
-                f"(extrinsic={receipt.extrinsic_hash}, block={receipt.block_hash})"
-            )
-            return 0
+            outcome = await ensure_solver_registered(client, keystore.signer, miner_type)
         finally:
             await client.close()
+        if outcome is SolverGuardOutcome.TYPE_MISMATCH:
+            click.echo(
+                "solver already registered with a different type; "
+                f"deregister first to change to {mt.name}",
+                err=True,
+            )
+            return 4
+        if outcome is SolverGuardOutcome.FAILED:
+            click.echo("register_solver failed (see log for details)", err=True)
+            return 3
+        verb = (
+            "already registered"
+            if outcome is SolverGuardOutcome.ALREADY_REGISTERED
+            else "registered"
+        )
+        click.echo(f"{verb} as {mt.name}")
+        return 0
 
     raise SystemExit(asyncio.run(_do()))
 
