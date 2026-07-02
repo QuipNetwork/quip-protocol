@@ -243,10 +243,12 @@ Two costs the original plan omitted:
   mempool job with different adapted num_reads forces a FULL driver
   respawn per flip (Metal kernel recompile, CUDA re-init, D-Wave
   reconnect, new shm ring), twice per job on a 1-handle node.
-  **Fix:** relax the reuse gate to `len(nodes)` match AND
-  `num_reads <= ring max_rows` (SampleView already stores `max_rows`
-  capacity, base_miner.py:1294-1296), clamping the dispatch's num_reads
-  to the ring capacity when larger; log every forced respawn with its
+  **Fix (as shipped):** relax the reuse gate to `len(nodes)` match AND
+  `num_reads <= ring max_rows` (`_ring_can_host`; SampleView already
+  stores `max_rows` capacity). When num_reads outgrows the ring there is
+  no clamping — the driver is respawned with the new ring sized to the
+  larger num_reads, so ring capacity grows monotonically and later
+  smaller rounds reuse it; every forced respawn is logged with its
   reason so the residual cost is measurable. Preemption hysteresis
   (minimum pow run time) is deferred until job arrival rates demand it.
 
@@ -294,7 +296,8 @@ effectively enabled, after funding (Guard C), alongside Guard D:
   pattern (quip_cli.py:1371-1387).
 - **Race-tolerant:** if the extrinsic fails with SolverAlreadyRegistered
   (two sibling children on one account racing), re-query; matching type
-  → success.
+  → success. An empty re-query after a SolverAlreadyRegistered race maps
+  to FAILED (transient bucket), not TYPE_MISMATCH.
 - **Vendor-resolved type:** register `MinerType.from_kind(miner_kind)`
   with the vendor-resolved kind, exactly as `_build_controllers` does at
   quip_cli.py:1997 — never the backend-group name. A QPU vendor switch on
