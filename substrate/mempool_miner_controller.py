@@ -2,9 +2,12 @@
 
 Parallel to `SubstrateMinerController` but driven by
 `QuantumComputeMempool.JobProposed` events rather than new chain heads.
-Phase 8d will merge the two into a single controller capable of running
-PoW and mempool concurrently against the same worker pool; for 8c the
-two run independently.
+The T7 scheduler cutover (MEMPOOL_PRIORITY_PLAN) replaces this controller
+with `substrate.mempool_producer` + `substrate.mempool_submitter` wired
+into the single WorkScheduler; until then the controller keeps its
+polling shell and delegates the shared logic to those modules — the
+eligibility filter to `mempool_producer.job_matches_sampler` and the
+submit/claim mechanics to `mempool_submitter.MempoolSubmitter`.
 
 Lifecycle:
 
@@ -54,18 +57,27 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from shared.allowed_value_spec import AllowedValueSpec
 from shared.asyncio_supervise import supervise
 from shared.logging_config import get_logger
+from substrate.mempool_producer import job_matches_sampler
+from substrate.mempool_submitter import (
+    CLAIM_STALE_ERRORS,
+    SOLUTION_FATAL_ERRORS,
+    SOLUTION_STALE_ERRORS,
+    ClaimOutcome,
+    MempoolSubmitter,
+    SubmitOutcome,
+    classify_claim_receipt,
+    classify_submit_receipt,
+)
 from substrate.mempool_types import (
     JobOrder,
     MempoolJobContext,
     MempoolSolverInfo,
     MinerType,
     OrderStatus,
-    solutions_to_scale,
 )
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from shared.signer import Signer
-from shared.topology_hash import topology_hash
 from substrate.client import SubstrateClient
 from substrate.event_manager import ChainEventManager
 from substrate.pool import ValidatorPool
@@ -74,30 +86,6 @@ from substrate.types import SubstrateMiningContext
 
 
 logger = get_logger("mempool_miner_controller")
-
-
-# Error name fragments classifying a submit_solution / claim_reward
-# receipt. Match by substring against the receipt error message.
-SOLUTION_STALE_ERRORS = (
-    "OrderNotOpen",      # raced an expiry — drop, move on
-    "OrderNotFound",     # raced a purge — drop, move on
-    "InsufficientEnergy",
-    "InsufficientDiversity",
-    "InsufficientSolutions",
-    "NotEligibleSolver",
-)
-SOLUTION_FATAL_ERRORS = (
-    "SolverNotRegistered",  # operator deregistered out from under us
-    "BadSignature",
-    "BadProof",
-)
-
-CLAIM_STALE_ERRORS = (
-    "OrderNotExpired",    # the order didn't expire yet — try again later
-    "NotWinner",          # we didn't rank — give up on this order
-    "AlreadyClaimed",
-    "OrderNotFound",
-)
 
 
 @dataclass
@@ -497,38 +485,19 @@ class MempoolMinerController:
     def _should_accept_job(self, order: JobOrder) -> bool:
         """Topology + mode eligibility filter.
 
-        Mirrors the pallet's `solver_is_eligible` for mode; adds an
-        upfront topology-hash check so we don't dispatch a job our
-        sampler can't actually solve.
+        Delegates to the extracted `mempool_producer.job_matches_sampler`
+        — the T7 producer applies the same filter (plus the new deadline
+        and min-reward guards this legacy path deliberately lacks).
         """
-        # Topology match — sampler is bound to one specific graph.
-        job_topology = topology_hash(
-            order.ising_params.nodes,
-            order.ising_params.edges,
-            self.allowed_h_values,
-            self.allowed_j_values,
-            self.allowed_spin_values,
+        return job_matches_sampler(
+            order,
+            sampler_topology_hash=self.sampler_topology_hash,
+            allowed_h_values=self.allowed_h_values,
+            allowed_j_values=self.allowed_j_values,
+            allowed_spin_values=self.allowed_spin_values,
+            account=self.signer.account_id_bytes(),
+            solver_type=self.solver_type,
         )
-        if job_topology != self.sampler_topology_hash:
-            logger.debug(
-                "skipping order topology mismatch: job=0x%s sampler=0x%s",
-                job_topology.hex()[:16],
-                self.sampler_topology_hash.hex()[:16],
-            )
-            return False
-
-        # Mode filter — OR semantics on Bid (account OR solver_type).
-        mode = order.mode
-        if mode.tag == "Open":
-            return True
-        if mode.tag == "Bid":
-            account = self.signer.account_id_bytes()
-            if mode.miners and account in mode.miners:
-                return True
-            if mode.miner_types and self.solver_type in mode.miner_types:
-                return True
-            return False
-        return False
 
     # ------------------------------------------------------------------
     # Main loop
@@ -635,6 +604,26 @@ class MempoolMinerController:
             )
             self._clear_active_order()
 
+    def _make_submitter(self) -> MempoolSubmitter:
+        """Build a `MempoolSubmitter` view over this controller's state.
+
+        Constructed per call so tests that bypass ``__init__`` and set
+        ``build_client`` / ``pool_client`` directly keep working; the
+        stats object and order-bookkeeping sets are shared (mutable
+        references), so the submitter's accounting lands on the
+        controller. ``on_solution_submitted`` stays with the controller
+        to preserve the clear-active-order-before-callback ordering.
+        """
+        return MempoolSubmitter(
+            build_client=self.build_client,
+            pool_client=self.pool_client,
+            signer=self.signer,
+            on_reward_claimed=self.on_reward_claimed,
+            stats=self.stats,
+            submitted_orders=self._submitted_orders,
+            claimable=self._claimable,
+        )
+
     async def _handle_result(self, envelope: _MempoolResultEnvelope) -> None:
         self.stats.results_received += 1
         order_id = envelope.context.order_id
@@ -656,47 +645,11 @@ class MempoolMinerController:
                 except Exception:  # noqa: BLE001 — best-effort
                     pass
 
-        solutions = solutions_to_scale(envelope.result.solutions)
-        # The pallet bounds solutions to MaxSolutions=20; clip generously.
-        if len(solutions) > 20:
-            solutions = solutions[:20]
+        report = await self._make_submitter().submit_solution(
+            order_id, envelope.result
+        )
 
-        # `solutions: BoundedVec<BoundedVec<i8, MaxNodes>, MaxSolutions>`
-        # — both layers are 1-field composites in substrate metadata,
-        # so each inner solution AND the outer list need 1-tuple wrapping.
-        # Matches `substrate.submitter.encode_quantum_proof` shape.
-        solutions_wrapped = ([(sol,) for sol in solutions],)
-
-        try:
-            extrinsic_hex = await self.build_client.build_signed_extrinsic(
-                "QuantumComputeMempool",
-                "submit_solution",
-                {
-                    "order_id": order_id,
-                    "solutions": solutions_wrapped,
-                },
-                self.signer,
-            )
-            receipt = await self.pool_client.submit_signed_extrinsic(
-                extrinsic_hex, wait_for="inblock",
-            )
-        except Exception as exc:  # noqa: BLE001 — surface RPC errors to logs
-            self.stats.solution_errors += 1
-            logger.exception(
-                "submit_solution RPC failed for order=%d: %s", order_id, exc
-            )
-            self._clear_active_order()
-            return
-
-        outcome = _classify_solution(receipt.error)
-        if outcome == "ok":
-            self.stats.solutions_submitted += 1
-            self._submitted_orders.add(order_id)
-            logger.info(
-                "submit_solution accepted: order=%d extrinsic=%s",
-                order_id,
-                receipt.extrinsic_hash,
-            )
+        if report.outcome is SubmitOutcome.OK:
             if self.core is not None:
                 self.core.record_result(
                     winning_miner_id=envelope.result.miner_id,
@@ -713,21 +666,18 @@ class MempoolMinerController:
                         "on_solution_submitted callback raised for order=%d: %s",
                         order_id, exc,
                     )
-        elif outcome == "stale":
-            self.stats.solution_stale_drops += 1
-            logger.info(
-                "submit_solution dropped as stale: order=%d error=%s",
-                order_id,
-                receipt.error,
-            )
-            self._clear_active_order()
-        else:  # fatal
-            self.stats.solution_errors += 1
-            self._clear_active_order()
+            return
+
+        self._clear_active_order()
+        if report.outcome is SubmitOutcome.MEMPOOL_DISABLE:
+            # T7's scheduler parks the producer on this signal; until the
+            # cutover, preserve the legacy fatal contract for the
+            # two-controller layout.
             raise RuntimeError(
                 f"submit_solution failed fatally: order={order_id} "
-                f"error={receipt.error}"
+                f"error={report.error}"
             )
+        # STALE / FAILED: logged and counted by the submitter — move on.
 
     # ------------------------------------------------------------------
     # Reward claiming
@@ -747,52 +697,7 @@ class MempoolMinerController:
             await self._claim_expired_orders()
 
     async def _claim_expired_orders(self) -> None:
-        if not self._claimable:
-            return
-        to_remove: List[int] = []
-        for order_id in list(self._claimable):
-            try:
-                extrinsic_hex = await self.build_client.build_signed_extrinsic(
-                    "QuantumComputeMempool",
-                    "claim_reward",
-                    {"order_id": order_id},
-                    self.signer,
-                )
-                receipt = await self.pool_client.submit_signed_extrinsic(
-                    extrinsic_hex, wait_for="inblock",
-                )
-            except Exception as exc:  # noqa: BLE001 — keep trying other orders
-                logger.exception(
-                    "claim_reward RPC failed for order=%d: %s", order_id, exc
-                )
-                continue
-            outcome = _classify_claim(receipt.error)
-            if outcome == "ok":
-                self.stats.rewards_claimed += 1
-                to_remove.append(order_id)
-                logger.info(
-                    "claim_reward accepted: order=%d extrinsic=%s",
-                    order_id,
-                    receipt.extrinsic_hash,
-                )
-                if self.on_reward_claimed is not None:
-                    await self.on_reward_claimed(order_id, 0)
-            elif outcome == "stale":
-                # OrderNotExpired -> retry on next tick.
-                # NotWinner / AlreadyClaimed -> give up.
-                err = receipt.error or ""
-                if "OrderNotExpired" not in err:
-                    to_remove.append(order_id)
-            else:
-                self.stats.claim_errors += 1
-                logger.error(
-                    "claim_reward failed fatally for order=%d: error=%s — giving up",
-                    order_id,
-                    receipt.error,
-                )
-                to_remove.append(order_id)
-        for order_id in to_remove:
-            self._claimable.discard(order_id)
+        await self._make_submitter().claim_expired_orders()
 
     # ------------------------------------------------------------------
     # Worker queue drainer
@@ -887,22 +792,29 @@ class MempoolMinerController:
                 return
 
 
+# Legacy string classifiers — thin views over the extracted outcome
+# enums in `substrate.mempool_submitter`. The T7 cutover removes these
+# with the controller.
+_LEGACY_SUBMIT_CLASS = {
+    SubmitOutcome.OK: "ok",
+    SubmitOutcome.STALE: "stale",
+    SubmitOutcome.FAILED: "fatal",
+    SubmitOutcome.MEMPOOL_DISABLE: "fatal",
+}
+_LEGACY_CLAIM_CLASS = {
+    ClaimOutcome.OK: "ok",
+    ClaimOutcome.RETRY: "stale",
+    ClaimOutcome.GIVE_UP: "stale",
+    ClaimOutcome.FAILED: "fatal",
+}
+
+
 def _classify_solution(error: Optional[str]) -> str:
-    if error is None:
-        return "ok"
-    if any(name in error for name in SOLUTION_STALE_ERRORS):
-        return "stale"
-    # Unknown error strings are treated as fatal — includes SOLUTION_FATAL_ERRORS
-    # and anything unrecognized (version mismatch, config error, etc.).
-    return "fatal"
+    return _LEGACY_SUBMIT_CLASS[classify_submit_receipt(error)]
 
 
 def _classify_claim(error: Optional[str]) -> str:
-    if error is None:
-        return "ok"
-    if any(name in error for name in CLAIM_STALE_ERRORS):
-        return "stale"
-    return "fatal"
+    return _LEGACY_CLAIM_CLASS[classify_claim_receipt(error)]
 
 
 __all__ = [
