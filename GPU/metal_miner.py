@@ -20,14 +20,19 @@ from GPU.metal_scheduler import MetalScheduler
 
 
 def get_gpu_core_count() -> int:
-    """Detect Apple Silicon GPU core count via ioreg."""
+    """Detect Apple Silicon GPU core count via a targeted ioreg query.
+
+    Queries only the AGXAccelerator registry node (~0.05s) rather than
+    dumping the whole registry (``ioreg -l``, ~1.1s on an idle M4 Max) —
+    the full dump blew its timeout under CPU contention and crash-looped
+    the stream driver, whose context factory runs this at every spawn.
+    """
     try:
         result = subprocess.run(
-            "ioreg -l | grep gpu-core-count",
-            shell=True,
+            ["ioreg", "-rc", "AGXAccelerator", "-d1"],
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=10,
         )
         if result.stdout:
             for line in result.stdout.splitlines():
@@ -172,6 +177,9 @@ class MetalMiner(BaseMiner):
             "yielding": self.yielding,
             "active_util": self.active_util,
             "idle_after_s": self.idle_after_s,
+            # Detected once at worker init; a driver respawn must never
+            # re-run the ioreg probe (see get_gpu_core_count).
+            "gpu_cores": self.gpu_core_count,
         }
 
     def _cleanup_handler(self, signum, frame):
