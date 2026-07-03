@@ -21,7 +21,9 @@
 
 [miner]
 # Ordered failover list — tried in order at startup, live-rotated on
-# disconnect. Set at least one. CLI: --validator URL (repeatable).
+# disconnect. Optional: when unset, mining commands fall back to
+# ["ws://quip-validator:9944", "ws://127.0.0.1:9944"].
+# CLI: --validator URL (repeatable).
 validators = [
     "ws://quip-validator:9944",
     # "wss://validator-2.quip.network/rpc",

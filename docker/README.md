@@ -49,8 +49,10 @@ docker run -d --pull always --name quip-miner \
 
 On first start the entrypoint:
 
-1. Seeds `/data/config.toml` from the image template (v0.2 `[miner]` schema,
-   default validator `ws://127.0.0.1:9944`).
+1. Seeds `/data/config.toml` from the image template (v0.2 `[miner]`
+   schema). With no `validators` set, the miner falls back to
+   `ws://quip-validator:9944` (a validator container on a shared docker
+   network) and then `ws://127.0.0.1:9944`.
 2. Generates a fresh hybrid sr25519 + ML-DSA-44 keystore at
    `/data/keystore.json` (mode `0600`). **Back this up — the chain key
    lives here.**

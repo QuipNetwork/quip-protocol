@@ -63,6 +63,9 @@ miner. Use one or the other.
 `validators` is the canonical key for the failover-ordered list of
 substrate validator WebSocket URLs. The TOML form must be a list of
 strings; type errors fail fast at load time, before we touch the chain.
+When the key is absent (and no --validator flag is given), the mining
+commands fall back to ["ws://quip-validator:9944",
+"ws://127.0.0.1:9944"] — see quip_cli._DEFAULT_VALIDATORS.
 """
 from __future__ import annotations
 

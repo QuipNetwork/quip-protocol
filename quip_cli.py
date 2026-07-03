@@ -437,7 +437,9 @@ _VALIDATOR_HELP = (
     "Substrate validator WebSocket URL (e.g. ws://localhost:9944). "
     "Repeat to provide a failover list: tried in order at startup, "
     "and live-failover rotates through them on connection drop. "
-    "Required unless provided via --config."
+    "When neither this flag nor a --config `validators` list is set, "
+    "mining commands fall back to ws://quip-validator:9944 (docker "
+    "service name), then ws://127.0.0.1:9944."
 )
 _CONFIG_HELP = (
     "Path to a TOML config file. Keys in the [miner] section serve as "
@@ -2391,9 +2393,18 @@ _GPU_BACKEND_DEFAULTS: dict[str, dict] = {
     "modal": {"modal": [{"gpu_type": "t4"}]},
 }
 
+# Zero-config validator fallback, in failover order: the validator's
+# docker service/container name first (resolves when the miner shares a
+# docker network with a `quip-validator` container; DNS fails fast
+# elsewhere and the ValidatorPool moves on to the next URL), then a
+# local node. Explicit --validator flags or a TOML `validators = [...]`
+# always win.
+_DEFAULT_VALIDATORS = ["ws://quip-validator:9944", "ws://127.0.0.1:9944"]
+
 # Shared default fallbacks for the cpu/gpu/qpu commands (applied after the
 # TOML+CLI merge, so an explicit TOML/CLI value always wins).
 _MINING_DEFAULTS = {
+    "validators": _DEFAULT_VALIDATORS,
     "signer_key": "~/.quip-miner/signing.json",
     "rest_port": -1,
     "rest_host": "127.0.0.1",

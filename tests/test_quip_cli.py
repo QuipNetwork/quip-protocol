@@ -235,15 +235,50 @@ def test_quip_miner_cpu_multiple_validators_pass_through(monkeypatch):
     assert captured.get("validators") == ("ws://primary:9944", "ws://standby:9944")
 
 
-def test_quip_miner_cpu_missing_validators_fails_fast(monkeypatch):
-    """No --validator and no --config → ClickException with actionable text."""
-    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", lambda **_: 0)
+def test_quip_miner_cpu_no_validators_falls_back_to_defaults(monkeypatch):
+    """No --validator and no --config → the compose service name first
+    (resolves on a shared docker network), local node as backup."""
+    captured: Dict[str, Any] = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
     result = CliRunner().invoke(
         quip_cli.quip_miner_cpu,
         ["--num-cpus", "1"],
     )
-    assert result.exit_code != 0
-    assert "validator" in result.output.lower()
+    assert result.exit_code == 0, result.output
+    assert captured["validators"] == (
+        "ws://quip-validator:9944",
+        "ws://127.0.0.1:9944",
+    )
+
+
+def test_quip_miner_cpu_config_without_validators_falls_back(
+    monkeypatch, tmp_path
+):
+    """A config that declares backends but no `validators` key gets the
+    same fallback — seeded docker volumes need no validator edit to find
+    a composed validator."""
+    captured: Dict[str, Any] = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
+    cfg = tmp_path / "miner.toml"
+    cfg.write_text(
+        '[miner]\nsigner_key = "/tmp/signing.json"\n[cpu]\nnum_cpus = 1\n'
+    )
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert captured["validators"] == (
+        "ws://quip-validator:9944",
+        "ws://127.0.0.1:9944",
+    )
 
 
 def test_quip_miner_cpu_config_file_supplies_validators(monkeypatch, tmp_path):
