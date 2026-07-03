@@ -45,8 +45,10 @@ rest_port = 8086
 # Backend inventory — the active section(s) below decide what this
 # container mines (see `quip-miner resolve-modes`). One worker process
 # per backend group. One [cuda.N] section per GPU; shared tuning goes
-# in [gpu].
+# in [gpu]. Mempool participation is per-miner, set in [gpu] for the
+# gpu group (defaults: cpu/gpu on, qpu off).
 # [gpu]
 # utilization = 100
 # yielding    = false
+# mempool     = false
 [cuda.0]

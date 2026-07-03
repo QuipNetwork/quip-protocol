@@ -31,10 +31,12 @@ keystore + identification.
     log_level   = "INFO"                    # optional, DEBUG/INFO/WARNING/ERROR
     node_log    = "/var/log/quip-miner.log" # optional rotating file handler
 
-    # Mempool participation. `mempool` must be an unquoted TOML boolean —
-    # the string "false" is truthy and is rejected at load time.
+    # Mempool participation is a PER-MINER property, set inside the
+    # backend sections, not here: `[cpu] mempool = false`,
+    # `[gpu] mempool = false` (also [metal]/[modal]), or a qpu vendor
+    # section (`[dwave] mempool = true`). Defaults: cpu/gpu on, qpu off.
+    # A `mempool` key in [miner] is rejected at load time.
     # `mempool_min_reward` drops orders paying less (0 = accept all).
-    mempool     = true                      # optional bool
     mempool_min_reward = 0                  # optional non-negative int
 
     # v0.1 compatibility aliases — `listen` → `rest_host`, `port` → `rest_port`.
@@ -100,7 +102,13 @@ def load_miner_config(
         )
     miner_dict = dict(miner)
     _validate_validators_field(miner_dict.get("validators"))
-    _validate_mempool_field(miner_dict.get("mempool"))
+    if "mempool" in miner_dict:
+        raise MinerConfigError(
+            "miner config: `mempool` is a per-miner property — move it "
+            "from [miner] into the backend section it applies to "
+            "([cpu], [gpu], [metal], [modal], or a qpu vendor section "
+            "like [dwave]). Defaults: cpu/gpu on, qpu off."
+        )
     _validate_mempool_min_reward_field(miner_dict.get("mempool_min_reward"))
     _apply_v01_aliases(miner_dict)
     return miner_dict
@@ -285,24 +293,86 @@ def present_backend_groups(backends: Mapping[str, Any]) -> dict[str, list[str]]:
 MODE_NAMES: tuple[str, ...] = ("cpu", "gpu", "qpu")
 
 
+# Sections that may carry the per-miner `mempool` key: the flat tables
+# of each group. The [cuda.N]/[nvidia.N] device maps are excluded — the
+# key is group-level (one solver type per substrate account), never
+# per-device.
+_MEMPOOL_KEY_SECTIONS: dict[str, tuple[str, ...]] = {
+    "cpu": CPU_BACKEND_SECTIONS,
+    "gpu": ("gpu", "metal", "modal"),
+    "qpu": QPU_BACKEND_SECTIONS,
+}
+
+
+def group_mempool_value(
+    backends: Mapping[str, Any], group: str
+) -> Optional[bool]:
+    """The explicit per-miner `mempool` value for a backend group.
+
+    Reads the key from the group's flat sections (`[cpu]`, the `[gpu]`
+    defaults table, `[metal]`/`[modal]`, or a qpu vendor section like
+    `[dwave]`). Returns ``None`` when no section sets it. Raises
+    :class:`MinerConfigError` on a non-bool value (the TOML string
+    ``"false"`` is truthy and would silently enable participation) or
+    when two sections of the same group disagree.
+    """
+    found: dict[str, bool] = {}
+    for section in _MEMPOOL_KEY_SECTIONS[group]:
+        table = backends.get(section)
+        if not isinstance(table, Mapping) or "mempool" not in table:
+            continue
+        value = table["mempool"]
+        if not isinstance(value, bool):
+            raise MinerConfigError(
+                f"miner config: [{section}].mempool must be a TOML "
+                f"boolean (true/false, unquoted), got "
+                f"{type(value).__name__} ({value!r})"
+            )
+        found[section] = value
+    if len(set(found.values())) > 1:
+        detail = ", ".join(f"[{s}]={v}" for s, v in found.items())
+        raise MinerConfigError(
+            f"miner config: conflicting `mempool` values within the "
+            f"{group} group ({detail}); the key is group-level — set it "
+            f"once"
+        )
+    return next(iter(found.values()), None)
+
+
 def mempool_owner_group(backends: Mapping[str, Any]) -> Optional[str]:
     """The one backend group whose child participates in the mempool.
 
-    A pure function of the config's backend sections: the first non-qpu
-    group in canonical cpu,gpu,qpu order. One substrate account can only
-    register one solver type on chain, so on a multi-group config every
-    other child resolves mempool off — derived from the same TOML, with
-    no out-of-band transport, so supervised, direct-subcommand, and
-    ``--mode``-narrowed runs all agree.
+    A pure function of the config's backend sections — derived from the
+    same TOML by every process, with no out-of-band transport, so
+    supervised, direct-subcommand, and ``--mode``-narrowed runs all
+    agree. One substrate account can only register one solver type on
+    chain, so every non-owner child resolves mempool off.
 
-    Returns ``None`` when no non-qpu group is configured (qpu-only or
-    empty backends): no election, the per-kind default applies (qpu is
-    opt-in via an explicit ``[miner] mempool = true``).
+    Election, over the configured groups' per-miner `mempool` keys
+    (see :func:`group_mempool_value`):
+
+    1. An explicit ``mempool = true`` states intent and outranks groups
+       that are merely default-on (this is how a lone
+       ``[dwave] mempool = true`` owns the mempool). Canonical
+       cpu,gpu,qpu order breaks ties.
+    2. Otherwise the first default-on group owns — cpu/gpu default on,
+       qpu defaults off (paid samples are opt-in).
+    3. ``None`` when nothing is enabled (explicit opt-outs, qpu-only,
+       or empty backends).
     """
     groups = present_backend_groups(backends)
-    return next(
-        (g for g in MODE_NAMES if g != "qpu" and groups[g]), None
-    )
+    values = {
+        g: group_mempool_value(backends, g)
+        for g in MODE_NAMES
+        if groups[g]
+    }
+    for g in MODE_NAMES:  # explicit opt-ins first
+        if values.get(g) is True:
+            return g
+    for g in MODE_NAMES:  # then default-on groups (qpu is default-off)
+        if g != "qpu" and g in values and values[g] is None:
+            return g
+    return None
 
 
 class ModeResolutionError(MinerConfigError):
@@ -544,18 +614,6 @@ def _apply_v01_aliases(miner_dict: dict[str, Any]) -> None:
         del miner_dict[alias]
 
 
-def _validate_mempool_field(value: Any) -> None:
-    """Reject a non-bool `mempool` early — the TOML string `"false"` is
-    truthy and would silently enable mempool participation."""
-    if value is None:
-        return
-    if not isinstance(value, bool):
-        raise MinerConfigError(
-            f"miner config: [miner].mempool must be a TOML boolean "
-            f"(true/false, unquoted), got {type(value).__name__} ({value!r})"
-        )
-
-
 def _validate_mempool_min_reward_field(value: Any) -> None:
     """Reject a non-int or negative `mempool_min_reward` at load time."""
     if value is None:
@@ -598,8 +656,10 @@ __all__ = [
     "MinerConfigError",
     "ModeResolutionError",
     "QPU_BACKEND_SECTIONS",
+    "group_mempool_value",
     "load_backend_config",
     "load_miner_config",
+    "mempool_owner_group",
     "merge_config",
     "present_backend_groups",
     "resolve_mode",

@@ -12,6 +12,7 @@ from shared.miner_config import (
     SubmissionConfig,
     load_backend_config,
     load_miner_config,
+    group_mempool_value,
     load_submission_config,
     mempool_owner_group,
     merge_config,
@@ -224,33 +225,50 @@ def test_load_only_alias_present_no_canonical(tmp_path):
 
 
 # ----------------------------------------------------------------------
-# [miner] mempool / mempool_min_reward validation
+# mempool: per-backend-section key / [miner] mempool_min_reward
 # ----------------------------------------------------------------------
 
 
-def test_load_mempool_true_and_false_accepted(tmp_path):
-    for literal, expected in (("true", True), ("false", False)):
+def test_load_miner_mempool_key_rejected_with_pointer(tmp_path):
+    """`mempool` is a per-miner property, not a `[miner]` global — a
+    config still carrying the old key must fail loudly with the new
+    location, never silently flip participation."""
+    for literal in ("true", "false"):
         p = tmp_path / f"mempool-{literal}.toml"
         p.write_text(
             f'[miner]\nvalidators = ["ws://a:9944"]\nmempool = {literal}\n'
         )
-        assert load_miner_config(p)["mempool"] is expected
+        with pytest.raises(MinerConfigError, match=r"backend section"):
+            load_miner_config(p)
 
 
-def test_load_mempool_string_false_rejected(tmp_path):
-    """`mempool = "false"` is a truthy TOML string — reject loudly instead
-    of silently enabling mempool."""
-    p = tmp_path / "config.toml"
-    p.write_text('[miner]\nvalidators = ["ws://a:9944"]\nmempool = "false"\n')
+def test_group_mempool_value_reads_backend_sections():
+    """The key is read from the group's flat sections: [cpu], the [gpu]
+    defaults table (also metal/modal), and the qpu vendor sections."""
+    assert group_mempool_value({"cpu": {"mempool": False}}, "cpu") is False
+    assert group_mempool_value(
+        {"gpu": {"mempool": True}, "cuda": {"0": {}}}, "gpu"
+    ) is True
+    assert group_mempool_value({"dwave": {"mempool": True}}, "qpu") is True
+    assert group_mempool_value({"cpu": {"num_cpus": 2}}, "cpu") is None
+    assert group_mempool_value({"cuda": {"0": {}}}, "gpu") is None
+
+
+def test_group_mempool_value_rejects_non_bool():
+    """`mempool = "false"` is a truthy TOML string — reject loudly
+    instead of silently enabling mempool."""
     with pytest.raises(MinerConfigError, match=r"mempool.*boolean"):
-        load_miner_config(p)
-
-
-def test_load_mempool_int_rejected(tmp_path):
-    p = tmp_path / "config.toml"
-    p.write_text('[miner]\nvalidators = ["ws://a:9944"]\nmempool = 1\n')
+        group_mempool_value({"cpu": {"mempool": "false"}}, "cpu")
     with pytest.raises(MinerConfigError, match=r"mempool.*boolean"):
-        load_miner_config(p)
+        group_mempool_value({"dwave": {"mempool": 1}}, "qpu")
+
+
+def test_group_mempool_value_rejects_conflicts_within_group():
+    """Two sections of one group disagreeing is operator error, not a
+    precedence puzzle."""
+    backends = {"gpu": {"mempool": False}, "metal": {"mempool": True}}
+    with pytest.raises(MinerConfigError, match=r"conflict"):
+        group_mempool_value(backends, "gpu")
 
 
 def test_load_mempool_keys_absent_stay_absent(tmp_path):
@@ -651,21 +669,53 @@ def test_resolve_modes_multi_backend_unconditional():
     assert resolve_modes(backends) == ["cpu", "gpu", "qpu"]
 
 
-def test_mempool_owner_group_is_first_non_qpu_configured():
-    """The mempool owner is a pure function of the config's backend
-    sections: first non-qpu group in canonical cpu,gpu,qpu order."""
+def test_mempool_owner_group_defaults_to_first_non_qpu_configured():
+    """With no per-section `mempool` keys the owner is the first non-qpu
+    group in canonical cpu,gpu,qpu order — mempool defaults ON."""
     assert mempool_owner_group({"cpu": {}, "cuda": {"0": {}}}) == "cpu"
     assert mempool_owner_group({"cuda": {"0": {}}, "dwave": {}}) == "gpu"
     assert mempool_owner_group({"cpu": {}}) == "cpu"
     assert mempool_owner_group({"metal": {}}) == "gpu"
 
 
+def test_mempool_owner_group_explicit_false_moves_ownership():
+    """`[cpu] mempool = false` hands the mempool to the next default-on
+    group — per-miner opt-out is the operator's control."""
+    assert mempool_owner_group(
+        {"cpu": {"mempool": False}, "cuda": {"0": {}}}
+    ) == "gpu"
+    assert mempool_owner_group({"cpu": {"mempool": False}}) is None
+    assert mempool_owner_group(
+        {"cpu": {"mempool": False}, "gpu": {"mempool": False},
+         "cuda": {"0": {}}}
+    ) is None
+
+
+def test_mempool_owner_group_explicit_true_beats_defaults():
+    """An explicit `mempool = true` states intent — it outranks groups
+    that are merely default-on, letting `[dwave] mempool = true` own the
+    mempool without also opting every other section out."""
+    assert mempool_owner_group(
+        {"cpu": {}, "dwave": {"mempool": True}}
+    ) == "qpu"
+    assert mempool_owner_group(
+        {"cpu": {}, "gpu": {"mempool": True}, "cuda": {"0": {}}}
+    ) == "gpu"
+    # Two explicit trues: canonical order breaks the tie.
+    assert mempool_owner_group(
+        {"cpu": {"mempool": True}, "gpu": {"mempool": True},
+         "cuda": {"0": {}}}
+    ) == "cpu"
+
+
 def test_mempool_owner_group_none_for_qpu_only_or_empty():
-    """qpu-only configs elect nobody (per-kind default applies: opt-in
-    via explicit `mempool = true`); empty backends likewise."""
+    """qpu-only configs elect nobody by default (paid samples are
+    opt-in: `[dwave] mempool = true` makes qpu the owner); empty
+    backends likewise."""
     assert mempool_owner_group({"dwave": {}}) is None
     assert mempool_owner_group({"ibm": {}, "dwave": {}}) is None
     assert mempool_owner_group({}) is None
+    assert mempool_owner_group({"dwave": {"mempool": True}}) == "qpu"
 
 
 def test_resolve_modes_rejects_mine_mode_kwarg():

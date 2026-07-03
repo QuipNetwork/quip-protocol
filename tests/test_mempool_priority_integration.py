@@ -22,7 +22,8 @@ pallet.
 Manual QPU smoke procedure (NOT automated — per project policy the operator
 runs every QPU/D-Wave job, never test automation):
 
-    1. Run a qpu config with an explicit ``[miner] mempool = true``::
+    1. Run a qpu config with an explicit vendor-section opt-in
+       (``[dwave] mempool = true``)::
 
            quip-miner qpu --config <qpu toml>
 

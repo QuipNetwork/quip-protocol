@@ -103,19 +103,22 @@ docker run ... quip-miner-image --mode gpu
 The selection is CLI-only; there is no config key for it (a legacy
 `[miner] mode` key still loads but is ignored). Mempool ownership
 stays config-derived: in the example above the gpu child mines pow
-only, because cpu owns the mempool per the config — remove the `[cpu]`
-section to move ownership.
+only, because cpu owns the mempool per the config — set
+`[cpu] mempool = false` (or `[gpu] mempool = true`) to move ownership.
 
 The templates ship with an active default section (`[cpu]` on the cpu
 image, `[cuda.0]` on the cuda image), so what runs is always stated in
 the config. Every worker mines PoW continuously; mempool participation
-is config-only via `[miner] mempool` (defaults: cpu/gpu on, qpu off —
-paid samples are opt-in). On multi-backend configs the mempool owner
-is derived from the config itself (the first non-qpu backend group):
-the other children run pow-only, because one substrate account can
-only register one solver type on chain. The supervisor echoes the
-election; each child resolves its own participation from the same
-TOML, so nothing is passed out-of-band.
+is config-only and per-miner: set `mempool = false` inside a backend
+section (`[cpu]`, `[gpu]`/`[metal]`/`[modal]`, or a qpu vendor section
+like `[dwave]`) to opt that miner out — defaults are cpu/gpu on, qpu
+off (paid samples; opt in with `[dwave] mempool = true`). On
+multi-backend configs the mempool owner is derived from those keys (an
+explicit `true` wins, then the first default-on group): the other
+children run pow-only, because one substrate account can only register
+one solver type on chain. The supervisor echoes the election; each
+child resolves its own participation from the same TOML, so nothing is
+passed out-of-band.
 
 Capability is probed from the installed libraries: a config asking for
 hardware the image can't run (e.g. `[cuda.0]` on the CPU image, which

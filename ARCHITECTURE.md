@@ -26,8 +26,8 @@ A running miner node is one controller process plus its children:
 │   quip_cli._run_concurrent_miner()                             │
 │     ├─ SubstrateMinerController   (the PoW brain)              │
 │     ├─ WorkScheduler              (owns ALL miner handles)     │
-│     ├─ MempoolStack               (only when [miner] mempool   │
-│     │                              resolves on)                │
+│     ├─ MempoolStack               (only when the per-section   │
+│     │                              mempool key resolves on)    │
 │     ├─ ValidatorPool                                           │
 │     │     └─ one ValidatorHandle  (active URL only)            │
 │     └─ ChainEventManager          (shared: PoW + mempool)      │
@@ -193,18 +193,20 @@ Thin composition of producer + submitter over the scheduler:
   `MempoolStack.run()` returns only on shutdown — under the CLI's
   FIRST_COMPLETED orchestration an early return would tear pow down.
 
-Mempool participation is config-only: `[miner] mempool` (defaults:
-cpu/gpu ON, qpu OFF — paid samples are opt-in) and
-`[miner] mempool_min_reward`. There is no mempool-only operation mode
-and no CLI flag for the work source (the supervisor's
-`--mode cpu|gpu|qpu` selects miner *types*, not what they mine).
-On a multi-backend config the mempool owner is config-derived
-(`shared/miner_config.py:mempool_owner_group`: first non-qpu backend
-group in canonical cpu,gpu,qpu order) because one substrate account
-can register only ONE solver type on chain; every non-owner child
-resolves mempool off from the same TOML — no env var, so supervised,
-direct-subcommand, and `--mode` runs agree, and the supervisor merely
-echoes the election. Guard D+
+Mempool participation is config-only and per-miner: `mempool` is set
+inside each backend section (`[cpu] mempool = false`,
+`[gpu]`/`[metal]`/`[modal]`, qpu vendor sections like `[dwave]`);
+defaults cpu/gpu ON, qpu OFF — paid samples are opt-in. A `[miner]`
+`mempool` key is rejected at load; `[miner] mempool_min_reward` stays
+global. There is no mempool-only operation mode and no CLI flag for
+the work source (the supervisor's `--mode cpu|gpu|qpu` selects miner
+*types*, not what they mine). On a multi-backend config the mempool
+owner is config-derived (`shared/miner_config.py:mempool_owner_group`:
+explicit `true` outranks default-on, then canonical cpu,gpu,qpu order)
+because one substrate account can register only ONE solver type on
+chain; every non-owner child resolves mempool off from the same TOML —
+no env var, so supervised, direct-subcommand, and `--mode` runs agree,
+and the supervisor merely echoes the election. Guard D+
 (`substrate/solver_registration.py:ensure_solver_registered`)
 auto-registers the solver at startup: query-first (idempotent),
 race-tolerant, and it NEVER auto-deregisters — switching solver type
@@ -223,8 +225,8 @@ Sequence:
    scheduler serves both work sources, so 1-handle nodes are fully
    supported), `_build_scheduler_stack` builds the pow controller, ONE
    `WorkScheduler` over ALL handles, and the optional `MempoolStack`
-   (when `[miner] mempool` resolves on), then attaches the scheduler to
-   both.
+   (when the per-section mempool key resolves on), then attaches the
+   scheduler to both.
 3. `_orchestrate_controllers`: `scheduler.start()` first (drainers must
    be live before the first dispatch), SIGINT/SIGTERM → `shutdown()` on
    all three, `asyncio.wait(..., FIRST_COMPLETED)` over the pow

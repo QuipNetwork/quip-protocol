@@ -493,13 +493,40 @@ def _capture_run(monkeypatch) -> Dict[str, Any]:
     return captured
 
 
-def test_quip_miner_cpu_mempool_false_in_toml_disables(monkeypatch, tmp_path):
-    """An explicit `mempool = false` always wins over the cpu default."""
-    p = _mempool_toml(tmp_path, "mempool = false\n")
+def test_quip_miner_cpu_mempool_false_in_section_disables(
+    monkeypatch, tmp_path
+):
+    """`mempool = false` INSIDE the miner's own section always wins over
+    the default-on — per-miner opt-out is the operator control."""
+    p = _mempool_toml(tmp_path, "[cpu]\nnum_cpus = 1\nmempool = false\n")
     captured = _capture_run(monkeypatch)
     result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
     assert result.exit_code == 0, result.output
     assert captured.get("mempool_enabled") is False
+
+
+def test_quip_miner_mempool_key_in_miner_table_rejected(
+    monkeypatch, tmp_path
+):
+    """The old global `[miner] mempool` fails loudly with a pointer to
+    the backend sections — never a silent participation flip."""
+    p = _mempool_toml(tmp_path, "mempool = false\n[cpu]\nnum_cpus = 1\n")
+    _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
+    assert result.exit_code != 0
+    assert "backend section" in result.output
+
+
+def test_quip_miner_cpu_mempool_key_stripped_from_miner_config(
+    monkeypatch, tmp_path
+):
+    """The control key never reaches the spec builders (they whitelist
+    and warn on unknown section keys)."""
+    p = _mempool_toml(tmp_path, "[cpu]\nnum_cpus = 3\nmempool = false\n")
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured["miner_config"] == {"cpu": {"num_cpus": 3}}
 
 
 def test_quip_miner_cpu_mempool_defaults_on(monkeypatch, tmp_path):
@@ -522,9 +549,10 @@ def test_quip_miner_qpu_mempool_defaults_off(monkeypatch, tmp_path):
 
 
 def test_quip_miner_qpu_mempool_explicit_true_opts_in(monkeypatch, tmp_path):
-    """`mempool = true` on a QPU node overrides the qpu default-off."""
+    """`mempool = true` inside the vendor section overrides the qpu
+    default-off."""
     p = _mempool_toml(
-        tmp_path, 'mempool = true\n[dwave]\ndaily_budget = "60s"\n'
+        tmp_path, '[dwave]\ndaily_budget = "60s"\nmempool = true\n'
     )
     captured = _capture_run(monkeypatch)
     result = CliRunner().invoke(quip_cli.quip_miner_qpu, ["--config", str(p)])
@@ -555,19 +583,36 @@ def test_quip_miner_gpu_non_owner_resolves_mempool_off(monkeypatch, tmp_path):
     assert captured.get("mempool_enabled") is False
 
 
-def test_quip_miner_qpu_non_owner_even_with_mempool_true(
-    monkeypatch, tmp_path
-):
-    """cpu+dwave + mempool=true: cpu owns; the qpu child stays OFF —
-    `true` cannot lift one-solver-type-per-account."""
-    p = _mempool_toml(
-        tmp_path,
-        'mempool = true\n[cpu]\nnum_cpus = 1\n[dwave]\ndaily_budget = "60s"\n',
+def test_quip_miner_qpu_explicit_true_takes_ownership(monkeypatch, tmp_path):
+    """cpu+dwave with `[dwave] mempool = true`: the explicit opt-in
+    outranks cpu's default-on — qpu owns, cpu resolves OFF."""
+    extra = (
+        '[cpu]\nnum_cpus = 1\n'
+        '[dwave]\ndaily_budget = "60s"\nmempool = true\n'
     )
+    p = _mempool_toml(tmp_path, extra)
     captured = _capture_run(monkeypatch)
     result = CliRunner().invoke(quip_cli.quip_miner_qpu, ["--config", str(p)])
     assert result.exit_code == 0, result.output
+    assert captured.get("mempool_enabled") is True
+
+    p2 = _mempool_toml(tmp_path, extra)
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p2)])
+    assert result.exit_code == 0, result.output
     assert captured.get("mempool_enabled") is False
+
+
+def test_quip_miner_gpu_owns_after_cpu_opts_out(monkeypatch, tmp_path):
+    """`[cpu] mempool = false` moves ownership to the next default-on
+    group: the gpu child of a cpu+gpu config resolves ON."""
+    p = _mempool_toml(
+        tmp_path, "[cpu]\nnum_cpus = 1\nmempool = false\n[cuda.0]\n"
+    )
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_gpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mempool_enabled") is True
 
 
 def test_quip_miner_cpu_mempool_min_reward_threaded(monkeypatch, tmp_path):
@@ -1575,35 +1620,54 @@ def test_plan_processes_single_backend_no_election(
     assert "mempool owner" not in capsys.readouterr().out
 
 
-def test_plan_processes_mempool_false_skips_election(
+def test_plan_processes_all_sections_opted_out_skips_election(
     monkeypatch, tmp_path, capsys
 ):
-    """Explicit `mempool = false` disables participation everywhere via
-    config; the supervisor reports no election."""
+    """Every section carrying `mempool = false` disables participation
+    everywhere via config; the supervisor reports no election."""
     cfg = _write_supervisor_toml(
         tmp_path,
-        extra_miner="mempool = false\n",
-        backend="[cpu]\nnum_cpus = 1\n[cuda.0]\n",
+        backend=(
+            "[cpu]\nnum_cpus = 1\nmempool = false\n"
+            "[gpu]\nmempool = false\n[cuda.0]\n"
+        ),
     )
     _envs, procs = _plan_with_all_supports(monkeypatch, cfg)
     assert all("QUIP_MEMPOOL" not in p["env"] for p in procs)
     assert "mempool owner" not in capsys.readouterr().out
 
 
-def test_plan_processes_mempool_true_still_elects(
+def test_plan_processes_explicit_true_wins_ownership(
     monkeypatch, tmp_path, capsys
 ):
-    """`mempool = true` cannot lift the one-solver-type-per-account
-    constraint — the election still reports every non-owner pow-only."""
+    """`[dwave] mempool = true` outranks cpu's default-on: qpu owns and
+    cpu is echoed pow-only."""
     cfg = _write_supervisor_toml(
         tmp_path,
-        extra_miner="mempool = true\n",
-        backend='[cpu]\nnum_cpus = 1\n[dwave]\ndaily_budget = "60s"\n',
+        backend=(
+            '[cpu]\nnum_cpus = 1\n'
+            '[dwave]\ndaily_budget = "60s"\nmempool = true\n'
+        ),
     )
     _envs, _procs = _plan_with_all_supports(monkeypatch, cfg)
     out = capsys.readouterr().out
-    assert "supervisor: mempool owner is cpu" in out
-    assert "pow-only: qpu" in out
+    assert "supervisor: mempool owner is qpu" in out
+    assert "pow-only: cpu" in out
+
+
+def test_plan_processes_cpu_opt_out_moves_ownership_to_gpu(
+    monkeypatch, tmp_path, capsys
+):
+    """`[cpu] mempool = false` hands the mempool to gpu — the echo names
+    the new owner and the opted-out child."""
+    cfg = _write_supervisor_toml(
+        tmp_path,
+        backend="[cpu]\nnum_cpus = 1\nmempool = false\n[cuda.0]\n",
+    )
+    _envs, _procs = _plan_with_all_supports(monkeypatch, cfg)
+    out = capsys.readouterr().out
+    assert "supervisor: mempool owner is gpu" in out
+    assert "pow-only: cpu" in out
 
 
 def test_plan_processes_mode_non_owner_reports_config_owner(

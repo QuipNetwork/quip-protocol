@@ -51,6 +51,7 @@ from shared.miner_config import (
     GPU_BACKEND_SECTIONS,
     MODE_NAMES,
     MinerConfigError,
+    group_mempool_value,
     ModeResolutionError,
     QPU_BACKEND_SECTIONS,
     SubmissionConfig,
@@ -853,11 +854,10 @@ def _plan_processes(
     except ModeResolutionError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    # Election report — `mempool` is validated bool-or-None at load.
-    # Purely informational: children resolve ownership themselves via
-    # _resolve_mempool_enabled; nothing is transported out-of-band.
-    mempool_value = miner_toml.get("mempool")
-    if mempool_value is not False and mempool_owner is not None:
+    # Election report — purely informational: children resolve ownership
+    # themselves via _resolve_mempool_enabled from the same TOML; nothing
+    # is transported out-of-band.
+    if mempool_owner is not None:
         pow_only = [m for m in modes if m != mempool_owner]
         if pow_only:
             click.echo(
@@ -2340,36 +2340,48 @@ async def _run_concurrent_miner(
             core.close()
 
 
-def _resolve_mempool_enabled(
-    merged: dict, miner_kind: str, backends: dict
-) -> bool:
-    """Effective `[miner] mempool` flag for this backend process.
+def _resolve_mempool_enabled(miner_kind: str, backends: dict) -> bool:
+    """Effective mempool participation for this backend process.
 
-    Everything is derived from the config — no env var, no CLI flag:
+    `mempool` is a PER-MINER key set inside the backend sections
+    (`[cpu] mempool = false`, `[gpu] mempool = false`,
+    `[dwave] mempool = true`, ...), default ON for cpu/gpu and OFF for
+    qpu (QPU handles are never preempted and every dispatched job costs
+    paid QPU time). Everything derives from the config — no env var, no
+    CLI flag — so supervised, direct-subcommand, and `--mode`-narrowed
+    runs of the same TOML all agree:
 
-    - `mempool = false` always wins (preserved by the `is None` default
-      machinery in :func:`_resolve_runtime_config`).
-    - The config's backend sections elect ONE mempool owner (see
-      :func:`shared.miner_config.mempool_owner_group`): a child of any
-      other group resolves OFF, because one substrate account can only
-      register one solver type on chain. Supervised, direct-subcommand,
-      and `--mode`-narrowed runs of the same TOML therefore all agree.
-    - No owner (qpu-only or no backend sections, e.g. flag-driven runs):
-      per-kind default — cpu/gpu ON, qpu (any vendor kind — `qpu`,
-      `qpu_ibm`, ...) OFF, since QPU handles are never preempted and
-      every dispatched job costs paid QPU time. An explicit
-      `mempool = true` opts a lone QPU node in.
+    - This miner's own section says `mempool = false` → OFF.
+    - Otherwise the config elects ONE owner (see
+      :func:`shared.miner_config.mempool_owner_group`; an explicit
+      `true` outranks default-on groups): owner → ON, everyone else →
+      OFF, because one substrate account can only register one solver
+      type on chain.
+    - No owner and no opinion (e.g. flag-driven runs with no backend
+      sections): per-kind default — cpu/gpu ON, qpu (any vendor kind —
+      `qpu`, `qpu_ibm`, ...) OFF.
     """
-    value = merged.get("mempool")
-    if value is False:
-        return False
     group = "qpu" if miner_kind.startswith("qpu") else miner_kind
-    owner = mempool_owner_group(backends)
-    if owner is not None and group != owner:
+    if group_mempool_value(backends, group) is False:
         return False
-    if value is None:
-        return not miner_kind.startswith("qpu")
-    return bool(value)
+    owner = mempool_owner_group(backends)
+    if owner is not None:
+        return group == owner
+    return not miner_kind.startswith("qpu")
+
+
+def _strip_mempool_keys(miner_config: dict) -> dict:
+    """Drop the group-level `mempool` control key before the sections
+    reach the spec builders (which whitelist and warn on unknown
+    section keys). Device maps ([cuda.N]) never carry it."""
+    return {
+        name: (
+            {k: v for k, v in section.items() if k != "mempool"}
+            if isinstance(section, dict)
+            else section
+        )
+        for name, section in miner_config.items()
+    }
 
 
 # Default miner_config for each --gpu-backend choice (no TOML inventory).
@@ -2443,7 +2455,7 @@ def _dispatch_mining_command(
     """Shared tail of the cpu/gpu/qpu commands; raises ``SystemExit``.
 
     Merges CLI overrides onto the already-parsed `raw` config, resolves the
-    effective `[miner] mempool` flag for this backend, and hands off to
+    effective per-miner mempool participation for this backend, and hands off to
     :func:`_run_concurrent_miner`. Each command supplies only its
     backend-specific `miner_kind` + `miner_config`; reusing `raw` keeps the
     config file parsed exactly once per invocation.
@@ -2472,14 +2484,14 @@ def _dispatch_mining_command(
         rest_port=int(merged["rest_port"]),
         rest_host=str(merged["rest_host"]),
         topology_spec=topology_spec,
-        miner_config=miner_config,
+        miner_config=_strip_mempool_keys(miner_config),
         node_name=merged.get("node_name"),
         public_host=merged.get("public_host"),
         public_port=merged.get("public_port"),
         node_log=merged.get("node_log"),
         submission_config=_load_submission_config_or_default(None, raw=raw),
         mempool_enabled=_resolve_mempool_enabled(
-            merged, miner_kind, _load_backends_or_fail(None, raw=raw)
+            miner_kind, _load_backends_or_fail(None, raw=raw)
         ),
         mempool_min_reward=int(merged.get("mempool_min_reward") or 0),
     )))
@@ -2515,8 +2527,9 @@ def quip_miner_cpu(
     Every worker mines PoW (chain heads via QuantumPow.submit_proof)
     continuously. Mempool participation defaults ON for CPU: matching
     QuantumComputeMempool jobs preempt PoW on the same workers and PoW
-    resumes after. Disable with `mempool = false` in the `[miner]` table;
-    solver registration happens automatically at startup.
+    resumes after. Disable per miner with `mempool = false` inside the
+    `[cpu]` section; solver registration happens automatically at
+    startup.
     """
     raw = _parse_config_or_fail(config_path)
     backends = _load_backends_or_fail(config_path, raw=raw)
@@ -2581,7 +2594,8 @@ def quip_miner_gpu(
 
     See `quip-miner cpu --help` for the PoW + mempool scheduling model;
     mempool participation defaults ON for GPU (disable with
-    `mempool = false` in `[miner]`).
+    `mempool = false` inside the `[gpu]` / `[metal]` / `[modal]`
+    section).
     """
     raw = _parse_config_or_fail(config_path)
     backends = _load_backends_or_fail(config_path, raw=raw)
@@ -2661,7 +2675,7 @@ def quip_miner_qpu(
     See `quip-miner cpu --help` for the PoW + mempool scheduling model.
     Mempool participation defaults OFF for QPU (paid samples; jobs
     dispatch idle-only, never preempting in-flight QPU work) — opt in
-    with `mempool = true` in the `[miner]` table.
+    with `mempool = true` inside the vendor section (e.g. `[dwave]`).
     """
     raw = _parse_config_or_fail(config_path)
     backends = _load_backends_or_fail(config_path, raw=raw)

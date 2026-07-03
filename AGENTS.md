@@ -69,20 +69,26 @@ direct `quip-miner cpu|gpu|qpu` run does the same narrowing with the
 same warning. There is no config key for it — a legacy `[miner] mode`
 key still loads but is ignored.
 
-**Mempool participation is config-only** — `[miner] mempool` (unquoted
-TOML bool; defaults: cpu/gpu on, qpu off — paid QPU samples are opt-in)
-and `[miner] mempool_min_reward` (0 = accept all). There is no CLI flag
-for it and no mempool-only mode (`--mode` selects miner types, not the
-work source): every worker mines PoW continuously, mempool
-jobs preempt PoW on the same workers, and PoW resumes afterward. Solver
+**Mempool participation is config-only and per-miner** — `mempool` is
+an unquoted TOML bool set INSIDE each backend section
+(`[cpu] mempool = false`, `[gpu]`/`[metal]`/`[modal]`, or a qpu vendor
+section like `[dwave] mempool = true`); defaults: cpu/gpu on, qpu off —
+paid QPU samples are opt-in. A `mempool` key in `[miner]` is rejected
+at load time; `[miner] mempool_min_reward` (0 = accept all) stays
+global. There is no CLI flag for it and no mempool-only mode (`--mode`
+selects miner types, not the work source): every worker mines PoW
+continuously, mempool jobs preempt PoW on the same workers, and PoW
+resumes afterward. Solver
 registration is automatic at miner startup (query-first, never
 auto-deregisters — switching solver type requires an explicit
 `quip-miner deregister-solver` and restart). A mempool-fatal submit
 receipt parks the mempool side for the run while PoW mining continues.
-On a multi-backend config the mempool owner is derived from the config
-itself — the first non-qpu backend group in canonical cpu,gpu,qpu
-order owns; every other child resolves mempool off from the same TOML
-(one substrate account can only register one solver type on chain).
+On a multi-backend config the mempool owner is derived from the
+per-section keys: an explicit `mempool = true` outranks default-on
+groups, then the first default-on group in canonical cpu,gpu,qpu order
+owns; every other child resolves mempool off from the same TOML (one
+substrate account can only register one solver type on chain). Set
+`mempool = false` in a section to move ownership to the next group.
 Nothing is transported out-of-band, so supervised, direct-subcommand,
 and `--mode`-narrowed runs all agree; the supervisor echoes the
 election so operators see why a child is pow-only.

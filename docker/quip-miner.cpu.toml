@@ -47,3 +47,5 @@ rest_port = 8086
 # per backend group.
 [cpu]
 num_cpus = 1
+# Mempool participation is per-miner (defaults: cpu/gpu on, qpu off).
+# mempool = false
