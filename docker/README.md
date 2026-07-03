@@ -18,10 +18,11 @@ registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu
 registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda
 ```
 
-Mutable tags:
-- `:latest` — built from `main`
-- `:v0.2-preview` — built from `v0.2` (in-progress)
-- `:<full-sha>` — every push, pinnable
+Images are built and pushed **only on git tags** (branch merges never
+push). Tags:
+- `:latest` — moved by stable release tags (`vX.Y.Z`)
+- `:v0.2` — rolled by every `v0.2*` release/pre-release tag
+- `:<git tag>` / `:<full-sha>` — immutable pins per release
 
 For Apple Silicon (Metal) GPU mining, run directly on macOS without Docker.
 

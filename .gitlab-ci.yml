@@ -1,5 +1,5 @@
 # GitLab CI/CD for Quip Network Node
-# Tests on branches, builds + releases on main/tags
+# Tests on branches; image + binary pushes on git tags ONLY
 
 stages:
   - test
@@ -75,11 +75,11 @@ check-version:
 # Docker image builds (Kaniko — no daemon required)
 # ---------------------------------------------------------------------------
 
-# Shared trigger rules + per-branch mutable tags. Referenced from every
-# image-build job so the Docker pipelines move in lockstep. MUTABLE_TAGS is
-# a space-separated list; each entry becomes an additional registry tag:
-#   main                  -> :latest                (stable)
-#   v0.2                  -> :v0.2                   (rolling branch pointer)
+# Shared trigger rules + per-tag mutable tags. Referenced from every
+# image-build job so the Docker pipelines move in lockstep. Image pushes
+# happen ONLY on git tags — branch merges (main/v0.2) run tests but never
+# push images. MUTABLE_TAGS is a space-separated list; each entry becomes
+# an additional registry tag:
 #   git tag v0.2.0rc7     -> :v0.2 :v0.2.0rc7        (pre-release: rolls the
 #                                        :v0.2 pointer and pins the immutable
 #                                        :<tag>. Must NOT move :latest, which
@@ -90,12 +90,6 @@ check-version:
 # can pin to a specific build regardless of branch.
 .shared_image_rules:
   rules:
-    - if: $CI_COMMIT_BRANCH == "main"
-      variables:
-        MUTABLE_TAGS: latest
-    - if: $CI_COMMIT_BRANCH == "v0.2"
-      variables:
-        MUTABLE_TAGS: v0.2
     # Pre-release tag — STANDARD form: SemVer hyphenated (vX.Y.Z-rcN), e.g.
     # v0.2.1-rc17. This is the only pre-release form quip-node-manager's SemVer
     # parser (parse_semver) recognizes, so all releases MUST use it — see
