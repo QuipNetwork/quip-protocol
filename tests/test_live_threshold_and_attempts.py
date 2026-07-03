@@ -695,6 +695,126 @@ def test_decay_within_generation_preserves_stash(monkeypatch):
     assert len(state.top_k) == 1, "decay within a generation cleared the stash"
 
 
+def test_out_of_band_ease_admits_candidate_outside_schedule_horizon(monkeypatch):
+    """Stash admission must never be stricter than the submit gate.
+
+    The decay schedule is frozen at dispatch. An out-of-band difficulty
+    ease (a sudo reseed on dev/testnet) can move the LIVE threshold below
+    the frozen schedule's horizon while the item is still mining: the
+    submit gate (`_select_submittable_candidate`, live-threshold based)
+    would accept the candidate immediately, but `_compute_stash_entry`
+    returned None ("never clears within the schedule horizon") so the
+    candidate was never stashed — no preview, no submission, wedged for
+    the item's whole lifetime. Found live by
+    tests/test_mempool_priority_integration.py (strict-baked item + a
+    relaxed reseed 8s later; the single-miner chain never rolls the work
+    key, so nothing ever recovered).
+    """
+    import multiprocessing as mp
+
+    import numpy as np
+
+    from shared.base_miner import _MiningLoopState
+    from shared.miner_types import BlockRequirements, MiningResult
+    from tests.test_base_miner_pump import _DriverMiner
+
+    miner = _DriverMiner()
+    # Live threshold eased OUT-OF-BAND to -2500 while the frozen schedule
+    # (baked from a strict -10000 base) tops out at -8100: the candidate
+    # floor -3504 clears live but never clears the schedule.
+    miner._live_max_energy_milli = mp.Value("q", -2_500_000)
+    miner._ctl_q = None
+
+    req = BlockRequirements(
+        difficulty_energy=-10_000.0, min_diversity=0.0, min_solutions=1,
+        timeout_to_difficulty_adjustment_decay=10 ** 9,
+    )
+    state = _MiningLoopState(
+        requirements=req, nodes=[0, 1, 2], edges=[(0, 1), (1, 2)],
+        prev_timestamp=0, start_time=0.0, solution_number_for_log=0,
+        dispatch_id_for_log=0,
+        attempt_log=_make_attempt_logger(miner),
+        solution_store=_make_solution_store(miner),
+        live_threshold_var=miner._live_max_energy_milli,
+        top_k_cap=5, top_k=[], previewed_wintime=(1 << 62, 1 << 62),
+        generation=1,
+        decay_schedule=list(range(-10_000_000, -8_000_000, 100_000)),
+        last_proof_block=987,
+        epoch_length=10,
+    )
+
+    cand = MiningResult(
+        miner_id=miner.miner_id, miner_type="CPU", nonce=b"\x01" * 32,
+        salt=b"\x02" * 32, timestamp=0, prev_timestamp=0,
+        solutions=[[1, -1, 1]], energy=-3_508.0, diversity=1.0, num_valid=1,
+        mining_time=0, node_list=[0, 1, 2], edge_list=[(0, 1), (1, 2)],
+        submit_floor_energy=-3_504.0,
+    )
+    monkeypatch.setattr(miner, "evaluate_sampleset", lambda *a, **k: cand)
+
+    ss = _energy_sampleset(np.full(4, -3_508.0))
+    result = miner._run_substrate_ratchet(
+        state, ss, b"\x01" * 32, b"\x02" * 32, 0.0,
+        preview_cb=None, attempt_log_kwargs={},
+    )
+    assert state.top_k, "candidate clearing the LIVE threshold was not stashed"
+    assert state.top_k[0].decay_num == 0
+    assert state.top_k[0].valid_at_block == 987  # immediately submittable
+    assert result is cand, "submit gate should fire on the admitted candidate"
+
+
+def test_out_of_horizon_candidate_not_admitted_when_live_still_strict(monkeypatch):
+    """Negative control for the out-of-band-ease admission: a floor outside
+    the schedule horizon that does NOT clear the live threshold stays
+    un-stashed (the pre-fix behavior is correct in this case)."""
+    import multiprocessing as mp
+
+    import numpy as np
+
+    from shared.base_miner import _MiningLoopState
+    from shared.miner_types import BlockRequirements, MiningResult
+    from tests.test_base_miner_pump import _DriverMiner
+
+    miner = _DriverMiner()
+    miner._live_max_energy_milli = mp.Value("q", -4_000_000)  # tighter than floor
+    miner._ctl_q = None
+
+    req = BlockRequirements(
+        difficulty_energy=-10_000.0, min_diversity=0.0, min_solutions=1,
+        timeout_to_difficulty_adjustment_decay=10 ** 9,
+    )
+    state = _MiningLoopState(
+        requirements=req, nodes=[0, 1, 2], edges=[(0, 1), (1, 2)],
+        prev_timestamp=0, start_time=0.0, solution_number_for_log=0,
+        dispatch_id_for_log=0,
+        attempt_log=_make_attempt_logger(miner),
+        solution_store=_make_solution_store(miner),
+        live_threshold_var=miner._live_max_energy_milli,
+        top_k_cap=5, top_k=[], previewed_wintime=(1 << 62, 1 << 62),
+        generation=1,
+        decay_schedule=list(range(-10_000_000, -8_000_000, 100_000)),
+        last_proof_block=987,
+        epoch_length=10,
+    )
+
+    cand = MiningResult(
+        miner_id=miner.miner_id, miner_type="CPU", nonce=b"\x01" * 32,
+        salt=b"\x02" * 32, timestamp=0, prev_timestamp=0,
+        solutions=[[1, -1, 1]], energy=-3_508.0, diversity=1.0, num_valid=1,
+        mining_time=0, node_list=[0, 1, 2], edge_list=[(0, 1), (1, 2)],
+        submit_floor_energy=-3_504.0,
+    )
+    monkeypatch.setattr(miner, "evaluate_sampleset", lambda *a, **k: cand)
+
+    ss = _energy_sampleset(np.full(4, -3_508.0))
+    result = miner._run_substrate_ratchet(
+        state, ss, b"\x01" * 32, b"\x02" * 32, 0.0,
+        preview_cb=None, attempt_log_kwargs={},
+    )
+    assert state.top_k == []
+    assert result is None
+
+
 def test_ratchet_stashes_top5_energy_regardless_of_threshold(monkeypatch):
     """top-5 gate: evaluate_sampleset must be called even when the live
     threshold is MUCH stricter than the attempt's best energy.

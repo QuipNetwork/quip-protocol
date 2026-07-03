@@ -135,6 +135,19 @@ class NoValidatorReachable(RuntimeError):
         return "\n".join(lines)
 
 
+class ExtrinsicRejected(ValueError):
+    """The submit-and-watch subscription reported a terminal pool failure.
+
+    Raised for ``usurped`` / ``dropped`` / ``invalid`` / ``retracted`` /
+    ``finalityTimeout`` watch statuses. Typed (vs a bare ``ValueError``)
+    so retry layers can treat it as transient: every retry re-composes
+    and re-signs with a freshly read nonce, and usurpation by a
+    higher-priority sibling from the same account (e.g. a tipped mempool
+    extrinsic outranking pow traffic) is a normal pool outcome, not a
+    programming error.
+    """
+
+
 class NoRegisteredTopology(RuntimeError):
     """Raised when the chain has no registered topology to mine against.
 
@@ -1461,11 +1474,15 @@ class SubstrateClient:
                     # `dropped` / `invalid` / `usurped` / `retracted` /
                     # `finalityTimeout` are all terminal — without raising
                     # here the subscription would silently keep waiting and
-                    # callers would hang forever.
+                    # callers would hang forever. Typed so retry layers can
+                    # distinguish a pool-level rejection (retry-safe with a
+                    # fresh compose — usurpation by a tipped sibling is a
+                    # NORMAL outcome of priority replacement) from a real
+                    # programming-error ValueError.
                     self._iface.rpc_request(
                         "author_unwatchExtrinsic", [subscription_id]
                     )
-                    raise ValueError(f"extrinsic rejected: {result}")
+                    raise ExtrinsicRejected(f"extrinsic rejected: {result}")
                 return None  # non-terminal status — keep waiting
 
             return self._iface.rpc_request(
@@ -1737,7 +1754,15 @@ def _fetch_extrinsic_dispatch_error(
         v = ev.value if hasattr(ev, "value") else (ev if isinstance(ev, dict) else None)
         if not isinstance(v, dict):
             continue
-        applied_idx = _phase_extrinsic_idx(v.get("phase") or {})
+        # The current substrate-interface decoder surfaces the phase as the
+        # bare string 'ApplyExtrinsic' with the index in a SIBLING
+        # `extrinsic_idx` field — phase parsing alone matched nothing, so a
+        # real in-block ExtrinsicFailed produced a false-OK receipt for
+        # every failed hybrid extrinsic (found live by T9). Prefer the
+        # explicit field; fall back to the phase-variant shapes.
+        applied_idx = _as_int_or_none(v.get("extrinsic_idx"))
+        if applied_idx is None:
+            applied_idx = _phase_extrinsic_idx(v.get("phase") or {})
         if applied_idx != ext_idx:
             continue
         event = v.get("event") or v
@@ -1752,11 +1777,53 @@ def _fetch_extrinsic_dispatch_error(
         )
         if module_id == "System" and event_id == "ExtrinsicFailed":
             attrs = event.get("attributes") or event.get("fields") or {}
+            name = _decode_module_error_name(
+                iface,
+                attrs.get("dispatch_error") if isinstance(attrs, dict) else None,
+            )
+            if name is not None:
+                # `Module(error=<Name>)` — the shape the submit/claim
+                # classifiers match error-name substrings against.
+                return f"Module(error={name})"
             return f"Module(ExtrinsicFailed, attrs={attrs!r})"
         if module_id == "System" and event_id == "ExtrinsicSuccess":
             # Authoritative success for this extrinsic — short-circuit.
             return None
     return None
+
+
+def _decode_module_error_name(iface, dispatch_error: Any) -> Optional[str]:
+    """Resolve ``{'Module': {'index': i, 'error': ...}}`` to the error name.
+
+    The event decoder surfaces module errors as raw pallet/variant indexes;
+    the metadata maps them back to names (e.g. ``SolverNotRegistered``).
+    Best-effort: any unexpected shape or lookup failure returns ``None``
+    and the caller falls back to the raw-attrs error string.
+    """
+    if not isinstance(dispatch_error, dict):
+        return None
+    module = dispatch_error.get("Module")
+    if not isinstance(module, dict):
+        return None
+    pallet_index = _as_int_or_none(module.get("index"))
+    raw_error = module.get("error")
+    error_index: Optional[int] = None
+    if isinstance(raw_error, str) and raw_error.startswith("0x"):
+        try:
+            error_index = int.from_bytes(bytes.fromhex(raw_error[2:]), "little")
+        except ValueError:
+            return None
+    elif isinstance(raw_error, (list, tuple)) and raw_error:
+        error_index = _as_int_or_none(raw_error[0])
+    else:
+        error_index = _as_int_or_none(raw_error)
+    if pallet_index is None or error_index is None:
+        return None
+    try:
+        err = iface.metadata.get_module_error(pallet_index, error_index)
+    except Exception:  # noqa: BLE001 — decode is best-effort by contract
+        return None
+    return getattr(err, "name", None)
 
 
 def _result_was_found(result) -> bool:

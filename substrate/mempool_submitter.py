@@ -19,8 +19,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional, Set
 
+from substrateinterface.exceptions import SubstrateRequestException
+
 from shared.logging_config import get_logger
-from substrate.mempool_types import solutions_to_scale
+from substrate.client import ExtrinsicRejected
+from substrate.mempool_producer import deadline_blocks_remaining
+from substrate.mempool_types import OrderStatus, solutions_to_scale
 
 if TYPE_CHECKING:
     from shared.miner_types import MiningResult
@@ -55,6 +59,10 @@ CLAIM_STALE_ERRORS = (
 
 # The pallet bounds solutions to MaxSolutions=20; clip generously.
 MAX_SOLUTIONS = 20
+
+# Hard cap on one submit-and-watch attempt (mirrors the pow submitter's
+# _SUBMIT_WATCH_TIMEOUT_S): a watch alive past this is a dead subscription.
+_SUBMIT_WATCH_TIMEOUT_S = 90.0
 
 
 class SubmitOutcome(Enum):
@@ -125,6 +133,24 @@ class MempoolSubmitterStats:
 
 class MempoolSubmitter:
     """Build, sign, and submit mempool extrinsics; claim expired rewards."""
+
+    # Extra submit attempts after a txpool rejection (nonce race with a
+    # sibling pow extrinsic from the same account); each retry recomposes
+    # with a freshly read nonce. The backoff must span at least one block:
+    # a lower-priority extrinsic cannot REPLACE the pooled sibling at the
+    # same nonce ("Priority is too low"), it can only follow once the
+    # sibling is included and the account nonce advances. Sub-block
+    # backoffs re-read the same nonce and lose the same race every time.
+    TXPOOL_RETRIES = 3
+    txpool_retry_backoff_s = 3.0
+    # ChargeTransactionPayment tip on mempool extrinsics. The shared signer
+    # account continuously pools tip-0 pow extrinsics on an actively-winning
+    # node, and a tip-0 submit_solution has lower priority — it can neither
+    # replace the pooled sibling at its nonce nor win the recompose race
+    # (starved indefinitely; observed live). Mempool is the priority work
+    # source, so its extrinsics outrank same-account pow traffic at the
+    # txpool layer too. 0.002 UNIT — noise next to any order reward.
+    tip_plancks = 2_000_000_000
 
     def __init__(
         self,
@@ -201,17 +227,8 @@ class MempoolSubmitter:
         solutions_wrapped = ([(sol,) for sol in solutions],)
 
         try:
-            extrinsic_hex = await self.build_client.build_signed_extrinsic(
-                "QuantumComputeMempool",
-                "submit_solution",
-                {
-                    "order_id": order_id,
-                    "solutions": solutions_wrapped,
-                },
-                self.signer,
-            )
-            receipt = await self.pool_client.submit_signed_extrinsic(
-                extrinsic_hex, wait_for="inblock",
+            receipt = await self._submit_with_txpool_retry(
+                order_id, solutions_wrapped,
             )
         except Exception as exc:  # noqa: BLE001 — surface RPC errors to logs
             self.stats.solution_errors += 1
@@ -254,6 +271,57 @@ class MempoolSubmitter:
             )
         return SubmitReport(outcome, receipt.error)
 
+    async def _submit_with_txpool_retry(
+        self, order_id: int, solutions_wrapped
+    ):
+        """Compose + submit, retrying txpool rejections with a fresh nonce.
+
+        The signer account is shared with the pow controller: its proof
+        submissions and participation remarks race this extrinsic for the
+        next nonce, and the loser is rejected at the txpool (1010
+        "Transaction is outdated" / 1014 "Priority is too low"). Each
+        retry re-composes via ``build_signed_extrinsic``, which reads the
+        account nonce anew — the same policy as the pow path's
+        ``submit_with_retry``. Bounded by ``TXPOOL_RETRIES``; the final
+        rejection propagates to the caller's FAILED path.
+        """
+        attempt = 0
+        while True:
+            extrinsic_hex = await self.build_client.build_signed_extrinsic(
+                "QuantumComputeMempool",
+                "submit_solution",
+                {
+                    "order_id": order_id,
+                    "solutions": solutions_wrapped,
+                },
+                self.signer,
+                tip=self.tip_plancks,
+            )
+            try:
+                # Watch-timeout cap: a dead watch subscription must retry,
+                # not freeze the consume loop (same hang class observed on
+                # the pow submit path).
+                return await asyncio.wait_for(
+                    self.pool_client.submit_signed_extrinsic(
+                        extrinsic_hex, wait_for="inblock",
+                    ),
+                    timeout=_SUBMIT_WATCH_TIMEOUT_S,
+                )
+            except (
+                SubstrateRequestException,
+                ExtrinsicRejected,
+                asyncio.TimeoutError,
+            ) as exc:
+                attempt += 1
+                if attempt > self.TXPOOL_RETRIES:
+                    raise
+                logger.warning(
+                    "submit_solution txpool rejection for order=%d "
+                    "(attempt %d/%d, retrying with a fresh nonce): %s",
+                    order_id, attempt, self.TXPOOL_RETRIES, exc,
+                )
+                await asyncio.sleep(self.txpool_retry_backoff_s * attempt)
+
     # ------------------------------------------------------------------
     # Reward claiming
     # ------------------------------------------------------------------
@@ -277,7 +345,17 @@ class MempoolSubmitter:
             await self.claim_expired_orders()
 
     async def claim_expired_orders(self) -> None:
-        """Attempt `claim_reward` for every claimable order once."""
+        """Attempt `claim_reward` for every claimable order once.
+
+        Also scans ``submitted_orders`` for orders past their COMPUTED
+        expiry: the pallet expires orders lazily (``expire_order_if_needed``
+        runs only inside submit_solution / claim_reward / reclaim_order —
+        no on_initialize sweep), so on a quiet mempool the ``OrderExpired``
+        event never fires on its own and an event-only claim loop would
+        wait forever. ``claim_reward`` performs the lazy expiry inline and
+        pays, so claiming a logically-expired Opened order is safe.
+        """
+        await self._scan_submitted_for_lazy_expiry()
         if not self.claimable:
             return
         to_remove: List[int] = []
@@ -288,6 +366,7 @@ class MempoolSubmitter:
                     "claim_reward",
                     {"order_id": order_id},
                     self.signer,
+                    tip=self.tip_plancks,
                 )
                 receipt = await self.pool_client.submit_signed_extrinsic(
                     extrinsic_hex, wait_for="inblock",
@@ -322,6 +401,45 @@ class MempoolSubmitter:
                 to_remove.append(order_id)
         for order_id in to_remove:
             self.claimable.discard(order_id)
+            self.submitted_orders.discard(order_id)
+
+    async def _scan_submitted_for_lazy_expiry(self) -> None:
+        """Move lazily-expired won orders into ``claimable``.
+
+        Best-effort: a query/RPC failure keeps the order in
+        ``submitted_orders`` for the next tick.
+        """
+        outstanding = self.submitted_orders - self.claimable
+        if not outstanding:
+            return
+        try:
+            now = await self.pool_client.get_block_number()
+        except Exception as exc:  # noqa: BLE001 — retry next tick
+            logger.warning("lazy-expiry scan: get_block_number failed: %s", exc)
+            return
+        for order_id in list(outstanding):
+            try:
+                order = await self.pool_client.query_job_order(order_id)
+            except Exception as exc:  # noqa: BLE001 — retry next tick
+                logger.warning(
+                    "lazy-expiry scan: query_job_order(%d) failed: %s",
+                    order_id, exc,
+                )
+                continue
+            if order is None:
+                # Purged — nothing left to claim.
+                self.submitted_orders.discard(order_id)
+                continue
+            if order.status == OrderStatus.EXPIRED or (
+                order.status == OrderStatus.OPENED
+                and deadline_blocks_remaining(order, now) <= 0
+            ):
+                logger.info(
+                    "lazy-expiry scan: order=%d past expiry (status=%s, "
+                    "block=%d); queueing claim",
+                    order_id, order.status, now,
+                )
+                self.claimable.add(order_id)
 
 
 __all__ = [

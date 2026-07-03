@@ -169,6 +169,94 @@ async def test_submit_rpc_failure_returns_failed_without_raise():
     assert s.stats.solution_errors == 1
 
 
+async def test_submit_and_claim_carry_the_mempool_tip():
+    """Mempool extrinsics tip so they outrank same-account pow traffic.
+
+    The signer account continuously pools tip-0 pow extrinsics (proofs,
+    markers, anticipatory fires). A tip-0 submit_solution has lower
+    txpool priority and can neither replace a pooled sibling at its
+    nonce nor win the recompose race — starved indefinitely on an
+    actively-winning node (found live by T9). The tip mirrors the
+    scheduler's priority inversion at the txpool layer; its cost is
+    noise next to the order reward."""
+    s = _submitter()
+    await s.submit_solution(42, _result())
+    assert s.build_client.build_signed_extrinsic.await_args.kwargs.get(
+        "tip"
+    ) == s.tip_plancks
+    assert s.tip_plancks > 0
+
+    s.claimable.add(7)
+    await s.claim_expired_orders()
+    assert s.build_client.build_signed_extrinsic.await_args.kwargs.get(
+        "tip"
+    ) == s.tip_plancks
+
+
+async def test_submit_retries_txpool_nonce_race_with_fresh_compose():
+    """A txpool rejection (1010/1014 nonce race with a sibling pow
+    extrinsic from the same account) must be retried with a fresh
+    compose — each build_signed_extrinsic reads the next nonce anew.
+    Found live by T9: the pow proof + participation remark race the
+    mempool submit on a shared signer, and a one-shot FAILED meant the
+    SolverNotRegistered receipt (and its MEMPOOL_DISABLE park) was
+    never reached."""
+    from substrateinterface.exceptions import SubstrateRequestException
+
+    s = _submitter()
+    s.txpool_retry_backoff_s = 0.0
+    s.pool_client.submit_signed_extrinsic = AsyncMock(
+        side_effect=[
+            SubstrateRequestException(
+                {"code": 1014, "message": "Priority is too low"}
+            ),
+            _receipt(),
+        ]
+    )
+    report = await s.submit_solution(42, _result())
+    assert report.outcome is SubmitOutcome.OK
+    assert s.stats.solutions_submitted == 1
+    assert s.build_client.build_signed_extrinsic.await_count == 2  # recomposed
+    assert s.stats.solution_errors == 0
+
+
+async def test_submit_retries_usurped_watch_rejection():
+    """Our own tipped sibling (or any higher-priority replacement) can
+    usurp a pooled mempool extrinsic; the watch reports it as a typed
+    ExtrinsicRejected. Retry with a fresh compose, same as the txpool
+    nonce race."""
+    from substrate.client import ExtrinsicRejected
+
+    s = _submitter()
+    s.txpool_retry_backoff_s = 0.0
+    s.pool_client.submit_signed_extrinsic = AsyncMock(
+        side_effect=[
+            ExtrinsicRejected("extrinsic rejected: usurped"),
+            _receipt(),
+        ]
+    )
+    report = await s.submit_solution(42, _result())
+    assert report.outcome is SubmitOutcome.OK
+    assert s.build_client.build_signed_extrinsic.await_count == 2
+
+
+async def test_submit_txpool_retries_are_bounded():
+    from substrateinterface.exceptions import SubstrateRequestException
+
+    s = _submitter(
+        submit_exc=SubstrateRequestException(
+            {"code": 1010, "message": "Invalid Transaction",
+             "data": "Transaction is outdated"}
+        )
+    )
+    s.txpool_retry_backoff_s = 0.0
+    report = await s.submit_solution(42, _result())
+    assert report.outcome is SubmitOutcome.FAILED
+    assert s.stats.solution_errors == 1
+    attempts = s.pool_client.submit_signed_extrinsic.await_count
+    assert attempts == 1 + s.TXPOOL_RETRIES
+
+
 async def test_submit_ok_invokes_callback():
     calls = []
 
@@ -252,6 +340,91 @@ async def test_claim_rpc_failure_keeps_order_for_retry():
     s.claimable.add(7)
     await s.claim_expired_orders()  # must not raise
     assert 7 in s.claimable
+    assert s.stats.rewards_claimed == 0
+
+
+# ----------------------------------------------------------------------
+# Proactive claim on lazy expiry (found live by T9)
+# ----------------------------------------------------------------------
+#
+# The pallet expires orders LAZILY: `expire_order_if_needed` runs only
+# inside submit_solution / claim_reward / reclaim_order — there is no
+# on_initialize sweep, so OrderExpired never fires on a quiet mempool
+# and an event-driven claim loop waits forever. The claim loop must also
+# scan `submitted_orders` for orders past their COMPUTED expiry
+# (claim_reward performs the lazy expiry inline and pays).
+
+
+def _order(status, *, created_at=100, deadline_blocks=50,
+           first_solution_at=None, block_wait=5):
+    from substrate.mempool_types import OrderStatus as _OS
+
+    return SimpleNamespace(
+        status=_OS[status] if isinstance(status, str) else status,
+        created_at=created_at,
+        first_solution_at=first_solution_at,
+        timing=SimpleNamespace(
+            deadline_blocks=deadline_blocks, block_wait=block_wait,
+        ),
+    )
+
+
+async def test_claim_scans_submitted_orders_for_lazy_expiry():
+    """An order we won whose status already reads EXPIRED is claimed even
+    though no OrderExpired event was ever routed."""
+    s = _submitter()
+    s.submitted_orders.add(13)
+    s.pool_client.query_job_order = AsyncMock(return_value=_order("EXPIRED"))
+    s.pool_client.get_block_number = AsyncMock(return_value=200)
+    await s.claim_expired_orders()
+    assert s.stats.rewards_claimed == 1
+    assert 13 not in s.submitted_orders
+    assert 13 not in s.claimable
+
+
+async def test_claim_scan_claims_opened_order_past_computed_expiry():
+    """Lazy expiry: the order still READS Opened (nobody poked it), but
+    first_solution_at + block_wait is behind the current block — claiming
+    triggers the pallet's inline expiry and pays."""
+    s = _submitter()
+    s.submitted_orders.add(13)
+    s.pool_client.query_job_order = AsyncMock(
+        return_value=_order(
+            "OPENED", created_at=100, deadline_blocks=50,
+            first_solution_at=110, block_wait=5,
+        )
+    )
+    s.pool_client.get_block_number = AsyncMock(return_value=116)  # >= 115
+    await s.claim_expired_orders()
+    assert s.stats.rewards_claimed == 1
+    assert 13 not in s.submitted_orders
+
+
+async def test_claim_scan_leaves_unexpired_opened_order_alone():
+    s = _submitter()
+    s.submitted_orders.add(13)
+    s.pool_client.query_job_order = AsyncMock(
+        return_value=_order(
+            "OPENED", created_at=100, deadline_blocks=50,
+            first_solution_at=110, block_wait=5,
+        )
+    )
+    s.pool_client.get_block_number = AsyncMock(return_value=112)  # < 115
+    await s.claim_expired_orders()
+    assert s.stats.rewards_claimed == 0
+    assert 13 in s.submitted_orders  # kept for the next tick
+    s.pool_client.submit_signed_extrinsic.assert_not_awaited()
+
+
+async def test_claim_scan_query_failure_keeps_order_for_next_tick():
+    s = _submitter()
+    s.submitted_orders.add(13)
+    s.pool_client.query_job_order = AsyncMock(
+        side_effect=ConnectionError("rpc down")
+    )
+    s.pool_client.get_block_number = AsyncMock(return_value=200)
+    await s.claim_expired_orders()  # must not raise
+    assert 13 in s.submitted_orders
     assert s.stats.rewards_claimed == 0
 
 

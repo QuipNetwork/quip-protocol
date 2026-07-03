@@ -477,6 +477,59 @@ async def test_retry_on_transient_exception_then_success():
     assert result.attempts == 2
 
 
+async def test_retry_on_usurped_watch_rejection_then_success():
+    """A pooled extrinsic replaced by a higher-priority sibling (the
+    mempool submitter tips precisely to outrank pow traffic on the shared
+    account) reports 'usurped' on the watch. That is a normal outcome of
+    priority replacement, not a programming error: retry with a fresh
+    compose — the recompose reads the advanced nonce and coexists."""
+    from substrate.client import ExtrinsicRejected
+
+    result, _ = await _run(
+        [ExtrinsicRejected("extrinsic rejected: usurped"), _ok_receipt()],
+        retry_backoff_ms=0,
+    )
+    assert result.action is SubmitRetryAction.SUCCESS
+    assert result.attempts == 2
+
+
+@pytest.mark.timeout(10)
+async def test_hung_watch_times_out_and_retries(monkeypatch):
+    """A watch subscription that never resolves must not freeze the caller.
+
+    Found live by T9: an in-flight submit's watch never delivered a
+    terminal status and the anticipatory fire timer froze mid-await —
+    the controller stopped processing results and heads while its run
+    task stayed 'alive'. Each attempt is capped by the watch timeout;
+    asyncio.TimeoutError is already transient, so the next attempt
+    recomposes and proceeds."""
+    import asyncio
+
+    import substrate.submitter as submitter_mod
+
+    monkeypatch.setattr(submitter_mod, "_SUBMIT_WATCH_TIMEOUT_S", 0.05)
+
+    class _HangingThenOkPool(_ScriptedPoolClient):
+        async def submit_signed_extrinsic(self, extrinsic_hex, wait_for="inblock"):  # noqa: ARG002
+            self.attempts += 1
+            if self.attempts == 1:
+                await asyncio.Event().wait()  # never resolves
+            return _ok_receipt()
+
+    sleeper = _RecordingSleeper()
+    result = await submit_with_retry(
+        _ScriptedBuildClient(),
+        _HangingThenOkPool([]),
+        MagicMock(),
+        _make_result(),
+        _make_context(),
+        sleeper=sleeper,
+        retry_backoff_ms=0,
+    )
+    assert result.action is SubmitRetryAction.SUCCESS
+    assert result.attempts == 2
+
+
 async def test_stops_on_invalid_nonce_round_stale():
     result, sleeper = await _run([_err_receipt("InvalidNonce")])
     assert result.action is SubmitRetryAction.STOP_ROUND_STALE

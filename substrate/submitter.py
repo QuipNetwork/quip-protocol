@@ -18,13 +18,15 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Awaitable, Callable, List, Optional
 
+from substrateinterface.exceptions import SubstrateRequestException
+
 from shared.allowed_value_spec import MILLI_SCALE
 from shared.logging_config import get_logger
 from shared.miner_types import MiningResult
 from substrate.validator_handle import ValidatorSwapped
 from shared.packed_solution import pack_solution
 from shared.signer import Signer
-from substrate.client import SubstrateClient
+from substrate.client import ExtrinsicRejected, SubstrateClient
 from substrate.pool_client import PoolClient
 from substrate.types import ExtrinsicReceipt, SubstrateMiningContext
 
@@ -284,7 +286,9 @@ async def submit_with_retry(
     Retry policy:
       - Transient exceptions (``BrokenPipeError`` / ``TimeoutError`` /
         ``ConnectionError`` / ``OSError`` / generic ``RuntimeError`` from an
-        RPC) → RETRY. ``submit_proof`` already reconnects first via its
+        RPC, and ``SubstrateRequestException`` txpool rejections such as
+        1010 stale-nonce races with a sibling extrinsic from the same
+        account) → RETRY. ``submit_proof`` already reconnects first via its
         ``ensure_live`` probe.
       - ``ValidatorSwapped`` (the pool hot-swapped validators mid-submit) →
         RETRY. This is safe here *only* because each attempt re-composes
@@ -320,14 +324,23 @@ async def submit_with_retry(
 
     for attempt in range(1, total_attempts + 1):
         try:
-            receipt = await submit_proof(
-                build_client,
-                pool_client,
-                signer,
-                result,
-                context,
-                wait_for=wait_for,
-                tip=tip,
+            # Watch-timeout cap: a submit-and-watch subscription can die
+            # without ever delivering a terminal status (observed live —
+            # it froze the anticipatory fire timer mid-await, silently
+            # stopping all head/result processing while the run task
+            # looked alive). asyncio.TimeoutError is transient, so a dead
+            # watch becomes a fresh-compose retry instead of a hang.
+            receipt = await asyncio.wait_for(
+                submit_proof(
+                    build_client,
+                    pool_client,
+                    signer,
+                    result,
+                    context,
+                    wait_for=wait_for,
+                    tip=tip,
+                ),
+                timeout=_SUBMIT_WATCH_TIMEOUT_S,
             )
         except _TRANSIENT_SUBMIT_EXCEPTIONS as exc:
             last_error = f"{type(exc).__name__}: {exc}"
@@ -378,7 +391,26 @@ _TRANSIENT_SUBMIT_EXCEPTIONS = (
     asyncio.TimeoutError,
     RuntimeError,
     ValidatorSwapped,
+    # Txpool-level rejections raised by substrate-interface (e.g. 1010
+    # "Transaction is outdated" when a sibling extrinsic from the same
+    # account — a participation remark, or the result-path submission of
+    # the same candidate — consumed the composed nonce first). Safe to
+    # retry for the same reason ValidatorSwapped is: every attempt
+    # re-composes and re-signs with a freshly-read nonce. Without this,
+    # the exception escaped `_fire_preview` AFTER the mid-fire mark was
+    # set, permanently wedging the round's submissions (found live by
+    # tests/test_mempool_priority_integration.py).
+    SubstrateRequestException,
+    # Terminal watch statuses (usurped / dropped / retracted / ...). With
+    # the mempool submitter tipping to outrank same-account pow traffic,
+    # usurpation of a pooled pow extrinsic is a NORMAL pool outcome — the
+    # retry recomposes against the advanced nonce and coexists.
+    ExtrinsicRejected,
 )
+
+# Hard cap on one submit attempt (compose + submit + watch-to-inclusion).
+# Inclusion is 1-2 blocks; a watch alive past this is a dead subscription.
+_SUBMIT_WATCH_TIMEOUT_S = 90.0
 
 
 def _backoff_seconds(attempt: int, retry_backoff_ms: int) -> float:

@@ -1896,6 +1896,7 @@ class BaseMiner(ABC):
         self,
         state: _MiningLoopState,
         result: MiningResult,
+        live_threshold_milli: int,
     ) -> Optional[StashEntry]:
         """Wrap a valid ``result`` into a ``StashEntry`` for the active ranking.
 
@@ -1903,14 +1904,24 @@ class BaseMiner(ABC):
         result's effective floor and the absolute block it lands on; returns
         ``None`` when the floor never clears within the schedule horizon (so
         the caller stashes nothing). Legacy path: ``StashEntry(0, 0, result)``.
+
+        Admission must never be stricter than the submit gate: the schedule
+        is frozen at dispatch, but an out-of-band difficulty ease (a sudo
+        reseed) can move the LIVE threshold below the schedule's horizon
+        while the item is still mining. A floor that already clears
+        ``live_threshold_milli`` is therefore admitted as immediately
+        submittable even when ``step_for_energy`` finds no step — otherwise
+        the candidate is silently dropped and, on a chain where the work key
+        never rolls, nothing ever submits again for this item.
         """
         decay_schedule = state.decay_schedule
         if decay_schedule is None:
             return StashEntry(0, 0, result)
-        s_floor = step_for_energy(
-            decay_schedule, int(result.effective_floor * 1000),
-        )
+        floor_milli = int(result.effective_floor * 1000)
+        s_floor = step_for_energy(decay_schedule, floor_milli)
         if s_floor is None:
+            if floor_milli < live_threshold_milli:
+                return StashEntry(0, state.last_proof_block, result)
             # Never clears within the schedule horizon — not stashed.
             return None
         valid_at = state.last_proof_block + s_floor * state.epoch_length
@@ -1993,7 +2004,9 @@ class BaseMiner(ABC):
             if result is not None:
                 post_num_valid = result.num_valid
                 post_diversity_milli = int(result.diversity * 1000)
-                entry = self._compute_stash_entry(state, result)
+                entry = self._compute_stash_entry(
+                    state, result, live_threshold_milli,
+                )
                 stored_replaced = entry is not None and self._stash_insert(
                     state.top_k, state.top_k_cap, entry, state.is_decay_ranked,
                 )
