@@ -47,8 +47,8 @@ def _spy_ctl_q(miner, sent: list):
     """Wrap the miner's ctl_q.put to record command kinds (after _ensure)."""
     orig_ensure = miner._ensure_driver
 
-    def _ensure_spy(sample_ctx):
-        ready = orig_ensure(sample_ctx)
+    def _ensure_spy(sample_ctx, **kwargs):
+        ready = orig_ensure(sample_ctx, **kwargs)
         if ready and miner._ctl_q is not None and not getattr(
             miner._ctl_q, "_quip_spied", False,
         ):
@@ -447,8 +447,8 @@ def test_aggressive_submit_on_decay_end_to_end():
 
     orig_ensure = miner._ensure_driver
 
-    def _ensure_spy(sample_ctx):
-        ready = orig_ensure(sample_ctx)
+    def _ensure_spy(sample_ctx, **kwargs):
+        ready = orig_ensure(sample_ctx, **kwargs)
         if ready and miner._ctl_q is not None and not getattr(
             miner._ctl_q, "_quip_spied", False,
         ):
@@ -852,6 +852,120 @@ def test_ensure_driver_respawns_dead_driver_with_reason(caplog):
         miner._close_driver()
 
 
+class _BackoffMiner(_DriverMiner):
+    """Driver miner with a recording, configurable crash-backoff policy."""
+
+    def __init__(self):
+        super().__init__()
+        self.backoff_calls: list = []
+        self.backoff_delay = 0.0
+
+    def _crash_backoff_delay(self, streak: int) -> float:
+        self.backoff_calls.append(streak)
+        return self.backoff_delay
+
+
+def _kill_driver(miner):
+    terminate_join(miner._driver_proc, 5.0)
+    assert not miner._driver_proc.is_alive()
+
+
+def test_fast_dead_driver_respawn_consults_backoff_policy():
+    """A driver that dies within DRIVER_FAST_DEATH_S of spawning counts as a
+    crash: consecutive fast deaths grow the streak handed to the policy."""
+    miner = _BackoffMiner()
+    try:
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        _kill_driver(miner)
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        assert miner.backoff_calls == [1]
+        _kill_driver(miner)
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        assert miner.backoff_calls == [1, 2]
+    finally:
+        miner._close_driver()
+
+
+def test_long_lived_driver_death_resets_crash_streak():
+    """Dying AFTER a healthy run is not a crash loop: respawn immediately,
+    no policy consult, streak back to zero."""
+    import time as _t
+
+    miner = _BackoffMiner()
+    try:
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        _kill_driver(miner)
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        assert miner.backoff_calls == [1]
+        # Backdate the spawn so this driver "ran" past the fast-death window.
+        miner._driver_spawned_at = (
+            _t.monotonic() - miner.DRIVER_FAST_DEATH_S - 1.0
+        )
+        _kill_driver(miner)
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        assert miner.backoff_calls == [1]  # no new consult
+        # And the streak restarted: the next fast death is streak 1 again.
+        _kill_driver(miner)
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        assert miner.backoff_calls == [1, 1]
+    finally:
+        miner._close_driver()
+
+
+def test_healthy_respawn_reasons_do_not_count_as_crashes():
+    """dims-grew / node-count-changed respawns never consult the policy."""
+    miner = _BackoffMiner()
+    try:
+        assert miner._ensure_driver(_driver_sample_ctx(num_reads=8)) is True
+        assert miner._ensure_driver(_driver_sample_ctx(num_reads=16)) is True
+        assert miner._ensure_driver(
+            _driver_sample_ctx(nodes=(0, 1, 2, 3)),
+        ) is True
+        assert miner.backoff_calls == []
+    finally:
+        miner._close_driver()
+
+
+def test_default_crash_backoff_policy_backs_off_forever():
+    """Default policy: exponential backoff capped at 60s, never raises —
+    transient causes self-heal; a permanently broken backend retries slowly
+    forever instead of hot-looping (chosen over hard-fail-after-N)."""
+    miner = _DriverMiner()
+    assert miner._crash_backoff_delay(1) == 2.0
+    assert miner._crash_backoff_delay(2) == 4.0
+    assert miner._crash_backoff_delay(3) == 8.0
+    assert miner._crash_backoff_delay(6) == 60.0   # 2^6=64, capped
+    assert miner._crash_backoff_delay(1000) == 60.0  # no overflow, no raise
+
+
+def test_backoff_delay_is_waited_and_stop_aware():
+    """The policy's delay is actually waited before the respawn — unless the
+    dispatch stop_event is set, which cuts the wait short (shutdown must not
+    hang for the backoff duration)."""
+    import time as _t
+
+    miner = _BackoffMiner()
+    try:
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        miner.backoff_delay = 0.5
+        _kill_driver(miner)
+        t0 = _t.monotonic()
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        assert _t.monotonic() - t0 >= 0.5
+
+        miner.backoff_delay = 30.0
+        stop = mp.Event()
+        stop.set()
+        _kill_driver(miner)
+        t0 = _t.monotonic()
+        assert miner._ensure_driver(
+            _driver_sample_ctx(), stop_event=stop,
+        ) is True
+        assert _t.monotonic() - t0 < 10.0
+    finally:
+        miner._close_driver()
+
+
 class _VariableReadsMiner(_DriverMiner):
     """Driver miner whose adapted num_reads follows ``reads_next`` per dispatch."""
 
@@ -943,8 +1057,8 @@ def test_switch_tuple_with_metal_style_params_no_crash():
 
     orig_ensure = miner._ensure_driver
 
-    def _ensure_and_hijack(sample_ctx):
-        ready = orig_ensure(sample_ctx)
+    def _ensure_and_hijack(sample_ctx, **kwargs):
+        ready = orig_ensure(sample_ctx, **kwargs)
         if ready and miner._ctl_q is not None and not real_put_holder:
             # Grab the real put but replace it so the item lands in our list.
             real_put_holder["real"] = miner._ctl_q.put

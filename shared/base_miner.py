@@ -385,6 +385,12 @@ class BaseMiner(ABC):
         # when its node count matches and its num_reads fits (_ring_can_host);
         # only num_reads growth or a topology change forces a respawn.
         self._ring_dims: Optional[Tuple[int, int]] = None
+        # Crash-loop guard state: when the driver spawned (monotonic) and how
+        # many consecutive times it died within DRIVER_FAST_DEATH_S of its
+        # spawn. A persistent startup failure (e.g. the context factory
+        # raising every time) otherwise respawns in a tight loop forever.
+        self._driver_spawned_at: Optional[float] = None
+        self._driver_crash_streak: int = 0
         # Monotonic per-miner round generation. Bumped once per dispatch in
         # _setup_dispatch; tags every switch_round and every descriptor so a
         # superseded round's results are dropped. Process-local; never persisted.
@@ -507,6 +513,11 @@ class BaseMiner(ABC):
     # the consumer has headroom equal to what the cloud holds; on full the
     # pump drops the newest result (rare safety valve) and counts it.
     RESULT_QUEUE_MAXSIZE: int = 32
+
+    # A driver death within this many seconds of its spawn counts as a crash
+    # for the respawn-backoff guard (see _crash_backoff_delay); a driver that
+    # outlived the window died "healthy" and respawns immediately.
+    DRIVER_FAST_DEATH_S: float = 30.0
 
     # --- Submitter split (QPU only) ---
     # When True, ``_ensure_driver`` spawns TWO processes instead of one: a
@@ -1202,7 +1213,7 @@ class BaseMiner(ABC):
         }
 
         generation = 0
-        if self._ensure_driver(sample_ctx):
+        if self._ensure_driver(sample_ctx, stop_event=stop_event):
             # New round: bump the generation and tell the persistent driver to
             # switch (reseed feeder, cancel in-flight, set threshold). The
             # driver keeps its D-Wave connection — no reconnect, no respawn.
@@ -1288,7 +1299,11 @@ class BaseMiner(ABC):
         max_rows, max_cols = self._ring_dims
         return dims[1] == max_cols and dims[0] <= max_rows
 
-    def _ensure_driver(self, sample_ctx: Dict[str, Any]) -> bool:
+    def _ensure_driver(
+        self,
+        sample_ctx: Dict[str, Any],
+        stop_event: Optional[multiprocessing.synchronize.Event] = None,
+    ) -> bool:
         """Ensure ONE persistent stream-driver process is running.
 
         Idempotent. Spawns the driver (and its persistent ring / ctl_q /
@@ -1299,6 +1314,13 @@ class BaseMiner(ABC):
         later smaller rounds reuse it). The driver builds its own connected
         context via ``STREAM_FACTORY_DOTTED`` and keeps it alive across
         dispatches; only ``_close_driver`` (miner shutdown) reaps it.
+
+        Crash-loop guard: a driver that died within ``DRIVER_FAST_DEATH_S``
+        of its spawn grows a consecutive-crash streak, and the respawn waits
+        ``_crash_backoff_delay(streak)`` seconds first — otherwise a
+        persistent startup failure respawns in a tight loop forever.
+        ``stop_event`` (the dispatch cancellation event) cuts that wait
+        short so shutdown never blocks on the backoff.
 
         Returns:
             ``True`` once a live driver is ready (always — every backend mines
@@ -1328,6 +1350,7 @@ class BaseMiner(ABC):
                 "stream driver respawn (%s): ring capacity %s, dispatch dims %s",
                 reason, self._ring_dims, dims,
             )
+            self._apply_crash_backoff(reason, stop_event)
         self._close_driver()
         import multiprocessing as _mp
         ctx = _mp.get_context("spawn")
@@ -1360,8 +1383,63 @@ class BaseMiner(ABC):
         self._ctl_q = ctl_q
         self._driver_stop = driver_stop
         self._ring_dims = dims
+        self._driver_spawned_at = time.monotonic()
         self._last_forwarded_threshold_milli = None
         return True
+
+    def _apply_crash_backoff(
+        self,
+        reason: str,
+        stop_event: Optional[multiprocessing.synchronize.Event],
+    ) -> None:
+        """Grow/reset the fast-death streak and wait out the policy's delay.
+
+        Only a ``dead-driver`` respawn whose driver died within
+        ``DRIVER_FAST_DEATH_S`` of spawning counts as a crash; healthy
+        respawns (dims-grew, node-count-changed, or a death after a long
+        run) reset the streak and never wait.
+        """
+        lifetime = (
+            time.monotonic() - self._driver_spawned_at
+            if self._driver_spawned_at is not None else None
+        )
+        if (
+            reason != "dead-driver"
+            or lifetime is None
+            or lifetime >= self.DRIVER_FAST_DEATH_S
+        ):
+            self._driver_crash_streak = 0
+            return
+        self._driver_crash_streak += 1
+        delay = self._crash_backoff_delay(self._driver_crash_streak)
+        if delay <= 0:
+            return
+        self.logger.warning(
+            "stream driver died %.1fs after spawn (crash streak %d); "
+            "backing off %.1fs before respawn",
+            lifetime, self._driver_crash_streak, delay,
+        )
+        if stop_event is not None:
+            stop_event.wait(delay)
+        else:
+            time.sleep(delay)
+
+    def _crash_backoff_delay(self, streak: int) -> float:
+        """Backoff policy for a crash-looping stream driver.
+
+        Called only when the previous driver died within
+        ``DRIVER_FAST_DEATH_S`` of its spawn; ``streak`` counts consecutive
+        such fast deaths (1 = first). Returns seconds to wait before the
+        respawn.
+
+        Exponential backoff, capped, retrying forever: transient causes
+        (e.g. the ioreg probe timing out under CPU contention) self-heal,
+        and a permanently broken backend degrades to one respawn per minute
+        instead of a hot loop. Chosen over hard-fail-after-N so a
+        recoverable stall never kills the worker; the per-respawn WARNING
+        in _apply_crash_backoff keeps the loop operator-visible.
+        """
+        return min(2.0 ** streak, 60.0)
 
     def _spawn_split_driver(
         self, ctx: Any, ring: Any, desc_q: Any, ctl_q: Any, driver_stop: Any,
