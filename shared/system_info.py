@@ -447,11 +447,15 @@ def _apple_gpu_name() -> Optional[str]:
 
 
 def _apple_gpu_core_count() -> Optional[int]:
-    """Parse GPU core count from 'ioreg -l | grep gpu-core-count'."""
+    """Parse GPU core count from the AGXAccelerator ioreg node.
+
+    Targeted class query (~0.05s); a full ``ioreg -l`` dump takes ~1.1s
+    idle and times out under CPU contention.
+    """
     try:
         result = subprocess.run(
-            "ioreg -l | grep gpu-core-count",
-            shell=True, capture_output=True, text=True, timeout=2,
+            ["ioreg", "-rc", "AGXAccelerator", "-d1"],
+            capture_output=True, text=True, timeout=10,
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
