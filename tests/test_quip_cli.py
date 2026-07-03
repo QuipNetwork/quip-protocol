@@ -1569,6 +1569,176 @@ def test_detect_image_supports_probes_imports(monkeypatch):
     assert quip_cli._detect_image_supports() == ["cpu", "gpu", "qpu"]
 
 
+# ── CLI miner-type selection: supervisor --mode + subcommand narrowing ──
+
+
+def test_plan_processes_mode_narrows_to_requested_type(
+    monkeypatch, tmp_path, capsys
+):
+    """--mode gpu on a cpu+gpu config plans ONLY the gpu child (the
+    telemetry aggregator survives) and echoes which configured miner
+    types were dropped."""
+    monkeypatch.setattr(
+        quip_cli, "_detect_image_supports", lambda: ["cpu", "gpu", "qpu"]
+    )
+    cfg = _write_supervisor_toml(
+        tmp_path, backend="[cpu]\nnum_cpus = 1\n[cuda.0]\n"
+    )
+    _runtime_dir, procs = quip_cli._plan_processes(cfg, mode="gpu")
+    assert [p["args"][0] for p in procs] == ["telemetry", "gpu"]
+    out = capsys.readouterr().out
+    assert "--mode gpu keeps gpu only" in out
+    assert "dropping configured miner types: cpu" in out
+
+
+def test_plan_processes_mode_skips_election(monkeypatch, tmp_path, capsys):
+    """Narrowing to one child means no owner election: the kept child
+    keeps its own mempool default (no QUIP_MEMPOOL force-off, no
+    election echo)."""
+    monkeypatch.setattr(
+        quip_cli, "_detect_image_supports", lambda: ["cpu", "gpu", "qpu"]
+    )
+    cfg = _write_supervisor_toml(
+        tmp_path, backend="[cpu]\nnum_cpus = 1\n[cuda.0]\n"
+    )
+    _runtime_dir, procs = quip_cli._plan_processes(cfg, mode="cpu")
+    assert all("QUIP_MEMPOOL" not in p["env"] for p in procs)
+    assert "mempool owner" not in capsys.readouterr().out
+
+
+def test_plan_processes_mode_unconfigured_type_fails(monkeypatch, tmp_path):
+    """--mode qpu with no qpu backend sections is an error that names
+    what IS configured, instead of silently planning nothing."""
+    monkeypatch.setattr(
+        quip_cli, "_detect_image_supports", lambda: ["cpu", "gpu", "qpu"]
+    )
+    cfg = _write_supervisor_toml(tmp_path)  # cpu only
+    with pytest.raises(
+        click.ClickException, match="no qpu backend sections"
+    ) as excinfo:
+        quip_cli._plan_processes(cfg, mode="qpu")
+    assert "cpu" in str(excinfo.value)
+
+
+def test_plan_processes_mode_matching_single_backend_stays_quiet(
+    monkeypatch, tmp_path, capsys
+):
+    """--mode cpu on a cpu-only config drops nothing → no drop echo."""
+    monkeypatch.setattr(
+        quip_cli, "_detect_image_supports", lambda: ["cpu", "gpu", "qpu"]
+    )
+    cfg = _write_supervisor_toml(tmp_path)
+    _runtime_dir, procs = quip_cli._plan_processes(cfg, mode="cpu")
+    assert [p["args"][0] for p in procs] == ["telemetry", "cpu"]
+    assert "dropping configured miner types" not in capsys.readouterr().out
+
+
+def test_plan_processes_mode_narrows_before_image_support_check(
+    monkeypatch, tmp_path
+):
+    """--mode cpu must boot on an install that can't run the config's
+    [cuda.0]: once a type is dropped by choice, its libraries are
+    irrelevant (no unsupported-mode error for dropped types)."""
+    monkeypatch.setattr(quip_cli, "_detect_image_supports", lambda: ["cpu"])
+    cfg = _write_supervisor_toml(
+        tmp_path, backend="[cpu]\nnum_cpus = 1\n[cuda.0]\n"
+    )
+    _runtime_dir, procs = quip_cli._plan_processes(cfg, mode="cpu")
+    assert [p["args"][0] for p in procs] == ["telemetry", "cpu"]
+
+
+def test_quip_miner_mode_requires_config():
+    """--mode without --config has nothing to narrow → usage error."""
+    result = CliRunner().invoke(quip_cli.quip_miner, ["--mode", "cpu"])
+    assert result.exit_code != 0
+    assert "--mode requires --config" in result.output
+
+
+def test_quip_miner_mode_rejected_with_subcommand(tmp_path):
+    """--mode is supervisor-only; with a subcommand the subcommand
+    already selects the miner type."""
+    result = CliRunner().invoke(
+        quip_cli.quip_miner, ["--mode", "cpu", "resolve-modes"]
+    )
+    assert result.exit_code != 0
+    assert "already selects the miner type" in result.output
+
+
+def test_quip_miner_mode_passes_through_to_supervisor(monkeypatch, tmp_path):
+    """`quip-miner --config X --mode gpu` hands the mode to the
+    supervisor run."""
+    captured = {}
+
+    def fake_supervisor(config_path, *, mode=None):
+        captured["config_path"] = config_path
+        captured["mode"] = mode
+        return 0
+
+    monkeypatch.setattr(quip_cli, "_run_supervisor", fake_supervisor)
+    cfg = _write_supervisor_toml(tmp_path)
+    result = CliRunner().invoke(
+        quip_cli.quip_miner, ["--config", str(cfg), "--mode", "gpu"]
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["mode"] == "gpu"
+
+
+def test_quip_miner_cpu_warns_on_dropped_configured_types(
+    monkeypatch, tmp_path
+):
+    """Direct `quip-miner cpu` against a config that also declares gpu
+    and qpu sections keeps cpu and warns what was dropped — a
+    wrong-subcommand launch must be visible, not silent."""
+    _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(
+        tmp_path,
+        '[cpu]\nnum_cpus = 1\n[cuda.0]\n[dwave]\ndaily_budget = "60s"\n',
+    )
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert "config also declares miner types gpu, qpu" in result.output
+    assert "running cpu only" in result.output
+
+
+def test_quip_miner_gpu_warns_even_on_flag_defaults_path(
+    monkeypatch, tmp_path
+):
+    """`quip-miner gpu` against a cpu-only config runs GPU from flag
+    defaults — the configured cpu sections are still dropped, so the
+    warning fires on that path too."""
+    _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(tmp_path, "[cpu]\nnum_cpus = 2\n")
+    result = CliRunner().invoke(quip_cli.quip_miner_gpu, ["--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert "config also declares miner types cpu" in result.output
+    assert "running gpu only" in result.output
+
+
+def test_quip_miner_qpu_warns_on_dropped_types(monkeypatch, tmp_path):
+    """`quip-miner qpu` with a cpu+dwave config warns about the dropped
+    cpu sections."""
+    _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(
+        tmp_path, '[cpu]\nnum_cpus = 1\n[dwave]\ndaily_budget = "60s"\n'
+    )
+    result = CliRunner().invoke(quip_cli.quip_miner_qpu, ["--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert "config also declares miner types cpu" in result.output
+    assert "running qpu only" in result.output
+
+
+def test_quip_miner_cpu_no_warning_on_single_backend_config(
+    monkeypatch, tmp_path
+):
+    """A cpu-only config invoked via `quip-miner cpu` drops nothing —
+    no warning noise on the matched path."""
+    _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(tmp_path, "[cpu]\nnum_cpus = 1\n")
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert "config also declares miner types" not in result.output
+
+
 def test_bare_quip_miner_with_config_runs_supervisor(monkeypatch, tmp_path):
     """`quip-miner --config x.toml` (no subcommand) is the production
     entry: it hands off to the supervisor."""
@@ -1576,7 +1746,7 @@ def test_bare_quip_miner_with_config_runs_supervisor(monkeypatch, tmp_path):
     called: Dict[str, Any] = {}
     monkeypatch.setattr(
         quip_cli, "_run_supervisor",
-        lambda path: called.setdefault("path", path) and 0 or 0,
+        lambda path, mode=None: called.setdefault("path", path) and 0 or 0,
     )
     result = CliRunner().invoke(quip_cli.quip_miner, ["--config", str(cfg)])
     assert result.exit_code == 0, result.output

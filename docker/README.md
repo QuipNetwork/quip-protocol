@@ -85,10 +85,23 @@ everything it declares:
    `quip-miner cpu`, `[gpu]`/`[cuda.N]`/`[metal]`/`[modal]` →
    `quip-miner gpu`, `[qpu]`/`[dwave]`/`[ibm]`/`[braket]`/`[pasqal]`/
    `[ionq]`/`[origin]` → `quip-miner qpu`. (The per-mode subcommands
-   remain available as test/ops tooling.)
+   remain available as test/ops tooling; invoked directly against a
+   multi-backend config they keep their own type and warn about the
+   dropped sections.)
 2. The telemetry aggregator is spawned when `rest_port > 0`.
 3. The built-in supervisor forwards SIGTERM/SIGINT to every child and
    tears down the container if any child exits.
+
+To run just one miner type from a multi-backend config, pass `--mode`
+— the entrypoint forwards container args to the supervisor:
+
+```bash
+docker run ... quip-miner-image --mode gpu
+# supervisor: --mode gpu keeps gpu only; dropping configured miner types: cpu
+```
+
+The selection is CLI-only; there is no config key for it (a legacy
+`[miner] mode` key still loads but is ignored).
 
 The templates ship with an active default section (`[cpu]` on the cpu
 image, `[cuda.0]` on the cuda image), so what runs is always stated in
@@ -102,7 +115,9 @@ register one solver type on chain.
 Capability is probed from the installed libraries: a config asking for
 hardware the image can't run (e.g. `[cuda.0]` on the CPU image, which
 lacks `cupy`) is rejected with `unsupported-mode` before any child
-starts.
+starts. With `--mode`, only the kept type must be runnable — dropped
+sections are not probed, so `--mode cpu` boots the CPU image even if
+the config carries `[cuda.N]` for another host.
 
 ## Telemetry aggregation
 

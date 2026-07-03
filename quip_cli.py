@@ -760,7 +760,54 @@ def _detect_image_supports() -> list[str]:
     return supports
 
 
-def _plan_processes(config_path: Path) -> Tuple[Path, list[dict]]:
+def _narrow_backends_to_mode(
+    backends: dict, mode: str
+) -> dict:
+    """Apply the supervisor's ``--mode`` narrowing: keep only *mode*'s
+    backend sections, echoing which configured miner types get dropped.
+
+    Narrowing happens BEFORE ``resolve_modes`` so image-support
+    validation only applies to the kept type — ``--mode cpu`` must boot
+    on a host that can't import the dropped ``[cuda.N]``'s libraries.
+    Requesting a type the config never declares is an error: the
+    supervisor is config-driven, so there is nothing to synthesize from.
+    """
+    groups = present_backend_groups(backends)
+    active = [g for g in MODE_NAMES if groups[g]]
+    if mode not in active:
+        raise click.ClickException(
+            f"--mode {mode}: config declares no {mode} backend sections "
+            f"(configured: {', '.join(active) or 'none'})"
+        )
+    dropped = [g for g in active if g != mode]
+    if dropped:
+        click.echo(
+            f"supervisor: --mode {mode} keeps {mode} only; dropping "
+            f"configured miner types: {', '.join(dropped)}"
+        )
+    return {s: backends[s] for s in groups[mode]}
+
+
+def _warn_dropped_backend_groups(backends: dict, kept: str) -> None:
+    """Warn when a direct `quip-miner cpu|gpu|qpu` run drops config.
+
+    The subcommand narrows a multi-backend config to the invoked type's
+    sections; say so, so a wrong-subcommand launch is visible instead of
+    silently mining less than the config declares. (The top-level
+    supervisor is the run-everything path.)
+    """
+    groups = present_backend_groups(backends)
+    dropped = [g for g in MODE_NAMES if g != kept and groups[g]]
+    if dropped:
+        click.echo(
+            f"warning: config also declares miner types "
+            f"{', '.join(dropped)} — dropped; running {kept} only"
+        )
+
+
+def _plan_processes(
+    config_path: Path, *, mode: Optional[str] = None
+) -> Tuple[Path, list[dict]]:
     """Turn a config.toml into the process set the supervisor runs.
 
     Pure planning — no spawns. Returns ``(runtime_dir, procs)`` where each
@@ -771,6 +818,10 @@ def _plan_processes(config_path: Path) -> Tuple[Path, list[dict]]:
     - one miner child per backend group the config declares (the same
       resolution `resolve-modes` exposes for testing), rejected up front
       with ``unsupported-mode`` when the install lacks the libraries.
+
+    ``mode`` is the CLI-only ``--mode`` narrowing: keep just that miner
+    type's child and echo the configured types that were dropped (see
+    :func:`_narrow_backends_to_mode`).
 
     Multi-backend plans elect a single mempool owner: one substrate
     account can only register one solver type on chain, so unless the
@@ -787,6 +838,8 @@ def _plan_processes(config_path: Path) -> Tuple[Path, list[dict]]:
     raw = _load_or_fail(load_toml, str(config_path), None, {})
     miner_toml = _load_or_fail(load_miner_config, None, raw, {})
     backends = _load_backends_or_fail(None, raw=raw)
+    if mode is not None:
+        backends = _narrow_backends_to_mode(backends, mode)
     try:
         modes = resolve_modes(
             backends,
@@ -834,16 +887,17 @@ def _plan_processes(config_path: Path) -> Tuple[Path, list[dict]]:
     return runtime_dir, procs
 
 
-def _run_supervisor(config_path: Path) -> int:
+def _run_supervisor(config_path: Path, *, mode: Optional[str] = None) -> int:
     """Production entry: spawn + supervise everything the config declares.
 
     One child per planned process (see :func:`_plan_processes`), launched
     as `quip-miner <subcommand> --config <file>`. SIGTERM/SIGINT fan out
     to every child; the first child to exit (clean or otherwise) tears
     down the rest and its code becomes the supervisor's — operators or
-    orchestrators (compose/k8s/systemd) re-spawn from there.
+    orchestrators (compose/k8s/systemd) re-spawn from there. ``mode``
+    narrows the plan to one configured miner type (CLI ``--mode``).
     """
-    runtime_dir, procs = _plan_processes(config_path)
+    runtime_dir, procs = _plan_processes(config_path, mode=mode)
     runtime_dir.mkdir(parents=True, exist_ok=True)
     binary = shutil.which("quip-miner") or sys.argv[0]
 
@@ -907,20 +961,45 @@ def _run_supervisor(config_path: Path) -> int:
     "aggregator when rest_port > 0 — and supervise them. The "
     "subcommands below are test/ops tooling.",
 )
+@click.option(
+    "--mode",
+    "mode",
+    type=click.Choice(["cpu", "gpu", "qpu"], case_sensitive=False),
+    default=None,
+    help="With --config: keep only this configured miner type's child "
+    "and warn about the other configured types. CLI-only — there is "
+    "no config-file equivalent.",
+)
 @click.pass_context
-def quip_miner(ctx: click.Context, log_level: str, config_path: Optional[str]) -> None:
+def quip_miner(
+    ctx: click.Context,
+    log_level: str,
+    config_path: Optional[str],
+    mode: Optional[str],
+) -> None:
     """Substrate-integrated quantum mining frontend.
 
     Production usage is config-driven: `quip-miner --config config.toml`
-    starts the full node (miners + telemetry) from the file alone.
+    starts the full node (miners + telemetry) from the file alone;
+    `--mode cpu|gpu|qpu` narrows it to one configured miner type.
     """
     setup_logging(log_level=log_level.upper())
     if ctx.invoked_subcommand is not None:
+        if mode is not None:
+            raise click.UsageError(
+                "--mode applies to the config-driven supervisor; the "
+                f"'{ctx.invoked_subcommand}' subcommand already selects "
+                "the miner type"
+            )
         return
     if config_path is None:
+        if mode is not None:
+            raise click.UsageError("--mode requires --config")
         click.echo(ctx.get_help())
         ctx.exit(0)
-    raise SystemExit(_run_supervisor(Path(config_path).expanduser()))
+    raise SystemExit(
+        _run_supervisor(Path(config_path).expanduser(), mode=mode)
+    )
 
 
 def _selftest_spawn_child(result_queue) -> None:
@@ -2431,6 +2510,7 @@ def quip_miner_cpu(
         group="cpu",
         flag_param_pairs=(("--num-cpus", "num_cpus"),),
     )
+    _warn_dropped_backend_groups(backends, kept="cpu")
     if "cpu" in backends:
         # TOML drives inventory verbatim — MinerCore._initialize_miners
         # reads `cpu.num_cpus` and `cpu.args` directly. Coerce the
@@ -2495,6 +2575,7 @@ def quip_miner_gpu(
         group="gpu",
         flag_param_pairs=(("--gpu-backend", "gpu_backend"),),
     )
+    _warn_dropped_backend_groups(backends, kept="gpu")
     has_gpu_toml = any(s in backends for s in GPU_BACKEND_SECTIONS)
     if has_gpu_toml:
         # TOML inventory drives the miner config — `_build_gpu_specs`
@@ -2577,6 +2658,7 @@ def quip_miner_qpu(
             ("--daily-budget", "daily_budget"),
         ),
     )
+    _warn_dropped_backend_groups(backends, kept="qpu")
     has_qpu_toml = any(s in backends for s in QPU_BACKEND_SECTIONS)
     if has_qpu_toml:
         miner_config = {

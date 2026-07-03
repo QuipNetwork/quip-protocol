@@ -196,7 +196,9 @@ Thin composition of producer + submitter over the scheduler:
 Mempool participation is config-only: `[miner] mempool` (defaults:
 cpu/gpu ON, qpu OFF — paid samples are opt-in) and
 `[miner] mempool_min_reward`. There is no mempool-only operation mode
-and no CLI mode flag. `QUIP_MEMPOOL=0` force-disables mempool in a child; the
+and no CLI flag for the work source (the supervisor's
+`--mode cpu|gpu|qpu` selects miner *types*, not what they mine).
+`QUIP_MEMPOOL=0` force-disables mempool in a child; the
 supervisor's owner election sets it on every non-owner child of a
 multi-backend config (first non-qpu mode in canonical cpu,gpu,qpu
 order) because one substrate account can register only ONE solver type

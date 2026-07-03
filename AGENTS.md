@@ -54,12 +54,26 @@ quip-miner cpu --validator ws://... --num-cpus 4 --signer-key ...
 
 # TOML config (see docker/quip-miner.cpu.toml, docker/quip-miner.cuda.toml)
 quip-miner cpu --config ./docker/quip-miner.cpu.toml
+
+# Production: run everything the config declares, supervised
+quip-miner --config ./docker/quip-miner.cpu.toml
+
+# Narrow a multi-backend config to one miner type (CLI-only; the
+# supervisor echoes which configured types were dropped)
+quip-miner --config config.toml --mode gpu
 ```
+
+Miner-type selection is CLI-only: the supervisor's `--mode cpu|gpu|qpu`
+keeps one configured type (warning about the dropped ones), and a
+direct `quip-miner cpu|gpu|qpu` run does the same narrowing with the
+same warning. There is no config key for it — a legacy `[miner] mode`
+key still loads but is ignored.
 
 **Mempool participation is config-only** — `[miner] mempool` (unquoted
 TOML bool; defaults: cpu/gpu on, qpu off — paid QPU samples are opt-in)
 and `[miner] mempool_min_reward` (0 = accept all). There is no CLI flag
-and no mempool-only mode: every worker mines PoW continuously, mempool
+for it and no mempool-only mode (`--mode` selects miner types, not the
+work source): every worker mines PoW continuously, mempool
 jobs preempt PoW on the same workers, and PoW resumes afterward. Solver
 registration is automatic at miner startup (query-first, never
 auto-deregisters — switching solver type requires an explicit
