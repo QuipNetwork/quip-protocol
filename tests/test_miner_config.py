@@ -635,80 +635,40 @@ def test_mode_names_matches_expected_subcommands():
 
 
 # ----------------------------------------------------------------------
-# Mempool + multi-backend fail-fast (W4a)
+# Multi-backend acceptance + mine_mode removal (T8)
 # ----------------------------------------------------------------------
 
 
-def test_resolve_modes_mempool_single_backend_ok():
-    """Single backend + --mine-mode mempool works as before — the
-    constraint only fires when there are multiple groups competing
-    for the same substrate-account solver registration."""
-    assert resolve_modes({"cpu": {"num_cpus": 4}}, mine_mode="mempool") == ["cpu"]
-    assert resolve_modes({"dwave": {}}, mine_mode="both") == ["qpu"]
+def test_resolve_modes_multi_backend_unconditional():
+    """Multi-backend configs resolve to every active group with no
+    mempool guard — the one-solver-type-per-account constraint is now
+    handled by supervisor owner election (QUIP_MEMPOOL=0 on non-owner
+    children), not by mode resolution."""
+    assert resolve_modes({"cpu": {}, "dwave": {}}) == ["cpu", "qpu"]
+    backends = {"cpu": {}, "cuda": {"0": {}}, "dwave": {}}
+    assert resolve_modes(backends) == ["cpu", "gpu", "qpu"]
 
 
-def test_resolve_modes_pow_mode_allows_multi_backend():
-    """PoW path has no per-account solver registration — multi-backend
-    containers work fine and each child submits proofs independently."""
-    backends = {"cpu": {}, "dwave": {}}
-    assert resolve_modes(backends, mine_mode="pow") == ["cpu", "qpu"]
+def test_resolve_modes_rejects_mine_mode_kwarg():
+    """The mine_mode parameter is gone with the [miner] mode key —
+    passing it is a caller bug, surfaced as a TypeError."""
+    with pytest.raises(TypeError):
+        resolve_modes({"cpu": {}}, mine_mode="mempool")
 
 
-def test_resolve_modes_no_mine_mode_skips_guard():
-    """When the caller doesn't pass --mine-mode (e.g. operator running
-    one-shot `quip-miner resolve-modes` without a PoW intent), the
-    multi-backend guard is skipped — the constraint belongs to
-    mempool, not to backend resolution itself."""
-    backends = {"cpu": {}, "dwave": {}}
-    assert resolve_modes(backends) == ["cpu", "qpu"]
+def test_resolve_mode_rejects_mine_mode_kwarg():
+    """The singular wrapper dropped mine_mode along with the plural."""
+    with pytest.raises(TypeError):
+        resolve_mode({"cpu": {}}, mine_mode="pow")
 
 
-def test_resolve_modes_mempool_multi_backend_rejected():
-    """The headline case — multi-backend config + --mine-mode mempool
-    must fail at launch with a clear code so the operator sees the
-    architectural constraint instead of getting silent
-    solver-registration failures from N-1 children at runtime."""
-    backends = {"cpu": {}, "dwave": {}}
-    with pytest.raises(ModeResolutionError) as excinfo:
-        resolve_modes(backends, mine_mode="mempool")
-    assert excinfo.value.code == "multi-backend-not-allowed-in-mempool-mode"
-    # Error names every group so the operator knows what to drop.
-    assert "cpu" in str(excinfo.value)
-    assert "dwave" in str(excinfo.value)
-
-
-def test_resolve_modes_both_mode_multi_backend_rejected():
-    """--mine-mode both is a superset of mempool's constraint — also
-    rejected for multi-backend."""
-    backends = {"cpu": {}, "cuda": {"0": {}}}
-    with pytest.raises(ModeResolutionError) as excinfo:
-        resolve_modes(backends, mine_mode="both")
-    assert excinfo.value.code == "multi-backend-not-allowed-in-mempool-mode"
-
-
-def test_resolve_modes_mempool_case_insensitive():
-    """`MEMPOOL` / `Both` / etc. all trigger the guard. Callers may pass
-    through whatever casing the operator wrote in the TOML `mode` key or
-    --mine-mode flag; the guard normalises rather than insisting on
-    lowercase."""
-    backends = {"cpu": {}, "dwave": {}}
-    for variant in ("MEMPOOL", "Mempool", "MeMpOoL", "BOTH", "Both"):
-        with pytest.raises(ModeResolutionError) as excinfo:
-            resolve_modes(backends, mine_mode=variant)
-        assert (
-            excinfo.value.code == "multi-backend-not-allowed-in-mempool-mode"
-        ), variant
-
-
-def test_resolve_mode_singular_also_respects_mine_mode():
-    """The singular wrapper threads `mine_mode` through to the plural
-    impl so one-shot callers benefit from the same guard."""
-    with pytest.raises(ModeResolutionError) as excinfo:
-        resolve_mode({"cpu": {}, "dwave": {}}, mine_mode="mempool")
-    # Multi-backend triggers BOTH the mempool guard AND the
-    # single-mode rejection — the mempool one fires first since it's
-    # architecturally more specific.
-    assert excinfo.value.code == "multi-backend-not-allowed-in-mempool-mode"
+def test_load_tolerates_stale_mode_key(tmp_path):
+    """Legacy configs may still carry the removed [miner] `mode` key;
+    the loader passes unknown keys through and nothing reads it."""
+    p = tmp_path / "config.toml"
+    p.write_text('[miner]\nvalidators = ["ws://a:9944"]\nmode = "mempool"\n')
+    cfg = load_miner_config(p)
+    assert cfg["validators"] == ["ws://a:9944"]
 
 
 # ----------------------------------------------------------------------

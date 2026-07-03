@@ -772,6 +772,13 @@ def _plan_processes(config_path: Path) -> Tuple[Path, list[dict]]:
       resolution `resolve-modes` exposes for testing), rejected up front
       with ``unsupported-mode`` when the install lacks the libraries.
 
+    Multi-backend plans elect a single mempool owner: one substrate
+    account can only register one solver type on chain, so unless the
+    config disables mempool outright (``[miner] mempool = false``),
+    the first non-qpu mode in canonical order keeps mempool and every
+    other miner child gets ``QUIP_MEMPOOL=0`` in its env (the force-off
+    each backend honors via ``_resolve_mempool_enabled``).
+
     ``runtime_dir`` (`<config dir>/runtime`) is internal glue: children
     write per-mode snapshots there and skip their in-process REST sibling;
     the aggregator reads it. Operators never configure it.
@@ -780,15 +787,26 @@ def _plan_processes(config_path: Path) -> Tuple[Path, list[dict]]:
     raw = _load_or_fail(load_toml, str(config_path), None, {})
     miner_toml = _load_or_fail(load_miner_config, None, raw, {})
     backends = _load_backends_or_fail(None, raw=raw)
-    toml_mode = miner_toml.get("mode")
     try:
         modes = resolve_modes(
             backends,
             image_supports=_detect_image_supports(),
-            mine_mode=str(toml_mode).lower() if toml_mode else None,
         )
     except ModeResolutionError as exc:
         raise click.ClickException(str(exc)) from exc
+
+    # Mempool owner election — `mempool` is validated bool-or-None at load.
+    mempool_value = miner_toml.get("mempool")
+    mempool_owner = None
+    if mempool_value is not False and len(modes) > 1:
+        mempool_owner = next((m for m in modes if m != "qpu"), None)
+        if mempool_owner is not None:
+            disabled = [m for m in modes if m != mempool_owner]
+            click.echo(
+                f"supervisor: mempool owner is {mempool_owner}; disabling "
+                f"mempool on {', '.join(disabled)} — one substrate account "
+                "can only register one solver type on chain"
+            )
 
     runtime_dir = config_path.resolve().parent / "runtime"
     procs: list[dict] = []
@@ -803,12 +821,15 @@ def _plan_processes(config_path: Path) -> Tuple[Path, list[dict]]:
             "env": {},
         })
     for mode in modes:
+        env = {
+            "QUIP_RUNTIME_DIR": str(runtime_dir),
+            "QUIP_TELEMETRY_EXTERNAL": "1",
+        } if telemetry_on else {}
+        if mempool_owner is not None and mode != mempool_owner:
+            env["QUIP_MEMPOOL"] = "0"
         procs.append({
             "args": [mode, "--config", str(config_path)],
-            "env": {
-                "QUIP_RUNTIME_DIR": str(runtime_dir),
-                "QUIP_TELEMETRY_EXTERNAL": "1",
-            } if telemetry_on else {},
+            "env": env,
         })
     return runtime_dir, procs
 
@@ -985,19 +1006,10 @@ def quip_miner_selftest() -> None:
     "config asks for a mode outside this set. Set by Docker images "
     "via QUIP_IMAGE_SUPPORTS; omit for unrestricted resolution.",
 )
-@click.option(
-    "--mine-mode",
-    "mine_mode",
-    type=click.Choice(["pow", "mempool", "both"], case_sensitive=False),
-    default=None,
-    help="See `quip-miner resolve-modes --help`. Same guard, single-mode "
-    "convenience caller.",
-)
 def quip_miner_resolve_mode(
     config_path: Optional[str],
     default_mode: Optional[str],
     image_supports_csv: Optional[str],
-    mine_mode: Optional[str],
 ) -> None:
     """Resolve the quip-miner subcommand for a config file.
 
@@ -1008,11 +1020,8 @@ def quip_miner_resolve_mode(
     error code on stderr when resolution is ambiguous, unsupported by
     the image, or unspecified.
 
-    Designed for entrypoint scripts that need to dispatch:
-
-        MODE=$(quip-miner resolve-mode --config /data/config.toml \
-                  --default cpu --image-supports cpu,qpu) || exit 1
-        exec quip-miner "$MODE" --config /data/config.toml ...
+    One-shot inspection/test tooling — production is the top-level
+    `quip-miner --config` supervisor.
     """
     backends = _load_backends_or_fail(config_path)
     image_supports = _parse_image_supports(image_supports_csv)
@@ -1022,27 +1031,11 @@ def quip_miner_resolve_mode(
             backends,
             default=default_mode.lower() if default_mode else None,
             image_supports=image_supports,
-            mine_mode=_effective_mine_mode(mine_mode, config_path),
         )
     except ModeResolutionError as exc:
         raise click.ClickException(str(exc)) from exc
 
     click.echo(resolved)
-
-
-def _effective_mine_mode(
-    mine_mode: Optional[str], config_path: Optional[str]
-) -> Optional[str]:
-    """--mine-mode flag, falling back to the config's `[miner] mode` key.
-
-    Keeps the mempool multi-backend guard active for config-only launches
-    (the docker entrypoint passes no flags — config.toml is the single
-    source of truth for the work source).
-    """
-    if mine_mode:
-        return mine_mode.lower()
-    toml_mode = _load_or_fail(load_miner_config, config_path, None, {}).get("mode")
-    return str(toml_mode).lower() if toml_mode else None
 
 
 @quip_miner.command("resolve-modes")
@@ -1060,34 +1053,18 @@ def _effective_mine_mode(
     default=None,
     help="Comma-separated subset of {cpu,gpu,qpu} this container can run.",
 )
-@click.option(
-    "--mine-mode",
-    "mine_mode",
-    type=click.Choice(["pow", "mempool", "both"], case_sensitive=False),
-    default=None,
-    help="Work source override (falls back to the config's `[miner] mode` "
-    "key). When mempool or both, a multi-backend config is rejected with "
-    "`multi-backend-not-allowed-in-mempool-mode` — a single substrate account can "
-    "only register as one solver type, so the other children would silently fail "
-    "registration.",
-)
 def quip_miner_resolve_modes(
     config_path: Optional[str],
     default_mode: Optional[str],
     image_supports_csv: Optional[str],
-    mine_mode: Optional[str],
 ) -> None:
     """Resolve the quip-miner subcommand(s) for a config file.
 
     Like `resolve-mode` but returns the *full* list — one mode per
-    line — when the config declares multiple backend groups. The
-    Docker entrypoint uses this to drive the per-mode child-process
-    supervisor:
+    line — when the config declares multiple backend groups.
 
-        mapfile -t MODES < <(quip-miner resolve-modes --config $CFG ...)
-        for mode in "${MODES[@]}"; do
-            quip-miner "$mode" --config "$CFG" ... &
-        done
+    One-shot inspection/test tooling — production is the top-level
+    `quip-miner --config` supervisor.
     """
     backends = _load_backends_or_fail(config_path)
     image_supports = _parse_image_supports(image_supports_csv)
@@ -1097,7 +1074,6 @@ def quip_miner_resolve_modes(
             backends,
             default=default_mode.lower() if default_mode else None,
             image_supports=image_supports,
-            mine_mode=_effective_mine_mode(mine_mode, config_path),
         )
     except ModeResolutionError as exc:
         raise click.ClickException(str(exc)) from exc

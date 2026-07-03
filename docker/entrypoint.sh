@@ -2,7 +2,7 @@
 # Entrypoint for the quip-miner Docker image (CPU / CUDA).
 #
 # Everything the miner does is declared in /data/config.toml (seeded
-# from the image template on first run): validators, mode, faucet,
+# from the image template on first run): validators, mempool, faucet,
 # telemetry, identity, and backend inventory. `quip-miner --config`
 # reads it and spawns/supervises every process itself — the entrypoint
 # only prepares the volume and drops privileges.

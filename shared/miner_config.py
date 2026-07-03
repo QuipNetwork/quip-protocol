@@ -37,9 +37,6 @@ keystore + identification.
     mempool     = true                      # optional bool
     mempool_min_reward = 0                  # optional non-negative int
 
-    # Work-source mode — slated for removal in favor of `mempool` above.
-    mode        = "pow"                     # optional, "pow"|"mempool"|"both"
-
     # v0.1 compatibility aliases — `listen` → `rest_host`, `port` → `rest_port`.
     # These are convenience for v0.1 migrants; if both an alias and its
     # canonical key are present, the canonical key wins and the alias is
@@ -302,15 +299,11 @@ class ModeResolutionError(MinerConfigError):
         self.code = code
 
 
-_MEMPOOL_MINE_MODES: tuple[str, ...] = ("mempool", "both")
-
-
 def resolve_modes(
     backends: Mapping[str, Any],
     *,
     default: Optional[str] = None,
     image_supports: Optional[Sequence[str]] = None,
-    mine_mode: Optional[str] = None,
 ) -> list[str]:
     """Pick the quip-miner subcommands (subset of `cpu` / `gpu` / `qpu`)
     that should run for the given config.
@@ -329,16 +322,6 @@ def resolve_modes(
     to that subset of `MODE_NAMES`. Any resolved mode outside the
     supported list raises `unsupported-mode` — the image can't run
     hardware it doesn't have libraries for.
-
-    `mine_mode`, when set to `"mempool"` or `"both"`, additionally
-    rejects multi-backend configurations: one substrate account can
-    only register as a single `MinerType` solver, so a multi-backend
-    container would silently let N-1 children fail solver-registration
-    at startup. Raise `multi-backend-not-allowed-in-mempool-mode` so
-    the operator sees the constraint at launch rather than after the
-    fact from a "solver not registered" runtime warning. The PoW path
-    has no such constraint — leave `mine_mode=None` or pass `"pow"`
-    to skip the check.
 
     Returns a list of one or more modes (always non-empty when no
     error). Raises `ModeResolutionError` with a kebab-case `code` on
@@ -365,23 +348,6 @@ def resolve_modes(
 
     groups = present_backend_groups(backends)
     active = [g for g in MODE_NAMES if groups[g]]
-
-    if (
-        mine_mode
-        and mine_mode.lower() in _MEMPOOL_MINE_MODES
-        and len(active) > 1
-    ):
-        details = ", ".join(f"{g}={groups[g]}" for g in active)
-        raise ModeResolutionError(
-            "multi-backend-not-allowed-in-mempool-mode",
-            f"--mine-mode={mine_mode.lower()} requires a single backend "
-            f"group, but config declares {len(active)} ({details}). One "
-            f"substrate account can only register as a single solver "
-            f"type, so multi-backend containers would silently leave "
-            f"N-1 children unable to participate in mempool. Either "
-            f"set --mine-mode pow (works across all backends), or "
-            f"narrow config to one group.",
-        )
 
     if active:
         unsupported = [g for g in active if g not in supports]
@@ -422,7 +388,6 @@ def resolve_mode(
     *,
     default: Optional[str] = None,
     image_supports: Optional[Sequence[str]] = None,
-    mine_mode: Optional[str] = None,
 ) -> str:
     """Single-mode variant of `resolve_modes` — convenience for callers
     that won't supervise multiple processes.
@@ -435,7 +400,6 @@ def resolve_mode(
         backends,
         default=default,
         image_supports=image_supports,
-        mine_mode=mine_mode,
     )
     if len(modes) > 1:
         raise ModeResolutionError(

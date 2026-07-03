@@ -17,10 +17,6 @@ validators = ["ws://127.0.0.1:9944"]
 # key lives here.
 signer_key = "/data/keystore.json"
 
-# Work source: "pow" (chain heads), "mempool" (QuantumComputeMempool
-# jobs), or "both".
-mode = "pow"
-
 # Optional faucet bot for auto-topup when the wallet is underfunded at
 # startup. Without it, an underfunded wallet fails fast with
 # `wallet-underfunded`.

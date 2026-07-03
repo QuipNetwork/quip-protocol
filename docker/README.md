@@ -29,8 +29,8 @@ For Apple Silicon (Metal) GPU mining, run directly on macOS without Docker.
 
 `/data/config.toml` is the single source of truth. It is seeded from the
 image template on first run; edit it and restart the container to change
-anything — validators, mode, faucet, telemetry bind, identity
-(`node_name` / `public_host`), and the backend inventory. There are no
+anything — validators, mempool participation, faucet, telemetry bind,
+identity (`node_name` / `public_host`), and the backend inventory. There are no
 configuration env vars: the entrypoint prepares the volume, then execs
 `quip-miner --config /data/config.toml`, which spawns and supervises
 every process the config declares.
@@ -92,8 +92,12 @@ everything it declares:
 
 The templates ship with an active default section (`[cpu]` on the cpu
 image, `[cuda.0]` on the cuda image), so what runs is always stated in
-the config. The work source (`pow` / `mempool` / `both`) comes from the
-`[miner] mode` key.
+the config. Every worker mines PoW continuously; mempool participation
+is config-only via `[miner] mempool` (defaults: cpu/gpu on, qpu off —
+paid samples are opt-in). On multi-backend configs the supervisor
+elects one mempool owner (the first non-qpu mode) and force-disables
+the rest via `QUIP_MEMPOOL=0`, because one substrate account can only
+register one solver type on chain.
 
 Capability is probed from the installed libraries: a config asking for
 hardware the image can't run (e.g. `[cuda.0]` on the CPU image, which

@@ -1424,6 +1424,140 @@ def test_plan_processes_rejects_backend_without_library(monkeypatch, tmp_path):
         quip_cli._plan_processes(cfg)
 
 
+# ── mempool owner election (T8): one substrate account = one solver ──
+
+
+def _plan_with_all_supports(monkeypatch, cfg):
+    """_plan_processes with every backend group importable; returns the
+    per-mode env map for the miner children plus the raw proc list."""
+    monkeypatch.setattr(
+        quip_cli, "_detect_image_supports", lambda: ["cpu", "gpu", "qpu"]
+    )
+    _runtime_dir, procs = quip_cli._plan_processes(cfg)
+    envs = {p["args"][0]: p["env"] for p in procs if p["args"][0] != "telemetry"}
+    return envs, procs
+
+
+def test_plan_processes_elects_cpu_owner_over_gpu(monkeypatch, tmp_path, capsys):
+    """cpu+gpu, mempool key absent → cpu owns mempool; the gpu child is
+    force-disabled via QUIP_MEMPOOL=0 while its telemetry glue survives,
+    and the telemetry aggregator itself is left alone. The election is
+    echoed — the operator's only visibility into why a child has
+    mempool off."""
+    cfg = _write_supervisor_toml(
+        tmp_path, backend="[cpu]\nnum_cpus = 1\n[cuda.0]\n"
+    )
+    envs, procs = _plan_with_all_supports(monkeypatch, cfg)
+    assert "QUIP_MEMPOOL" not in envs["cpu"]
+    assert envs["gpu"]["QUIP_MEMPOOL"] == "0"
+    for mode in ("cpu", "gpu"):
+        assert envs[mode]["QUIP_TELEMETRY_EXTERNAL"] == "1"
+        assert "QUIP_RUNTIME_DIR" in envs[mode]
+    telemetry_env = next(p["env"] for p in procs if p["args"][0] == "telemetry")
+    assert "QUIP_MEMPOOL" not in telemetry_env
+    out = capsys.readouterr().out
+    assert "supervisor: mempool owner is cpu" in out
+    assert "gpu" in out
+
+
+def test_plan_processes_three_backends_disables_all_non_owners(
+    monkeypatch, tmp_path
+):
+    """EVERY non-owner is disabled, not just one: cpu+gpu+qpu → cpu owns,
+    both gpu and qpu children get the force-off. Guards against a
+    disable-only-the-last-mode mutant that every 2-backend test passes."""
+    cfg = _write_supervisor_toml(
+        tmp_path,
+        backend='[cpu]\nnum_cpus = 1\n[cuda.0]\n[dwave]\ndaily_budget = "60s"\n',
+    )
+    envs, _procs = _plan_with_all_supports(monkeypatch, cfg)
+    assert "QUIP_MEMPOOL" not in envs["cpu"]
+    assert envs["gpu"]["QUIP_MEMPOOL"] == "0"
+    assert envs["qpu"]["QUIP_MEMPOOL"] == "0"
+
+
+def test_plan_processes_election_independent_of_telemetry(monkeypatch, tmp_path):
+    """rest_port = -1 still elects: the force-off must not ride the
+    telemetry-glue branch of the env construction."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[miner]\nvalidators = ["ws://localhost:9944"]\n'
+        'signer_key = "/data/keystore.json"\n'
+        'rest_port = -1\n'
+        '[cpu]\nnum_cpus = 1\n[cuda.0]\n'
+    )
+    envs, procs = _plan_with_all_supports(monkeypatch, cfg)
+    assert all(p["args"][0] != "telemetry" for p in procs)
+    assert envs["cpu"] == {}
+    assert envs["gpu"] == {"QUIP_MEMPOOL": "0"}
+
+
+def test_plan_processes_tolerates_stale_mode_key(monkeypatch, tmp_path):
+    """A legacy volume's `mode = "pow"` is dead but harmless: the config
+    loads, the supervisor plans, and the election still fires."""
+    cfg = _write_supervisor_toml(
+        tmp_path,
+        extra_miner='mode = "pow"\n',
+        backend="[cpu]\nnum_cpus = 1\n[cuda.0]\n",
+    )
+    envs, _procs = _plan_with_all_supports(monkeypatch, cfg)
+    assert set(envs) == {"cpu", "gpu"}
+    assert envs["gpu"]["QUIP_MEMPOOL"] == "0"
+
+
+def test_plan_processes_elects_gpu_owner_over_qpu(monkeypatch, tmp_path):
+    """gpu+qpu → gpu is the first non-qpu mode, so qpu is disabled."""
+    cfg = _write_supervisor_toml(
+        tmp_path, backend='[cuda.0]\n[dwave]\ndaily_budget = "60s"\n'
+    )
+    envs, _procs = _plan_with_all_supports(monkeypatch, cfg)
+    assert "QUIP_MEMPOOL" not in envs["gpu"]
+    assert envs["qpu"]["QUIP_MEMPOOL"] == "0"
+
+
+def test_plan_processes_elects_cpu_owner_over_qpu(monkeypatch, tmp_path):
+    """cpu+qpu → cpu owns mempool, qpu child is disabled."""
+    cfg = _write_supervisor_toml(
+        tmp_path, backend='[cpu]\nnum_cpus = 1\n[dwave]\ndaily_budget = "60s"\n'
+    )
+    envs, _procs = _plan_with_all_supports(monkeypatch, cfg)
+    assert "QUIP_MEMPOOL" not in envs["cpu"]
+    assert envs["qpu"]["QUIP_MEMPOOL"] == "0"
+
+
+def test_plan_processes_single_backend_no_election(monkeypatch, tmp_path):
+    """A single miner child needs no election — no QUIP_MEMPOOL key on
+    any planned process."""
+    cfg = _write_supervisor_toml(tmp_path)
+    _envs, procs = _plan_with_all_supports(monkeypatch, cfg)
+    assert all("QUIP_MEMPOOL" not in p["env"] for p in procs)
+
+
+def test_plan_processes_mempool_false_skips_election(monkeypatch, tmp_path):
+    """Explicit `mempool = false` disables participation everywhere via
+    config; the supervisor adds no force-off env at all."""
+    cfg = _write_supervisor_toml(
+        tmp_path,
+        extra_miner="mempool = false\n",
+        backend="[cpu]\nnum_cpus = 1\n[cuda.0]\n",
+    )
+    _envs, procs = _plan_with_all_supports(monkeypatch, cfg)
+    assert all("QUIP_MEMPOOL" not in p["env"] for p in procs)
+
+
+def test_plan_processes_mempool_true_still_elects(monkeypatch, tmp_path):
+    """`mempool = true` cannot lift the one-solver-type-per-account
+    constraint — election still disables every non-owner child."""
+    cfg = _write_supervisor_toml(
+        tmp_path,
+        extra_miner="mempool = true\n",
+        backend='[cpu]\nnum_cpus = 1\n[dwave]\ndaily_budget = "60s"\n',
+    )
+    envs, _procs = _plan_with_all_supports(monkeypatch, cfg)
+    assert "QUIP_MEMPOOL" not in envs["cpu"]
+    assert envs["qpu"]["QUIP_MEMPOOL"] == "0"
+
+
 def test_detect_image_supports_probes_imports(monkeypatch):
     """cpu is always supported; gpu/qpu depend on importable libraries."""
     available = {"dwave.system"}
@@ -1678,89 +1812,39 @@ def test_resolve_modes_no_config_no_default_errors():
     assert "no-mode-resolvable" in result.output
 
 
-# ── --mine-mode guard (W4a) ───────────────────────────────────────────
+# ── mode resolution has no mempool guard (T8) ─────────────────────────
 
 
-def test_resolve_modes_mempool_multi_backend_cli_errors(tmp_path):
-    """End-to-end via the CLI: --mine-mode mempool + multi-backend
-    config → non-zero exit with the kebab-case error code on stderr
-    for the entrypoint to grep."""
+def test_resolve_modes_multi_backend_cli_ok(tmp_path):
+    """Multi-backend configs resolve unconditionally — the old mempool
+    multi-backend guard is replaced by supervisor owner election."""
     cfg = tmp_path / "miner.toml"
     cfg.write_text(
-        '[miner]\nvalidators = ["ws://a:9944"]\n'
-        '[cpu]\nnum_cpus = 2\n'
-        '[dwave]\ndaily_budget = "60s"\n'
-    )
-    result = CliRunner().invoke(
-        quip_cli.quip_miner,
-        ["resolve-modes", "--config", str(cfg), "--mine-mode", "mempool"],
-    )
-    assert result.exit_code != 0
-    assert "multi-backend-not-allowed-in-mempool-mode" in result.output
-
-
-def test_resolve_modes_reads_mode_from_miner_table(tmp_path):
-    """`mode` in the [miner] table acts as the --mine-mode fallback, so a
-    config-only docker launch still gets the mempool multi-backend guard."""
-    cfg = tmp_path / "miner.toml"
-    cfg.write_text(
-        '[miner]\nvalidators = ["ws://a:9944"]\nmode = "mempool"\n'
+        '[miner]\nvalidators = ["ws://a:9944"]\nmempool = true\n'
         '[cpu]\nnum_cpus = 2\n'
         '[dwave]\ndaily_budget = "60s"\n'
     )
     result = CliRunner().invoke(
         quip_cli.quip_miner, ["resolve-modes", "--config", str(cfg)],
     )
-    assert result.exit_code != 0
-    assert "multi-backend-not-allowed-in-mempool-mode" in result.output
-
-
-def test_resolve_modes_mine_mode_flag_beats_miner_table(tmp_path):
-    """--mine-mode pow overrides a TOML mode = "mempool"."""
-    cfg = tmp_path / "miner.toml"
-    cfg.write_text(
-        '[miner]\nvalidators = ["ws://a:9944"]\nmode = "mempool"\n'
-        '[cpu]\nnum_cpus = 2\n'
-        '[dwave]\ndaily_budget = "60s"\n'
-    )
-    result = CliRunner().invoke(
-        quip_cli.quip_miner,
-        ["resolve-modes", "--config", str(cfg), "--mine-mode", "pow"],
-    )
     assert result.exit_code == 0, result.output
     assert result.output.strip().splitlines() == ["cpu", "qpu"]
 
 
-def test_resolve_modes_pow_multi_backend_cli_ok(tmp_path):
-    """--mine-mode pow with multi-backend → 2 modes, no error.
-    Mirror of the test above with the safe mine-mode value."""
+def test_resolve_modes_mine_mode_flag_removed(tmp_path):
+    """--mine-mode is gone along with the [miner] mode key — from both
+    the plural and singular resolve commands."""
     cfg = tmp_path / "miner.toml"
     cfg.write_text(
-        '[miner]\nvalidators = ["ws://a:9944"]\n'
-        '[cpu]\nnum_cpus = 2\n'
-        '[dwave]\n'
+        '[miner]\nvalidators = ["ws://a:9944"]\n[cpu]\nnum_cpus = 2\n'
     )
-    result = CliRunner().invoke(
-        quip_cli.quip_miner,
-        ["resolve-modes", "--config", str(cfg), "--mine-mode", "pow"],
-    )
-    assert result.exit_code == 0, result.output
-    assert result.output.strip().splitlines() == ["cpu", "qpu"]
-
-
-def test_resolve_modes_mempool_single_backend_cli_ok(tmp_path):
-    """Single backend + mempool is the supported path — no error."""
-    cfg = tmp_path / "miner.toml"
-    cfg.write_text(
-        '[miner]\nvalidators = ["ws://a:9944"]\n'
-        '[dwave]\ndaily_budget = "60s"\n'
-    )
-    result = CliRunner().invoke(
-        quip_cli.quip_miner,
-        ["resolve-modes", "--config", str(cfg), "--mine-mode", "mempool"],
-    )
-    assert result.exit_code == 0, result.output
-    assert result.output.strip() == "qpu"
+    for command in ("resolve-modes", "resolve-mode"):
+        result = CliRunner().invoke(
+            quip_cli.quip_miner,
+            [command, "--config", str(cfg), "--mine-mode", "mempool"],
+        )
+        assert result.exit_code != 0, command
+        assert "no such option" in result.output.lower(), command
 
 
 # ---------------------------------------------------------------------------
