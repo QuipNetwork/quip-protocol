@@ -1,11 +1,9 @@
 """MempoolJobProducer — handle-free mempool job discovery.
 
-Extraction of `MempoolMinerController`'s per-block evaluation pipeline
-(T5 of MEMPOOL_PRIORITY_PLAN): poll `System.Events` on every new block,
-route `QuantumComputeMempool` events, filter `JobProposed` orders through
-the eligibility guards, and queue accepted order ids for a consumer (the
-T7 WorkScheduler; today the legacy controller keeps its own copy of the
-polling shell until the T7 cutover deletes it).
+Polls `System.Events` on every new block, routes `QuantumComputeMempool`
+events, filters `JobProposed` orders through the eligibility guards, and
+queues accepted order ids for a consumer (`substrate.mempool_stack`,
+which feeds the WorkScheduler).
 
 The producer owns no handles and submits nothing. It is registered as a
 ``new_head`` callback on a caller-supplied ``ChainEventManager``::
@@ -87,8 +85,8 @@ def job_matches_sampler(
 
     Mirrors the pallet's `solver_is_eligible` for mode; adds an upfront
     topology-hash check so we don't dispatch a job our sampler can't
-    actually solve. Ported unchanged from
-    ``MempoolMinerController._should_accept_job``.
+    actually solve. Ported unchanged from the pre-T7 mempool controller's
+    ``_should_accept_job``.
     """
     # Topology match — sampler is bound to one specific graph.
     job_topology = topology_hash(
@@ -194,6 +192,17 @@ class MempoolJobProducer:
         # Orders already accepted once — JobProposed dedup. Orders that
         # were *filtered* (not accepted) stay reconsiderable.
         self._pending_seen: Set[int] = set()
+        self._parked = False
+
+    def park(self) -> None:
+        """Stop discovering: ``on_new_block`` becomes a no-op.
+
+        The producer stays subscribed to the shared ChainEventManager for
+        the process lifetime, so MEMPOOL_DISABLE parks it here instead —
+        no more per-block event polls, no unbounded ``accepted`` growth
+        once the feed loop is gone. Irreversible for the run.
+        """
+        self._parked = True
 
     async def on_new_block(self, ctx: Optional["SubstrateMiningContext"]) -> None:
         """ChainEventManager ``new_head`` callback.
@@ -201,6 +210,8 @@ class MempoolJobProducer:
         Only ``ctx.block_hash`` and ``ctx.block_number`` are read;
         everything else in the snapshot is PoW-only.
         """
+        if self._parked:
+            return
         if ctx is None:
             logger.debug(
                 "mempool producer: snapshot is None — no topology "

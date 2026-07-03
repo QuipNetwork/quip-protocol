@@ -1,15 +1,12 @@
 """MempoolSubmitter — submit_solution / claim_reward side of the mempool stack.
 
-Extraction of `MempoolMinerController._handle_result`'s build/submit path
-and its reward-claim loop (T5 of MEMPOOL_PRIORITY_PLAN). Behavior change
-shipped with the extraction: receipt classification returns an outcome
-enum and the previously-fatal error class (SolverNotRegistered /
-BadSignature / BadProof / anything unrecognized) maps to
-:attr:`SubmitOutcome.MEMPOOL_DISABLE` instead of raising. Under the T7
-single-process scheduler a raise would tear down pow mining too (and via
-the supervisor's first-child-exit rule, the whole node); the scheduler
-parks the producer on this signal instead. Until T7 the legacy controller
-maps MEMPOOL_DISABLE back to its historical RuntimeError.
+Receipt classification returns an outcome enum: the mempool-fatal error
+class (SolverNotRegistered / BadSignature / BadProof / anything
+unrecognized) maps to :attr:`SubmitOutcome.MEMPOOL_DISABLE` instead of
+raising. Under the single-process scheduler stack a raise would tear down
+pow mining too (and via the supervisor's first-child-exit rule, the whole
+node); `substrate.mempool_stack` parks the mempool side on this signal
+and pow continues.
 
 Extrinsics are composed+signed on a parent-process ``build_client``
 (signer key material never crosses an IPC boundary) and submitted through
@@ -161,8 +158,8 @@ class MempoolSubmitter:
             claim_poll_interval: Cadence of :meth:`run_claim_loop`.
             stats: Counter object (see :class:`MempoolSubmitterStats`).
             submitted_orders / claimable: Mutable containers for order
-                bookkeeping. Caller-suppliable so the legacy controller
-                can share its own state until the T7 cutover.
+                bookkeeping; caller-suppliable for tests that want to
+                observe or seed the sets.
         """
         self.build_client = build_client
         self.pool_client = pool_client

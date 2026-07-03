@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 logger = get_logger("solver_registration")
 
 # Matched by substring against the extrinsic receipt error, mirroring the
-# classifier convention in `substrate.mempool_miner_controller`.
+# classifier convention in `substrate.mempool_submitter`.
 _RACE_ERROR = "SolverAlreadyRegistered"
 
 

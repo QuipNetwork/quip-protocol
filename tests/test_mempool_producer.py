@@ -353,6 +353,22 @@ async def test_ignores_non_mempool_events():
     assert p.stats.heads_observed == 1
 
 
+async def test_parked_producer_skips_event_poll():
+    """MEMPOOL_DISABLE parks the producer, not just the feed loop.
+
+    A parked producer must stop issuing per-block get_events_at RPCs on
+    the shared loop and stop growing `accepted` — nothing consumes it
+    after the stack parks.
+    """
+    client = FakePoolClient(orders={5: _order()}, events=[_job_proposed(5)])
+    p = _producer(client)
+    p.park()
+    await _drive(p)
+    assert _drain(p) == []
+    assert p.stats.heads_observed == 0
+    assert client.query_calls == []
+
+
 async def test_get_events_failure_is_swallowed():
     client = FakePoolClient(events_exc=RuntimeError("rpc down"))
     p = _producer(client)

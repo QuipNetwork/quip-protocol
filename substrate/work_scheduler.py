@@ -269,6 +269,109 @@ class WorkScheduler:
         )
         self._mempool_enabled.clear()
 
+    async def dispatch_pow(
+        self, context: Any, *, solution_number: Optional[int] = None
+    ) -> dict[str, int]:
+        """Broadcast pow dispatch for a work-key change.
+
+        Preempts (cancel → sentinel → dispatch) every live handle NOT
+        owned by the active mempool job — mempool is the priority source,
+        so pow must never steal a job's handles; the job keeps running and
+        pow takes the rest. The job-owned exclusion is evaluated INSIDE
+        the preempt lock (``exclude_job_owned``): a snapshot taken here
+        is stale by the time the lock is acquired — the job pump may be
+        holding it mid-fan-out, and its ``fanned`` set only exists once
+        its own dispatch returns. Busy QPU handles ARE preempted here: on
+        a work-key change their in-flight pow work is dead either way.
+
+        Returns ``{miner_id: dispatch_id}`` for every handle dispatched.
+        """
+        return await self.preempt_and_dispatch(
+            self.miner_handles,
+            context,
+            solution_number=solution_number,
+            exclude_job_owned=True,
+        )
+
+    async def fill_idle(
+        self, context: Any, *, solution_number: Optional[int] = None
+    ) -> dict[str, int]:
+        """Dispatch *context* to idle, non-job-owned handles; never cancels.
+
+        The pow verify-fail re-dispatch path: busy handles keep whatever
+        they are mining. Takes the preempt lock so it cannot interleave
+        with a preempt's cancel → sentinel → dispatch window (dispatching
+        into that window would trip the busy-handle invariant).
+        """
+        async with self._preempt_lock:
+            dispatched: dict[str, int] = {}
+            if self._shutdown_event.is_set():
+                return dispatched
+            owned = self._job_owned_handle_ids()
+            for handle in self.miner_handles:
+                if (
+                    handle.miner_id in owned
+                    or handle.miner_id in self._dead_handles
+                    or handle._active_dispatch_id != 0
+                ):
+                    continue
+                dispatched[handle.miner_id] = self._dispatch_to_handle(
+                    handle, context, solution_number=solution_number
+                )
+            return dispatched
+
+    def cancel_pow_siblings(self, winning_handle_id: str) -> None:
+        """Cancel every handle except the pow winner and the active job's.
+
+        The pow submission-storm fix: once one proof is accepted, sibling
+        handles mining the same work item must stop immediately. Mempool
+        is the priority source, so the active job's fanned handles are
+        spared — post-cutover the controller's handle list is ALL
+        handles, and only the scheduler knows which ones the job owns.
+        Cancel-only (no dispatch), so it needs no preempt lock: an extra
+        cancel on a preempt victim is idempotent, and an idle handle's
+        next ``mine_work_item`` clears the stop event.
+        """
+        owned = self._job_owned_handle_ids()
+        for handle in self.miner_handles:
+            if (
+                handle.miner_id == winning_handle_id
+                or handle.miner_id in owned
+                or handle.miner_id in self._dead_handles
+            ):
+                continue
+            try:
+                handle.cancel()
+            except Exception as exc:  # noqa: BLE001 — best-effort
+                logger.warning(
+                    "sibling cancel failed for %s (winner=%s): %s: %s",
+                    handle.miner_id,
+                    winning_handle_id,
+                    type(exc).__name__,
+                    exc,
+                )
+
+    def _job_owned_handle_ids(self) -> set[str]:
+        """The active mempool job's fanned handle ids (empty when none).
+
+        ``fanned`` is assigned synchronously with the job's dispatch (no
+        awaits in between), so any event-loop caller observes either the
+        pre-dispatch empty set or the complete final set — never a
+        partial one.
+        """
+        job = self._active_job
+        return set(job.fanned) if job is not None else set()
+
+    def dispatch_context(self, handle_id: str, dispatch_id) -> Optional[Any]:
+        """The immutable context dispatched as ``(handle_id, dispatch_id)``.
+
+        Returns ``None`` when the dispatch is older than the retention
+        window. Lets the pow controller pair non-terminal worker messages
+        (previews) with the exact context they were produced against
+        without owning its own dispatch bookkeeping.
+        """
+        return self._dispatch_contexts.get((handle_id, dispatch_id))
+
     async def preempt_and_dispatch(
         self,
         handles: list,
@@ -276,6 +379,7 @@ class WorkScheduler:
         *,
         solution_number: Optional[int] = None,
         allow_qpu_victims: bool = True,
+        exclude_job_owned: bool = False,
     ) -> dict[str, int]:
         """Atomically cancel busy handles, await their acks, then dispatch.
 
@@ -292,6 +396,12 @@ class WorkScheduler:
                 busy meanwhile must be neither cancelled nor dispatched
                 to. The default True keeps broadcast preempts (e.g. the
                 pow key-change path) able to cancel busy QPU consumers.
+            exclude_job_owned: When True (the pow broadcast path), the
+                active job's fanned handles are excluded INSIDE the
+                preempt lock — same staleness class as above: the job
+                pump may hold the lock mid-fan-out, and its ``fanned``
+                set is assigned synchronously with the dispatch, so a
+                lock waiter always observes the final set.
 
         Returns:
             ``{miner_id: dispatch_id}`` for every handle actually
@@ -309,6 +419,9 @@ class WorkScheduler:
                         for h in live
                         if h._active_dispatch_id == 0 or not self._is_qpu(h)
                     ]
+                if exclude_job_owned:
+                    owned = self._job_owned_handle_ids()
+                    live = [h for h in live if h.miner_id not in owned]
                 victims = [
                     (h, h._active_dispatch_id)
                     for h in live

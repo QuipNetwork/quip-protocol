@@ -705,3 +705,175 @@ async def test_disable_mempool_parks_jobs_but_pow_backfills():
         await asyncio.sleep(0.2)
     assert handle.job_dispatches() == []
     assert handle.dispatched[-1][0] is pow_ctx2
+
+
+# ----------------------------------------------------------------------
+# T7 pow-delegation surface: dispatch_pow / fill_idle / dispatch_context
+# ----------------------------------------------------------------------
+
+
+async def test_dispatch_pow_broadcasts_and_preempts_idle_and_busy():
+    """The pow key-change broadcast: idle handles dispatch immediately,
+    busy ones go through cancel -> sentinel -> dispatch."""
+    idle = FakeHandle("idle")
+    busy = FakeHandle("busy")
+    sched = _make_scheduler([idle, busy])
+    ctx = _pow_context()
+    async with running(sched):
+        first = await sched.preempt_and_dispatch([busy], _pow_context())
+        task = asyncio.create_task(sched.dispatch_pow(ctx, solution_number=9))
+        await wait_until(lambda: busy.cancel_calls == 1, what="busy cancelled")
+        busy.emit_done(first["busy"])
+        fanned = await asyncio.wait_for(task, timeout=3)
+    assert set(fanned) == {"idle", "busy"}
+    assert idle.dispatched[-1] == (ctx, 9)
+    assert busy.dispatched[-1] == (ctx, 9)
+    assert idle.violations == [] and busy.violations == []
+
+
+async def test_dispatch_pow_never_steals_active_job_handles():
+    """Mempool is the priority source: a pow broadcast during an active
+    job leaves the job's fanned handles alone."""
+    h1 = FakeHandle("h1")
+    h2 = FakeHandle("h2")
+    on_job = AsyncMock()
+    sched = _make_scheduler([h1, h2], on_job_result=on_job)
+    job_ctx = _job_context()
+    pow_ctx = _pow_context()
+    async with running(sched):
+        sched.submit_job(job_ctx)
+        await wait_until(
+            lambda: h1.job_dispatches() == [job_ctx]
+            and h2.job_dispatches() == [job_ctx],
+            what="job fanned to both handles",
+        )
+        # Simulate one handle finishing its job dispatch early: it stays
+        # excluded (still in the fanned set) while the job is active.
+        fanned_h2 = h2._active_dispatch_id
+        h2.emit_done(fanned_h2)
+        await wait_until(
+            lambda: h2._active_dispatch_id == 0, what="h2 went idle"
+        )
+        dispatched = await sched.dispatch_pow(pow_ctx)
+    assert dispatched == {}          # both handles belong to the job
+    assert h1.cancel_calls == 0      # the job dispatch was never preempted
+    assert pow_ctx not in [c for c, _ in h1.dispatched]
+    assert pow_ctx not in [c for c, _ in h2.dispatched]
+
+
+async def test_dispatch_pow_parked_on_lock_during_fanout_never_steals_job():
+    """TOCTOU regression: the job-owned exclusion must be evaluated INSIDE
+    the preempt lock.
+
+    Interleaving: the job pump holds _preempt_lock awaiting its pow
+    victim's done sentinel when a new head fires dispatch_pow. The
+    broadcast snapshots eligibility while job.fanned is still empty,
+    then parks on the lock; the pump fans the job and releases. A
+    pre-lock snapshot would now cancel the just-fanned job dispatch
+    (burning the single requeue; paid samples on opted-in QPU). The
+    exclusion must be re-read after the lock is acquired — the same
+    staleness class the in-lock allow_qpu_victims re-filter handles.
+    """
+    handle = FakeHandle("h1")
+    on_job = AsyncMock()
+    sched = _make_scheduler([handle], on_job_result=on_job)
+    job_ctx = _job_context()
+    pow_ctx = _pow_context()
+    async with running(sched):
+        first = await sched.preempt_and_dispatch([handle], _pow_context())
+        sched.submit_job(job_ctx)
+        await wait_until(lambda: handle.cancel_calls == 1, what="victim cancelled")
+        # The pump is inside the lock awaiting the sentinel; the new-head
+        # broadcast arrives now and parks on the lock behind it.
+        pow_task = asyncio.create_task(sched.dispatch_pow(pow_ctx))
+        await asyncio.sleep(0.1)
+        handle.emit_done(first["h1"])  # pump fans the job, releases the lock
+        await wait_until(
+            lambda: handle.job_dispatches() == [job_ctx], what="job fanned"
+        )
+        dispatched = await asyncio.wait_for(pow_task, timeout=3)
+    assert dispatched == {}                 # the only handle is job-owned
+    assert handle.cancel_calls == 1         # the job dispatch was never cancelled
+    # Identity check: SimpleNamespace __eq__ is attribute-based, and the
+    # initial pow context has equal attributes.
+    assert all(c is not pow_ctx for c, _ in handle.dispatched)
+    assert handle.violations == []
+
+
+async def test_cancel_pow_siblings_spares_active_job_handles():
+    """A pow win's sibling cancel must never touch the active mempool job.
+
+    Post-cutover the controller's handle list is ALL handles, so the
+    won-work sibling cancel routes through the scheduler — the only
+    component that knows which handles the job owns.
+    """
+    winner = FakeHandle("w", miner_type="QPU")
+    sib = FakeHandle("s", miner_type="QPU")
+    jobh = FakeHandle("j")
+    on_job = AsyncMock()
+    sched = _make_scheduler([winner, sib, jobh], on_job_result=on_job)
+    job_ctx = _job_context()
+    async with running(sched):
+        # Busy QPU pow handles are ineligible for the job -> it fans to
+        # the idle CPU handle only.
+        await sched.preempt_and_dispatch([winner, sib], _pow_context())
+        sched.submit_job(job_ctx)
+        await wait_until(
+            lambda: jobh.job_dispatches() == [job_ctx], what="job fanned to j"
+        )
+        sched.cancel_pow_siblings("w")
+    assert sib.cancel_calls == 1     # pow sibling cancelled
+    assert winner.cancel_calls == 0  # the winner is never cancelled
+    assert jobh.cancel_calls == 0    # the job's handle is spared
+
+
+async def test_one_handle_full_cycle_pow_job_pow():
+    """The cutover's headline case: a 1-handle node (previously exit-5)
+    cycles pow -> job-preempt -> job result -> pow refill end to end."""
+    handle = FakeHandle("h1")
+    pow_ctx2 = _pow_context()
+    provide = AsyncMock(return_value=PowWork(context=pow_ctx2, solution_number=3))
+    on_job = AsyncMock()
+    sched = _make_scheduler(
+        [handle], on_job_result=on_job, provide_pow_context=provide
+    )
+    job_ctx = _job_context()
+    async with running(sched):
+        pow_fan = await sched.dispatch_pow(_pow_context())
+        sched.submit_job(job_ctx)
+        await wait_until(lambda: handle.cancel_calls == 1, what="pow preempted")
+        handle.emit_done(pow_fan["h1"])
+        await wait_until(
+            lambda: handle.job_dispatches() == [job_ctx], what="job dispatched"
+        )
+        handle.emit_result(handle._active_dispatch_id, _mining_result("h1"))
+        await wait_until(lambda: on_job.await_count == 1, what="job result routed")
+        await wait_until(
+            lambda: handle.dispatched[-1] == (pow_ctx2, 3),
+            what="pow refilled after job terminal",
+        )
+    assert handle.violations == []
+    assert on_job.await_args.args[0].context is job_ctx
+
+
+async def test_fill_idle_dispatches_only_idle_handles_without_cancel():
+    idle = FakeHandle("idle")
+    busy = FakeHandle("busy")
+    sched = _make_scheduler([idle, busy])
+    async with running(sched):
+        await sched.preempt_and_dispatch([busy], _pow_context())
+        ctx = _pow_context()
+        dispatched = await sched.fill_idle(ctx, solution_number=3)
+    assert set(dispatched) == {"idle"}
+    assert idle.dispatched[-1] == (ctx, 3)
+    assert busy.cancel_calls == 0    # fill_idle never cancels
+    assert idle.violations == [] and busy.violations == []
+
+
+async def test_dispatch_context_accessor_resolves_immutable_map():
+    handle = FakeHandle("h1")
+    sched = _make_scheduler([handle])
+    ctx = _pow_context()
+    dispatch_id = sched._dispatch_to_handle(handle, ctx)
+    assert sched.dispatch_context("h1", dispatch_id) is ctx
+    assert sched.dispatch_context("h1", dispatch_id + 100) is None

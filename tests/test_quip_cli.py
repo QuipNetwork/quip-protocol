@@ -110,7 +110,7 @@ def test_quip_miner_cpu_config(monkeypatch):
     assert result.exit_code == 0, result.output
     assert captured.get("miner_config") == {"cpu": {"num_cpus": 3}}
     assert captured.get("miner_kind") == "cpu"
-    assert captured.get("mode") == "pow"
+    assert captured.get("mempool_enabled") is True  # cpu default: on
 
 
 def test_quip_miner_gpu_local_config(monkeypatch):
@@ -130,7 +130,7 @@ def test_quip_miner_gpu_local_config(monkeypatch):
     assert result.exit_code == 0, result.output
     assert captured.get("miner_config") == {"cuda": [{"device": "0"}]}
     assert captured.get("miner_kind") == "gpu"
-    assert captured.get("mode") == "pow"
+    assert captured.get("mempool_enabled") is True  # gpu default: on
 
 
 def test_quip_miner_gpu_metal_config(monkeypatch):
@@ -471,16 +471,18 @@ def test_quip_miner_cpu_identification_via_toml(monkeypatch, tmp_path):
     assert captured.get("node_log") == "/var/log/quip-miner.log"
 
 
-def test_quip_miner_cpu_mode_falls_back_to_toml(monkeypatch, tmp_path):
-    """`mode` in the [miner] table drives the work source when --mode is
-    not passed — config.toml is the single source of truth in docker."""
+def _mempool_toml(tmp_path, extra: str = "") -> Path:
     p = tmp_path / "config.toml"
     p.write_text(
         '[miner]\n'
         'validators = ["ws://localhost:9944"]\n'
         'signer_key = "~/.quip-miner/signing.json"\n'
-        'mode = "mempool"\n'
+        f'{extra}'
     )
+    return p
+
+
+def _capture_run(monkeypatch) -> Dict[str, Any]:
     captured: Dict[str, Any] = {}
 
     async def fake_run(**kwargs):
@@ -488,52 +490,85 @@ def test_quip_miner_cpu_mode_falls_back_to_toml(monkeypatch, tmp_path):
         return 0
 
     monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
+    return captured
+
+
+def test_quip_miner_cpu_mempool_false_in_toml_disables(monkeypatch, tmp_path):
+    """An explicit `mempool = false` always wins over the cpu default."""
+    p = _mempool_toml(tmp_path, "mempool = false\n")
+    captured = _capture_run(monkeypatch)
     result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
     assert result.exit_code == 0, result.output
-    assert captured.get("mode") == "mempool"
+    assert captured.get("mempool_enabled") is False
 
 
-def test_quip_miner_cpu_mode_flag_beats_toml(monkeypatch, tmp_path):
-    """An explicit --mode wins over the TOML `mode` key."""
-    p = tmp_path / "config.toml"
-    p.write_text(
-        '[miner]\n'
-        'validators = ["ws://localhost:9944"]\n'
-        'signer_key = "~/.quip-miner/signing.json"\n'
-        'mode = "mempool"\n'
+def test_quip_miner_cpu_mempool_defaults_on(monkeypatch, tmp_path):
+    """No `mempool` key → cpu/gpu default ON (pow + mempool priority)."""
+    p = _mempool_toml(tmp_path)
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mempool_enabled") is True
+
+
+def test_quip_miner_qpu_mempool_defaults_off(monkeypatch, tmp_path):
+    """QPU defaults mempool OFF (paid samples; opt-in only)."""
+    p = _mempool_toml(tmp_path, '[dwave]\ndaily_budget = "60s"\n')
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_qpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("miner_kind") == "qpu"
+    assert captured.get("mempool_enabled") is False
+
+
+def test_quip_miner_qpu_mempool_explicit_true_opts_in(monkeypatch, tmp_path):
+    """`mempool = true` on a QPU node overrides the qpu default-off."""
+    p = _mempool_toml(
+        tmp_path, 'mempool = true\n[dwave]\ndaily_budget = "60s"\n'
     )
-    captured: Dict[str, Any] = {}
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_qpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mempool_enabled") is True
 
-    async def fake_run(**kwargs):
-        captured.update(kwargs)
-        return 0
 
-    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
+def test_quip_mempool_env_zero_force_disables(monkeypatch, tmp_path):
+    """QUIP_MEMPOOL=0 (supervisor owner election, T8) beats config."""
+    monkeypatch.setenv("QUIP_MEMPOOL", "0")
+    p = _mempool_toml(tmp_path, "mempool = true\n")
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mempool_enabled") is False
+
+
+def test_quip_miner_cpu_mempool_min_reward_threaded(monkeypatch, tmp_path):
+    """[miner] mempool_min_reward reaches the runner (→ producer)."""
+    p = _mempool_toml(tmp_path, "mempool_min_reward = 250\n")
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mempool_min_reward") == 250
+
+
+def test_quip_miner_cpu_mempool_min_reward_defaults_zero(monkeypatch, tmp_path):
+    p = _mempool_toml(tmp_path)
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mempool_min_reward") == 0
+
+
+def test_quip_miner_cpu_rejects_removed_mode_flag(monkeypatch):
+    """--mode was removed with the two-controller split; passing it must
+    fail loudly so operators see the config-key change."""
+    _capture_run(monkeypatch)
     result = CliRunner().invoke(
-        quip_cli.quip_miner_cpu, ["--config", str(p), "--mode", "pow"]
+        quip_cli.quip_miner_cpu,
+        ["--validator", "ws://x:9944", "--mode", "both"],
     )
-    assert result.exit_code == 0, result.output
-    assert captured.get("mode") == "pow"
-
-
-def test_quip_miner_cpu_mode_defaults_to_pow(monkeypatch, tmp_path):
-    """No --mode and no TOML `mode` → pow (unchanged default)."""
-    p = tmp_path / "config.toml"
-    p.write_text(
-        '[miner]\n'
-        'validators = ["ws://localhost:9944"]\n'
-        'signer_key = "~/.quip-miner/signing.json"\n'
-    )
-    captured: Dict[str, Any] = {}
-
-    async def fake_run(**kwargs):
-        captured.update(kwargs)
-        return 0
-
-    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
-    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
-    assert result.exit_code == 0, result.output
-    assert captured.get("mode") == "pow"
+    assert result.exit_code != 0
+    assert "no such option" in result.output.lower()
 
 
 def test_quip_miner_cpu_listen_port_aliased_to_rest(monkeypatch, tmp_path):
@@ -1807,6 +1842,104 @@ def test_guard_d_registration_retries_then_succeeds(monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
+# Guard D+ — non-fatal mempool solver registration
+# ---------------------------------------------------------------------------
+
+
+def _guard_dplus(monkeypatch, outcome_or_exc) -> bool:
+    """Run _ensure_solver_or_disable_mempool with a stubbed helper."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    if isinstance(outcome_or_exc, Exception):
+        stub = AsyncMock(side_effect=outcome_or_exc)
+    else:
+        stub = AsyncMock(return_value=outcome_or_exc)
+    monkeypatch.setattr(quip_cli, "ensure_solver_registered", stub)
+    fake_keystore = MagicMock()
+    return asyncio.run(
+        quip_cli._ensure_solver_or_disable_mempool(
+            MagicMock(), fake_keystore, "cpu",
+        )
+    )
+
+
+def test_guard_dplus_success_keeps_mempool_enabled(monkeypatch):
+    from substrate.solver_registration import SolverGuardOutcome
+
+    assert _guard_dplus(monkeypatch, SolverGuardOutcome.REGISTERED) is True
+    assert (
+        _guard_dplus(monkeypatch, SolverGuardOutcome.ALREADY_REGISTERED)
+        is True
+    )
+
+
+def test_guard_dplus_failed_disables_mempool_without_raising(monkeypatch, capsys):
+    """FAILED → loud log + mempool off for the run; pow proceeds (no raise —
+    a fatal exit here would trip supervisor terminate-all-siblings)."""
+    from substrate.solver_registration import SolverGuardOutcome
+
+    assert _guard_dplus(monkeypatch, SolverGuardOutcome.FAILED) is False
+    assert "mempool DISABLED" in capsys.readouterr().err
+
+
+def test_guard_dplus_type_mismatch_disables_mempool(monkeypatch, capsys):
+    from substrate.solver_registration import SolverGuardOutcome
+
+    assert _guard_dplus(monkeypatch, SolverGuardOutcome.TYPE_MISMATCH) is False
+    err = capsys.readouterr().err
+    assert "TYPE_MISMATCH" in err
+    assert "deregister-solver" in err
+
+
+def test_guard_dplus_unexpected_exception_disables_mempool(monkeypatch, capsys):
+    assert _guard_dplus(monkeypatch, RuntimeError("rpc down")) is False
+    assert "mempool DISABLED" in capsys.readouterr().err
+
+
+def test_startup_guards_return_effective_mempool(monkeypatch):
+    """_run_startup_guards runs D+ only when mempool is enabled and
+    propagates its verdict; C/D/E still run unconditionally."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from substrate.solver_registration import SolverGuardOutcome
+
+    monkeypatch.setattr(
+        quip_cli, "_ensure_funded_or_fail", AsyncMock(return_value=1)
+    )
+    monkeypatch.setattr(
+        quip_cli, "_ensure_registered_or_fail", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(
+        quip_cli, "_auto_identify", AsyncMock(return_value=None)
+    )
+    solver_guard = AsyncMock(return_value=SolverGuardOutcome.FAILED)
+    monkeypatch.setattr(quip_cli, "ensure_solver_registered", solver_guard)
+
+    common = dict(
+        faucet_url=None,
+        node_name=None,
+        public_host=None,
+        public_port=None,
+        miner_config={},
+    )
+    enabled = asyncio.run(quip_cli._run_startup_guards(
+        MagicMock(), MagicMock(),
+        mempool_enabled=True, miner_kind="cpu", **common,
+    ))
+    assert enabled is False  # Guard D+ FAILED → mempool off, no raise
+    assert solver_guard.await_count == 1
+
+    enabled = asyncio.run(quip_cli._run_startup_guards(
+        MagicMock(), MagicMock(),
+        mempool_enabled=False, miner_kind="cpu", **common,
+    ))
+    assert enabled is False
+    assert solver_guard.await_count == 1  # D+ skipped when mempool is off
+
+
+# ---------------------------------------------------------------------------
 # Chain-pull topology (replaces --topology on the live path)
 # ---------------------------------------------------------------------------
 
@@ -1841,7 +1974,6 @@ def test_run_concurrent_miner_rejects_topology_on_live_path():
     """--topology is tools-only; passing it to live mining errors (exit 2)
     before any chain connection is attempted."""
     code = asyncio.run(quip_cli._run_concurrent_miner(
-        mode="pow",
         miner_kind="cpu",
         validators=("ws://unused:9944",),
         signer_key_path="/nonexistent",
