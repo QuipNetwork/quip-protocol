@@ -49,12 +49,24 @@ quip-miner gpu --validator ws://127.0.0.1:9944 --gpu-backend local --signer-key 
 quip-miner gpu --validator ws://127.0.0.1:9944 --gpu-backend metal --signer-key ...
 quip-miner qpu --validator ws://127.0.0.1:9944 --daily-budget 30s --signer-key ...
 
-# Concurrent PoW + mempool in one process
-quip-miner cpu --validator ws://... --mode both --num-cpus 4 --signer-key ...
+# Multiple CPU workers (PoW + mempool jobs share the same workers)
+quip-miner cpu --validator ws://... --num-cpus 4 --signer-key ...
 
 # TOML config (see docker/quip-miner.cpu.toml, docker/quip-miner.cuda.toml)
 quip-miner cpu --config ./docker/quip-miner.cpu.toml
 ```
+
+**Mempool participation is config-only** — `[miner] mempool` (unquoted
+TOML bool; defaults: cpu/gpu on, qpu off — paid QPU samples are opt-in)
+and `[miner] mempool_min_reward` (0 = accept all). There is no CLI flag
+and no mempool-only mode: every worker mines PoW continuously, mempool
+jobs preempt PoW on the same workers, and PoW resumes afterward. Solver
+registration is automatic at miner startup (query-first, never
+auto-deregisters — switching solver type requires an explicit
+`quip-miner deregister-solver` and restart). A mempool-fatal submit
+receipt parks the mempool side for the run while PoW mining continues.
+`QUIP_MEMPOOL=0` is the supervisor's mempool-owner-election force-off
+for non-owner children, not an operator knob.
 
 Live integration uses the docker-compose validator under `docker/`
 (`docker compose up quip-validator`); the validator listens on
@@ -250,18 +262,16 @@ on `dispatch_id`.
     writing into the same solution dir — that is not stale accretion, it
     is the same solution. Different solution number ⇒ different dir.
 
-- **`dispatch_id`** — an **internal-only** controller↔worker coordination
+- **`dispatch_id`** — an **internal-only** scheduler↔worker coordination
   handle: `_dispatch_contexts[(handle_id, dispatch_id)]`, cancel-ack
-  (`_await_handle_done`), and the preview channel (see `ARCHITECTURE.md`
+  (`_await_done_sentinel`), and the preview channel (see `ARCHITECTURE.md`
   §3.3). It is a process-local monotonic counter that **resets to 0 on
   restart**, so it collides across runs and MUST NOT be used as a durable
   or on-disk identity. Keep it in memory for pairing responses to
   contexts; never name persisted artifacts after it.
 
-The old `SubmissionLogger` `next_solution_id` local counter (persisted in
-`{base}/next_solution_id`) was a stand-in for the chain solution number
-and is misaligned with this model — replace it with the chain-derived
-solution number, do not extend it.
+The old `SubmissionLogger` `next_solution_id` local counter was removed;
+the on-disk archive is keyed by the chain-derived solution number.
 
 ## Code style
 
