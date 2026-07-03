@@ -380,9 +380,10 @@ class BaseMiner(ABC):
         # switch. Replaced (and previous freed) on each mempool dispatch;
         # close-unlinked in _close_driver on shutdown.
         self._mempool_problem_view: Optional[Any] = None
-        # (max_rows, max_cols) the persistent ring was sized for; a dispatch
-        # whose dims differ forces a driver respawn (rare — num_reads and the
-        # topology are stable within a miner's life).
+        # (max_rows, max_cols) the persistent ring was sized for. This is
+        # CAPACITY, not the last dispatch's dims: a dispatch reuses the ring
+        # when its node count matches and its num_reads fits (_ring_can_host);
+        # only num_reads growth or a topology change forces a respawn.
         self._ring_dims: Optional[Tuple[int, int]] = None
         # Monotonic per-miner round generation. Bumped once per dispatch in
         # _setup_dispatch; tags every switch_round and every descriptor so a
@@ -1264,15 +1265,40 @@ class BaseMiner(ABC):
             f"{type(self).__name__} does not override _stream_factory_kwargs"
         )
 
+    def _ring_can_host(self, dims: Tuple[int, int]) -> bool:
+        """True when the persistent ring can host a dispatch of ``dims``.
+
+        Reuse-when-compatible gate: the node count must equal the ring's
+        column capacity (the sample layout is topology-bound), while
+        ``num_reads`` only needs to FIT — descriptors carry the written row
+        count and the per-dispatch ``num_reads`` rides the ``('switch', ...)``
+        command, so a smaller round reuses a larger ring (pow<->mempool flips
+        stop paying a full respawn each direction).
+
+        Caveat: on ``USES_SUBMITTER_SPLIT`` backends the submitter's
+        ``num_reads`` is frozen at spawn time (only a respawn propagates a
+        new value); safe today because QPU ``num_reads`` is constant per
+        process.
+
+        Args:
+            dims: ``(num_reads, node_count)`` of the incoming dispatch.
+        """
+        if self._ring_dims is None:
+            return False
+        max_rows, max_cols = self._ring_dims
+        return dims[1] == max_cols and dims[0] <= max_rows
+
     def _ensure_driver(self, sample_ctx: Dict[str, Any]) -> bool:
         """Ensure ONE persistent stream-driver process is running.
 
         Idempotent. Spawns the driver (and its persistent ring / ctl_q /
-        desc_q / stop event) on first use, and respawns it if it died or if a
-        new dispatch needs a differently-sized ring (rare — ``num_reads`` and
-        the topology are stable within a miner's life). The driver builds its
-        own connected context via ``STREAM_FACTORY_DOTTED`` and keeps it alive
-        across dispatches; only ``_close_driver`` (miner shutdown) reaps it.
+        desc_q / stop event) on first use, and respawns it if it died or if
+        the ring cannot host the new dispatch (``_ring_can_host``: node count
+        changed, or ``num_reads`` outgrew the ring — the respawn sizes the new
+        ring to the larger ``num_reads``, so capacity grows monotonically and
+        later smaller rounds reuse it). The driver builds its own connected
+        context via ``STREAM_FACTORY_DOTTED`` and keeps it alive across
+        dispatches; only ``_close_driver`` (miner shutdown) reaps it.
 
         Returns:
             ``True`` once a live driver is ready (always — every backend mines
@@ -1286,9 +1312,22 @@ class BaseMiner(ABC):
                 self._submitter_proc is not None
                 and self._submitter_proc.is_alive()
             )
-        if alive and self._ring_dims == dims:
+        if alive and self._ring_can_host(dims):
             return True  # reuse the running driver(s)
-        # Dead, first-time, or dims changed: tear down any stale driver, spawn.
+        # Dead, first-time, or incompatible ring: tear down any stale driver,
+        # spawn. Every forced respawn is logged with its reason so the
+        # residual pow<->mempool flip cost stays measurable.
+        if self._ring_dims is not None:
+            if not alive:
+                reason = "dead-driver"
+            elif dims[1] != self._ring_dims[1]:
+                reason = "node-count-changed"
+            else:
+                reason = "dims-grew"
+            self.logger.info(
+                "stream driver respawn (%s): ring capacity %s, dispatch dims %s",
+                reason, self._ring_dims, dims,
+            )
         self._close_driver()
         import multiprocessing as _mp
         ctx = _mp.get_context("spawn")
@@ -1857,6 +1896,7 @@ class BaseMiner(ABC):
         self,
         state: _MiningLoopState,
         result: MiningResult,
+        live_threshold_milli: int,
     ) -> Optional[StashEntry]:
         """Wrap a valid ``result`` into a ``StashEntry`` for the active ranking.
 
@@ -1864,14 +1904,24 @@ class BaseMiner(ABC):
         result's effective floor and the absolute block it lands on; returns
         ``None`` when the floor never clears within the schedule horizon (so
         the caller stashes nothing). Legacy path: ``StashEntry(0, 0, result)``.
+
+        Admission must never be stricter than the submit gate: the schedule
+        is frozen at dispatch, but an out-of-band difficulty ease (a sudo
+        reseed) can move the LIVE threshold below the schedule's horizon
+        while the item is still mining. A floor that already clears
+        ``live_threshold_milli`` is therefore admitted as immediately
+        submittable even when ``step_for_energy`` finds no step — otherwise
+        the candidate is silently dropped and, on a chain where the work key
+        never rolls, nothing ever submits again for this item.
         """
         decay_schedule = state.decay_schedule
         if decay_schedule is None:
             return StashEntry(0, 0, result)
-        s_floor = step_for_energy(
-            decay_schedule, int(result.effective_floor * 1000),
-        )
+        floor_milli = int(result.effective_floor * 1000)
+        s_floor = step_for_energy(decay_schedule, floor_milli)
         if s_floor is None:
+            if floor_milli < live_threshold_milli:
+                return StashEntry(0, state.last_proof_block, result)
             # Never clears within the schedule horizon — not stashed.
             return None
         valid_at = state.last_proof_block + s_floor * state.epoch_length
@@ -1954,7 +2004,9 @@ class BaseMiner(ABC):
             if result is not None:
                 post_num_valid = result.num_valid
                 post_diversity_milli = int(result.diversity * 1000)
-                entry = self._compute_stash_entry(state, result)
+                entry = self._compute_stash_entry(
+                    state, result, live_threshold_milli,
+                )
                 stored_replaced = entry is not None and self._stash_insert(
                     state.top_k, state.top_k_cap, entry, state.is_decay_ranked,
                 )

@@ -110,7 +110,7 @@ def test_quip_miner_cpu_config(monkeypatch):
     assert result.exit_code == 0, result.output
     assert captured.get("miner_config") == {"cpu": {"num_cpus": 3}}
     assert captured.get("miner_kind") == "cpu"
-    assert captured.get("mode") == "pow"
+    assert captured.get("mempool_enabled") is True  # cpu default: on
 
 
 def test_quip_miner_gpu_local_config(monkeypatch):
@@ -130,7 +130,7 @@ def test_quip_miner_gpu_local_config(monkeypatch):
     assert result.exit_code == 0, result.output
     assert captured.get("miner_config") == {"cuda": [{"device": "0"}]}
     assert captured.get("miner_kind") == "gpu"
-    assert captured.get("mode") == "pow"
+    assert captured.get("mempool_enabled") is True  # gpu default: on
 
 
 def test_quip_miner_gpu_metal_config(monkeypatch):
@@ -471,16 +471,18 @@ def test_quip_miner_cpu_identification_via_toml(monkeypatch, tmp_path):
     assert captured.get("node_log") == "/var/log/quip-miner.log"
 
 
-def test_quip_miner_cpu_mode_falls_back_to_toml(monkeypatch, tmp_path):
-    """`mode` in the [miner] table drives the work source when --mode is
-    not passed — config.toml is the single source of truth in docker."""
+def _mempool_toml(tmp_path, extra: str = "") -> Path:
     p = tmp_path / "config.toml"
     p.write_text(
         '[miner]\n'
         'validators = ["ws://localhost:9944"]\n'
         'signer_key = "~/.quip-miner/signing.json"\n'
-        'mode = "mempool"\n'
+        f'{extra}'
     )
+    return p
+
+
+def _capture_run(monkeypatch) -> Dict[str, Any]:
     captured: Dict[str, Any] = {}
 
     async def fake_run(**kwargs):
@@ -488,52 +490,158 @@ def test_quip_miner_cpu_mode_falls_back_to_toml(monkeypatch, tmp_path):
         return 0
 
     monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
+    return captured
+
+
+def test_quip_miner_cpu_mempool_false_in_section_disables(
+    monkeypatch, tmp_path
+):
+    """`mempool = false` INSIDE the miner's own section always wins over
+    the default-on — per-miner opt-out is the operator control."""
+    p = _mempool_toml(tmp_path, "[cpu]\nnum_cpus = 1\nmempool = false\n")
+    captured = _capture_run(monkeypatch)
     result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
     assert result.exit_code == 0, result.output
-    assert captured.get("mode") == "mempool"
+    assert captured.get("mempool_enabled") is False
 
 
-def test_quip_miner_cpu_mode_flag_beats_toml(monkeypatch, tmp_path):
-    """An explicit --mode wins over the TOML `mode` key."""
-    p = tmp_path / "config.toml"
-    p.write_text(
-        '[miner]\n'
-        'validators = ["ws://localhost:9944"]\n'
-        'signer_key = "~/.quip-miner/signing.json"\n'
-        'mode = "mempool"\n'
+def test_quip_miner_mempool_key_in_miner_table_rejected(
+    monkeypatch, tmp_path
+):
+    """The old global `[miner] mempool` fails loudly with a pointer to
+    the backend sections — never a silent participation flip."""
+    p = _mempool_toml(tmp_path, "mempool = false\n[cpu]\nnum_cpus = 1\n")
+    _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
+    assert result.exit_code != 0
+    assert "backend section" in result.output
+
+
+def test_quip_miner_cpu_mempool_key_stripped_from_miner_config(
+    monkeypatch, tmp_path
+):
+    """The control key never reaches the spec builders (they whitelist
+    and warn on unknown section keys)."""
+    p = _mempool_toml(tmp_path, "[cpu]\nnum_cpus = 3\nmempool = false\n")
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured["miner_config"] == {"cpu": {"num_cpus": 3}}
+
+
+def test_quip_miner_cpu_mempool_defaults_on(monkeypatch, tmp_path):
+    """No `mempool` key → cpu/gpu default ON (pow + mempool priority)."""
+    p = _mempool_toml(tmp_path)
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mempool_enabled") is True
+
+
+def test_quip_miner_qpu_mempool_defaults_off(monkeypatch, tmp_path):
+    """QPU defaults mempool OFF (paid samples; opt-in only)."""
+    p = _mempool_toml(tmp_path, '[dwave]\ndaily_budget = "60s"\n')
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_qpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("miner_kind") == "qpu"
+    assert captured.get("mempool_enabled") is False
+
+
+def test_quip_miner_qpu_mempool_explicit_true_opts_in(monkeypatch, tmp_path):
+    """`mempool = true` inside the vendor section overrides the qpu
+    default-off."""
+    p = _mempool_toml(
+        tmp_path, '[dwave]\ndaily_budget = "60s"\nmempool = true\n'
     )
-    captured: Dict[str, Any] = {}
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_qpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mempool_enabled") is True
 
-    async def fake_run(**kwargs):
-        captured.update(kwargs)
-        return 0
 
-    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
+def test_quip_miner_cpu_is_mempool_owner_on_multi_backend_config(
+    monkeypatch, tmp_path
+):
+    """cpu+gpu config: the mempool owner is derived from the config
+    itself (first non-qpu backend group) — the cpu child resolves ON."""
+    p = _mempool_toml(tmp_path, "[cpu]\nnum_cpus = 1\n[cuda.0]\n")
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mempool_enabled") is True
+
+
+def test_quip_miner_gpu_non_owner_resolves_mempool_off(monkeypatch, tmp_path):
+    """Same cpu+gpu config, gpu child: cpu owns per the config-derived
+    election, so gpu resolves mempool OFF — identically whether the
+    child runs supervised, direct, or --mode-narrowed. No env var."""
+    p = _mempool_toml(tmp_path, "[cpu]\nnum_cpus = 1\n[cuda.0]\n")
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_gpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mempool_enabled") is False
+
+
+def test_quip_miner_qpu_explicit_true_takes_ownership(monkeypatch, tmp_path):
+    """cpu+dwave with `[dwave] mempool = true`: the explicit opt-in
+    outranks cpu's default-on — qpu owns, cpu resolves OFF."""
+    extra = (
+        '[cpu]\nnum_cpus = 1\n'
+        '[dwave]\ndaily_budget = "60s"\nmempool = true\n'
+    )
+    p = _mempool_toml(tmp_path, extra)
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_qpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mempool_enabled") is True
+
+    p2 = _mempool_toml(tmp_path, extra)
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p2)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mempool_enabled") is False
+
+
+def test_quip_miner_gpu_owns_after_cpu_opts_out(monkeypatch, tmp_path):
+    """`[cpu] mempool = false` moves ownership to the next default-on
+    group: the gpu child of a cpu+gpu config resolves ON."""
+    p = _mempool_toml(
+        tmp_path, "[cpu]\nnum_cpus = 1\nmempool = false\n[cuda.0]\n"
+    )
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_gpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mempool_enabled") is True
+
+
+def test_quip_miner_cpu_mempool_min_reward_threaded(monkeypatch, tmp_path):
+    """[miner] mempool_min_reward reaches the runner (→ producer)."""
+    p = _mempool_toml(tmp_path, "mempool_min_reward = 250\n")
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mempool_min_reward") == 250
+
+
+def test_quip_miner_cpu_mempool_min_reward_defaults_zero(monkeypatch, tmp_path):
+    p = _mempool_toml(tmp_path)
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mempool_min_reward") == 0
+
+
+def test_quip_miner_cpu_rejects_removed_mode_flag(monkeypatch):
+    """--mode was removed with the two-controller split; passing it must
+    fail loudly so operators see the config-key change."""
+    _capture_run(monkeypatch)
     result = CliRunner().invoke(
-        quip_cli.quip_miner_cpu, ["--config", str(p), "--mode", "pow"]
+        quip_cli.quip_miner_cpu,
+        ["--validator", "ws://x:9944", "--mode", "both"],
     )
-    assert result.exit_code == 0, result.output
-    assert captured.get("mode") == "pow"
-
-
-def test_quip_miner_cpu_mode_defaults_to_pow(monkeypatch, tmp_path):
-    """No --mode and no TOML `mode` → pow (unchanged default)."""
-    p = tmp_path / "config.toml"
-    p.write_text(
-        '[miner]\n'
-        'validators = ["ws://localhost:9944"]\n'
-        'signer_key = "~/.quip-miner/signing.json"\n'
-    )
-    captured: Dict[str, Any] = {}
-
-    async def fake_run(**kwargs):
-        captured.update(kwargs)
-        return 0
-
-    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
-    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
-    assert result.exit_code == 0, result.output
-    assert captured.get("mode") == "pow"
+    assert result.exit_code != 0
+    assert "no such option" in result.output.lower()
 
 
 def test_quip_miner_cpu_listen_port_aliased_to_rest(monkeypatch, tmp_path):
@@ -1389,6 +1497,195 @@ def test_plan_processes_rejects_backend_without_library(monkeypatch, tmp_path):
         quip_cli._plan_processes(cfg)
 
 
+# ── mempool owner election: config-derived, one account = one solver ──
+
+
+def _plan_with_all_supports(monkeypatch, cfg, mode=None):
+    """_plan_processes with every backend group importable; returns the
+    per-mode env map for the miner children plus the raw proc list."""
+    monkeypatch.setattr(
+        quip_cli, "_detect_image_supports", lambda: ["cpu", "gpu", "qpu"]
+    )
+    _runtime_dir, procs = quip_cli._plan_processes(cfg, mode=mode)
+    envs = {p["args"][0]: p["env"] for p in procs if p["args"][0] != "telemetry"}
+    return envs, procs
+
+
+def test_plan_processes_elects_cpu_owner_over_gpu(monkeypatch, tmp_path, capsys):
+    """cpu+gpu, mempool key absent → cpu owns mempool by config
+    derivation. The supervisor injects NO env var — each child resolves
+    ownership from the same TOML — and echoes the election so operators
+    see why a child is pow-only. Telemetry glue is untouched."""
+    cfg = _write_supervisor_toml(
+        tmp_path, backend="[cpu]\nnum_cpus = 1\n[cuda.0]\n"
+    )
+    envs, procs = _plan_with_all_supports(monkeypatch, cfg)
+    assert all("QUIP_MEMPOOL" not in p["env"] for p in procs)
+    for mode in ("cpu", "gpu"):
+        assert envs[mode]["QUIP_TELEMETRY_EXTERNAL"] == "1"
+        assert "QUIP_RUNTIME_DIR" in envs[mode]
+    out = capsys.readouterr().out
+    assert "supervisor: mempool owner is cpu" in out
+    assert "pow-only: gpu" in out
+
+
+def test_plan_processes_three_backends_reports_all_non_owners(
+    monkeypatch, tmp_path, capsys
+):
+    """EVERY non-owner is reported, not just one: cpu+gpu+qpu → cpu
+    owns, both gpu and qpu children are echoed pow-only. Guards against
+    a report-only-the-last-mode mutant that every 2-backend test
+    passes."""
+    cfg = _write_supervisor_toml(
+        tmp_path,
+        backend='[cpu]\nnum_cpus = 1\n[cuda.0]\n[dwave]\ndaily_budget = "60s"\n',
+    )
+    _envs, procs = _plan_with_all_supports(monkeypatch, cfg)
+    assert all("QUIP_MEMPOOL" not in p["env"] for p in procs)
+    out = capsys.readouterr().out
+    assert "supervisor: mempool owner is cpu" in out
+    assert "pow-only: gpu, qpu" in out
+
+
+def test_plan_processes_election_independent_of_telemetry(
+    monkeypatch, tmp_path, capsys
+):
+    """rest_port = -1 still reports the election: the echo must not
+    ride the telemetry-glue branch, and children get NO env at all."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[miner]\nvalidators = ["ws://localhost:9944"]\n'
+        'signer_key = "/data/keystore.json"\n'
+        'rest_port = -1\n'
+        '[cpu]\nnum_cpus = 1\n[cuda.0]\n'
+    )
+    envs, procs = _plan_with_all_supports(monkeypatch, cfg)
+    assert all(p["args"][0] != "telemetry" for p in procs)
+    assert envs["cpu"] == {}
+    assert envs["gpu"] == {}
+    out = capsys.readouterr().out
+    assert "supervisor: mempool owner is cpu" in out
+
+
+def test_plan_processes_tolerates_stale_mode_key(
+    monkeypatch, tmp_path, capsys
+):
+    """A legacy volume's `mode = "pow"` is dead but harmless: the config
+    loads, the supervisor plans, and the election still fires."""
+    cfg = _write_supervisor_toml(
+        tmp_path,
+        extra_miner='mode = "pow"\n',
+        backend="[cpu]\nnum_cpus = 1\n[cuda.0]\n",
+    )
+    envs, _procs = _plan_with_all_supports(monkeypatch, cfg)
+    assert set(envs) == {"cpu", "gpu"}
+    assert "supervisor: mempool owner is cpu" in capsys.readouterr().out
+
+
+def test_plan_processes_elects_gpu_owner_over_qpu(
+    monkeypatch, tmp_path, capsys
+):
+    """gpu+qpu → gpu is the first non-qpu mode; qpu is echoed pow-only."""
+    cfg = _write_supervisor_toml(
+        tmp_path, backend='[cuda.0]\n[dwave]\ndaily_budget = "60s"\n'
+    )
+    _envs, procs = _plan_with_all_supports(monkeypatch, cfg)
+    assert all("QUIP_MEMPOOL" not in p["env"] for p in procs)
+    out = capsys.readouterr().out
+    assert "supervisor: mempool owner is gpu" in out
+    assert "pow-only: qpu" in out
+
+
+def test_plan_processes_elects_cpu_owner_over_qpu(
+    monkeypatch, tmp_path, capsys
+):
+    """cpu+qpu → cpu owns mempool; qpu is echoed pow-only."""
+    cfg = _write_supervisor_toml(
+        tmp_path, backend='[cpu]\nnum_cpus = 1\n[dwave]\ndaily_budget = "60s"\n'
+    )
+    _envs, _procs = _plan_with_all_supports(monkeypatch, cfg)
+    out = capsys.readouterr().out
+    assert "supervisor: mempool owner is cpu" in out
+    assert "pow-only: qpu" in out
+
+
+def test_plan_processes_single_backend_no_election(
+    monkeypatch, tmp_path, capsys
+):
+    """A single miner child needs no election — no env key and no
+    election echo on any planned process."""
+    cfg = _write_supervisor_toml(tmp_path)
+    _envs, procs = _plan_with_all_supports(monkeypatch, cfg)
+    assert all("QUIP_MEMPOOL" not in p["env"] for p in procs)
+    assert "mempool owner" not in capsys.readouterr().out
+
+
+def test_plan_processes_all_sections_opted_out_skips_election(
+    monkeypatch, tmp_path, capsys
+):
+    """Every section carrying `mempool = false` disables participation
+    everywhere via config; the supervisor reports no election."""
+    cfg = _write_supervisor_toml(
+        tmp_path,
+        backend=(
+            "[cpu]\nnum_cpus = 1\nmempool = false\n"
+            "[gpu]\nmempool = false\n[cuda.0]\n"
+        ),
+    )
+    _envs, procs = _plan_with_all_supports(monkeypatch, cfg)
+    assert all("QUIP_MEMPOOL" not in p["env"] for p in procs)
+    assert "mempool owner" not in capsys.readouterr().out
+
+
+def test_plan_processes_explicit_true_wins_ownership(
+    monkeypatch, tmp_path, capsys
+):
+    """`[dwave] mempool = true` outranks cpu's default-on: qpu owns and
+    cpu is echoed pow-only."""
+    cfg = _write_supervisor_toml(
+        tmp_path,
+        backend=(
+            '[cpu]\nnum_cpus = 1\n'
+            '[dwave]\ndaily_budget = "60s"\nmempool = true\n'
+        ),
+    )
+    _envs, _procs = _plan_with_all_supports(monkeypatch, cfg)
+    out = capsys.readouterr().out
+    assert "supervisor: mempool owner is qpu" in out
+    assert "pow-only: cpu" in out
+
+
+def test_plan_processes_cpu_opt_out_moves_ownership_to_gpu(
+    monkeypatch, tmp_path, capsys
+):
+    """`[cpu] mempool = false` hands the mempool to gpu — the echo names
+    the new owner and the opted-out child."""
+    cfg = _write_supervisor_toml(
+        tmp_path,
+        backend="[cpu]\nnum_cpus = 1\nmempool = false\n[cuda.0]\n",
+    )
+    _envs, _procs = _plan_with_all_supports(monkeypatch, cfg)
+    out = capsys.readouterr().out
+    assert "supervisor: mempool owner is gpu" in out
+    assert "pow-only: cpu" in out
+
+
+def test_plan_processes_mode_non_owner_reports_config_owner(
+    monkeypatch, tmp_path, capsys
+):
+    """--mode gpu on a cpu+gpu config plans only the gpu child, but the
+    config still gives mempool to cpu — the echo tells the operator the
+    narrowed child mines pow only."""
+    cfg = _write_supervisor_toml(
+        tmp_path, backend="[cpu]\nnum_cpus = 1\n[cuda.0]\n"
+    )
+    _envs, procs = _plan_with_all_supports(monkeypatch, cfg, mode="gpu")
+    assert [p["args"][0] for p in procs] == ["telemetry", "gpu"]
+    out = capsys.readouterr().out
+    assert "supervisor: mempool owner is cpu" in out
+    assert "pow-only: gpu" in out
+
+
 def test_detect_image_supports_probes_imports(monkeypatch):
     """cpu is always supported; gpu/qpu depend on importable libraries."""
     available = {"dwave.system"}
@@ -1400,6 +1697,178 @@ def test_detect_image_supports_probes_imports(monkeypatch):
     assert quip_cli._detect_image_supports() == ["cpu", "gpu", "qpu"]
 
 
+# ── CLI miner-type selection: supervisor --mode + subcommand narrowing ──
+
+
+def test_plan_processes_mode_narrows_to_requested_type(
+    monkeypatch, tmp_path, capsys
+):
+    """--mode gpu on a cpu+gpu config plans ONLY the gpu child (the
+    telemetry aggregator survives) and echoes which configured miner
+    types were dropped."""
+    monkeypatch.setattr(
+        quip_cli, "_detect_image_supports", lambda: ["cpu", "gpu", "qpu"]
+    )
+    cfg = _write_supervisor_toml(
+        tmp_path, backend="[cpu]\nnum_cpus = 1\n[cuda.0]\n"
+    )
+    _runtime_dir, procs = quip_cli._plan_processes(cfg, mode="gpu")
+    assert [p["args"][0] for p in procs] == ["telemetry", "gpu"]
+    out = capsys.readouterr().out
+    assert "--mode gpu keeps gpu only" in out
+    assert "dropping configured miner types: cpu" in out
+
+
+def test_plan_processes_mode_on_owner_stays_quiet(
+    monkeypatch, tmp_path, capsys
+):
+    """--mode cpu keeps the config-derived mempool owner itself, so
+    nothing is pow-only and no election echo fires (and no env var —
+    ownership is never transported out-of-band)."""
+    monkeypatch.setattr(
+        quip_cli, "_detect_image_supports", lambda: ["cpu", "gpu", "qpu"]
+    )
+    cfg = _write_supervisor_toml(
+        tmp_path, backend="[cpu]\nnum_cpus = 1\n[cuda.0]\n"
+    )
+    _runtime_dir, procs = quip_cli._plan_processes(cfg, mode="cpu")
+    assert all("QUIP_MEMPOOL" not in p["env"] for p in procs)
+    assert "mempool owner" not in capsys.readouterr().out
+
+
+def test_plan_processes_mode_unconfigured_type_fails(monkeypatch, tmp_path):
+    """--mode qpu with no qpu backend sections is an error that names
+    what IS configured, instead of silently planning nothing."""
+    monkeypatch.setattr(
+        quip_cli, "_detect_image_supports", lambda: ["cpu", "gpu", "qpu"]
+    )
+    cfg = _write_supervisor_toml(tmp_path)  # cpu only
+    with pytest.raises(
+        click.ClickException, match="no qpu backend sections"
+    ) as excinfo:
+        quip_cli._plan_processes(cfg, mode="qpu")
+    assert "cpu" in str(excinfo.value)
+
+
+def test_plan_processes_mode_matching_single_backend_stays_quiet(
+    monkeypatch, tmp_path, capsys
+):
+    """--mode cpu on a cpu-only config drops nothing → no drop echo."""
+    monkeypatch.setattr(
+        quip_cli, "_detect_image_supports", lambda: ["cpu", "gpu", "qpu"]
+    )
+    cfg = _write_supervisor_toml(tmp_path)
+    _runtime_dir, procs = quip_cli._plan_processes(cfg, mode="cpu")
+    assert [p["args"][0] for p in procs] == ["telemetry", "cpu"]
+    assert "dropping configured miner types" not in capsys.readouterr().out
+
+
+def test_plan_processes_mode_narrows_before_image_support_check(
+    monkeypatch, tmp_path
+):
+    """--mode cpu must boot on an install that can't run the config's
+    [cuda.0]: once a type is dropped by choice, its libraries are
+    irrelevant (no unsupported-mode error for dropped types)."""
+    monkeypatch.setattr(quip_cli, "_detect_image_supports", lambda: ["cpu"])
+    cfg = _write_supervisor_toml(
+        tmp_path, backend="[cpu]\nnum_cpus = 1\n[cuda.0]\n"
+    )
+    _runtime_dir, procs = quip_cli._plan_processes(cfg, mode="cpu")
+    assert [p["args"][0] for p in procs] == ["telemetry", "cpu"]
+
+
+def test_quip_miner_mode_requires_config():
+    """--mode without --config has nothing to narrow → usage error."""
+    result = CliRunner().invoke(quip_cli.quip_miner, ["--mode", "cpu"])
+    assert result.exit_code != 0
+    assert "--mode requires --config" in result.output
+
+
+def test_quip_miner_mode_rejected_with_subcommand(tmp_path):
+    """--mode is supervisor-only; with a subcommand the subcommand
+    already selects the miner type."""
+    result = CliRunner().invoke(
+        quip_cli.quip_miner, ["--mode", "cpu", "resolve-modes"]
+    )
+    assert result.exit_code != 0
+    assert "already selects the miner type" in result.output
+
+
+def test_quip_miner_mode_passes_through_to_supervisor(monkeypatch, tmp_path):
+    """`quip-miner --config X --mode gpu` hands the mode to the
+    supervisor run."""
+    captured = {}
+
+    def fake_supervisor(config_path, *, mode=None):
+        captured["config_path"] = config_path
+        captured["mode"] = mode
+        return 0
+
+    monkeypatch.setattr(quip_cli, "_run_supervisor", fake_supervisor)
+    cfg = _write_supervisor_toml(tmp_path)
+    result = CliRunner().invoke(
+        quip_cli.quip_miner, ["--config", str(cfg), "--mode", "gpu"]
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["mode"] == "gpu"
+
+
+def test_quip_miner_cpu_warns_on_dropped_configured_types(
+    monkeypatch, tmp_path
+):
+    """Direct `quip-miner cpu` against a config that also declares gpu
+    and qpu sections keeps cpu and warns what was dropped — a
+    wrong-subcommand launch must be visible, not silent."""
+    _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(
+        tmp_path,
+        '[cpu]\nnum_cpus = 1\n[cuda.0]\n[dwave]\ndaily_budget = "60s"\n',
+    )
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert "config also declares miner types gpu, qpu" in result.output
+    assert "running cpu only" in result.output
+
+
+def test_quip_miner_gpu_warns_even_on_flag_defaults_path(
+    monkeypatch, tmp_path
+):
+    """`quip-miner gpu` against a cpu-only config runs GPU from flag
+    defaults — the configured cpu sections are still dropped, so the
+    warning fires on that path too."""
+    _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(tmp_path, "[cpu]\nnum_cpus = 2\n")
+    result = CliRunner().invoke(quip_cli.quip_miner_gpu, ["--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert "config also declares miner types cpu" in result.output
+    assert "running gpu only" in result.output
+
+
+def test_quip_miner_qpu_warns_on_dropped_types(monkeypatch, tmp_path):
+    """`quip-miner qpu` with a cpu+dwave config warns about the dropped
+    cpu sections."""
+    _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(
+        tmp_path, '[cpu]\nnum_cpus = 1\n[dwave]\ndaily_budget = "60s"\n'
+    )
+    result = CliRunner().invoke(quip_cli.quip_miner_qpu, ["--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert "config also declares miner types cpu" in result.output
+    assert "running qpu only" in result.output
+
+
+def test_quip_miner_cpu_no_warning_on_single_backend_config(
+    monkeypatch, tmp_path
+):
+    """A cpu-only config invoked via `quip-miner cpu` drops nothing —
+    no warning noise on the matched path."""
+    _stub_runner(monkeypatch)
+    cfg = _write_backend_toml(tmp_path, "[cpu]\nnum_cpus = 1\n")
+    result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert "config also declares miner types" not in result.output
+
+
 def test_bare_quip_miner_with_config_runs_supervisor(monkeypatch, tmp_path):
     """`quip-miner --config x.toml` (no subcommand) is the production
     entry: it hands off to the supervisor."""
@@ -1407,7 +1876,7 @@ def test_bare_quip_miner_with_config_runs_supervisor(monkeypatch, tmp_path):
     called: Dict[str, Any] = {}
     monkeypatch.setattr(
         quip_cli, "_run_supervisor",
-        lambda path: called.setdefault("path", path) and 0 or 0,
+        lambda path, mode=None: called.setdefault("path", path) and 0 or 0,
     )
     result = CliRunner().invoke(quip_cli.quip_miner, ["--config", str(cfg)])
     assert result.exit_code == 0, result.output
@@ -1643,89 +2112,39 @@ def test_resolve_modes_no_config_no_default_errors():
     assert "no-mode-resolvable" in result.output
 
 
-# ── --mine-mode guard (W4a) ───────────────────────────────────────────
+# ── mode resolution has no mempool guard (T8) ─────────────────────────
 
 
-def test_resolve_modes_mempool_multi_backend_cli_errors(tmp_path):
-    """End-to-end via the CLI: --mine-mode mempool + multi-backend
-    config → non-zero exit with the kebab-case error code on stderr
-    for the entrypoint to grep."""
+def test_resolve_modes_multi_backend_cli_ok(tmp_path):
+    """Multi-backend configs resolve unconditionally — the old mempool
+    multi-backend guard is replaced by supervisor owner election."""
     cfg = tmp_path / "miner.toml"
     cfg.write_text(
-        '[miner]\nvalidators = ["ws://a:9944"]\n'
-        '[cpu]\nnum_cpus = 2\n'
-        '[dwave]\ndaily_budget = "60s"\n'
-    )
-    result = CliRunner().invoke(
-        quip_cli.quip_miner,
-        ["resolve-modes", "--config", str(cfg), "--mine-mode", "mempool"],
-    )
-    assert result.exit_code != 0
-    assert "multi-backend-not-allowed-in-mempool-mode" in result.output
-
-
-def test_resolve_modes_reads_mode_from_miner_table(tmp_path):
-    """`mode` in the [miner] table acts as the --mine-mode fallback, so a
-    config-only docker launch still gets the mempool multi-backend guard."""
-    cfg = tmp_path / "miner.toml"
-    cfg.write_text(
-        '[miner]\nvalidators = ["ws://a:9944"]\nmode = "mempool"\n'
+        '[miner]\nvalidators = ["ws://a:9944"]\nmempool = true\n'
         '[cpu]\nnum_cpus = 2\n'
         '[dwave]\ndaily_budget = "60s"\n'
     )
     result = CliRunner().invoke(
         quip_cli.quip_miner, ["resolve-modes", "--config", str(cfg)],
     )
-    assert result.exit_code != 0
-    assert "multi-backend-not-allowed-in-mempool-mode" in result.output
-
-
-def test_resolve_modes_mine_mode_flag_beats_miner_table(tmp_path):
-    """--mine-mode pow overrides a TOML mode = "mempool"."""
-    cfg = tmp_path / "miner.toml"
-    cfg.write_text(
-        '[miner]\nvalidators = ["ws://a:9944"]\nmode = "mempool"\n'
-        '[cpu]\nnum_cpus = 2\n'
-        '[dwave]\ndaily_budget = "60s"\n'
-    )
-    result = CliRunner().invoke(
-        quip_cli.quip_miner,
-        ["resolve-modes", "--config", str(cfg), "--mine-mode", "pow"],
-    )
     assert result.exit_code == 0, result.output
     assert result.output.strip().splitlines() == ["cpu", "qpu"]
 
 
-def test_resolve_modes_pow_multi_backend_cli_ok(tmp_path):
-    """--mine-mode pow with multi-backend → 2 modes, no error.
-    Mirror of the test above with the safe mine-mode value."""
+def test_resolve_modes_mine_mode_flag_removed(tmp_path):
+    """--mine-mode is gone along with the [miner] mode key — from both
+    the plural and singular resolve commands."""
     cfg = tmp_path / "miner.toml"
     cfg.write_text(
-        '[miner]\nvalidators = ["ws://a:9944"]\n'
-        '[cpu]\nnum_cpus = 2\n'
-        '[dwave]\n'
+        '[miner]\nvalidators = ["ws://a:9944"]\n[cpu]\nnum_cpus = 2\n'
     )
-    result = CliRunner().invoke(
-        quip_cli.quip_miner,
-        ["resolve-modes", "--config", str(cfg), "--mine-mode", "pow"],
-    )
-    assert result.exit_code == 0, result.output
-    assert result.output.strip().splitlines() == ["cpu", "qpu"]
-
-
-def test_resolve_modes_mempool_single_backend_cli_ok(tmp_path):
-    """Single backend + mempool is the supported path — no error."""
-    cfg = tmp_path / "miner.toml"
-    cfg.write_text(
-        '[miner]\nvalidators = ["ws://a:9944"]\n'
-        '[dwave]\ndaily_budget = "60s"\n'
-    )
-    result = CliRunner().invoke(
-        quip_cli.quip_miner,
-        ["resolve-modes", "--config", str(cfg), "--mine-mode", "mempool"],
-    )
-    assert result.exit_code == 0, result.output
-    assert result.output.strip() == "qpu"
+    for command in ("resolve-modes", "resolve-mode"):
+        result = CliRunner().invoke(
+            quip_cli.quip_miner,
+            [command, "--config", str(cfg), "--mine-mode", "mempool"],
+        )
+        assert result.exit_code != 0, command
+        assert "no such option" in result.output.lower(), command
 
 
 # ---------------------------------------------------------------------------
@@ -1807,6 +2226,104 @@ def test_guard_d_registration_retries_then_succeeds(monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
+# Guard D+ — non-fatal mempool solver registration
+# ---------------------------------------------------------------------------
+
+
+def _guard_dplus(monkeypatch, outcome_or_exc) -> bool:
+    """Run _ensure_solver_or_disable_mempool with a stubbed helper."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    if isinstance(outcome_or_exc, Exception):
+        stub = AsyncMock(side_effect=outcome_or_exc)
+    else:
+        stub = AsyncMock(return_value=outcome_or_exc)
+    monkeypatch.setattr(quip_cli, "ensure_solver_registered", stub)
+    fake_keystore = MagicMock()
+    return asyncio.run(
+        quip_cli._ensure_solver_or_disable_mempool(
+            MagicMock(), fake_keystore, "cpu",
+        )
+    )
+
+
+def test_guard_dplus_success_keeps_mempool_enabled(monkeypatch):
+    from substrate.solver_registration import SolverGuardOutcome
+
+    assert _guard_dplus(monkeypatch, SolverGuardOutcome.REGISTERED) is True
+    assert (
+        _guard_dplus(monkeypatch, SolverGuardOutcome.ALREADY_REGISTERED)
+        is True
+    )
+
+
+def test_guard_dplus_failed_disables_mempool_without_raising(monkeypatch, capsys):
+    """FAILED → loud log + mempool off for the run; pow proceeds (no raise —
+    a fatal exit here would trip supervisor terminate-all-siblings)."""
+    from substrate.solver_registration import SolverGuardOutcome
+
+    assert _guard_dplus(monkeypatch, SolverGuardOutcome.FAILED) is False
+    assert "mempool DISABLED" in capsys.readouterr().err
+
+
+def test_guard_dplus_type_mismatch_disables_mempool(monkeypatch, capsys):
+    from substrate.solver_registration import SolverGuardOutcome
+
+    assert _guard_dplus(monkeypatch, SolverGuardOutcome.TYPE_MISMATCH) is False
+    err = capsys.readouterr().err
+    assert "TYPE_MISMATCH" in err
+    assert "deregister-solver" in err
+
+
+def test_guard_dplus_unexpected_exception_disables_mempool(monkeypatch, capsys):
+    assert _guard_dplus(monkeypatch, RuntimeError("rpc down")) is False
+    assert "mempool DISABLED" in capsys.readouterr().err
+
+
+def test_startup_guards_return_effective_mempool(monkeypatch):
+    """_run_startup_guards runs D+ only when mempool is enabled and
+    propagates its verdict; C/D/E still run unconditionally."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from substrate.solver_registration import SolverGuardOutcome
+
+    monkeypatch.setattr(
+        quip_cli, "_ensure_funded_or_fail", AsyncMock(return_value=1)
+    )
+    monkeypatch.setattr(
+        quip_cli, "_ensure_registered_or_fail", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(
+        quip_cli, "_auto_identify", AsyncMock(return_value=None)
+    )
+    solver_guard = AsyncMock(return_value=SolverGuardOutcome.FAILED)
+    monkeypatch.setattr(quip_cli, "ensure_solver_registered", solver_guard)
+
+    common = dict(
+        faucet_url=None,
+        node_name=None,
+        public_host=None,
+        public_port=None,
+        miner_config={},
+    )
+    enabled = asyncio.run(quip_cli._run_startup_guards(
+        MagicMock(), MagicMock(),
+        mempool_enabled=True, miner_kind="cpu", **common,
+    ))
+    assert enabled is False  # Guard D+ FAILED → mempool off, no raise
+    assert solver_guard.await_count == 1
+
+    enabled = asyncio.run(quip_cli._run_startup_guards(
+        MagicMock(), MagicMock(),
+        mempool_enabled=False, miner_kind="cpu", **common,
+    ))
+    assert enabled is False
+    assert solver_guard.await_count == 1  # D+ skipped when mempool is off
+
+
+# ---------------------------------------------------------------------------
 # Chain-pull topology (replaces --topology on the live path)
 # ---------------------------------------------------------------------------
 
@@ -1841,7 +2358,6 @@ def test_run_concurrent_miner_rejects_topology_on_live_path():
     """--topology is tools-only; passing it to live mining errors (exit 2)
     before any chain connection is attempted."""
     code = asyncio.run(quip_cli._run_concurrent_miner(
-        mode="pow",
         miner_kind="cpu",
         validators=("ws://unused:9944",),
         signer_key_path="/nonexistent",

@@ -51,7 +51,7 @@ from shared.hybrid_signer import HybridSigner
 from shared.keystore_hybrid import HybridKeystoreFile, load_or_generate
 from shared.logging_config import get_logger
 from substrate.client import SubstrateClient
-from substrate.types import SubstrateDifficulty
+from substrate.types import ExtrinsicReceipt, SubstrateDifficulty
 
 
 # Default puzzle parameters seeded by `--seed-chain` on dev nodes. Mirror
@@ -405,8 +405,13 @@ async def _sudo_call(
     inner_module: str,
     inner_function: str,
     inner_params: dict,
-) -> None:
-    """Compose and submit `Sudo.sudo(<inner_call>)`."""
+) -> ExtrinsicReceipt:
+    """Compose and submit `Sudo.sudo(<inner_call>)`, returning the receipt.
+
+    Raises on a failed receipt. The returned receipt lets callers read
+    events from the inclusion block (e.g. `JobSpecRegistered` after a
+    root-only `register_job_spec`).
+    """
     # substrate-interface lets us nest by composing the inner call first,
     # then passing it as the `call` param of Sudo.sudo.
     iface = client._iface  # noqa: SLF001 — bootstrap is internal client
@@ -428,6 +433,7 @@ async def _sudo_call(
         raise RuntimeError(
             f"sudo call {inner_module}.{inner_function} failed: {receipt.error}"
         )
+    return receipt
 
 
 def _difficulty_to_dict(d: SubstrateDifficulty) -> dict:

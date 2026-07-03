@@ -2,10 +2,12 @@
 # Entrypoint for the quip-miner Docker image (CPU / CUDA).
 #
 # Everything the miner does is declared in /data/config.toml (seeded
-# from the image template on first run): validators, mode, faucet,
+# from the image template on first run): validators, mempool, faucet,
 # telemetry, identity, and backend inventory. `quip-miner --config`
 # reads it and spawns/supervises every process itself — the entrypoint
-# only prepares the volume and drops privileges.
+# only prepares the volume and drops privileges. Container args are
+# forwarded to the supervisor (e.g. `--mode gpu` keeps one configured
+# miner type and reports the dropped ones).
 #
 # Host environment (not miner configuration):
 #   PUID / PGID   uid/gid to run as (default 1000:1000; PUID=0 = root)
@@ -62,7 +64,7 @@ PGID="${PGID:-1000}"
 
 if [ "$PUID" = "0" ]; then
     echo "Privilege drop: PUID=0 — running as root (legacy mode)"
-    exec quip-miner --config "$CONFIG_FILE"
+    exec quip-miner --config "$CONFIG_FILE" "$@"
 fi
 
 [ "$(id -g quip)" != "$PGID" ] && groupmod -g "$PGID" quip
@@ -70,4 +72,4 @@ fi
 chown -R quip:quip /data
 chmod 600 "$KEYSTORE_FILE"
 echo "Privilege drop: exec as uid=$PUID gid=$PGID"
-exec gosu quip:quip quip-miner --config "$CONFIG_FILE"
+exec gosu quip:quip quip-miner --config "$CONFIG_FILE" "$@"

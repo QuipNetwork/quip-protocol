@@ -4,7 +4,7 @@
 #       docker compose -f docker/docker-compose.yml up gpu-miner
 #
 # All miner configuration lives in the volume's config.toml (seeded
-# from the image template on first run) — validators, mode, identity,
+# from the image template on first run) — validators, mempool, identity,
 # backend inventory. Edit it and `docker compose restart`.
 #
 # File ownership: the container drops from root to the in-container

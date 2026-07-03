@@ -123,10 +123,55 @@ def _set_current(controller, ctx) -> None:
     )
 
 
+class _StubScheduler:
+    """Minimal WorkScheduler stand-in for bare-controller unit tests.
+
+    Reads the controller's live ``miner_handles`` / ``_dispatch_contexts``
+    at call time (tests reassign both after construction) and mirrors the
+    real scheduler's dispatch surface: ``dispatch_pow`` broadcasts,
+    ``fill_idle`` dispatches to idle handles only, ``dispatch_context``
+    resolves the immutable per-dispatch context map.
+    """
+
+    def __init__(self, controller) -> None:
+        self._controller = controller
+        # Handles the "active mempool job" owns; cancel_pow_siblings
+        # spares them exactly like the real scheduler.
+        self.job_owned: set[str] = set()
+
+    def dispatch_context(self, handle_id, dispatch_id):
+        return self._controller._dispatch_contexts.get((handle_id, dispatch_id))
+
+    def cancel_pow_siblings(self, winning_handle_id):
+        for h in self._controller.miner_handles:
+            if h.miner_id == winning_handle_id or h.miner_id in self.job_owned:
+                continue
+            h.cancel()
+
+    async def dispatch_pow(self, context, *, solution_number=None):
+        return {
+            h.miner_id: h.mine_work_item(context, solution_number=solution_number)
+            for h in self._controller.miner_handles
+        }
+
+    async def fill_idle(self, context, *, solution_number=None):
+        return {
+            h.miner_id: h.mine_work_item(context, solution_number=solution_number)
+            for h in self._controller.miner_handles
+            if h._active_dispatch_id == 0
+        }
+
+
 def _bare_controller() -> SubstrateMinerController:
     """Controller without calling __init__ — for unit tests that only
     exercise a single method. Sets up the attributes that method needs."""
     c = SubstrateMinerController.__new__(SubstrateMinerController)
+    # T7: handle ops delegate to the scheduler; the stub reads the
+    # controller's mutable handle list / context map at call time.
+    # (`_dispatch_contexts` below is now test-only seed data the stub
+    # scheduler's dispatch_context resolves — the real map lives on the
+    # WorkScheduler.)
+    c._scheduler = _StubScheduler(c)
     # After the pool.get("rpc") removal: parent owns build_client (compose+
     # sign only) and pool_client (swap-aware reads + submit).
     c.build_client = MagicMock()
@@ -772,6 +817,7 @@ async def _live_controller(
         handle = MinerHandle(spec=spec)
 
     from substrate.pool import ValidatorPool
+    from substrate.work_scheduler import WorkScheduler
     pool = ValidatorPool(urls=[DEFAULT_URL])
     controller = SubstrateMinerController(
         pool=pool,
@@ -780,6 +826,16 @@ async def _live_controller(
         topology_hash=chain_topology_hash,
         core=core,
     )
+    # T7 wiring: the WorkScheduler owns the handle's drainer and all
+    # dispatch; the controller delegates (mirrors _build_scheduler_stack).
+    scheduler = WorkScheduler(
+        [handle],
+        on_pow_result=controller.enqueue_pow_result,
+        on_worker_message=controller.handle_worker_message,
+        provide_pow_context=controller.provide_pow_context,
+        on_fatal=lambda _hid, _reason: controller.shutdown(),
+    )
+    controller.attach_scheduler(scheduler)
 
     # Tests that use the yielded ``client`` (e.g., to query the chain
     # after a submission) need a direct SubstrateClient — the controller
@@ -787,6 +843,7 @@ async def _live_controller(
     # the swap-aware pool.
     client = SubstrateClient(urls=[DEFAULT_URL])
     await client.connect()
+    scheduler.start()
     run_task = asyncio.create_task(controller.run())
     try:
         # Yield after one scheduler tick so controller.run() has reached
@@ -808,6 +865,7 @@ async def _live_controller(
             logging.getLogger(__name__).exception(
                 "controller.run() raised during _live_controller teardown"
             )
+        await scheduler.stop()
         await client.close()
         await pool.shutdown()
         # When `core` owns the handle, let `core.close()` tear it down; the
@@ -999,6 +1057,41 @@ async def test_handle_result_cancels_siblings_on_ok(monkeypatch):
     assert winner.cancel_calls == 0  # don't cancel the winner
     assert sibling_a.cancel_calls == 1
     assert sibling_b.cancel_calls == 1
+
+
+async def test_won_work_sibling_cancel_spares_job_owned_handles(monkeypatch):
+    """T7 regression: post-cutover `miner_handles` is ALL handles, so the
+    won-work sibling cancel must route through the scheduler — a direct
+    handle.cancel() would steal an active mempool job's dispatches (burning
+    its single requeue; paid samples on opted-in QPU)."""
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+
+    winner = _FakeHandle("winner")
+    pow_sibling = _FakeHandle("pow-sibling")
+    job_handle = _FakeHandle("job-handle")
+    winner._active_dispatch_id = 1
+    pow_sibling._active_dispatch_id = 1
+    job_handle._active_dispatch_id = 1
+    controller.miner_handles = [winner, pow_sibling, job_handle]
+    controller._scheduler.job_owned = {"job-handle"}
+
+    async def fake_submit_proof(*args, **kwargs):
+        return ExtrinsicReceipt(extrinsic_hash="0xabc")  # OK
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+
+    envelope = _ResultEnvelope(
+        result=_mining_result(), context=ctx, handle_id="winner"
+    )
+    await controller._handle_result(envelope)
+
+    assert pow_sibling.cancel_calls == 1
+    assert job_handle.cancel_calls == 0  # the job's handle is spared
+    assert winner.cancel_calls == 0
 
 
 async def test_handle_result_redispatches_idle_handle_on_verify_mismatch(monkeypatch):

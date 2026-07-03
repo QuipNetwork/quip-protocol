@@ -49,12 +49,49 @@ quip-miner gpu --validator ws://127.0.0.1:9944 --gpu-backend local --signer-key 
 quip-miner gpu --validator ws://127.0.0.1:9944 --gpu-backend metal --signer-key ...
 quip-miner qpu --validator ws://127.0.0.1:9944 --daily-budget 30s --signer-key ...
 
-# Concurrent PoW + mempool in one process
-quip-miner cpu --validator ws://... --mode both --num-cpus 4 --signer-key ...
+# Multiple CPU workers (PoW + mempool jobs share the same workers)
+quip-miner cpu --validator ws://... --num-cpus 4 --signer-key ...
 
 # TOML config (see docker/quip-miner.cpu.toml, docker/quip-miner.cuda.toml)
 quip-miner cpu --config ./docker/quip-miner.cpu.toml
+
+# Production: run everything the config declares, supervised
+quip-miner --config ./docker/quip-miner.cpu.toml
+
+# Narrow a multi-backend config to one miner type (CLI-only; the
+# supervisor echoes which configured types were dropped)
+quip-miner --config config.toml --mode gpu
 ```
+
+Miner-type selection is CLI-only: the supervisor's `--mode cpu|gpu|qpu`
+keeps one configured type (warning about the dropped ones), and a
+direct `quip-miner cpu|gpu|qpu` run does the same narrowing with the
+same warning. There is no config key for it — a legacy `[miner] mode`
+key still loads but is ignored.
+
+**Mempool participation is config-only and per-miner** — `mempool` is
+an unquoted TOML bool set INSIDE each backend section
+(`[cpu] mempool = false`, `[gpu]`/`[metal]`/`[modal]`, or a qpu vendor
+section like `[dwave] mempool = true`); defaults: cpu/gpu on, qpu off —
+paid QPU samples are opt-in. A `mempool` key in `[miner]` is rejected
+at load time; `[miner] mempool_min_reward` (0 = accept all) stays
+global. There is no CLI flag for it and no mempool-only mode (`--mode`
+selects miner types, not the work source): every worker mines PoW
+continuously, mempool jobs preempt PoW on the same workers, and PoW
+resumes afterward. Solver
+registration is automatic at miner startup (query-first, never
+auto-deregisters — switching solver type requires an explicit
+`quip-miner deregister-solver` and restart). A mempool-fatal submit
+receipt parks the mempool side for the run while PoW mining continues.
+On a multi-backend config the mempool owner is derived from the
+per-section keys: an explicit `mempool = true` outranks default-on
+groups, then the first default-on group in canonical cpu,gpu,qpu order
+owns; every other child resolves mempool off from the same TOML (one
+substrate account can only register one solver type on chain). Set
+`mempool = false` in a section to move ownership to the next group.
+Nothing is transported out-of-band, so supervised, direct-subcommand,
+and `--mode`-narrowed runs all agree; the supervisor echoes the
+election so operators see why a child is pow-only.
 
 Live integration uses the docker-compose validator under `docker/`
 (`docker compose up quip-validator`); the validator listens on
@@ -250,18 +287,16 @@ on `dispatch_id`.
     writing into the same solution dir — that is not stale accretion, it
     is the same solution. Different solution number ⇒ different dir.
 
-- **`dispatch_id`** — an **internal-only** controller↔worker coordination
+- **`dispatch_id`** — an **internal-only** scheduler↔worker coordination
   handle: `_dispatch_contexts[(handle_id, dispatch_id)]`, cancel-ack
-  (`_await_handle_done`), and the preview channel (see `ARCHITECTURE.md`
+  (`_await_done_sentinel`), and the preview channel (see `ARCHITECTURE.md`
   §3.3). It is a process-local monotonic counter that **resets to 0 on
   restart**, so it collides across runs and MUST NOT be used as a durable
   or on-disk identity. Keep it in memory for pairing responses to
   contexts; never name persisted artifacts after it.
 
-The old `SubmissionLogger` `next_solution_id` local counter (persisted in
-`{base}/next_solution_id`) was a stand-in for the chain solution number
-and is misaligned with this model — replace it with the chain-derived
-solution number, do not extend it.
+The old `SubmissionLogger` `next_solution_id` local counter was removed;
+the on-disk archive is keyed by the chain-derived solution number.
 
 ## Code style
 

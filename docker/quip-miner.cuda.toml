@@ -17,10 +17,6 @@ validators = ["ws://127.0.0.1:9944"]
 # key lives here.
 signer_key = "/data/keystore.json"
 
-# Work source: "pow" (chain heads), "mempool" (QuantumComputeMempool
-# jobs), or "both".
-mode = "pow"
-
 # Optional faucet bot for auto-topup when the wallet is underfunded at
 # startup. Without it, an underfunded wallet fails fast with
 # `wallet-underfunded`.
@@ -49,8 +45,10 @@ rest_port = 8086
 # Backend inventory — the active section(s) below decide what this
 # container mines (see `quip-miner resolve-modes`). One worker process
 # per backend group. One [cuda.N] section per GPU; shared tuning goes
-# in [gpu].
+# in [gpu]. Mempool participation is per-miner, set in [gpu] for the
+# gpu group (defaults: cpu/gpu on, qpu off).
 # [gpu]
 # utilization = 100
 # yielding    = false
+# mempool     = false
 [cuda.0]

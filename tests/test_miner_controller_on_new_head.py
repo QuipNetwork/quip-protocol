@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from substrate.miner_controller import SubstrateMinerController
+from substrate.work_scheduler import WorkScheduler
 
 
 class _FakeMinerHandle:
@@ -49,6 +50,10 @@ def controller():
     handle = _FakeMinerHandle("miner-1")
     ctrl = SubstrateMinerController.__new__(SubstrateMinerController)
     ctrl.miner_handles = [handle]
+    # T7: all dispatch goes through the WorkScheduler. A real (unstarted)
+    # scheduler over the fake handle exercises the same dispatch_pow path
+    # production uses; no drainer tasks are needed for these guards.
+    ctrl._scheduler = WorkScheduler([handle])
     ctrl._current_work_key = None
     ctrl._last_logged_work_key = None
     ctrl._current_context = None

@@ -46,8 +46,8 @@ def _ctx(
 
 
 def _state_key(snapshot):
-    # 3-tuple matches the production state_key in both SubstrateMinerController
-    # and MempoolMinerController: ``block_hash`` ensures the event manager
+    # 3-tuple matches SubstrateMinerController's production state_key
+    # (shared with the mempool producer): ``block_hash`` ensures the event manager
     # fires on every block, so the silent-subscription bug surfaces as a
     # stalled poll-loop counter rather than a stale-threshold drift.
     return (

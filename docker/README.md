@@ -30,8 +30,8 @@ For Apple Silicon (Metal) GPU mining, run directly on macOS without Docker.
 
 `/data/config.toml` is the single source of truth. It is seeded from the
 image template on first run; edit it and restart the container to change
-anything — validators, mode, faucet, telemetry bind, identity
-(`node_name` / `public_host`), and the backend inventory. There are no
+anything — validators, mempool participation, faucet, telemetry bind,
+identity (`node_name` / `public_host`), and the backend inventory. There are no
 configuration env vars: the entrypoint prepares the volume, then execs
 `quip-miner --config /data/config.toml`, which spawns and supervises
 every process the config declares.
@@ -86,20 +86,47 @@ everything it declares:
    `quip-miner cpu`, `[gpu]`/`[cuda.N]`/`[metal]`/`[modal]` →
    `quip-miner gpu`, `[qpu]`/`[dwave]`/`[ibm]`/`[braket]`/`[pasqal]`/
    `[ionq]`/`[origin]` → `quip-miner qpu`. (The per-mode subcommands
-   remain available as test/ops tooling.)
+   remain available as test/ops tooling; invoked directly against a
+   multi-backend config they keep their own type and warn about the
+   dropped sections.)
 2. The telemetry aggregator is spawned when `rest_port > 0`.
 3. The built-in supervisor forwards SIGTERM/SIGINT to every child and
    tears down the container if any child exits.
 
+To run just one miner type from a multi-backend config, pass `--mode`
+— the entrypoint forwards container args to the supervisor:
+
+```bash
+docker run ... quip-miner-image --mode gpu
+# supervisor: --mode gpu keeps gpu only; dropping configured miner types: cpu
+```
+
+The selection is CLI-only; there is no config key for it (a legacy
+`[miner] mode` key still loads but is ignored). Mempool ownership
+stays config-derived: in the example above the gpu child mines pow
+only, because cpu owns the mempool per the config — set
+`[cpu] mempool = false` (or `[gpu] mempool = true`) to move ownership.
+
 The templates ship with an active default section (`[cpu]` on the cpu
 image, `[cuda.0]` on the cuda image), so what runs is always stated in
-the config. The work source (`pow` / `mempool` / `both`) comes from the
-`[miner] mode` key.
+the config. Every worker mines PoW continuously; mempool participation
+is config-only and per-miner: set `mempool = false` inside a backend
+section (`[cpu]`, `[gpu]`/`[metal]`/`[modal]`, or a qpu vendor section
+like `[dwave]`) to opt that miner out — defaults are cpu/gpu on, qpu
+off (paid samples; opt in with `[dwave] mempool = true`). On
+multi-backend configs the mempool owner is derived from those keys (an
+explicit `true` wins, then the first default-on group): the other
+children run pow-only, because one substrate account can only register
+one solver type on chain. The supervisor echoes the election; each
+child resolves its own participation from the same TOML, so nothing is
+passed out-of-band.
 
 Capability is probed from the installed libraries: a config asking for
 hardware the image can't run (e.g. `[cuda.0]` on the CPU image, which
 lacks `cupy`) is rejected with `unsupported-mode` before any child
-starts.
+starts. With `--mode`, only the kept type must be runnable — dropped
+sections are not probed, so `--mode cpu` boots the CPU image even if
+the config carries `[cuda.N]` for another host.
 
 ## Telemetry aggregation
 

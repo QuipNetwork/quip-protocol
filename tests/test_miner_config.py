@@ -12,7 +12,9 @@ from shared.miner_config import (
     SubmissionConfig,
     load_backend_config,
     load_miner_config,
+    group_mempool_value,
     load_submission_config,
+    mempool_owner_group,
     merge_config,
     present_backend_groups,
     validate_merged,
@@ -220,6 +222,100 @@ def test_load_only_alias_present_no_canonical(tmp_path):
     cfg = load_miner_config(p)
     assert cfg["rest_port"] == 8086
     assert "rest_host" not in cfg
+
+
+# ----------------------------------------------------------------------
+# mempool: per-backend-section key / [miner] mempool_min_reward
+# ----------------------------------------------------------------------
+
+
+def test_load_miner_mempool_key_rejected_with_pointer(tmp_path):
+    """`mempool` is a per-miner property, not a `[miner]` global — a
+    config still carrying the old key must fail loudly with the new
+    location, never silently flip participation."""
+    for literal in ("true", "false"):
+        p = tmp_path / f"mempool-{literal}.toml"
+        p.write_text(
+            f'[miner]\nvalidators = ["ws://a:9944"]\nmempool = {literal}\n'
+        )
+        with pytest.raises(MinerConfigError, match=r"backend section"):
+            load_miner_config(p)
+
+
+def test_group_mempool_value_reads_backend_sections():
+    """The key is read from the group's flat sections: [cpu], the [gpu]
+    defaults table (also metal/modal), and the qpu vendor sections."""
+    assert group_mempool_value({"cpu": {"mempool": False}}, "cpu") is False
+    assert group_mempool_value(
+        {"gpu": {"mempool": True}, "cuda": {"0": {}}}, "gpu"
+    ) is True
+    assert group_mempool_value({"dwave": {"mempool": True}}, "qpu") is True
+    assert group_mempool_value({"cpu": {"num_cpus": 2}}, "cpu") is None
+    assert group_mempool_value({"cuda": {"0": {}}}, "gpu") is None
+
+
+def test_group_mempool_value_rejects_non_bool():
+    """`mempool = "false"` is a truthy TOML string — reject loudly
+    instead of silently enabling mempool."""
+    with pytest.raises(MinerConfigError, match=r"mempool.*boolean"):
+        group_mempool_value({"cpu": {"mempool": "false"}}, "cpu")
+    with pytest.raises(MinerConfigError, match=r"mempool.*boolean"):
+        group_mempool_value({"dwave": {"mempool": 1}}, "qpu")
+
+
+def test_group_mempool_value_rejects_conflicts_within_group():
+    """Two sections of one group disagreeing is operator error, not a
+    precedence puzzle."""
+    backends = {"gpu": {"mempool": False}, "metal": {"mempool": True}}
+    with pytest.raises(MinerConfigError, match=r"conflict"):
+        group_mempool_value(backends, "gpu")
+
+
+def test_load_mempool_keys_absent_stay_absent(tmp_path):
+    """No default is injected at load time — effective-default resolution
+    is per backend group and happens downstream."""
+    p = tmp_path / "config.toml"
+    p.write_text('[miner]\nvalidators = ["ws://a:9944"]\n')
+    cfg = load_miner_config(p)
+    assert "mempool" not in cfg
+    assert "mempool_min_reward" not in cfg
+
+
+def test_load_mempool_min_reward_zero_and_positive_accepted(tmp_path):
+    for value in (0, 12345):
+        p = tmp_path / f"reward-{value}.toml"
+        p.write_text(
+            f'[miner]\nvalidators = ["ws://a:9944"]\nmempool_min_reward = {value}\n'
+        )
+        assert load_miner_config(p)["mempool_min_reward"] == value
+
+
+def test_load_mempool_min_reward_negative_rejected(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\nmempool_min_reward = -1\n'
+    )
+    with pytest.raises(MinerConfigError, match="non-negative"):
+        load_miner_config(p)
+
+
+def test_load_mempool_min_reward_bool_rejected(tmp_path):
+    # bool is an int subclass; reject so `mempool_min_reward = true` fails loud.
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\nmempool_min_reward = true\n'
+    )
+    with pytest.raises(MinerConfigError, match="integer"):
+        load_miner_config(p)
+
+
+def test_load_mempool_min_reward_string_rejected(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text(
+        '[miner]\nvalidators = ["ws://a:9944"]\nmempool_min_reward = "5"\n'
+    )
+    with pytest.raises(MinerConfigError, match="integer"):
+        load_miner_config(p)
 
 
 # ----------------------------------------------------------------------
@@ -558,80 +654,90 @@ def test_mode_names_matches_expected_subcommands():
 
 
 # ----------------------------------------------------------------------
-# Mempool + multi-backend fail-fast (W4a)
+# Multi-backend acceptance + mine_mode removal (T8)
 # ----------------------------------------------------------------------
 
 
-def test_resolve_modes_mempool_single_backend_ok():
-    """Single backend + --mine-mode mempool works as before — the
-    constraint only fires when there are multiple groups competing
-    for the same substrate-account solver registration."""
-    assert resolve_modes({"cpu": {"num_cpus": 4}}, mine_mode="mempool") == ["cpu"]
-    assert resolve_modes({"dwave": {}}, mine_mode="both") == ["qpu"]
+def test_resolve_modes_multi_backend_unconditional():
+    """Multi-backend configs resolve to every active group with no
+    mempool guard — the one-solver-type-per-account constraint is
+    handled by the config-derived owner election (`mempool_owner_group`;
+    non-owner children resolve mempool off from the same TOML), not by
+    mode resolution."""
+    assert resolve_modes({"cpu": {}, "dwave": {}}) == ["cpu", "qpu"]
+    backends = {"cpu": {}, "cuda": {"0": {}}, "dwave": {}}
+    assert resolve_modes(backends) == ["cpu", "gpu", "qpu"]
 
 
-def test_resolve_modes_pow_mode_allows_multi_backend():
-    """PoW path has no per-account solver registration — multi-backend
-    containers work fine and each child submits proofs independently."""
-    backends = {"cpu": {}, "dwave": {}}
-    assert resolve_modes(backends, mine_mode="pow") == ["cpu", "qpu"]
+def test_mempool_owner_group_defaults_to_first_non_qpu_configured():
+    """With no per-section `mempool` keys the owner is the first non-qpu
+    group in canonical cpu,gpu,qpu order — mempool defaults ON."""
+    assert mempool_owner_group({"cpu": {}, "cuda": {"0": {}}}) == "cpu"
+    assert mempool_owner_group({"cuda": {"0": {}}, "dwave": {}}) == "gpu"
+    assert mempool_owner_group({"cpu": {}}) == "cpu"
+    assert mempool_owner_group({"metal": {}}) == "gpu"
 
 
-def test_resolve_modes_no_mine_mode_skips_guard():
-    """When the caller doesn't pass --mine-mode (e.g. operator running
-    one-shot `quip-miner resolve-modes` without a PoW intent), the
-    multi-backend guard is skipped — the constraint belongs to
-    mempool, not to backend resolution itself."""
-    backends = {"cpu": {}, "dwave": {}}
-    assert resolve_modes(backends) == ["cpu", "qpu"]
+def test_mempool_owner_group_explicit_false_moves_ownership():
+    """`[cpu] mempool = false` hands the mempool to the next default-on
+    group — per-miner opt-out is the operator's control."""
+    assert mempool_owner_group(
+        {"cpu": {"mempool": False}, "cuda": {"0": {}}}
+    ) == "gpu"
+    assert mempool_owner_group({"cpu": {"mempool": False}}) is None
+    assert mempool_owner_group(
+        {"cpu": {"mempool": False}, "gpu": {"mempool": False},
+         "cuda": {"0": {}}}
+    ) is None
 
 
-def test_resolve_modes_mempool_multi_backend_rejected():
-    """The headline case — multi-backend config + --mine-mode mempool
-    must fail at launch with a clear code so the operator sees the
-    architectural constraint instead of getting silent
-    solver-registration failures from N-1 children at runtime."""
-    backends = {"cpu": {}, "dwave": {}}
-    with pytest.raises(ModeResolutionError) as excinfo:
-        resolve_modes(backends, mine_mode="mempool")
-    assert excinfo.value.code == "multi-backend-not-allowed-in-mempool-mode"
-    # Error names every group so the operator knows what to drop.
-    assert "cpu" in str(excinfo.value)
-    assert "dwave" in str(excinfo.value)
+def test_mempool_owner_group_explicit_true_beats_defaults():
+    """An explicit `mempool = true` states intent — it outranks groups
+    that are merely default-on, letting `[dwave] mempool = true` own the
+    mempool without also opting every other section out."""
+    assert mempool_owner_group(
+        {"cpu": {}, "dwave": {"mempool": True}}
+    ) == "qpu"
+    assert mempool_owner_group(
+        {"cpu": {}, "gpu": {"mempool": True}, "cuda": {"0": {}}}
+    ) == "gpu"
+    # Two explicit trues: canonical order breaks the tie.
+    assert mempool_owner_group(
+        {"cpu": {"mempool": True}, "gpu": {"mempool": True},
+         "cuda": {"0": {}}}
+    ) == "cpu"
 
 
-def test_resolve_modes_both_mode_multi_backend_rejected():
-    """--mine-mode both is a superset of mempool's constraint — also
-    rejected for multi-backend."""
-    backends = {"cpu": {}, "cuda": {"0": {}}}
-    with pytest.raises(ModeResolutionError) as excinfo:
-        resolve_modes(backends, mine_mode="both")
-    assert excinfo.value.code == "multi-backend-not-allowed-in-mempool-mode"
+def test_mempool_owner_group_none_for_qpu_only_or_empty():
+    """qpu-only configs elect nobody by default (paid samples are
+    opt-in: `[dwave] mempool = true` makes qpu the owner); empty
+    backends likewise."""
+    assert mempool_owner_group({"dwave": {}}) is None
+    assert mempool_owner_group({"ibm": {}, "dwave": {}}) is None
+    assert mempool_owner_group({}) is None
+    assert mempool_owner_group({"dwave": {"mempool": True}}) == "qpu"
 
 
-def test_resolve_modes_mempool_case_insensitive():
-    """`MEMPOOL` / `Both` / etc. all trigger the guard. Callers may pass
-    through whatever casing the operator wrote in the TOML `mode` key or
-    --mine-mode flag; the guard normalises rather than insisting on
-    lowercase."""
-    backends = {"cpu": {}, "dwave": {}}
-    for variant in ("MEMPOOL", "Mempool", "MeMpOoL", "BOTH", "Both"):
-        with pytest.raises(ModeResolutionError) as excinfo:
-            resolve_modes(backends, mine_mode=variant)
-        assert (
-            excinfo.value.code == "multi-backend-not-allowed-in-mempool-mode"
-        ), variant
+def test_resolve_modes_rejects_mine_mode_kwarg():
+    """The mine_mode parameter is gone with the [miner] mode key —
+    passing it is a caller bug, surfaced as a TypeError."""
+    with pytest.raises(TypeError):
+        resolve_modes({"cpu": {}}, mine_mode="mempool")
 
 
-def test_resolve_mode_singular_also_respects_mine_mode():
-    """The singular wrapper threads `mine_mode` through to the plural
-    impl so one-shot callers benefit from the same guard."""
-    with pytest.raises(ModeResolutionError) as excinfo:
-        resolve_mode({"cpu": {}, "dwave": {}}, mine_mode="mempool")
-    # Multi-backend triggers BOTH the mempool guard AND the
-    # single-mode rejection — the mempool one fires first since it's
-    # architecturally more specific.
-    assert excinfo.value.code == "multi-backend-not-allowed-in-mempool-mode"
+def test_resolve_mode_rejects_mine_mode_kwarg():
+    """The singular wrapper dropped mine_mode along with the plural."""
+    with pytest.raises(TypeError):
+        resolve_mode({"cpu": {}}, mine_mode="pow")
+
+
+def test_load_tolerates_stale_mode_key(tmp_path):
+    """Legacy configs may still carry the removed [miner] `mode` key;
+    the loader passes unknown keys through and nothing reads it."""
+    p = tmp_path / "config.toml"
+    p.write_text('[miner]\nvalidators = ["ws://a:9944"]\nmode = "mempool"\n')
+    cfg = load_miner_config(p)
+    assert cfg["validators"] == ["ws://a:9944"]
 
 
 # ----------------------------------------------------------------------
