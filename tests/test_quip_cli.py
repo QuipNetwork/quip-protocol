@@ -532,12 +532,40 @@ def test_quip_miner_qpu_mempool_explicit_true_opts_in(monkeypatch, tmp_path):
     assert captured.get("mempool_enabled") is True
 
 
-def test_quip_mempool_env_zero_force_disables(monkeypatch, tmp_path):
-    """QUIP_MEMPOOL=0 (supervisor owner election, T8) beats config."""
-    monkeypatch.setenv("QUIP_MEMPOOL", "0")
-    p = _mempool_toml(tmp_path, "mempool = true\n")
+def test_quip_miner_cpu_is_mempool_owner_on_multi_backend_config(
+    monkeypatch, tmp_path
+):
+    """cpu+gpu config: the mempool owner is derived from the config
+    itself (first non-qpu backend group) — the cpu child resolves ON."""
+    p = _mempool_toml(tmp_path, "[cpu]\nnum_cpus = 1\n[cuda.0]\n")
     captured = _capture_run(monkeypatch)
     result = CliRunner().invoke(quip_cli.quip_miner_cpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mempool_enabled") is True
+
+
+def test_quip_miner_gpu_non_owner_resolves_mempool_off(monkeypatch, tmp_path):
+    """Same cpu+gpu config, gpu child: cpu owns per the config-derived
+    election, so gpu resolves mempool OFF — identically whether the
+    child runs supervised, direct, or --mode-narrowed. No env var."""
+    p = _mempool_toml(tmp_path, "[cpu]\nnum_cpus = 1\n[cuda.0]\n")
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_gpu, ["--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert captured.get("mempool_enabled") is False
+
+
+def test_quip_miner_qpu_non_owner_even_with_mempool_true(
+    monkeypatch, tmp_path
+):
+    """cpu+dwave + mempool=true: cpu owns; the qpu child stays OFF —
+    `true` cannot lift one-solver-type-per-account."""
+    p = _mempool_toml(
+        tmp_path,
+        'mempool = true\n[cpu]\nnum_cpus = 1\n[dwave]\ndaily_budget = "60s"\n',
+    )
+    captured = _capture_run(monkeypatch)
+    result = CliRunner().invoke(quip_cli.quip_miner_qpu, ["--config", str(p)])
     assert result.exit_code == 0, result.output
     assert captured.get("mempool_enabled") is False
 
@@ -1424,61 +1452,61 @@ def test_plan_processes_rejects_backend_without_library(monkeypatch, tmp_path):
         quip_cli._plan_processes(cfg)
 
 
-# ── mempool owner election (T8): one substrate account = one solver ──
+# ── mempool owner election: config-derived, one account = one solver ──
 
 
-def _plan_with_all_supports(monkeypatch, cfg):
+def _plan_with_all_supports(monkeypatch, cfg, mode=None):
     """_plan_processes with every backend group importable; returns the
     per-mode env map for the miner children plus the raw proc list."""
     monkeypatch.setattr(
         quip_cli, "_detect_image_supports", lambda: ["cpu", "gpu", "qpu"]
     )
-    _runtime_dir, procs = quip_cli._plan_processes(cfg)
+    _runtime_dir, procs = quip_cli._plan_processes(cfg, mode=mode)
     envs = {p["args"][0]: p["env"] for p in procs if p["args"][0] != "telemetry"}
     return envs, procs
 
 
 def test_plan_processes_elects_cpu_owner_over_gpu(monkeypatch, tmp_path, capsys):
-    """cpu+gpu, mempool key absent → cpu owns mempool; the gpu child is
-    force-disabled via QUIP_MEMPOOL=0 while its telemetry glue survives,
-    and the telemetry aggregator itself is left alone. The election is
-    echoed — the operator's only visibility into why a child has
-    mempool off."""
+    """cpu+gpu, mempool key absent → cpu owns mempool by config
+    derivation. The supervisor injects NO env var — each child resolves
+    ownership from the same TOML — and echoes the election so operators
+    see why a child is pow-only. Telemetry glue is untouched."""
     cfg = _write_supervisor_toml(
         tmp_path, backend="[cpu]\nnum_cpus = 1\n[cuda.0]\n"
     )
     envs, procs = _plan_with_all_supports(monkeypatch, cfg)
-    assert "QUIP_MEMPOOL" not in envs["cpu"]
-    assert envs["gpu"]["QUIP_MEMPOOL"] == "0"
+    assert all("QUIP_MEMPOOL" not in p["env"] for p in procs)
     for mode in ("cpu", "gpu"):
         assert envs[mode]["QUIP_TELEMETRY_EXTERNAL"] == "1"
         assert "QUIP_RUNTIME_DIR" in envs[mode]
-    telemetry_env = next(p["env"] for p in procs if p["args"][0] == "telemetry")
-    assert "QUIP_MEMPOOL" not in telemetry_env
     out = capsys.readouterr().out
     assert "supervisor: mempool owner is cpu" in out
-    assert "gpu" in out
+    assert "pow-only: gpu" in out
 
 
-def test_plan_processes_three_backends_disables_all_non_owners(
-    monkeypatch, tmp_path
+def test_plan_processes_three_backends_reports_all_non_owners(
+    monkeypatch, tmp_path, capsys
 ):
-    """EVERY non-owner is disabled, not just one: cpu+gpu+qpu → cpu owns,
-    both gpu and qpu children get the force-off. Guards against a
-    disable-only-the-last-mode mutant that every 2-backend test passes."""
+    """EVERY non-owner is reported, not just one: cpu+gpu+qpu → cpu
+    owns, both gpu and qpu children are echoed pow-only. Guards against
+    a report-only-the-last-mode mutant that every 2-backend test
+    passes."""
     cfg = _write_supervisor_toml(
         tmp_path,
         backend='[cpu]\nnum_cpus = 1\n[cuda.0]\n[dwave]\ndaily_budget = "60s"\n',
     )
-    envs, _procs = _plan_with_all_supports(monkeypatch, cfg)
-    assert "QUIP_MEMPOOL" not in envs["cpu"]
-    assert envs["gpu"]["QUIP_MEMPOOL"] == "0"
-    assert envs["qpu"]["QUIP_MEMPOOL"] == "0"
+    _envs, procs = _plan_with_all_supports(monkeypatch, cfg)
+    assert all("QUIP_MEMPOOL" not in p["env"] for p in procs)
+    out = capsys.readouterr().out
+    assert "supervisor: mempool owner is cpu" in out
+    assert "pow-only: gpu, qpu" in out
 
 
-def test_plan_processes_election_independent_of_telemetry(monkeypatch, tmp_path):
-    """rest_port = -1 still elects: the force-off must not ride the
-    telemetry-glue branch of the env construction."""
+def test_plan_processes_election_independent_of_telemetry(
+    monkeypatch, tmp_path, capsys
+):
+    """rest_port = -1 still reports the election: the echo must not
+    ride the telemetry-glue branch, and children get NO env at all."""
     cfg = tmp_path / "config.toml"
     cfg.write_text(
         '[miner]\nvalidators = ["ws://localhost:9944"]\n'
@@ -1489,10 +1517,14 @@ def test_plan_processes_election_independent_of_telemetry(monkeypatch, tmp_path)
     envs, procs = _plan_with_all_supports(monkeypatch, cfg)
     assert all(p["args"][0] != "telemetry" for p in procs)
     assert envs["cpu"] == {}
-    assert envs["gpu"] == {"QUIP_MEMPOOL": "0"}
+    assert envs["gpu"] == {}
+    out = capsys.readouterr().out
+    assert "supervisor: mempool owner is cpu" in out
 
 
-def test_plan_processes_tolerates_stale_mode_key(monkeypatch, tmp_path):
+def test_plan_processes_tolerates_stale_mode_key(
+    monkeypatch, tmp_path, capsys
+):
     """A legacy volume's `mode = "pow"` is dead but harmless: the config
     loads, the supervisor plans, and the election still fires."""
     cfg = _write_supervisor_toml(
@@ -1502,40 +1534,52 @@ def test_plan_processes_tolerates_stale_mode_key(monkeypatch, tmp_path):
     )
     envs, _procs = _plan_with_all_supports(monkeypatch, cfg)
     assert set(envs) == {"cpu", "gpu"}
-    assert envs["gpu"]["QUIP_MEMPOOL"] == "0"
+    assert "supervisor: mempool owner is cpu" in capsys.readouterr().out
 
 
-def test_plan_processes_elects_gpu_owner_over_qpu(monkeypatch, tmp_path):
-    """gpu+qpu → gpu is the first non-qpu mode, so qpu is disabled."""
+def test_plan_processes_elects_gpu_owner_over_qpu(
+    monkeypatch, tmp_path, capsys
+):
+    """gpu+qpu → gpu is the first non-qpu mode; qpu is echoed pow-only."""
     cfg = _write_supervisor_toml(
         tmp_path, backend='[cuda.0]\n[dwave]\ndaily_budget = "60s"\n'
     )
-    envs, _procs = _plan_with_all_supports(monkeypatch, cfg)
-    assert "QUIP_MEMPOOL" not in envs["gpu"]
-    assert envs["qpu"]["QUIP_MEMPOOL"] == "0"
+    _envs, procs = _plan_with_all_supports(monkeypatch, cfg)
+    assert all("QUIP_MEMPOOL" not in p["env"] for p in procs)
+    out = capsys.readouterr().out
+    assert "supervisor: mempool owner is gpu" in out
+    assert "pow-only: qpu" in out
 
 
-def test_plan_processes_elects_cpu_owner_over_qpu(monkeypatch, tmp_path):
-    """cpu+qpu → cpu owns mempool, qpu child is disabled."""
+def test_plan_processes_elects_cpu_owner_over_qpu(
+    monkeypatch, tmp_path, capsys
+):
+    """cpu+qpu → cpu owns mempool; qpu is echoed pow-only."""
     cfg = _write_supervisor_toml(
         tmp_path, backend='[cpu]\nnum_cpus = 1\n[dwave]\ndaily_budget = "60s"\n'
     )
-    envs, _procs = _plan_with_all_supports(monkeypatch, cfg)
-    assert "QUIP_MEMPOOL" not in envs["cpu"]
-    assert envs["qpu"]["QUIP_MEMPOOL"] == "0"
+    _envs, _procs = _plan_with_all_supports(monkeypatch, cfg)
+    out = capsys.readouterr().out
+    assert "supervisor: mempool owner is cpu" in out
+    assert "pow-only: qpu" in out
 
 
-def test_plan_processes_single_backend_no_election(monkeypatch, tmp_path):
-    """A single miner child needs no election — no QUIP_MEMPOOL key on
-    any planned process."""
+def test_plan_processes_single_backend_no_election(
+    monkeypatch, tmp_path, capsys
+):
+    """A single miner child needs no election — no env key and no
+    election echo on any planned process."""
     cfg = _write_supervisor_toml(tmp_path)
     _envs, procs = _plan_with_all_supports(monkeypatch, cfg)
     assert all("QUIP_MEMPOOL" not in p["env"] for p in procs)
+    assert "mempool owner" not in capsys.readouterr().out
 
 
-def test_plan_processes_mempool_false_skips_election(monkeypatch, tmp_path):
+def test_plan_processes_mempool_false_skips_election(
+    monkeypatch, tmp_path, capsys
+):
     """Explicit `mempool = false` disables participation everywhere via
-    config; the supervisor adds no force-off env at all."""
+    config; the supervisor reports no election."""
     cfg = _write_supervisor_toml(
         tmp_path,
         extra_miner="mempool = false\n",
@@ -1543,19 +1587,39 @@ def test_plan_processes_mempool_false_skips_election(monkeypatch, tmp_path):
     )
     _envs, procs = _plan_with_all_supports(monkeypatch, cfg)
     assert all("QUIP_MEMPOOL" not in p["env"] for p in procs)
+    assert "mempool owner" not in capsys.readouterr().out
 
 
-def test_plan_processes_mempool_true_still_elects(monkeypatch, tmp_path):
+def test_plan_processes_mempool_true_still_elects(
+    monkeypatch, tmp_path, capsys
+):
     """`mempool = true` cannot lift the one-solver-type-per-account
-    constraint — election still disables every non-owner child."""
+    constraint — the election still reports every non-owner pow-only."""
     cfg = _write_supervisor_toml(
         tmp_path,
         extra_miner="mempool = true\n",
         backend='[cpu]\nnum_cpus = 1\n[dwave]\ndaily_budget = "60s"\n',
     )
-    envs, _procs = _plan_with_all_supports(monkeypatch, cfg)
-    assert "QUIP_MEMPOOL" not in envs["cpu"]
-    assert envs["qpu"]["QUIP_MEMPOOL"] == "0"
+    _envs, _procs = _plan_with_all_supports(monkeypatch, cfg)
+    out = capsys.readouterr().out
+    assert "supervisor: mempool owner is cpu" in out
+    assert "pow-only: qpu" in out
+
+
+def test_plan_processes_mode_non_owner_reports_config_owner(
+    monkeypatch, tmp_path, capsys
+):
+    """--mode gpu on a cpu+gpu config plans only the gpu child, but the
+    config still gives mempool to cpu — the echo tells the operator the
+    narrowed child mines pow only."""
+    cfg = _write_supervisor_toml(
+        tmp_path, backend="[cpu]\nnum_cpus = 1\n[cuda.0]\n"
+    )
+    _envs, procs = _plan_with_all_supports(monkeypatch, cfg, mode="gpu")
+    assert [p["args"][0] for p in procs] == ["telemetry", "gpu"]
+    out = capsys.readouterr().out
+    assert "supervisor: mempool owner is cpu" in out
+    assert "pow-only: gpu" in out
 
 
 def test_detect_image_supports_probes_imports(monkeypatch):
@@ -1591,10 +1655,12 @@ def test_plan_processes_mode_narrows_to_requested_type(
     assert "dropping configured miner types: cpu" in out
 
 
-def test_plan_processes_mode_skips_election(monkeypatch, tmp_path, capsys):
-    """Narrowing to one child means no owner election: the kept child
-    keeps its own mempool default (no QUIP_MEMPOOL force-off, no
-    election echo)."""
+def test_plan_processes_mode_on_owner_stays_quiet(
+    monkeypatch, tmp_path, capsys
+):
+    """--mode cpu keeps the config-derived mempool owner itself, so
+    nothing is pow-only and no election echo fires (and no env var —
+    ownership is never transported out-of-band)."""
     monkeypatch.setattr(
         quip_cli, "_detect_image_supports", lambda: ["cpu", "gpu", "qpu"]
     )

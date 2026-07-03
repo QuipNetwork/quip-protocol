@@ -13,6 +13,7 @@ from shared.miner_config import (
     load_backend_config,
     load_miner_config,
     load_submission_config,
+    mempool_owner_group,
     merge_config,
     present_backend_groups,
     validate_merged,
@@ -641,12 +642,30 @@ def test_mode_names_matches_expected_subcommands():
 
 def test_resolve_modes_multi_backend_unconditional():
     """Multi-backend configs resolve to every active group with no
-    mempool guard — the one-solver-type-per-account constraint is now
-    handled by supervisor owner election (QUIP_MEMPOOL=0 on non-owner
-    children), not by mode resolution."""
+    mempool guard — the one-solver-type-per-account constraint is
+    handled by the config-derived owner election (`mempool_owner_group`;
+    non-owner children resolve mempool off from the same TOML), not by
+    mode resolution."""
     assert resolve_modes({"cpu": {}, "dwave": {}}) == ["cpu", "qpu"]
     backends = {"cpu": {}, "cuda": {"0": {}}, "dwave": {}}
     assert resolve_modes(backends) == ["cpu", "gpu", "qpu"]
+
+
+def test_mempool_owner_group_is_first_non_qpu_configured():
+    """The mempool owner is a pure function of the config's backend
+    sections: first non-qpu group in canonical cpu,gpu,qpu order."""
+    assert mempool_owner_group({"cpu": {}, "cuda": {"0": {}}}) == "cpu"
+    assert mempool_owner_group({"cuda": {"0": {}}, "dwave": {}}) == "gpu"
+    assert mempool_owner_group({"cpu": {}}) == "cpu"
+    assert mempool_owner_group({"metal": {}}) == "gpu"
+
+
+def test_mempool_owner_group_none_for_qpu_only_or_empty():
+    """qpu-only configs elect nobody (per-kind default applies: opt-in
+    via explicit `mempool = true`); empty backends likewise."""
+    assert mempool_owner_group({"dwave": {}}) is None
+    assert mempool_owner_group({"ibm": {}, "dwave": {}}) is None
+    assert mempool_owner_group({}) is None
 
 
 def test_resolve_modes_rejects_mine_mode_kwarg():

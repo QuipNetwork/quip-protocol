@@ -58,6 +58,7 @@ from shared.miner_config import (
     load_miner_config,
     load_submission_config,
     load_toml,
+    mempool_owner_group,
     merge_config,
     present_backend_groups,
     resolve_mode,
@@ -823,12 +824,12 @@ def _plan_processes(
     type's child and echo the configured types that were dropped (see
     :func:`_narrow_backends_to_mode`).
 
-    Multi-backend plans elect a single mempool owner: one substrate
-    account can only register one solver type on chain, so unless the
-    config disables mempool outright (``[miner] mempool = false``),
-    the first non-qpu mode in canonical order keeps mempool and every
-    other miner child gets ``QUIP_MEMPOOL=0`` in its env (the force-off
-    each backend honors via ``_resolve_mempool_enabled``).
+    The mempool owner election is config-derived (see
+    :func:`shared.miner_config.mempool_owner_group` and
+    :func:`_resolve_mempool_enabled`): each child resolves its own
+    participation from the same TOML, so the supervisor injects nothing
+    — it only echoes the election so operators see why a child is
+    pow-only.
 
     ``runtime_dir`` (`<config dir>/runtime`) is internal glue: children
     write per-mode snapshots there and skip their in-process REST sibling;
@@ -838,6 +839,10 @@ def _plan_processes(
     raw = _load_or_fail(load_toml, str(config_path), None, {})
     miner_toml = _load_or_fail(load_miner_config, None, raw, {})
     backends = _load_backends_or_fail(None, raw=raw)
+    # Owner is derived from the FULL config, before --mode narrowing:
+    # a narrowed non-owner child still resolves mempool off from the
+    # same TOML, and the echo below is what tells the operator.
+    mempool_owner = mempool_owner_group(backends)
     if mode is not None:
         backends = _narrow_backends_to_mode(backends, mode)
     try:
@@ -848,17 +853,17 @@ def _plan_processes(
     except ModeResolutionError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    # Mempool owner election — `mempool` is validated bool-or-None at load.
+    # Election report — `mempool` is validated bool-or-None at load.
+    # Purely informational: children resolve ownership themselves via
+    # _resolve_mempool_enabled; nothing is transported out-of-band.
     mempool_value = miner_toml.get("mempool")
-    mempool_owner = None
-    if mempool_value is not False and len(modes) > 1:
-        mempool_owner = next((m for m in modes if m != "qpu"), None)
-        if mempool_owner is not None:
-            disabled = [m for m in modes if m != mempool_owner]
+    if mempool_value is not False and mempool_owner is not None:
+        pow_only = [m for m in modes if m != mempool_owner]
+        if pow_only:
             click.echo(
-                f"supervisor: mempool owner is {mempool_owner}; disabling "
-                f"mempool on {', '.join(disabled)} — one substrate account "
-                "can only register one solver type on chain"
+                f"supervisor: mempool owner is {mempool_owner}; pow-only: "
+                f"{', '.join(pow_only)} — one substrate account can only "
+                "register one solver type on chain"
             )
 
     runtime_dir = config_path.resolve().parent / "runtime"
@@ -873,15 +878,13 @@ def _plan_processes(
             ],
             "env": {},
         })
-    for mode in modes:
+    for child_mode in modes:
         env = {
             "QUIP_RUNTIME_DIR": str(runtime_dir),
             "QUIP_TELEMETRY_EXTERNAL": "1",
         } if telemetry_on else {}
-        if mempool_owner is not None and mode != mempool_owner:
-            env["QUIP_MEMPOOL"] = "0"
         procs.append({
-            "args": [mode, "--config", str(config_path)],
+            "args": [child_mode, "--config", str(config_path)],
             "env": env,
         })
     return runtime_dir, procs
@@ -2337,22 +2340,33 @@ async def _run_concurrent_miner(
             core.close()
 
 
-def _resolve_mempool_enabled(merged: dict, miner_kind: str) -> bool:
+def _resolve_mempool_enabled(
+    merged: dict, miner_kind: str, backends: dict
+) -> bool:
     """Effective `[miner] mempool` flag for this backend process.
 
-    - Explicit TOML value always wins (`mempool = false` is preserved by
-      the `is None` default machinery in :func:`_resolve_runtime_config`).
-    - When the key is absent, cpu/gpu default ON and qpu (any vendor kind
-      — `qpu`, `qpu_ibm`, ...) defaults OFF: QPU handles are never
-      preempted and every dispatched job costs paid QPU time, so QPU
-      participation is opt-in.
-    - Env `QUIP_MEMPOOL=0` force-disables regardless of config: the T8
-      supervisor owner-election sets it on every non-owner child so one
-      account never races two solver registrations.
+    Everything is derived from the config — no env var, no CLI flag:
+
+    - `mempool = false` always wins (preserved by the `is None` default
+      machinery in :func:`_resolve_runtime_config`).
+    - The config's backend sections elect ONE mempool owner (see
+      :func:`shared.miner_config.mempool_owner_group`): a child of any
+      other group resolves OFF, because one substrate account can only
+      register one solver type on chain. Supervised, direct-subcommand,
+      and `--mode`-narrowed runs of the same TOML therefore all agree.
+    - No owner (qpu-only or no backend sections, e.g. flag-driven runs):
+      per-kind default — cpu/gpu ON, qpu (any vendor kind — `qpu`,
+      `qpu_ibm`, ...) OFF, since QPU handles are never preempted and
+      every dispatched job costs paid QPU time. An explicit
+      `mempool = true` opts a lone QPU node in.
     """
-    if os.environ.get("QUIP_MEMPOOL", "").strip() == "0":
-        return False
     value = merged.get("mempool")
+    if value is False:
+        return False
+    group = "qpu" if miner_kind.startswith("qpu") else miner_kind
+    owner = mempool_owner_group(backends)
+    if owner is not None and group != owner:
+        return False
     if value is None:
         return not miner_kind.startswith("qpu")
     return bool(value)
@@ -2464,7 +2478,9 @@ def _dispatch_mining_command(
         public_port=merged.get("public_port"),
         node_log=merged.get("node_log"),
         submission_config=_load_submission_config_or_default(None, raw=raw),
-        mempool_enabled=_resolve_mempool_enabled(merged, miner_kind),
+        mempool_enabled=_resolve_mempool_enabled(
+            merged, miner_kind, _load_backends_or_fail(None, raw=raw)
+        ),
         mempool_min_reward=int(merged.get("mempool_min_reward") or 0),
     )))
 

@@ -79,8 +79,13 @@ registration is automatic at miner startup (query-first, never
 auto-deregisters — switching solver type requires an explicit
 `quip-miner deregister-solver` and restart). A mempool-fatal submit
 receipt parks the mempool side for the run while PoW mining continues.
-`QUIP_MEMPOOL=0` is the supervisor's mempool-owner-election force-off
-for non-owner children, not an operator knob.
+On a multi-backend config the mempool owner is derived from the config
+itself — the first non-qpu backend group in canonical cpu,gpu,qpu
+order owns; every other child resolves mempool off from the same TOML
+(one substrate account can only register one solver type on chain).
+Nothing is transported out-of-band, so supervised, direct-subcommand,
+and `--mode`-narrowed runs all agree; the supervisor echoes the
+election so operators see why a child is pow-only.
 
 Live integration uses the docker-compose validator under `docker/`
 (`docker compose up quip-validator`); the validator listens on

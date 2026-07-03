@@ -198,11 +198,13 @@ cpu/gpu ON, qpu OFF — paid samples are opt-in) and
 `[miner] mempool_min_reward`. There is no mempool-only operation mode
 and no CLI flag for the work source (the supervisor's
 `--mode cpu|gpu|qpu` selects miner *types*, not what they mine).
-`QUIP_MEMPOOL=0` force-disables mempool in a child; the
-supervisor's owner election sets it on every non-owner child of a
-multi-backend config (first non-qpu mode in canonical cpu,gpu,qpu
-order) because one substrate account can register only ONE solver type
-on chain — it is not an operator knob. Guard D+
+On a multi-backend config the mempool owner is config-derived
+(`shared/miner_config.py:mempool_owner_group`: first non-qpu backend
+group in canonical cpu,gpu,qpu order) because one substrate account
+can register only ONE solver type on chain; every non-owner child
+resolves mempool off from the same TOML — no env var, so supervised,
+direct-subcommand, and `--mode` runs agree, and the supervisor merely
+echoes the election. Guard D+
 (`substrate/solver_registration.py:ensure_solver_registered`)
 auto-registers the solver at startup: query-first (idempotent),
 race-tolerant, and it NEVER auto-deregisters — switching solver type

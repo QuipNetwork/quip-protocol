@@ -285,6 +285,26 @@ def present_backend_groups(backends: Mapping[str, Any]) -> dict[str, list[str]]:
 MODE_NAMES: tuple[str, ...] = ("cpu", "gpu", "qpu")
 
 
+def mempool_owner_group(backends: Mapping[str, Any]) -> Optional[str]:
+    """The one backend group whose child participates in the mempool.
+
+    A pure function of the config's backend sections: the first non-qpu
+    group in canonical cpu,gpu,qpu order. One substrate account can only
+    register one solver type on chain, so on a multi-group config every
+    other child resolves mempool off — derived from the same TOML, with
+    no out-of-band transport, so supervised, direct-subcommand, and
+    ``--mode``-narrowed runs all agree.
+
+    Returns ``None`` when no non-qpu group is configured (qpu-only or
+    empty backends): no election, the per-kind default applies (qpu is
+    opt-in via an explicit ``[miner] mempool = true``).
+    """
+    groups = present_backend_groups(backends)
+    return next(
+        (g for g in MODE_NAMES if g != "qpu" and groups[g]), None
+    )
+
+
 class ModeResolutionError(MinerConfigError):
     """Operator-actionable problem in `resolve_mode`.
 
