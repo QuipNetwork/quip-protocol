@@ -899,10 +899,10 @@ async def test_mempool_disable_parks_but_pow_continues_live(tmp_path):
 
 @pytest.mark.timeout(120)
 async def test_one_account_one_solver_type_live(tmp_path):
-    """One account, one solver type: a second child electing a different
-    kind degrades to TYPE_MISMATCH (returned, not raised) and the original
-    registration stays intact — the live proof that a mis-elected child
-    can't crash the node or clobber the owner's registration."""
+    """One account, one solver type: config is the source of truth. A boot
+    electing a different kind retypes the on-chain registration in place
+    (deregister + register, returned as RETYPED, never raised) — the live
+    proof that a stale registration converges without operator repair."""
     client = SubstrateClient(url=DEFAULT_URL)
     await client.connect()
     try:
@@ -912,10 +912,10 @@ async def test_one_account_one_solver_type_live(tmp_path):
         assert first is SolverGuardOutcome.REGISTERED
 
         second = await ensure_solver_registered(client, keystore.signer, "gpu")
-        assert second is SolverGuardOutcome.TYPE_MISMATCH
+        assert second is SolverGuardOutcome.RETYPED
 
         info = await client.query_solver(keystore.signer.account_id_bytes())
-        assert info is not None, "original registration must survive the mismatch"
-        assert info.solver_type == MinerType.CPU
+        assert info is not None, "registration must exist after the retype"
+        assert info.solver_type == MinerType.GPU
     finally:
         await client.close()

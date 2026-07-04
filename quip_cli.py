@@ -1435,21 +1435,13 @@ def quip_miner_register_solver(
             outcome = await ensure_solver_registered(client, keystore.signer, miner_type)
         finally:
             await client.close()
-        if outcome is SolverGuardOutcome.TYPE_MISMATCH:
-            click.echo(
-                "solver already registered with a different type; "
-                f"deregister first to change to {mt.name}",
-                err=True,
-            )
-            return 4
         if outcome is SolverGuardOutcome.FAILED:
             click.echo("register_solver failed (see log for details)", err=True)
             return 3
-        verb = (
-            "already registered"
-            if outcome is SolverGuardOutcome.ALREADY_REGISTERED
-            else "registered"
-        )
+        verb = {
+            SolverGuardOutcome.ALREADY_REGISTERED: "already registered",
+            SolverGuardOutcome.RETYPED: "retyped",
+        }.get(outcome, "registered")
         click.echo(f"{verb} as {mt.name}")
         return 0
 
@@ -1806,8 +1798,8 @@ async def _run_startup_guards(
     await _ensure_registered_or_fail(client, keystore)
 
     # Guard D+ — mempool solver registered (query-first, race-tolerant,
-    # never auto-deregisters). Runs only when mempool is enabled; funding
-    # from Guard C covers the fee-scale cost.
+    # retypes a stale registration to the configured kind). Runs only when
+    # mempool is enabled; funding from Guard C covers the fee-scale cost.
     if mempool_enabled:
         mempool_enabled = await _ensure_solver_or_disable_mempool(
             client, keystore, miner_kind,
@@ -1835,10 +1827,11 @@ async def _ensure_solver_or_disable_mempool(
     """Guard D+ — non-fatal solver registration for mempool participation.
 
     Returns True when the account is (now) registered with the matching
-    vendor-resolved type. FAILED / TYPE_MISMATCH — and any unexpected
-    exception — log loudly and return False (mempool disabled for this
-    run; pow proceeds). Never raises: unlike Guard D, a failure here must
-    not stop pow mining.
+    vendor-resolved type — including RETYPED, where the guard converged a
+    stale-type registration to the configured kind. FAILED — and any
+    unexpected exception — logs loudly and returns False (mempool disabled
+    for this run; pow proceeds). Never raises: unlike Guard D, a failure
+    here must not stop pow mining.
     """
     try:
         outcome = await ensure_solver_registered(
@@ -1854,15 +1847,14 @@ async def _ensure_solver_or_disable_mempool(
     if outcome in (
         SolverGuardOutcome.REGISTERED,
         SolverGuardOutcome.ALREADY_REGISTERED,
+        SolverGuardOutcome.RETYPED,
     ):
         click.echo(f"mempool solver guard: {outcome.value} ({miner_kind})")
         return True
     click.echo(
         f"mempool DISABLED for this run: solver registration guard "
         f"returned {outcome.name} (kind={miner_kind}) — pow mining "
-        "continues. TYPE_MISMATCH needs an explicit "
-        "`quip-miner deregister-solver` + re-register; FAILED is usually "
-        "an RPC/chain error (see log).",
+        "continues. Usually an RPC/chain error (see log).",
         err=True,
     )
     return False

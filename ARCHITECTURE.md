@@ -209,8 +209,9 @@ no env var, so supervised, direct-subcommand, and `--mode` runs agree,
 and the supervisor merely echoes the election. Guard D+
 (`substrate/solver_registration.py:ensure_solver_registered`)
 auto-registers the solver at startup: query-first (idempotent),
-race-tolerant, and it NEVER auto-deregisters — switching solver type
-requires an explicit `quip-miner deregister-solver` and restart. Guard
+race-tolerant, and it retypes a stale registration to the configured
+kind (config is the source of truth; the on-chain solver stats counters
+reset, accepted because they are write-only bookkeeping). Guard
 failure is non-fatal: mempool is disabled for the run and pow proceeds.
 
 ### 2.4 CLI orchestration (`quip_cli.py:_run_concurrent_miner`)

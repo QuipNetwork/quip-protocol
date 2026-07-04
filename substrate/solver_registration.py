@@ -11,12 +11,17 @@ branch:
   - Query-first: `register_solver` is not idempotent on-chain (a repeat
     call fails with `SolverAlreadyRegistered` and still burns a fee), so a
     matching registration is confirmed via `query_solver` with no extrinsic.
-  - Race-tolerant: sibling children share one signer account; if the
+  - Race-tolerant: sibling children share one signer account; if an
     extrinsic loses a registration race, re-query and accept a matching
-    type as success.
-  - Never deregisters: `deregister_solver` resets on-chain solver stats,
-    and two children wanting different types would ping-pong registrations
-    every boot. A type mismatch is reported, never "fixed".
+    type as success. Siblings always want the SAME type — the config
+    elects one mempool owner group per account.
+  - Retypes on mismatch: the config is the source of truth for the solver
+    type, so a stale registration (e.g. the owner group moved from CPU to
+    GPU) is converged via deregister + register. The pallet has no
+    update-in-place call, so this resets the on-chain
+    `solutions_submitted`/`rewards_earned` counters — accepted, because
+    the pallet only ever increments them (dashboard bookkeeping, never
+    read for eligibility or payout).
 """
 from __future__ import annotations
 
@@ -36,41 +41,28 @@ logger = get_logger("solver_registration")
 # Matched by substring against the extrinsic receipt error, mirroring the
 # classifier convention in `substrate.mempool_submitter`.
 _RACE_ERROR = "SolverAlreadyRegistered"
+_DEREGISTER_RACE_ERROR = "SolverNotRegistered"
 
 
 class SolverGuardOutcome(Enum):
     """Result of the Guard D+ registration check.
 
-    ALREADY_REGISTERED / REGISTERED are success; TYPE_MISMATCH means the
-    account is registered under a different `MinerType` (operator must
-    `deregister-solver` explicitly); FAILED covers RPC/chain errors and
-    non-race extrinsic failures.
+    ALREADY_REGISTERED / REGISTERED / RETYPED are success (RETYPED means a
+    stale-type registration was converged to the configured kind); FAILED
+    covers RPC/chain errors, non-race extrinsic failures, and an active
+    conflicting writer detected mid-boot.
     """
 
     ALREADY_REGISTERED = "already_registered"
     REGISTERED = "registered"
-    TYPE_MISMATCH = "type_mismatch"
+    RETYPED = "retyped"
     FAILED = "failed"
-
-
-def _match_or_mismatch(existing: MinerType, target: MinerType) -> SolverGuardOutcome:
-    if existing == target:
-        logger.info("solver guard: already registered as %s", target.name)
-        return SolverGuardOutcome.ALREADY_REGISTERED
-    logger.error(
-        "solver guard: account registered as %s but this process wants %s; "
-        "run `quip-miner deregister-solver` and re-register to change types "
-        "(the guard never auto-deregisters — that resets on-chain solver stats)",
-        existing.name,
-        target.name,
-    )
-    return SolverGuardOutcome.TYPE_MISMATCH
 
 
 async def ensure_solver_registered(
     client: SubstrateClient, signer: Signer, miner_kind: str
 ) -> SolverGuardOutcome:
-    """Verify or create ``signer``'s solver registration for ``miner_kind``.
+    """Verify, create, or retype ``signer``'s solver registration.
 
     ``miner_kind`` must be the vendor-resolved kind (e.g. ``qpu_ibm``), not
     the backend-group name, so the registered ``MinerType`` matches what job
@@ -86,8 +78,80 @@ async def ensure_solver_registered(
         logger.exception("solver guard: query_solver failed")
         return SolverGuardOutcome.FAILED
     if existing is not None:
-        return _match_or_mismatch(existing.solver_type, target)
+        if existing.solver_type == target:
+            logger.info("solver guard: already registered as %s", target.name)
+            return SolverGuardOutcome.ALREADY_REGISTERED
+        return await _retype(client, signer, account, existing.solver_type, target)
 
+    return await _register(
+        client,
+        signer,
+        account,
+        target,
+        on_success=SolverGuardOutcome.REGISTERED,
+        on_race_match=SolverGuardOutcome.ALREADY_REGISTERED,
+    )
+
+
+async def _retype(
+    client: SubstrateClient,
+    signer: Signer,
+    account: bytes,
+    existing: MinerType,
+    target: MinerType,
+) -> SolverGuardOutcome:
+    """Converge a stale-type registration to ``target`` (deregister + register)."""
+    logger.warning(
+        "solver guard: retyping registration %s -> %s (config is the source "
+        "of truth; on-chain solutions_submitted/rewards_earned counters reset)",
+        existing.name,
+        target.name,
+    )
+    try:
+        receipt = await client.deregister_solver(signer)
+    except Exception:  # noqa: BLE001 — chain-side failure must not escape
+        logger.exception("solver guard: deregister_solver submit failed")
+        return SolverGuardOutcome.FAILED
+    if receipt.error is not None:
+        if _DEREGISTER_RACE_ERROR not in receipt.error:
+            logger.error(
+                "solver guard: deregister_solver failed: %s", receipt.error
+            )
+            return SolverGuardOutcome.FAILED
+        # A sibling child already deregistered the stale type between our
+        # query and our extrinsic — proceed straight to registration.
+        logger.info(
+            "solver guard: %s during retype — sibling already deregistered",
+            _DEREGISTER_RACE_ERROR,
+        )
+
+    return await _register(
+        client,
+        signer,
+        account,
+        target,
+        on_success=SolverGuardOutcome.RETYPED,
+        on_race_match=SolverGuardOutcome.RETYPED,
+    )
+
+
+async def _register(
+    client: SubstrateClient,
+    signer: Signer,
+    account: bytes,
+    target: MinerType,
+    *,
+    on_success: SolverGuardOutcome,
+    on_race_match: SolverGuardOutcome,
+) -> SolverGuardOutcome:
+    """Submit ``register_solver`` with race tolerance.
+
+    ``on_success`` is returned when our extrinsic lands; ``on_race_match``
+    when a sibling won the race but re-query shows the matching type. A
+    race followed by a NON-matching type means an active conflicting
+    writer on this account — FAILED, never fought in real time (the next
+    boot's query-first path retypes calmly).
+    """
     try:
         receipt = await client.register_solver(signer, target)
     except Exception:  # noqa: BLE001 — chain-side failure must not escape
@@ -95,12 +159,13 @@ async def ensure_solver_registered(
         return SolverGuardOutcome.FAILED
     if receipt.error is None:
         logger.info(
-            "solver guard: registered as %s (extrinsic=%s, block=%s)",
+            "solver guard: %s as %s (extrinsic=%s, block=%s)",
+            on_success.value,
             target.name,
             receipt.extrinsic_hash,
             receipt.block_hash,
         )
-        return SolverGuardOutcome.REGISTERED
+        return on_success
 
     if _RACE_ERROR in receipt.error:
         # A sibling child on the same account won the race between our
@@ -110,12 +175,26 @@ async def ensure_solver_registered(
         except Exception:  # noqa: BLE001 — chain-side failure must not escape
             logger.exception("solver guard: re-query after registration race failed")
             return SolverGuardOutcome.FAILED
-        if raced is not None:
-            return _match_or_mismatch(raced.solver_type, target)
+        if raced is None:
+            logger.error(
+                "solver guard: %s but re-query found no solver — inconsistent "
+                "chain view (concurrent deregister?)",
+                _RACE_ERROR,
+            )
+            return SolverGuardOutcome.FAILED
+        if raced.solver_type == target:
+            logger.info(
+                "solver guard: lost registration race to a sibling with "
+                "matching type %s",
+                target.name,
+            )
+            return on_race_match
         logger.error(
-            "solver guard: %s but re-query found no solver — inconsistent "
-            "chain view (concurrent deregister?)",
-            _RACE_ERROR,
+            "solver guard: lost registration race to a writer holding %s "
+            "while this process wants %s — conflicting process on this "
+            "account (one account = one solver type)",
+            raced.solver_type.name,
+            target.name,
         )
         return SolverGuardOutcome.FAILED
 

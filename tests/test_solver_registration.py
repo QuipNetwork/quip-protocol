@@ -2,8 +2,9 @@
 
 MEMPOOL_PRIORITY_PLAN.md §8: query-first (matching registration costs no
 extrinsic), vendor-resolved MinerType, SolverAlreadyRegistered race
-tolerance, never-deregister, and non-fatal RPC/chain failures. Also covers
-the refactored `register-solver` CLI outcome → exit-code mapping (0/4/3).
+tolerance, auto-retype on mismatch (config is the source of truth), and
+non-fatal RPC/chain failures. Also covers the refactored `register-solver`
+CLI outcome → exit-code mapping (0/3).
 """
 from __future__ import annotations
 
@@ -43,11 +44,11 @@ def _receipt(error: str | None = None) -> ExtrinsicReceipt:
     return ExtrinsicReceipt(extrinsic_hash="0xabc", block_hash="0xdef", error=error)
 
 
-def _client(query_solver=None, register_solver=None) -> MagicMock:
+def _client(query_solver=None, register_solver=None, deregister_solver=None) -> MagicMock:
     client = MagicMock()
     client.query_solver = query_solver or AsyncMock(return_value=None)
     client.register_solver = register_solver or AsyncMock(return_value=_receipt())
-    client.deregister_solver = AsyncMock()
+    client.deregister_solver = deregister_solver or AsyncMock(return_value=_receipt())
     return client
 
 
@@ -76,12 +77,77 @@ async def test_unregistered_registers_vendor_resolved_type():
     client.register_solver.assert_awaited_once_with(signer, MinerType.QPU_IBM)
 
 
-async def test_pre_existing_mismatch_is_type_mismatch_without_deregister():
+async def test_pre_existing_mismatch_retypes_registration():
+    # Config is the source of truth: a stale type (e.g. the mempool owner
+    # group moved from CPU to GPU) is converged on boot via
+    # deregister + register, not reported for manual repair.
+    signer = _signer()
     client = _client(query_solver=AsyncMock(return_value=_solver_info(MinerType.CPU)))
+    outcome = await ensure_solver_registered(client, signer, "gpu")
+    assert outcome is SolverGuardOutcome.RETYPED
+    client.deregister_solver.assert_awaited_once_with(signer)
+    client.register_solver.assert_awaited_once_with(signer, MinerType.GPU)
+
+
+async def test_retype_deregister_receipt_error_returns_failed_without_register():
+    client = _client(
+        query_solver=AsyncMock(return_value=_solver_info(MinerType.CPU)),
+        deregister_solver=AsyncMock(return_value=_receipt("Token.FundsUnavailable")),
+    )
     outcome = await ensure_solver_registered(client, _signer(), "gpu")
-    assert outcome is SolverGuardOutcome.TYPE_MISMATCH
+    assert outcome is SolverGuardOutcome.FAILED
     client.register_solver.assert_not_awaited()
-    client.deregister_solver.assert_not_awaited()
+
+
+async def test_retype_deregister_exception_returns_failed():
+    client = _client(
+        query_solver=AsyncMock(return_value=_solver_info(MinerType.CPU)),
+        deregister_solver=AsyncMock(side_effect=TimeoutError("no receipt")),
+    )
+    outcome = await ensure_solver_registered(client, _signer(), "gpu")
+    assert outcome is SolverGuardOutcome.FAILED
+    client.register_solver.assert_not_awaited()
+
+
+async def test_retype_deregister_race_not_registered_proceeds():
+    # A sibling child already deregistered the stale type between our query
+    # and our extrinsic — treat SolverNotRegistered as success and register.
+    client = _client(
+        query_solver=AsyncMock(return_value=_solver_info(MinerType.CPU)),
+        deregister_solver=AsyncMock(
+            return_value=_receipt("quantumComputeMempool.SolverNotRegistered")
+        ),
+    )
+    outcome = await ensure_solver_registered(client, _signer(), "gpu")
+    assert outcome is SolverGuardOutcome.RETYPED
+    client.register_solver.assert_awaited_once()
+
+
+async def test_retype_register_race_requery_matching_is_retyped():
+    # After our deregister, a sibling (which always wants the same type)
+    # won the re-register race — re-query and accept the matching type.
+    client = _client(
+        query_solver=AsyncMock(
+            side_effect=[_solver_info(MinerType.CPU), _solver_info(MinerType.GPU)]
+        ),
+        register_solver=AsyncMock(return_value=_receipt(RACE_ERROR)),
+    )
+    outcome = await ensure_solver_registered(client, _signer(), "gpu")
+    assert outcome is SolverGuardOutcome.RETYPED
+    assert client.query_solver.await_count == 2
+
+
+async def test_retype_register_race_requery_mismatch_returns_failed():
+    # Re-query after the race shows a THIRD type — an active conflicting
+    # writer (foreign process on the same signer). Don't fight it live.
+    client = _client(
+        query_solver=AsyncMock(
+            side_effect=[_solver_info(MinerType.CPU), _solver_info(MinerType.QPU_DWAVE)]
+        ),
+        register_solver=AsyncMock(return_value=_receipt(RACE_ERROR)),
+    )
+    outcome = await ensure_solver_registered(client, _signer(), "gpu")
+    assert outcome is SolverGuardOutcome.FAILED
 
 
 async def test_registration_race_requery_matching_is_already_registered():
@@ -97,13 +163,17 @@ async def test_registration_race_requery_matching_is_already_registered():
     client.deregister_solver.assert_not_awaited()
 
 
-async def test_registration_race_requery_mismatch_is_type_mismatch_no_deregister():
+async def test_registration_race_requery_mismatch_is_failed_no_deregister():
+    # We queried None, lost the register race, and the winner holds a
+    # DIFFERENT type: an active conflicting writer registered mid-boot.
+    # Retyping now would fight it in real time — FAILED; the next boot's
+    # query-first path converges the type calmly.
     client = _client(
         query_solver=AsyncMock(side_effect=[None, _solver_info(MinerType.GPU)]),
         register_solver=AsyncMock(return_value=_receipt(RACE_ERROR)),
     )
     outcome = await ensure_solver_registered(client, _signer(), "cpu")
-    assert outcome is SolverGuardOutcome.TYPE_MISMATCH
+    assert outcome is SolverGuardOutcome.FAILED
     client.deregister_solver.assert_not_awaited()
 
 
@@ -176,7 +246,7 @@ def _invoke_register_solver(monkeypatch, outcome: SolverGuardOutcome):
     [
         (SolverGuardOutcome.ALREADY_REGISTERED, 0),
         (SolverGuardOutcome.REGISTERED, 0),
-        (SolverGuardOutcome.TYPE_MISMATCH, 4),
+        (SolverGuardOutcome.RETYPED, 0),
         (SolverGuardOutcome.FAILED, 3),
     ],
 )

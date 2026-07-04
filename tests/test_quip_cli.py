@@ -2291,6 +2291,7 @@ def test_guard_dplus_success_keeps_mempool_enabled(monkeypatch):
         _guard_dplus(monkeypatch, SolverGuardOutcome.ALREADY_REGISTERED)
         is True
     )
+    assert _guard_dplus(monkeypatch, SolverGuardOutcome.RETYPED) is True
 
 
 def test_guard_dplus_failed_disables_mempool_without_raising(monkeypatch, capsys):
@@ -2302,13 +2303,17 @@ def test_guard_dplus_failed_disables_mempool_without_raising(monkeypatch, capsys
     assert "mempool DISABLED" in capsys.readouterr().err
 
 
-def test_guard_dplus_type_mismatch_disables_mempool(monkeypatch, capsys):
+def test_guard_dplus_failed_message_has_no_manual_repair_instruction(
+    monkeypatch, capsys
+):
+    # Type mismatches are auto-retyped now; the only remaining failure
+    # outcome is FAILED (RPC/chain), so the message must not send the
+    # operator to `deregister-solver` for it.
     from substrate.solver_registration import SolverGuardOutcome
 
-    assert _guard_dplus(monkeypatch, SolverGuardOutcome.TYPE_MISMATCH) is False
+    assert _guard_dplus(monkeypatch, SolverGuardOutcome.FAILED) is False
     err = capsys.readouterr().err
-    assert "TYPE_MISMATCH" in err
-    assert "deregister-solver" in err
+    assert "deregister-solver" not in err
 
 
 def test_guard_dplus_unexpected_exception_disables_mempool(monkeypatch, capsys):
