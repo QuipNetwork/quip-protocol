@@ -5,8 +5,9 @@ the float-to-milli boundary — stays reviewable independently of the RPC
 plumbing. Phase 4's controller orchestrates: it calls into here, but neither
 the client nor the controller knows about the proof shape.
 
-Post-MR-!20: the on-chain ``QuantumProof`` carries only
-``{topology_hash, nonce (U256), salt ([u8; 32]), solutions (BoundedVec<BoundedVec<u8>>)}``.
+Post-MR-!20: the on-chain ``QuantumProof`` carries
+``{topology_hash, nonce (U256), salt ([u8; 32]), solutions (BoundedVec<BoundedVec<u8>>),
+device_access_time_us (u64)}``.
 Nodes, edges, and h-values are looked up from ``RegisteredTopologies`` by
 ``topology_hash``. Each solution is bit-packed under the registered
 ``allowed_spin_values`` spec (1 byte per 8 binary spins).
@@ -116,8 +117,9 @@ def encode_quantum_proof(
 ) -> dict:
     """Build the `QuantumProof` payload expected by `QuantumPow.submit_proof`.
 
-    The returned dict matches the post-MR-!20 SCALE struct field-for-field —
-    ``compose_call`` serializes it for us.
+    The returned dict matches the spec-111 SCALE struct field-for-field —
+    ``compose_call`` serializes it for us. Fields: ``topology_hash``,
+    ``nonce``, ``salt``, ``solutions``, ``device_access_time_us (u64)``.
 
     Each solution is bit-packed against ``context.allowed_spin_values`` via
     :func:`shared.packed_solution.pack_solution`. For the default binary
@@ -164,6 +166,10 @@ def encode_quantum_proof(
         "nonce": int.from_bytes(result.nonce, "big"),
         "salt": [int(b) for b in result.salt],
         "solutions": ([([int(b) for b in packed],) for packed in packed_solutions],),
+        # Always included: scalecodec's Struct.process_encode iterates the
+        # CHAIN metadata's field list, so a pre-111 node ignores this key
+        # and a 111 node requires it. No spec-version gating needed.
+        "device_access_time_us": int(result.device_access_time_us or 0),
     }
 
 

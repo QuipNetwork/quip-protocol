@@ -90,8 +90,12 @@ def test_encode_quantum_proof_field_shape():
     assert proof["nonce"] == int.from_bytes(result.nonce, "big")
     assert bytes(proof["salt"]) == result.salt
 
-    # The post-MR-!20 proof carries ONLY topology_hash, nonce, salt, solutions.
-    assert set(proof.keys()) == {"topology_hash", "nonce", "salt", "solutions"}
+    # The spec-111 proof carries topology_hash, nonce, salt, solutions,
+    # device_access_time_us. scalecodec composes from chain metadata, so the
+    # extra key is ignored by a pre-111 chain and consumed by 111.
+    assert set(proof.keys()) == {
+        "topology_hash", "nonce", "salt", "solutions", "device_access_time_us",
+    }
 
     # One submitted solution, bit-packed against the binary spin spec
     # (1 bit per spin, 4 spins → 1 byte).
@@ -132,6 +136,19 @@ def test_encode_rejects_solution_length_mismatch():
     result = _make_result(solutions=[[1, -1, 1]])  # only 3 spins
     with pytest.raises(ValueError, match="topology node count"):
         encode_quantum_proof(result, ctx)
+
+
+def test_encode_quantum_proof_device_access_time_threading():
+    ctx = _make_context()
+    result = _make_result()
+    result.device_access_time_us = 987_654
+    assert encode_quantum_proof(result, ctx)["device_access_time_us"] == 987_654
+
+
+def test_encode_quantum_proof_device_access_time_defaults_zero():
+    ctx = _make_context()
+    result = _make_result()  # device_access_time_us left as None
+    assert encode_quantum_proof(result, ctx)["device_access_time_us"] == 0
 
 
 def test_normalize_spins_boolean_convention():
