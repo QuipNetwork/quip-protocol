@@ -25,6 +25,7 @@ import logging
 import time
 from typing import Any, Callable, Optional
 
+from substrate.sync_progress import SyncProgress
 from substrate.url_failover import AllUrlsDown, SubstrateUrlFailover
 from substrate.validator_handle import ValidatorHandle, ValidatorSwapped
 
@@ -103,6 +104,10 @@ class ValidatorPool:
             code passes `ValidatorHandle`; tests pass a fake factory.
         max_swap_retries: Maximum times an idempotent op retries across
             swaps before raising the underlying connection error.
+        sync_probe_timeout_s: Seconds the get_sync_state probe may take
+            before the node is treated as down; default 5.0.
+        sync_poll_interval_s: Seconds between sync-wait progress probes;
+            default 10.0.
     """
 
     def __init__(
@@ -207,6 +212,10 @@ class ValidatorPool:
                     raise ValidatorSwapped(
                         f"swapped during non-idempotent op {op}; caller must decide"
                     ) from conn_exc
+                if all_down and self._syncing_urls and await self._sync_wait():
+                    # Sync finished — retry the op with a fresh budget.
+                    attempts = 0
+                    continue
                 attempts += 1
                 if all_down or attempts >= self._max_swap_retries:
                     logger.error(
@@ -264,6 +273,53 @@ class ValidatorPool:
             self._syncing_urls.clear()
         self.last_sync_state = None
 
+    def _best_syncing_url(self) -> str:
+        """The syncing URL with the most-advanced chain (highest current_block)."""
+        return max(
+            self._syncing_urls.items(),
+            key=lambda kv: int(kv[1].get("current_block") or 0),
+        )[0]
+
+    async def _sync_wait(self) -> bool:
+        """Block until the active (syncing) validator catches up.
+
+        Probes ``get_sync_state`` every ``sync_poll_interval_s``, logging
+        one progress line per probe. This deliberately blocks the caller
+        of ``send()`` — "mining paused until the node syncs" is the
+        wanted semantics, and the event manager sits quietly awaiting it
+        instead of tracebacking every poll.
+
+        Returns:
+            True when sync completed (caller retries the original op with
+            a fresh retry budget); False when the probe died mid-wait
+            (caller falls back to normal failure accounting).
+        """
+        progress = SyncProgress()
+        logger.warning(
+            "validator node is syncing; mining paused until sync completes"
+        )
+        while True:
+            handle = self._active
+            if handle is None:
+                return False
+            state = await self._probe_sync_state(handle)
+            if state is None:
+                logger.warning(
+                    "pool: sync probe failed on %s; resuming normal failover",
+                    handle.url,
+                )
+                self._syncing_urls.pop(handle.url, None)
+                return False
+            self._publish_sync_state(handle.url, state)
+            if not state.get("is_syncing"):
+                logger.info(
+                    "pool: validator %s finished syncing; resuming", handle.url
+                )
+                self._clear_sync_state()
+                return True
+            logger.info("%s", progress.observe(state, time.monotonic()))
+            await asyncio.sleep(self._sync_poll_interval_s)
+
     async def _swap_after_failure(self, failed_url: str) -> bool:
         """Internal: kill the current handle, rotate URL, spawn new handle.
 
@@ -281,13 +337,28 @@ class ValidatorPool:
                 next_url = self._failover.advance_after_failure(failed_url)
             except AllUrlsDown as down:
                 all_down = True
-                logger.error(
-                    "pool: all validator URLs down; backing off %.2fs",
-                    down.backoff_s,
-                )
-                await asyncio.sleep(down.backoff_s)
-                self._failover.reset_after_backoff()
-                next_url = self._failover.current()
+                if self._syncing_urls:
+                    # A live-but-syncing node is not an outage: skip the
+                    # ERROR + exponential backoff and hand the caller the
+                    # most-advanced syncing URL to sync-wait against.
+                    # (If that node dies mid-wait, advance_after_failure
+                    # may log a current-URL mismatch warning once —
+                    # harmless; the rotation still advances.)
+                    next_url = self._best_syncing_url()
+                    self._failover.reset_after_backoff()
+                    logger.info(
+                        "pool: no healthy validator (%d syncing); waiting on %s",
+                        len(self._syncing_urls),
+                        next_url,
+                    )
+                else:
+                    logger.error(
+                        "pool: all validator URLs down; backing off %.2fs",
+                        down.backoff_s,
+                    )
+                    await asyncio.sleep(down.backoff_s)
+                    self._failover.reset_after_backoff()
+                    next_url = self._failover.current()
             await old.shutdown()
             self._active = self._handle_factory(next_url)
             self._active.start()

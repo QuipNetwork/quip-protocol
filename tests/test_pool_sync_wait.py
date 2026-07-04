@@ -145,3 +145,123 @@ async def test_non_connection_errors_still_pass_through_unprobed():
         assert pool.active_url() == "http://a"
     finally:
         await pool.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_single_syncing_url_blocks_until_synced_then_retries():
+    """Single URL syncing: send() blocks through sync-wait, then succeeds."""
+    sync_states = iter([_syncing(100), _syncing(600), _synced()])
+    done = {"synced": False}
+
+    def script_a(op: str) -> Any:
+        if op == "get_sync_state":
+            state = next(sync_states)
+            if not state["is_syncing"]:
+                done["synced"] = True
+            return state
+        if op == "get_head":
+            if not done["synced"]:
+                raise TimeoutError("runtime call timed out")
+            return b"head"
+        raise AssertionError(f"unexpected op {op}")
+
+    pool = _make_pool({"http://a": script_a})
+    await pool.start()
+    try:
+        assert await pool.send("get_head", {}) == b"head"
+        # Success clears both the record and the telemetry surface.
+        assert pool.last_sync_state is None
+    finally:
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_sync_wait_publishes_progress_for_telemetry():
+    """During the wait, last_sync_state carries the latest probe + url."""
+    seen_states: list[dict] = []
+    sync_states = iter([_syncing(100), _syncing(600), _synced()])
+    done = {"synced": False}
+
+    def script_a(op: str) -> Any:
+        if op == "get_sync_state":
+            state = next(sync_states)
+            if not state["is_syncing"]:
+                done["synced"] = True
+            return state
+        if not done["synced"]:
+            raise TimeoutError("runtime call timed out")
+        return b"head"
+
+    pool = _make_pool({"http://a": script_a})
+
+    original_publish = pool._publish_sync_state
+
+    def spy(url: str, state: dict) -> None:
+        original_publish(url, state)
+        seen_states.append(dict(pool.last_sync_state))
+
+    pool._publish_sync_state = spy
+    await pool.start()
+    try:
+        await pool.send("get_head", {})
+        blocks = [s["current_block"] for s in seen_states]
+        assert 100 in blocks and 600 in blocks
+        assert all(s["url"] == "http://a" for s in seen_states)
+        assert all("at" in s for s in seen_states)
+    finally:
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_sync_wait_picks_most_advanced_syncing_url():
+    """Both URLs syncing → wait against the one with the higher block."""
+    done = {"synced": False}
+
+    def script_a(op: str) -> Any:
+        if op == "get_sync_state":
+            return _syncing(current=100)
+        raise TimeoutError("runtime call timed out")
+
+    b_states = iter([_syncing(900), _synced()])
+
+    def script_b(op: str) -> Any:
+        if op == "get_sync_state":
+            state = next(b_states)
+            if not state["is_syncing"]:
+                done["synced"] = True
+            return state
+        if not done["synced"]:
+            raise TimeoutError("runtime call timed out")
+        return b"head-b"
+
+    pool = _make_pool({"http://a": script_a, "http://b": script_b})
+    await pool.start()
+    try:
+        assert await pool.send("get_head", {}) == b"head-b"
+        assert pool.active_url() == "http://b"
+    finally:
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_sync_wait_aborts_when_probe_dies_mid_wait():
+    """Node dies mid-sync: sync-wait returns to normal failure handling."""
+    probes = {"count": 0}
+
+    def script_a(op: str) -> Any:
+        if op == "get_sync_state":
+            probes["count"] += 1
+            if probes["count"] == 1:
+                return _syncing(100)
+            raise ConnectionError("node died mid-sync")
+        raise TimeoutError("runtime call timed out")
+
+    pool = _make_pool({"http://a": script_a})
+    await pool.start()
+    try:
+        # all_down + failed sync-wait → the original TimeoutError surfaces,
+        # exactly like today's exhausted-retries path.
+        with pytest.raises(TimeoutError):
+            await pool.send("get_head", {})
+    finally:
+        await pool.shutdown()
