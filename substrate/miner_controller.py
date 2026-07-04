@@ -1280,15 +1280,6 @@ class SubstrateMinerController:
         if self._should_drop_result(envelope, envelope_key):
             return
 
-        # Encoder errors (ValueError on no-solutions / wrong-salt-length)
-        # are code defects — retrying won't help. Keep them out of the
-        # RPC-error catch below so they raise loudly instead of being
-        # logged-and-dropped like a transient network blip.
-        try:
-            encode_quantum_proof(envelope.result, envelope.context)
-        except ValueError as exc:
-            raise RuntimeError(f"proof encoding failed (bug): {exc}") from exc
-
         # The solution number (resolved when this round was dispatched) is
         # the archive key shared with the worker's attempts.
         solution_number = self._solution_number_for_context(envelope.context)
@@ -1297,6 +1288,15 @@ class SubstrateMinerController:
         envelope.result.device_access_time_us = self._device_access_us(
             envelope.result, solution_number
         )
+
+        # Encoder errors (ValueError on no-solutions / wrong-salt-length)
+        # are code defects — retrying won't help. Keep them out of the
+        # RPC-error catch below so they raise loudly instead of being
+        # logged-and-dropped like a transient network blip.
+        try:
+            encode_quantum_proof(envelope.result, envelope.context)
+        except ValueError as exc:
+            raise RuntimeError(f"proof encoding failed (bug): {exc}") from exc
         result_energy_milli = int(envelope.result.energy * 1000)
         result_diversity_milli = int(envelope.result.diversity * 1000)
         snapshot_threshold_milli = int(envelope.context.difficulty.max_energy_milli)
@@ -1762,7 +1762,7 @@ class SubstrateMinerController:
         if qpu_us:
             return int(qpu_us)
         try:
-            return max(0, int(result.mining_time)) * 1_000_000
+            return max(0, int(result.mining_time * 1_000_000))
         except (TypeError, ValueError):
             return 0
 

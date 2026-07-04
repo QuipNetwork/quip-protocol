@@ -1374,10 +1374,13 @@ async def test_handle_result_falls_back_to_wall_clock(monkeypatch):
     )
     controller.pool_client.query_proofs_submitted = AsyncMock(return_value=0)
     result = _mining_result()
-    result.mining_time = 7
+    # mining_time is typed int but dataclasses don't enforce it; use a float
+    # to pin that sub-second precision is preserved (the old floor-then-scale
+    # bug would report 7_000_000 instead of 7_500_000).
+    result.mining_time = 7.5
     envelope = _ResultEnvelope(result=result, context=ctx, handle_id="t-0")
     await controller._handle_result(envelope)
-    assert captured["device"] == 7_000_000
+    assert captured["device"] == 7_500_000
 
 
 _RECORD_SUBMISSION_LOG_COMMON = {

@@ -129,9 +129,10 @@ def test_decode_winning_solution_trailing_bytes_rejected():
         _decode_winning_solution_with_nonce(encoded + "deadbeef")
 
 
-def test_decode_winning_solution_short_read_surfaces_field_name():
-    # Truncate inside the nonce — the field-tagged decoder should surface
-    # which field ran out of bytes.
+def test_decode_winning_solution_truncated_nonce_rejected_as_unknown_tail():
+    # Truncate inside the nonce — the remaining tail (16 bytes) matches
+    # neither the 32-byte legacy nonce nor the 72-byte spec-111 extension,
+    # so the length-branch fires and raises ValueError matching "tail".
     miner = b"\x00" * 32
     salt = b"\x01" * 32
     encoded = _build_winning_solution_hex(
@@ -223,3 +224,31 @@ def test_decode_rejects_unknown_tail_length():
     ) + "ff"  # one stray trailing byte -> neither 32 nor 72 remaining
     with pytest.raises(ValueError, match="tail"):
         _decode_winning_solution_with_nonce(encoded)
+
+
+def test_decode_spec111_truncated_tail_rejected():
+    # Build a valid spec-111 payload (topology_hash + device_access_time_us +
+    # nonce = 72-byte tail), then chop 16 bytes off the end.  The remaining
+    # tail is 56 bytes — neither 32 nor 72 — so the decoder raises ValueError
+    # matching "tail".
+    #
+    # Inherent blind spot: a 111 payload truncated to exactly 32 remaining
+    # bytes would be misread as a legacy-110 record (topology_hash parsed as
+    # the nonce).  That case is unreachable from a well-formed RPC response
+    # because the runtime always emits complete field values.
+    encoded = _build_winning_solution_hex(
+        miner=b"\x11" * 32,
+        salt=b"\x22" * 32,
+        energy_milli=-42_000,
+        reward=50,
+        submitted_at=7,
+        difficulty=_difficulty(),
+        last_proof_block_hash=b"\x33" * 32,
+        topology_hash=b"\x44" * 32,
+        device_access_time_us=1_000,
+        nonce=b"\x55" * 32,
+    )
+    # Chop last 16 bytes (32 hex chars) -> 56-byte tail, neither 32 nor 72.
+    truncated = encoded[:-32]
+    with pytest.raises(ValueError, match="tail"):
+        _decode_winning_solution_with_nonce(truncated)

@@ -6,8 +6,8 @@ plumbing. Phase 4's controller orchestrates: it calls into here, but neither
 the client nor the controller knows about the proof shape.
 
 Post-MR-!20: the on-chain ``QuantumProof`` carries
-``{topology_hash, nonce (U256), salt ([u8; 32]), solutions (BoundedVec<BoundedVec<u8>>),
-device_access_time_us (u64)}``.
+``{topology_hash, nonce (U256), salt ([u8; 32]),
+solutions (BoundedVec<BoundedVec<u8>>), device_access_time_us (u64)}``.
 Nodes, edges, and h-values are looked up from ``RegisteredTopologies`` by
 ``topology_hash``. Each solution is bit-packed under the registered
 ``allowed_spin_values`` spec (1 byte per 8 binary spins).
