@@ -542,7 +542,7 @@ async def ensure_funded_via_faucet(
         attempt += 1
         # A FaucetPermanentError (malformed request) propagates straight out
         # — no amount of retrying fixes a bad dest/amount.
-        balance, last_note = await _try_fund_once(
+        balance, last_note, faucet_free = await _try_fund_once(
             client,
             account,
             faucet_url=faucet_url,
@@ -556,13 +556,20 @@ async def ensure_funded_via_faucet(
                 balance,
             )
             return balance
+        # The faucet reports the account already holds >= min_balance, yet our
+        # own node reads below it — two reads of the same account/field that
+        # only disagree across different chain state. Raises if the node is
+        # synced (unrecoverable: different chains); else returns an accurate
+        # "node still syncing" note so the retry keeps waiting.
+        disagreement_note = await _reconcile_faucet_disagreement(
+            client, faucet_free=faucet_free, balance=balance, min_balance=min_balance
+        )
         if budget <= 0:
             break
         wait = min(backoff, budget)
         logger.warning(
-            "faucet not funded yet (%s); attempt %d, retrying in %.1fs "
-            "(%.0fs budget left)",
-            last_note,
+            "%s; attempt %d, retrying in %.1fs (%.0fs budget left)",
+            disagreement_note or f"faucet not funded yet ({last_note})",
             attempt,
             wait,
             budget,
@@ -584,16 +591,19 @@ async def _try_fund_once(
     faucet_url: str,
     dest_hex: str,
     amount: int,
-) -> Tuple[int, str]:
+) -> Tuple[int, str, Optional[int]]:
     """One faucet POST + balance read for the ``ensure_funded`` retry loop.
 
-    Returns ``(balance, status_note)``. A transient faucet failure is
-    swallowed and surfaced in the note so the caller backs off and retries;
-    the balance read still runs (it's the source of truth, and an earlier
-    mint may have settled). ``FaucetPermanentError`` propagates so the caller
-    fails fast.
+    Returns ``(balance, status_note, faucet_free)``. ``faucet_free`` is the
+    faucet-reported free balance on a 403 "already funded" (else ``None``), so
+    the caller can reconcile it against its own ``min_balance``. A transient
+    faucet failure is swallowed and surfaced in the note so the caller backs
+    off and retries; the balance read still runs (it's the source of truth,
+    and an earlier mint may have settled). ``FaucetPermanentError`` propagates
+    so the caller fails fast.
     """
     note = "requested"
+    faucet_free: Optional[int] = None
     try:
         _post_faucet(faucet_url, dest_hex=dest_hex, amount=amount)
     except FaucetTransientError as exc:
@@ -603,11 +613,60 @@ async def _try_fund_once(
     except FaucetAlreadyFunded as exc:
         # 403: the account is above the faucet's cap. Benign — the on-chain
         # balance read below is the source of truth on whether we cleared our
-        # own min_balance. Note it (incl. the faucet-reported free balance) so
-        # the retry loop can log and reconcile rather than crash.
+        # own min_balance. Surface the faucet-reported free balance so the
+        # retry loop can reconcile against min_balance rather than crash.
+        faucet_free = exc.free_balance
         note = f"already funded (faucet free={exc.free_balance}): {exc}"
     balance = await client.query_balance(account)
-    return balance, note
+    return balance, note, faucet_free
+
+
+async def _reconcile_faucet_disagreement(
+    client: SubstrateClient,
+    *,
+    faucet_free: Optional[int],
+    balance: int,
+    min_balance: int,
+) -> Optional[str]:
+    """Adjudicate a faucet-vs-node balance disagreement via the sync state.
+
+    Returns ``None`` when there is nothing to reconcile — either the faucet
+    did not report "already funded", or it reported a free balance below
+    ``min_balance`` (a genuine under-cap the normal retry handles).
+
+    When the faucet reports ``free >= min_balance`` but our node reads below
+    it, the two are reading the same account/field across different chain
+    state. Probes ``get_sync_state``:
+
+    * node still syncing → returns an accurate note so the caller keeps
+      waiting for it to catch up;
+    * node fully synced → raises ``RuntimeError`` (unrecoverable: the miner
+      and faucet are pointed at different chains);
+    * probe itself fails → fail open, returning a note so the caller retries
+      within its budget rather than crashing on an unprovable claim.
+    """
+    if faucet_free is None or faucet_free < min_balance:
+        return None
+    try:
+        state = await client.get_sync_state()
+    except Exception as exc:  # noqa: BLE001 — probe is best-effort; retry on any failure
+        return (
+            f"faucet reports account funded (free={faucet_free} >= min "
+            f"{min_balance}) but node reads {balance}; sync-state probe "
+            f"failed ({exc}), retrying"
+        )
+    if state.get("is_syncing"):
+        return (
+            f"faucet reports account funded (free={faucet_free} >= min "
+            f"{min_balance}) but node reads {balance}; node still syncing "
+            f"({state.get('current_block', 0)}/{state.get('highest_block', 0)} "
+            f"blocks), waiting for it to catch up"
+        )
+    raise RuntimeError(
+        f"faucet reports account free={faucet_free} (>= min_balance "
+        f"{min_balance}) but the fully-synced node reads {balance} for the "
+        f"same account — the miner and faucet are pointed at different chains"
+    )
 
 
 def _post_faucet(url: str, *, dest_hex: str, amount: int) -> None:
