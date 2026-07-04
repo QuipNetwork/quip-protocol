@@ -275,6 +275,10 @@ def _decode_u32(data: ScaleBytes) -> int:
     return int.from_bytes(_read_exact(data, 4), "little")
 
 
+def _decode_u64(data: ScaleBytes) -> int:
+    return int.from_bytes(_read_exact(data, 8), "little")
+
+
 def _decode_i32(data: ScaleBytes) -> int:
     return int.from_bytes(_read_exact(data, 4), "little", signed=True)
 
@@ -459,7 +463,10 @@ def _decode_winning_solution_with_nonce(
 ) -> Optional["WinningSolutionWithNonce"]:
     """Decode SCALE ``Option<WinningSolutionWithNonce<AccountId, Balance, BlockNumber>>``.
 
-    Layout (matches `pallet_quantum_pow::types::WinningSolutionWithNonce`):
+    Two wire shapes are supported, distinguished by the number of bytes
+    remaining after ``last_proof_block_hash``:
+
+    Pre-111 layout (32 bytes remaining after ``last_proof_block_hash``):
       - 1 byte option tag (0x00 = None, 0x01 = Some)
       - solution.miner: AccountId32 = [u8; 32]
       - solution.salt: [u8; 32]
@@ -467,9 +474,15 @@ def _decode_winning_solution_with_nonce(
       - solution.reward: u128 (Balance)
       - solution.submitted_at: BlockNumber (u32)
       - solution.difficulty: DifficultyConfig
-      - solution.last_proof_block_hash: H256 (last proof block hash the proof used)
+      - solution.last_proof_block_hash: H256
       - nonce: U256 (little-endian on the wire; reversed to recover the
         BLAKE3 digest order Python miners use)
+
+    Spec-111 layout (72 bytes remaining after ``last_proof_block_hash``):
+      - (all fields above through last_proof_block_hash)
+      - solution.topology_hash: H256 = [u8; 32]
+      - solution.device_access_time_us: u64
+      - nonce: U256 (little-endian on the wire; reversed to BLAKE3 order)
     """
     data = ScaleBytes(encoded_hex)
     tag = _read_exact(data, 1)
@@ -490,6 +503,28 @@ def _decode_winning_solution_with_nonce(
         last_proof_block_hash = _decode_field(
             "last_proof_block_hash", data, lambda d: _read_exact(d, 32)
         )
+        # Spec 111 appended two trailing QBlock fields before the runtime
+        # API's nonce. Branch on the remaining tail: 32 bytes = pre-111
+        # (nonce only); 72 = 111 (topology_hash 32 + device_access_time_us
+        # 8 + nonce 32). Anything else is an unknown shape — fail loudly
+        # rather than misalign the nonce read.
+        remaining = data.get_remaining_length()
+        topology_hash: Optional[bytes] = None
+        device_access_time_us: Optional[int] = None
+        if remaining == 72:
+            topology_hash = _decode_field(
+                "topology_hash", data, lambda d: _read_exact(d, 32)
+            )
+            device_access_time_us = _decode_field(
+                "device_access_time_us", data, _decode_u64
+            )
+        elif remaining != 32:
+            raise ValueError(
+                "unexpected winning_solution tail: "
+                f"{remaining} bytes remaining after last_proof_block_hash "
+                "(expected 32 pre-111 or 72 spec-111); "
+                "runtime API shape likely changed"
+            )
         nonce = _decode_field("nonce", data, _decode_u256_le)
     except ValueError:
         raise
@@ -509,6 +544,8 @@ def _decode_winning_solution_with_nonce(
             submitted_at=submitted_at,
             difficulty=difficulty,
             last_proof_block_hash=last_proof_block_hash,
+            topology_hash=topology_hash,
+            device_access_time_us=device_access_time_us,
         ),
         nonce=nonce,
     )

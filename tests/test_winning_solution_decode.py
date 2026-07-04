@@ -44,6 +44,8 @@ def _build_winning_solution_hex(
     last_proof_block_hash: bytes,
     nonce: bytes,
     is_some: bool = True,
+    topology_hash: bytes | None = None,
+    device_access_time_us: int | None = None,
 ) -> str:
     if not is_some:
         return "0x00"
@@ -55,6 +57,13 @@ def _build_winning_solution_hex(
     parts.append(submitted_at.to_bytes(4, "little"))
     parts.append(_encode_difficulty(difficulty))
     parts.append(last_proof_block_hash)
+    # Spec-111 QBlock appends topology_hash + device_access_time_us before
+    # the runtime-API nonce. Pass both to build the 111 shape; omit both
+    # for the legacy 110 shape. (Passing only one is a caller bug.)
+    if topology_hash is not None or device_access_time_us is not None:
+        assert topology_hash is not None and device_access_time_us is not None
+        parts.append(topology_hash)
+        parts.append(device_access_time_us.to_bytes(8, "little"))
     # U256 on the wire is little-endian. The Python side stores nonces in
     # BLAKE3-digest order, so we encode the reverse here.
     parts.append(bytes(reversed(nonce)))
@@ -116,7 +125,7 @@ def test_decode_winning_solution_trailing_bytes_rejected():
         last_proof_block_hash=b"\x03" * 32,
         nonce=nonce,
     )
-    with pytest.raises(ValueError, match="trailing bytes"):
+    with pytest.raises(ValueError, match="tail"):
         _decode_winning_solution_with_nonce(encoded + "deadbeef")
 
 
@@ -135,10 +144,11 @@ def test_decode_winning_solution_short_read_surfaces_field_name():
         last_proof_block_hash=b"\x03" * 32,
         nonce=b"\x02" * 32,
     )
-    # Chop the last 16 hex bytes (half the U256 nonce — last_proof_block_hash
-    # is fully present, so the decoder fails at `nonce`).
+    # Chop the last 32 hex chars (16 bytes) — last_proof_block_hash is fully
+    # present but only 16 bytes of nonce remain. The length-branch fires
+    # before reading the nonce, reporting an unknown tail size.
     truncated = encoded[: -32]
-    with pytest.raises(ValueError, match="nonce"):
+    with pytest.raises(ValueError, match="tail"):
         _decode_winning_solution_with_nonce(truncated)
 
 
@@ -153,3 +163,63 @@ def test_decode_difficulty_config_matches_storage_shape():
     data = ScaleBytes("0x" + _encode_difficulty(expected).hex())
     assert _decode_difficulty_config(data) == expected
     assert data.get_remaining_length() == 0
+
+
+def _difficulty() -> SubstrateDifficulty:
+    return SubstrateDifficulty(
+        min_solutions=3,
+        max_energy_milli=-1_000_000,
+        min_diversity_milli=200,
+    )
+
+
+def test_decode_spec111_shape_reads_topology_and_device_time():
+    encoded = _build_winning_solution_hex(
+        miner=b"\x11" * 32,
+        salt=b"\x22" * 32,
+        energy_milli=-42_000,
+        reward=50,
+        submitted_at=7,
+        difficulty=_difficulty(),
+        last_proof_block_hash=b"\x33" * 32,
+        topology_hash=b"\x44" * 32,
+        device_access_time_us=1_234_567,
+        nonce=b"\x55" * 32,
+    )
+    ws = _decode_winning_solution_with_nonce(encoded)
+    assert ws.solution.topology_hash == b"\x44" * 32
+    assert ws.solution.device_access_time_us == 1_234_567
+    assert ws.nonce == b"\x55" * 32
+    assert ws.solution.energy_milli == -42_000
+
+
+def test_decode_legacy_110_shape_leaves_new_fields_none():
+    encoded = _build_winning_solution_hex(
+        miner=b"\x11" * 32,
+        salt=b"\x22" * 32,
+        energy_milli=-42_000,
+        reward=50,
+        submitted_at=7,
+        difficulty=_difficulty(),
+        last_proof_block_hash=b"\x33" * 32,
+        nonce=b"\x55" * 32,
+    )
+    ws = _decode_winning_solution_with_nonce(encoded)
+    assert ws.solution.topology_hash is None
+    assert ws.solution.device_access_time_us is None
+    assert ws.nonce == b"\x55" * 32
+
+
+def test_decode_rejects_unknown_tail_length():
+    encoded = _build_winning_solution_hex(
+        miner=b"\x11" * 32,
+        salt=b"\x22" * 32,
+        energy_milli=-42_000,
+        reward=50,
+        submitted_at=7,
+        difficulty=_difficulty(),
+        last_proof_block_hash=b"\x33" * 32,
+        nonce=b"\x55" * 32,
+    ) + "ff"  # one stray trailing byte -> neither 32 nor 72 remaining
+    with pytest.raises(ValueError, match="tail"):
+        _decode_winning_solution_with_nonce(encoded)
