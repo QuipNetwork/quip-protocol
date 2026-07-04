@@ -380,6 +380,52 @@ class SubstrateClient:
             await self.reconnect()
             return False
 
+    async def get_sync_state(self) -> dict[str, Any]:
+        """Node-level sync status — answers fast even during major sync.
+
+        Wraps ``system_health`` (``isSyncing``, ``peers``) and
+        ``system_syncState`` (``startingBlock``/``currentBlock``/
+        ``highestBlock``). Runtime API calls stall while the node is in
+        major sync, but these node RPCs do not — the pool uses this to
+        distinguish "node down" from "node syncing" after a timeout.
+
+        Returns a plain picklable dict (the value crosses the validator
+        child's ``mp.Queue`` boundary)::
+
+            {"is_syncing": bool, "peers": int, "current_block": int,
+             "highest_block": int, "starting_block": int}
+
+        A node without ``system_syncState`` reports ``is_syncing=False``
+        — fail open to the pool's existing swap behavior rather than
+        entering a sync-wait on data we don't have.
+        """
+        def _do():
+            health = self._iface.rpc_request("system_health", [])
+            try:
+                sync = self._iface.rpc_request("system_syncState", [])
+            except Exception:  # noqa: BLE001 — RPC absent on some nodes
+                sync = None
+            return health, sync
+
+        health_raw, sync_raw = await self._run(_do, idempotent=True)
+        health = (health_raw or {}).get("result") or {}
+        sync = (sync_raw or {}).get("result") if isinstance(sync_raw, dict) else None
+        if not isinstance(sync, dict):
+            return {
+                "is_syncing": False,
+                "peers": int(health.get("peers") or 0),
+                "current_block": 0,
+                "highest_block": 0,
+                "starting_block": 0,
+            }
+        return {
+            "is_syncing": bool(health.get("isSyncing", False)),
+            "peers": int(health.get("peers") or 0),
+            "current_block": int(sync.get("currentBlock") or 0),
+            "highest_block": int(sync.get("highestBlock") or 0),
+            "starting_block": int(sync.get("startingBlock") or 0),
+        }
+
     async def close(self) -> None:
         await self._close_iface()
 
