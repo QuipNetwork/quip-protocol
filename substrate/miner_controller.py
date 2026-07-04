@@ -269,6 +269,15 @@ _LOCAL_DECAY_STALE_AFTER_S = 18.0
 # dispatch-time RPC failure used to leave the whole round schedule-less).
 _SCHEDULE_RETRY_INTERVAL_S = 5.0
 
+# Backoff between replay attempts of a queued pending submission.
+_PENDING_REPLAY_BACKOFF_S = 6.0
+
+# Watch timeout for the result-path submit_proof call. Mirrors the fire
+# path's _SUBMIT_WATCH_TIMEOUT_S in substrate/submitter.py: a half-dead
+# validator that accepts the extrinsic but never reports inclusion would
+# otherwise freeze the controller's result loop indefinitely.
+_RESULT_SUBMIT_TIMEOUT_S = 90.0
+
 
 # A "work key" uniquely identifies the puzzle a context is mining
 # against: same (last_proof_block_hash, topology_hash) means the pallet will
@@ -296,6 +305,17 @@ STALE_SUBMISSION_ERRORS = (
     "InvalidTopology",
 )
 
+# Submission errors that mean "this proof is merely EARLY": the chain's
+# live threshold hasn't decayed down to the proof's floor yet. Produced
+# when the controller's local decay model overshoots while the validator
+# is dark (chain stalled → estimate_block runs ahead of real decay).
+# Decay only eases, so the same proof can succeed later — queue and
+# replay, never treat as fatal.
+EARLY_SUBMISSION_ERRORS = (
+    "InsufficientEnergy",
+    "InsufficientSolutions",
+)
+
 # Submission errors that indicate something the controller can't recover
 # from — bad signing key, deregistered account, bad signed extension.
 FATAL_SUBMISSION_ERRORS = (
@@ -306,7 +326,7 @@ FATAL_SUBMISSION_ERRORS = (
 
 
 class SubmissionOutcome(str, Enum):
-    """Three-way receipt classification.
+    """Four-way receipt classification.
 
     Inherits from `str` so existing `==` comparisons against `"ok" / "stale"
     / "fatal"` literals keep working — but typo'd comparisons (e.g.
@@ -314,8 +334,28 @@ class SubmissionOutcome(str, Enum):
     """
 
     OK = "ok"
+    EARLY = "early"
     STALE = "stale"
     FATAL = "fatal"
+
+
+@dataclass
+class _PendingSubmission:
+    """A submittable result held for optimistic replay.
+
+    Queued when the result-path submit fails on RPC (validator dark or
+    half-dead) or the chain answers EARLY (threshold not yet decayed to
+    the proof's floor). Replayed from the fire loop once the pool is
+    fresh and the backoff has elapsed; dropped when the work key rolls
+    or the round is won.
+    """
+
+    envelope: "_ResultEnvelope"
+    work_key: "WorkKey"
+    floor_milli: int
+    queued_at_monotonic: float
+    last_attempt_monotonic: float
+    attempts: int = 0
 
 
 @dataclass
@@ -569,6 +609,14 @@ class SubstrateMinerController:
         # Earliest monotonic time the fire loop may retry a missing decay
         # schedule (throttles _maybe_refresh_schedule's chain reads).
         self._schedule_retry_next_monotonic: float = 0.0
+        # Single-slot queue for a submittable result whose submit failed
+        # (validator dark / EARLY receipt). Replayed by the fire loop on
+        # pool recovery; dropped when its work key rolls or wins.
+        self._pending_submission: Optional[_PendingSubmission] = None
+        # The pending currently being replayed (taken out of the slot for
+        # the duration of the attempt). Lets a failed replay's re-queue
+        # inherit the attempt count instead of restarting at 1.
+        self._replaying: Optional[_PendingSubmission] = None
         self._anticipatory_fired: set[WorkKey] = set()
         self._timing = TimingTracker()
         # Free-running cadence fire timer (Task 7). Re-evaluates the active
@@ -1320,13 +1368,19 @@ class SubstrateMinerController:
         }
 
         try:
-            receipt = await submit_proof(
-                self.build_client,
-                self.pool_client,
-                self.signer,
-                envelope.result,
-                envelope.context,
-                tip=self.submission_config.tip_plancks,
+            # Watch-timeout so a half-dead validator that accepts the
+            # extrinsic but never reports inclusion can't freeze the
+            # result loop (same failure class as a dark snapshot feed).
+            receipt = await asyncio.wait_for(
+                submit_proof(
+                    self.build_client,
+                    self.pool_client,
+                    self.signer,
+                    envelope.result,
+                    envelope.context,
+                    tip=self.submission_config.tip_plancks,
+                ),
+                timeout=_RESULT_SUBMIT_TIMEOUT_S,
             )
         except Exception as exc:  # noqa: BLE001 — surface RPC errors to logs
             self.stats.submission_errors += 1
@@ -1336,12 +1390,12 @@ class SubstrateMinerController:
                 envelope.handle_id,
                 exc,
             )
-            pow_seq_rpc_err = await self._query_proofs_submitted_safe()
-            self._record_submission(
-                log_common,
-                "chain_error",
-                pow_sequence=pow_seq_rpc_err,
+            # Optimistic-submit policy: hold the result and replay on pool
+            # recovery instead of dropping a possibly chain-winning proof.
+            await self._queue_pending_submission(
+                envelope, envelope_key,
                 error=f"{type(exc).__name__}: {exc}",
+                log_common=log_common,
             )
             return
 
@@ -1349,6 +1403,20 @@ class SubstrateMinerController:
         if outcome is SubmissionOutcome.OK:
             await self._finalize_accepted_proof(
                 envelope, envelope_key, receipt, solution_number, log_common,
+            )
+        elif outcome is SubmissionOutcome.EARLY:
+            # The chain's live threshold hasn't decayed to this proof's
+            # floor yet (local decay overshoot while the validator was
+            # dark). Decay only eases — hold and replay.
+            logger.info(
+                "submit_proof EARLY (threshold not yet decayed to floor): "
+                "error=%s",
+                receipt.error,
+            )
+            await self._queue_pending_submission(
+                envelope, envelope_key,
+                error=str(receipt.error or ""),
+                log_common=log_common,
             )
         elif outcome is SubmissionOutcome.STALE:
             self.stats.stale_drops += 1
@@ -1944,6 +2012,14 @@ class SubstrateMinerController:
         self._base_difficulty_by_key.pop(key, None)
         self._decay_schedule_by_key.pop(key, None)
         self._anticipatory_fired.discard(key)
+        pending = self._pending_submission
+        if pending is not None and pending.work_key == key:
+            self._pending_submission = None
+            logger.info(
+                "dropping pending submission (round rolled): "
+                "floor=%d milli attempts=%d",
+                pending.floor_milli, pending.attempts,
+            )
         # New round: re-arm the throttled status line so the next candidate
         # logs even if its (valid_at_block, decay_num) collides with the old.
         self._last_fire_status_key = None
@@ -1999,6 +2075,126 @@ class SubstrateMinerController:
             allowed_j=ctx.allowed_j_values,
         )
         return base, int(last_proof_block), constants, curve
+
+    async def _queue_pending_submission(
+        self,
+        envelope: _ResultEnvelope,
+        envelope_key: WorkKey,
+        *,
+        error: str,
+        log_common: dict[str, Any],
+    ) -> None:
+        """Hold a submittable result for optimistic replay.
+
+        Single slot: the active round has one best answer. A better result
+        (lower chain floor) replaces the held one; a worse sibling only
+        bumps the attempt/backoff state. After queueing, ``fill_idle``
+        resumes mining the round on the emitter (a worker idles after
+        returning a result), so darkness never parks the fleet.
+        """
+        floor_milli = int(envelope.result.effective_floor * 1000)
+        now = time.monotonic()
+        pending = self._pending_submission
+        # A replay in flight took the pending out of the slot; its re-queue
+        # must inherit the attempt history, not restart at 1.
+        if pending is None:
+            replaying = self._replaying
+            if replaying is not None and replaying.work_key == envelope_key:
+                pending = replaying
+                self._pending_submission = pending
+        if pending is not None and pending.work_key == envelope_key:
+            pending.attempts += 1
+            pending.last_attempt_monotonic = now
+            if floor_milli < pending.floor_milli:
+                pending.envelope = envelope
+                pending.floor_milli = floor_milli
+            queued = pending
+        else:
+            queued = _PendingSubmission(
+                envelope=envelope,
+                work_key=envelope_key,
+                floor_milli=floor_milli,
+                queued_at_monotonic=now,
+                last_attempt_monotonic=now,
+                attempts=1,
+            )
+            self._pending_submission = queued
+        logger.info(
+            "queueing pending submission for work_key 0x%s... "
+            "(floor=%d milli, attempts=%d, error=%s)",
+            envelope.context.last_proof_block_hash.hex()[:16],
+            queued.floor_milli,
+            queued.attempts,
+            error,
+        )
+        self._record_submission(log_common, "queued_retry", error=error)
+        # Resume mining the round: the emitter went idle when it returned
+        # this result, and without a head feed nothing else re-dispatches.
+        # fill_idle only touches idle, non-job-owned handles.
+        ctx = self._current_context
+        if ctx is not None and _work_key(ctx) == envelope_key:
+            try:
+                redispatched = await self._scheduler.fill_idle(ctx)
+                if redispatched:
+                    self.stats.contexts_dispatched += len(redispatched)
+            except Exception:  # noqa: BLE001 — best-effort resume
+                logger.exception(
+                    "fill_idle after queueing pending submission failed "
+                    "(ignored)",
+                )
+
+    async def _maybe_replay_pending(self) -> None:
+        """Replay the held pending submission once the pool looks alive.
+
+        Runs first in the fire tick (strictly before the anticipatory
+        fire, so the two submit paths never race). Requires a fresh
+        snapshot poll and an elapsed backoff; drops the pending when its
+        round rolled or was won. The pending is taken OUT before the
+        await — the failure paths in ``_handle_result`` re-queue it.
+        """
+        pending = self._pending_submission
+        if pending is None:
+            return
+        key = pending.work_key
+        if key != self._current_work_key or key in self._closed_work_keys:
+            self._pending_submission = None
+            reason = "won" if key in self._closed_work_keys else "round rolled"
+            logger.info(
+                "dropping pending submission (%s): floor=%d milli attempts=%d",
+                reason, pending.floor_milli, pending.attempts,
+            )
+            return
+        events = self.events
+        now = time.monotonic()
+        if events is None or events.last_successful_poll_monotonic is None:
+            return
+        if now - events.last_successful_poll_monotonic >= _LOCAL_DECAY_STALE_AFTER_S:
+            return  # pool still dark — wait for reconnect
+        if now - pending.last_attempt_monotonic < _PENDING_REPLAY_BACKOFF_S:
+            return
+        self._pending_submission = None
+        logger.info(
+            "replaying pending submission for work_key 0x%s... "
+            "(floor=%d milli, attempt=%d)",
+            pending.envelope.context.last_proof_block_hash.hex()[:16],
+            pending.floor_milli,
+            pending.attempts + 1,
+        )
+        self._replaying = pending
+        try:
+            # Full result-path semantics: drop-guards, fresh compose+sign,
+            # EARLY/STALE re-queue or drop, OK finalization.
+            await self._handle_result(pending.envelope)
+        except RuntimeError as exc:
+            # FATAL receipt (or encode bug) on a replay: drop the pending
+            # and keep the controller alive — never raise from the fire
+            # task for a candidate we chose to hold optimistically.
+            self.stats.submission_errors += 1
+            logger.warning(
+                "pending submission failed fatally; dropping: %s", exc,
+            )
+        finally:
+            self._replaying = None
 
     def _push_live_threshold(self, threshold_milli: int) -> None:
         """Push a live threshold to every miner handle and record it.
@@ -2135,6 +2331,7 @@ class SubstrateMinerController:
         """
         while not self._shutdown_event.is_set():
             try:
+                await self._maybe_replay_pending()
                 await self._maybe_refresh_schedule()
                 self._maybe_push_local_decay()
                 await self._maybe_fire_on_cadence()
@@ -2156,6 +2353,11 @@ class SubstrateMinerController:
             or key in self._anticipatory_fired
             or key in self._closed_work_keys
         ):
+            return
+        pending = self._pending_submission
+        if pending is not None and pending.work_key == key:
+            # A live-submittable result is already queued for replay —
+            # anticipation has nothing to add and firing would race it.
             return
         preview = self._latest_preview.get(key)
         ctx = self._current_context
@@ -2562,6 +2764,14 @@ class SubstrateMinerController:
 
     async def _teardown(self) -> None:
         logger.info("controller shutting down: cancelling handles, draining tasks")
+        if self._pending_submission is not None:
+            logger.warning(
+                "dropping pending submission on shutdown "
+                "(floor=%d milli, attempts=%d)",
+                self._pending_submission.floor_milli,
+                self._pending_submission.attempts,
+            )
+            self._pending_submission = None
         for handle in self.miner_handles:
             try:
                 handle.cancel()
@@ -2649,6 +2859,9 @@ def classify_submission(receipt: ExtrinsicReceipt) -> SubmissionOutcome:
     if receipt.is_success:
         return SubmissionOutcome.OK
     error = receipt.error or ""
+    for name in EARLY_SUBMISSION_ERRORS:
+        if name in error:
+            return SubmissionOutcome.EARLY
     for name in STALE_SUBMISSION_ERRORS:
         if name in error:
             return SubmissionOutcome.STALE
@@ -2665,6 +2878,7 @@ def classify_submission(receipt: ExtrinsicReceipt) -> SubmissionOutcome:
 
 __all__ = [
     "ControllerStats",
+    "EARLY_SUBMISSION_ERRORS",
     "STALE_SUBMISSION_ERRORS",
     "FATAL_SUBMISSION_ERRORS",
     "SubmissionOutcome",

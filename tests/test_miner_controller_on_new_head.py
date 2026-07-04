@@ -76,6 +76,12 @@ def controller():
     ctrl._base_difficulty_by_key = {}
     ctrl._decay_schedule_by_key = {}
     ctrl._pow_constants = None
+    # Resilience state (dark-validator fallbacks).
+    ctrl.events = None
+    ctrl._pending_submission = None
+    ctrl._replaying = None
+    ctrl._schedule_retry_next_monotonic = 0.0
+    ctrl._decay_horizon_logged_key = None
     # Per-round solution-number cache (the on-disk archive key). The stub
     # returns a fixed WinningSolutions count so dispatch resolves a stable
     # solution number without hitting the network.
