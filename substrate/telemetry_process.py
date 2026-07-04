@@ -531,6 +531,8 @@ async def _handle_status(request: web.Request) -> web.Response:
             "miner_registered": miner_registered,
             "miner_info": miner_info_dict,
             "miners": snapshot.get("miners", []),
+            # Node sync progress (pool sync-wait) — None when healthy.
+            "sync_state": snapshot.get("sync_state"),
             # Per-mode breakdown — populated in aggregator mode (one
             # entry per active backend group: cpu / gpu / qpu); empty
             # dict in legacy single-process mode where there's only

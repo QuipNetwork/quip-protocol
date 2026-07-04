@@ -71,6 +71,58 @@ def test_telemetry_process_starts_and_serves_stats(tmp_path: Path):
             proc.join()
 
 
+def test_telemetry_status_passes_through_sync_state(tmp_path: Path):
+    """/api/v1/status surfaces the snapshot's sync_state verbatim."""
+    from substrate.telemetry_process import telemetry_main
+
+    stats_path = tmp_path / "telemetry-stats.json"
+    stats_path.write_text(json.dumps({
+        "controller": {"heads_observed": 1},
+        "sync_state": {"is_syncing": True, "current_block": 5_000, "url": "ws://a"},
+    }))
+
+    port = _free_port()
+    shutdown_event = mp.Event()
+    proc = mp.Process(
+        target=telemetry_main,
+        kwargs={
+            "listen_host": "127.0.0.1",
+            "listen_port": port,
+            "stats_snapshot_path": str(stats_path),
+            "validator_urls": ["http://example.invalid"],
+            "shutdown_event": shutdown_event,
+        },
+    )
+    proc.start()
+    try:
+        import urllib.request
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            try:
+                resp = urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/v1/status", timeout=0.5,
+                ).read()
+                break
+            except Exception:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError("telemetry process did not start in 5s")
+
+        data = json.loads(resp)
+        assert data["success"] is True
+        assert data["data"]["sync_state"] == {
+            "is_syncing": True,
+            "current_block": 5_000,
+            "url": "ws://a",
+        }
+    finally:
+        shutdown_event.set()
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join()
+
+
 def test_telemetry_process_returns_503_when_snapshot_missing(tmp_path: Path):
     """If the snapshot file doesn't exist yet, /api/v1/stats returns 503."""
     from substrate.telemetry_process import telemetry_main

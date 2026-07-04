@@ -211,6 +211,10 @@ def build_stats_snapshot_for_telemetry(controller) -> dict[str, Any]:
         "descriptor": descriptor,
         "miner_survey": survey,
         "attempts_dir": attempts_dir,
+        # Pool sync-wait surface: last observed node sync state, or None
+        # when healthy. Lets dashboards distinguish "mining paused: node
+        # syncing" from "miner dead". See substrate/pool.py sync-wait.
+        "sync_state": getattr(getattr(controller, "pool", None), "last_sync_state", None),
     }
 
 
