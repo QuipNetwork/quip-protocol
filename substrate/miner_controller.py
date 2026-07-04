@@ -257,6 +257,14 @@ _ANTICIPATORY_SEARCH_LIMIT = 100
 # 6 s blocktime, large enough to be negligible overhead.
 _FIRE_TICK_S = 1.0
 
+# Poll staleness horizon after which the controller trusts its own decay
+# model and pushes locally-decayed thresholds (policy: keep mining against
+# the schedule when the validator goes dark, submit optimistically on
+# reconnect). Matches the event manager's dead threshold
+# (dead_blocktime_multiplier 3.0 × blocktime 6.0s) so local decay engages
+# at the same moment the watchdog starts force-swapping.
+_LOCAL_DECAY_STALE_AFTER_S = 18.0
+
 
 # A "work key" uniquely identifies the puzzle a context is mining
 # against: same (last_proof_block_hash, topology_hash) means the pallet will
@@ -551,6 +559,9 @@ class SubstrateMinerController:
         # epoch_length). Built once per round from _anticipatory_inputs; evicted
         # alongside the other per-key state in _evict_anticipatory_state.
         self._decay_schedule_by_key: dict = {}  # WorkKey -> (list[int], int, int)
+        # Work key whose schedule-horizon exhaustion was already logged by
+        # the local-decay push (one line per round, not per tick).
+        self._decay_horizon_logged_key: Optional[WorkKey] = None
         self._anticipatory_fired: set[WorkKey] = set()
         self._timing = TimingTracker()
         # Free-running cadence fire timer (Task 7). Re-evaluates the active
@@ -972,9 +983,7 @@ class SubstrateMinerController:
                 live_threshold,
                 ctx.last_proof_block_hash.hex()[:16],
             )
-            for handle in self.miner_handles:
-                handle.set_live_threshold_milli(live_threshold)
-            self._last_pushed_threshold_milli = live_threshold
+            self._push_live_threshold(live_threshold)
 
         # 4. Zero-seed guard. The chain transiently returns
         # ``last_proof_block_hash = 0x00..00`` between accepting a proof
@@ -1984,15 +1993,85 @@ class SubstrateMinerController:
         )
         return base, int(last_proof_block), constants, curve
 
+    def _push_live_threshold(self, threshold_milli: int) -> None:
+        """Push a live threshold to every miner handle and record it.
+
+        Shared by the chain-sourced push in ``on_new_head`` (authoritative,
+        unclamped — the chain may tighten on a new round) and the
+        local-decay fallback in ``_maybe_push_local_decay``. Workers re-run
+        their submit gate against the shared value every ratchet iteration,
+        so a push reaches them without re-dispatch.
+        """
+        for handle in self.miner_handles:
+            handle.set_live_threshold_milli(threshold_milli)
+        self._last_pushed_threshold_milli = threshold_milli
+
+    def _maybe_push_local_decay(self) -> None:
+        """Push locally-decayed thresholds while the validator pool is dark.
+
+        Policy (2026-07-04 incident): rather than grinding a whole round
+        against a threshold frozen at dispatch, trust the round's cached
+        decay schedule once snapshot polls have been failing for
+        ``_LOCAL_DECAY_STALE_AFTER_S``. The estimate only ever eases —
+        ``max()`` on negative milli values never regresses tighter than
+        the last push — and the moment a poll succeeds, the chain-sourced
+        push in ``on_new_head`` resumes as the source of truth.
+        """
+        events = self.events
+        if events is None or events.last_successful_poll_monotonic is None:
+            return
+        now = time.monotonic()
+        poll_stale_s = now - events.last_successful_poll_monotonic
+        if poll_stale_s <= _LOCAL_DECAY_STALE_AFTER_S:
+            return
+        key = self._current_work_key
+        if key is None or key in self._closed_work_keys:
+            return
+        sched = self._decay_schedule_by_key.get(key)
+        if sched is None:
+            return  # schedule-less round — _maybe_refresh_schedule's job
+        schedule, last_proof_block, epoch_length = sched
+        if not schedule or last_proof_block <= 0 or epoch_length <= 0:
+            return  # genesis sentinel / degenerate schedule
+        if self._last_pushed_threshold_milli == 0:
+            return  # no chain-sourced baseline yet — nothing to ease from
+        est_block = self._timing.estimate_block(
+            now_monotonic=asyncio.get_running_loop().time(),
+        )
+        if est_block is None:
+            return
+        step = max(0, (int(est_block) - int(last_proof_block)) // int(epoch_length))
+        idx = min(step, len(schedule) - 1)
+        if step > idx and key != self._decay_horizon_logged_key:
+            self._decay_horizon_logged_key = key
+            logger.info(
+                "local decay schedule horizon exhausted at step %d "
+                "(len=%d); holding last value",
+                step, len(schedule),
+            )
+        candidate = max(int(schedule[idx]), self._last_pushed_threshold_milli)
+        if candidate == self._last_pushed_threshold_milli:
+            return
+        logger.info(
+            "live energy threshold locally decayed: %d → %d milli "
+            "(est_block=%d step=%d poll_stale_s=%.1f)",
+            self._last_pushed_threshold_milli, candidate,
+            int(est_block), step, poll_stale_s,
+        )
+        self._push_live_threshold(candidate)
+
     async def _fire_timer_loop(self) -> None:
         """Cadence-driven fire authority: tick, predict, fire — no head needed.
 
         Runs until shutdown. Each tick re-evaluates the active preview's
         worker-computed ``valid_at_block`` against the cadence clock and fires
         at ``T* - lag``; resilient to a head feed that pauses between blocks.
+        Also hosts the staleness fallbacks: local decay pushes while the
+        pool is dark (they need no head, exactly like the fire authority).
         """
         while not self._shutdown_event.is_set():
             try:
+                self._maybe_push_local_decay()
                 await self._maybe_fire_on_cadence()
             except Exception:  # noqa: BLE001 — one bad tick must not kill the loop
                 logger.exception("fire timer tick failed; continuing")
