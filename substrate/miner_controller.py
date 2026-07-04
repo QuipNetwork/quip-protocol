@@ -265,6 +265,10 @@ _FIRE_TICK_S = 1.0
 # at the same moment the watchdog starts force-swapping.
 _LOCAL_DECAY_STALE_AFTER_S = 18.0
 
+# Retry cadence for rebuilding a missing decay schedule mid-round (a
+# dispatch-time RPC failure used to leave the whole round schedule-less).
+_SCHEDULE_RETRY_INTERVAL_S = 5.0
+
 
 # A "work key" uniquely identifies the puzzle a context is mining
 # against: same (last_proof_block_hash, topology_hash) means the pallet will
@@ -562,6 +566,9 @@ class SubstrateMinerController:
         # Work key whose schedule-horizon exhaustion was already logged by
         # the local-decay push (one line per round, not per tick).
         self._decay_horizon_logged_key: Optional[WorkKey] = None
+        # Earliest monotonic time the fire loop may retry a missing decay
+        # schedule (throttles _maybe_refresh_schedule's chain reads).
+        self._schedule_retry_next_monotonic: float = 0.0
         self._anticipatory_fired: set[WorkKey] = set()
         self._timing = TimingTracker()
         # Free-running cadence fire timer (Task 7). Re-evaluates the active
@@ -2006,6 +2013,63 @@ class SubstrateMinerController:
             handle.set_live_threshold_milli(threshold_milli)
         self._last_pushed_threshold_milli = threshold_milli
 
+    async def _maybe_refresh_schedule(self) -> None:
+        """Retry the decay-schedule build for a schedule-less active round.
+
+        ``_anticipatory_inputs`` runs once per work key from
+        ``on_new_head``, behind the same-key short-circuit — so a
+        dispatch-time RPC failure used to leave the entire round without a
+        schedule: legacy stash placeholders in the workers, a suppressed
+        anticipatory fire authority, and no basis for local decay. Ticked
+        from the fire timer, this retries (throttled) until the chain
+        answers. Already-running workers keep their placeholder previews
+        until the next dispatch; submission rides the live gate meanwhile.
+        """
+        key = self._current_work_key
+        if key is None or key in self._closed_work_keys:
+            return
+        if self._decay_schedule_by_key.get(key) is not None:
+            return
+        ctx = self._current_context
+        if ctx is None or _work_key(ctx) != key:
+            return
+        now = time.monotonic()
+        if now < self._schedule_retry_next_monotonic:
+            return
+        self._schedule_retry_next_monotonic = now + _SCHEDULE_RETRY_INTERVAL_S
+        inputs = await self._anticipatory_inputs(ctx, key)
+        if inputs is None:
+            return
+        if key != self._current_work_key:
+            # Round rolled while we awaited: the eviction that rolled it
+            # already ran, so drop the stale base ``_anticipatory_inputs``
+            # just re-cached for the dead key.
+            self._base_difficulty_by_key.pop(key, None)
+            return
+        base, last_proof_block, constants, curve = inputs
+        sched = (
+            build_decay_schedule(
+                int(base.max_energy_milli), curve, _ANTICIPATORY_SEARCH_LIMIT,
+            ),
+            int(last_proof_block),
+            int(constants.epoch_length),
+        )
+        self._decay_schedule_by_key[key] = sched
+        # Enrich the frozen context so any later re-dispatch of this round
+        # (fill_idle, idle fall-through) carries the schedule to workers.
+        self._current_context = dataclasses_replace(
+            ctx,
+            decay_schedule=sched[0],
+            last_proof_block=sched[1],
+            epoch_length=sched[2],
+        )
+        logger.info(
+            "decay schedule recovered mid-round for work_key 0x%s... "
+            "(steps=%d last_proof_block=%d)",
+            ctx.last_proof_block_hash.hex()[:16],
+            len(sched[0]), sched[1],
+        )
+
     def _maybe_push_local_decay(self) -> None:
         """Push locally-decayed thresholds while the validator pool is dark.
 
@@ -2071,6 +2135,7 @@ class SubstrateMinerController:
         """
         while not self._shutdown_event.is_set():
             try:
+                await self._maybe_refresh_schedule()
                 self._maybe_push_local_decay()
                 await self._maybe_fire_on_cadence()
             except Exception:  # noqa: BLE001 — one bad tick must not kill the loop

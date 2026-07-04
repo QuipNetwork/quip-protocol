@@ -283,6 +283,100 @@ async def test_chain_push_resumes_after_local_decay(controller):
     assert handle.threshold_pushes == [-9000, -12000]
 
 
+# ----------------------------------------------------------------------
+# Mid-round schedule recovery (_maybe_refresh_schedule) — a dispatch-time
+# RPC failure must not leave the whole round schedule-less.
+# ----------------------------------------------------------------------
+
+
+def _seed_schedule_retry(ctrl, monkeypatch):
+    """Wire a schedule-less active round plus predictor inputs.
+
+    Returns ``(ctx, key, inputs)``. ``dataclasses_replace`` is stubbed
+    for SimpleNamespace contexts (production contexts are frozen
+    dataclasses; these tests follow the file's convention of skipping
+    dataclass validation).
+    """
+    from substrate.miner_controller import _work_key
+
+    ctx = SimpleNamespace(
+        last_proof_block_hash=b"\x01" * 32,
+        topology_hash=b"\xab" * 32,
+        decay_schedule=None,
+        last_proof_block=0,
+        epoch_length=0,
+    )
+    key = _work_key(ctx)
+    ctrl._current_work_key = key
+    ctrl._current_context = ctx
+    ctrl._schedule_retry_next_monotonic = 0.0
+    inputs = (
+        SimpleNamespace(max_energy_milli=-10000),  # base difficulty
+        1234,                                      # last_proof_block
+        SimpleNamespace(epoch_length=10),          # constants
+        object(),                                  # curve
+    )
+    monkeypatch.setattr(
+        "substrate.miner_controller.build_decay_schedule",
+        lambda base_milli, curve, limit: [-10000, -9500, -9000],
+    )
+    monkeypatch.setattr(
+        "substrate.miner_controller.dataclasses_replace",
+        lambda c, **kw: SimpleNamespace(**{**vars(c), **kw}),
+    )
+    return ctx, key, inputs
+
+
+@pytest.mark.asyncio
+async def test_schedule_retry_populates_cache_mid_round(controller, monkeypatch):
+    """A failed dispatch-time build recovers on a later fire-loop tick."""
+    ctrl, _handle = controller
+    _ctx, key, inputs = _seed_schedule_retry(ctrl, monkeypatch)
+    ctrl._anticipatory_inputs = AsyncMock(side_effect=[None, inputs])
+
+    await ctrl._maybe_refresh_schedule()
+    assert ctrl._decay_schedule_by_key.get(key) is None  # first try failed
+
+    ctrl._schedule_retry_next_monotonic = 0.0  # bypass throttle for the test
+    await ctrl._maybe_refresh_schedule()
+    assert ctrl._decay_schedule_by_key[key] == ([-10000, -9500, -9000], 1234, 10)
+    # The frozen context is enriched so later re-dispatches carry the
+    # schedule to workers.
+    assert ctrl._current_context.decay_schedule == [-10000, -9500, -9000]
+    assert ctrl._current_context.last_proof_block == 1234
+    assert ctrl._current_context.epoch_length == 10
+
+
+@pytest.mark.asyncio
+async def test_schedule_retry_throttled(controller, monkeypatch):
+    """Failed retries back off — no chain read storm from the 1s tick."""
+    ctrl, _handle = controller
+    _seed_schedule_retry(ctrl, monkeypatch)
+    ctrl._anticipatory_inputs = AsyncMock(return_value=None)
+
+    await ctrl._maybe_refresh_schedule()
+    await ctrl._maybe_refresh_schedule()
+    assert ctrl._anticipatory_inputs.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_schedule_retry_discards_after_roll(controller, monkeypatch):
+    """Inputs that land after the round rolled are discarded, and the
+    stale base re-cached by _anticipatory_inputs is dropped."""
+    ctrl, _handle = controller
+    _ctx, key, inputs = _seed_schedule_retry(ctrl, monkeypatch)
+    ctrl._base_difficulty_by_key[key] = "stale-base"
+
+    async def roll_then_answer(ctx, k):
+        ctrl._current_work_key = (b"\x02" * 32, b"\xab" * 32)
+        return inputs
+
+    ctrl._anticipatory_inputs = roll_then_answer
+    await ctrl._maybe_refresh_schedule()
+    assert key not in ctrl._decay_schedule_by_key
+    assert key not in ctrl._base_difficulty_by_key
+
+
 @pytest.mark.asyncio
 async def test_on_new_head_dispatches_on_work_key_change(controller):
     """A context with a new (last_proof_block_hash, topology_hash) dispatches work."""
