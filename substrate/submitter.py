@@ -169,7 +169,8 @@ def encode_quantum_proof(
         # Always included: scalecodec's Struct.process_encode iterates the
         # CHAIN metadata's field list, so a pre-111 node ignores this key
         # and a 111 node requires it. No spec-version gating needed.
-        "device_access_time_us": int(result.device_access_time_us or 0),
+        # Clamp to zero: negative values would fail u64 SCALE encoding.
+        "device_access_time_us": max(0, int(result.device_access_time_us or 0)),
     }
 
 

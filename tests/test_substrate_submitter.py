@@ -151,6 +151,13 @@ def test_encode_quantum_proof_device_access_time_defaults_zero():
     assert encode_quantum_proof(result, ctx)["device_access_time_us"] == 0
 
 
+def test_encode_quantum_proof_device_access_time_clamps_negative():
+    ctx = _make_context()
+    result = _make_result()
+    result.device_access_time_us = -5
+    assert encode_quantum_proof(result, ctx)["device_access_time_us"] == 0
+
+
 def test_normalize_spins_boolean_convention():
     assert _normalize_spins([0, 1, 0, 1]) == [-1, 1, -1, 1]
 

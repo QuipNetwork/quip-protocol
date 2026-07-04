@@ -1327,6 +1327,59 @@ async def test_handle_result_not_won_pow_sequence_none_on_rpc_failure(monkeypatc
     )
 
 
+async def test_handle_result_fills_device_access_time_from_qpu_sum(monkeypatch):
+    """QPU path: the submitted MiningResult carries the summed per-attempt
+    QPU access time, not the wall clock."""
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    monkeypatch.setattr(controller, "_sum_qpu_access_us", lambda n: 555_000)
+
+    captured = {}
+
+    async def fake_submit_proof(bc, pc, signer, result, context, **kw):
+        captured["device"] = result.device_access_time_us
+        return ExtrinsicReceipt(
+            extrinsic_hash="0xabc",
+            error="Module(error=InvalidNonce, pallet='QuantumPow', index=0)",
+        )
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+    controller.pool_client.query_proofs_submitted = AsyncMock(return_value=0)
+    envelope = _ResultEnvelope(result=_mining_result(), context=ctx, handle_id="t-0")
+    await controller._handle_result(envelope)
+    assert captured["device"] == 555_000
+
+
+async def test_handle_result_falls_back_to_wall_clock(monkeypatch):
+    """No QPU time recorded -> wall clock seconds * 1e6."""
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    monkeypatch.setattr(controller, "_sum_qpu_access_us", lambda n: None)
+
+    captured = {}
+
+    async def fake_submit_proof(bc, pc, signer, result, context, **kw):
+        captured["device"] = result.device_access_time_us
+        return ExtrinsicReceipt(
+            extrinsic_hash="0xabc",
+            error="Module(error=InvalidNonce, pallet='QuantumPow', index=0)",
+        )
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+    controller.pool_client.query_proofs_submitted = AsyncMock(return_value=0)
+    result = _mining_result()
+    result.mining_time = 7
+    envelope = _ResultEnvelope(result=result, context=ctx, handle_id="t-0")
+    await controller._handle_result(envelope)
+    assert captured["device"] == 7_000_000
+
+
 _RECORD_SUBMISSION_LOG_COMMON = {
     "solution_number": _TEST_SOLUTION_NUMBER,
     "miner_id": "miner-7",
