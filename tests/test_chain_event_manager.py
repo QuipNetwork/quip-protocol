@@ -239,3 +239,115 @@ async def test_event_manager_force_swap_timeout_does_not_disable_watchdog():
     # Without the timeout, force_swap_calls would be 1 (stuck). With timeout
     # re-arming, we expect ≥ 2 attempts within 0.25s / (0.03s dead threshold).
     assert pool.force_swap_calls >= 2
+
+
+class _AlwaysFailingPool(_FakePool):
+    """Every poll raises — a validator that accepts connections but never
+    serves state (the 2026-07-04 incident shape)."""
+
+    async def send(self, op: str, args: dict) -> Any:
+        await asyncio.sleep(0.001)
+        raise TimeoutError("validator up but not serving state")
+
+
+@pytest.mark.asyncio
+async def test_successful_poll_updates_last_successful_poll():
+    """Every successful poll stamps poll-liveness, even with no state change
+    and even when the payload is None (live validator, unseeded chain)."""
+    pool = _FakePool()
+    pool.script(_snap(10))  # then idles returning the same snapshot
+    em = ChainEventManager(
+        pool=pool,
+        state_key=_state_key,
+        snapshot_op="get_mining_snapshot",
+        snapshot_args={},
+        blocktime_s=0.01,
+        settled_poll_pct=0.5,
+        catch_up_poll_pct=0.1,
+        stale_blocktime_multiplier=100.0,
+        dead_blocktime_multiplier=100.0,
+    )
+    assert em.last_successful_poll_monotonic is None
+    task = asyncio.create_task(em.run())
+    await asyncio.sleep(0.05)
+    first = em.last_successful_poll_monotonic
+    assert first is not None
+    # Later polls dedup (no state change) but must keep stamping liveness.
+    await asyncio.sleep(0.05)
+    em.request_shutdown()
+    await task
+    assert em.last_successful_poll_monotonic > first
+
+    # None payload variant: RPC succeeded, chain unseeded — still a live poll.
+    none_pool = _FakePool()  # empty script → returns None (its initial _last)
+    em_none = ChainEventManager(
+        pool=none_pool,
+        state_key=lambda payload: (
+            ("none-snapshot",) if payload is None else _state_key(payload)
+        ),
+        snapshot_op="get_mining_snapshot",
+        snapshot_args={},
+        blocktime_s=0.01,
+        settled_poll_pct=0.5,
+        catch_up_poll_pct=0.1,
+        stale_blocktime_multiplier=100.0,
+        dead_blocktime_multiplier=100.0,
+    )
+    task = asyncio.create_task(em_none.run())
+    await asyncio.sleep(0.05)
+    em_none.request_shutdown()
+    await task
+    assert em_none.last_successful_poll_monotonic is not None
+
+
+@pytest.mark.asyncio
+async def test_failed_poll_does_not_update_last_successful_poll():
+    """A raising poll must never stamp poll-liveness."""
+    pool = _AlwaysFailingPool()
+    em = ChainEventManager(
+        pool=pool,
+        state_key=_state_key,
+        snapshot_op="get_mining_snapshot",
+        snapshot_args={},
+        blocktime_s=0.01,
+        settled_poll_pct=0.5,
+        catch_up_poll_pct=0.1,
+        stale_blocktime_multiplier=100.0,
+        dead_blocktime_multiplier=100.0,
+    )
+    task = asyncio.create_task(em.run())
+    await asyncio.sleep(0.1)
+    em.request_shutdown()
+    await task
+    assert em.last_successful_poll_monotonic is None
+
+
+@pytest.mark.asyncio
+async def test_watchdog_force_swaps_on_persistent_poll_failure():
+    """The watchdog must be reachable when every poll raises.
+
+    Incident pin (2026-07-04): get_mining_snapshot timed out for ~30 min
+    and force_swap never fired, because the except branch continued past
+    the watchdog block. The failure path must accrue staleness and swap.
+    """
+    pool = _AlwaysFailingPool()
+    em = ChainEventManager(
+        pool=pool,
+        state_key=_state_key,
+        snapshot_op="get_mining_snapshot",
+        snapshot_args={},
+        blocktime_s=0.01,
+        settled_poll_pct=0.5,
+        catch_up_poll_pct=0.1,
+        stale_blocktime_multiplier=1.0,
+        dead_blocktime_multiplier=3.0,  # 0.03s dead threshold
+    )
+    em.subscribe("new_head", lambda p: None)
+    task = asyncio.create_task(em.run())
+    await asyncio.sleep(0.25)
+    em.request_shutdown()
+    await task
+    assert pool.force_swap_calls >= 1, (
+        "watchdog never fired under persistent poll failure — the "
+        "except branch is skipping the watchdog check"
+    )

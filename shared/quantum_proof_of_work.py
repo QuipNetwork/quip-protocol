@@ -1003,6 +1003,22 @@ def _select_diverse_with_fallback(
     caller's current value so the (unreachable in the success path) no-op
     branches preserve it unchanged.
     """
+    # Chain-contract fast path: with min_solutions == 1 the pallet needs a
+    # single below-threshold solution, so submit exactly the best-energy
+    # row. Without this, ``select_diverse_solutions`` seeds farthest-point
+    # sampling with the two most-distant rows and never trims, so a
+    # target_count of 1 ships 2 solutions and ``submit_floor_energy``
+    # (max over the selected set) gets dragged above the best row by a
+    # farthest-point sibling — the submit gate then holds back proofs the
+    # chain would accept. Guarded on ``min_diversity <= 0``: the chain
+    # scores 1-solution diversity as 0 and gates
+    # ``diversity >= min_diversity`` unconditionally, so a single solution
+    # only validates while diversity is unenforced; otherwise fall through
+    # to the diverse selection below.
+    if min_solutions == 1 and min_diversity <= 0.0 and len(valid_energies):
+        idx = int(np.argmin(valid_energies))
+        return valid_solutions[idx : idx + 1], 0.0, float(valid_energies[idx])
+
     filtered_solutions = valid_solutions
     diversity = 0.0
     if len(valid_solutions) >= min_solutions:

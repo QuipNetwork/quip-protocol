@@ -39,6 +39,7 @@ from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from substrate.client import SubstrateClient
 from substrate.miner_controller import (
+    EARLY_SUBMISSION_ERRORS,
     FATAL_SUBMISSION_ERRORS,
     STALE_SUBMISSION_ERRORS,
     ControllerStats,
@@ -227,6 +228,13 @@ def _bare_controller() -> SubstrateMinerController:
     c._timing = TimingTracker()
     c._fire_timer_task = None
     c._last_fire_status_key = None
+    # Resilience state (dark-validator fallbacks): no event manager, no
+    # pending submission, schedule retry unthrottled, horizon log unarmed.
+    c.events = None
+    c._pending_submission = None
+    c._replaying = None
+    c._schedule_retry_next_monotonic = 0.0
+    c._decay_horizon_logged_key = None
     # Per-round solution-number cache (on-disk archive key). Empty by
     # default; _set_current seeds it for the active round so submissions
     # land under the matching {solution_number}/ dir.
@@ -2402,3 +2410,294 @@ def test_sum_qpu_access_us_swallows_read_errors(monkeypatch):
         "substrate.miner_controller.query_by_solution_number", _boom
     )
     assert controller._sum_qpu_access_us(7) is None
+
+
+# ----------------------------------------------------------------------
+# Pending submissions (optimistic submit-on-reconnect) + EARLY outcome
+# ----------------------------------------------------------------------
+
+
+class _IdleHandle:
+    """Idle fake handle: records fill_idle re-dispatches."""
+
+    def __init__(self, miner_id: str = "h0") -> None:
+        self.miner_id = miner_id
+        self._active_dispatch_id = 0
+        self.dispatched: list = []
+
+    def mine_work_item(self, context, *, solution_number=None) -> int:
+        self.dispatched.append(context)
+        self._active_dispatch_id += 1
+        return self._active_dispatch_id
+
+
+@pytest.mark.parametrize("error_name", EARLY_SUBMISSION_ERRORS)
+def test_classify_early_error_names_substrate_format(error_name):
+    """EARLY beats the unknown→FATAL default: a local-decay overshoot
+    submission must queue-and-retry, never crash the controller."""
+    receipt = ExtrinsicReceipt(
+        extrinsic_hash="0xabc",
+        error=f"Module(error={error_name}, pallet='QuantumPow', index=0)",
+    )
+    assert classify_submission(receipt) is SubmissionOutcome.EARLY
+
+
+async def test_submit_failure_queues_pending_and_fills_idle(monkeypatch):
+    """An RPC-failed submit holds the result for replay (not a drop) and
+    resumes mining the round on the now-idle emitter."""
+    from substrate.miner_controller import _work_key
+
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    handle = _IdleHandle()
+    controller.miner_handles = [handle]
+
+    async def fake_submit_proof(*args, **kwargs):
+        raise ConnectionError("websocket disconnected")
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+
+    envelope = _ResultEnvelope(
+        result=_mining_result(), context=ctx, handle_id="test-0",
+    )
+    await controller._handle_result(envelope)
+
+    pending = controller._pending_submission
+    assert pending is not None
+    assert pending.work_key == _work_key(ctx)
+    assert pending.attempts == 1
+    # effective_floor falls back to energy (-1.0) => -1000 milli.
+    assert pending.floor_milli == -1000
+    assert handle.dispatched == [ctx], "fill_idle must resume the round"
+    assert controller.stats.submission_errors == 1
+
+
+async def test_early_receipt_queues_pending(monkeypatch):
+    """An EARLY receipt (threshold not yet decayed to the floor) queues the
+    result instead of raising like the former unknown→FATAL path."""
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    controller.miner_handles = []
+
+    async def fake_submit_proof(*args, **kwargs):
+        return ExtrinsicReceipt(
+            extrinsic_hash="0xabc",
+            error="Module(error=InsufficientEnergy, pallet='QuantumPow', index=0)",
+        )
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+
+    envelope = _ResultEnvelope(
+        result=_mining_result(), context=ctx, handle_id="test-0",
+    )
+    await controller._handle_result(envelope)  # must not raise
+    assert controller._pending_submission is not None
+
+
+async def test_pending_keeps_lower_floor():
+    """A better (lower-floor) sibling replaces the held envelope; a worse
+    one only bumps attempt/backoff state."""
+    import dataclasses as _dc
+
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    controller.miner_handles = []
+    from substrate.miner_controller import _work_key
+    key = _work_key(ctx)
+    log_common = {"solution_number": 1, "miner_id": "t", "miner_type": "CPU",
+                  "energy_milli": 0, "diversity_milli": 0, "threshold_milli": 0,
+                  "last_proof_block_hash_hex": "0x", "num_valid": 1}
+
+    def _envelope(floor):
+        result = _dc.replace(_mining_result(), submit_floor_energy=floor)
+        return _ResultEnvelope(result=result, context=ctx, handle_id="t")
+
+    await controller._queue_pending_submission(
+        _envelope(-5.0), key, error="e1", log_common=log_common,
+    )
+    assert controller._pending_submission.floor_milli == -5000
+
+    # Worse floor: state bumps, envelope kept.
+    await controller._queue_pending_submission(
+        _envelope(-4.0), key, error="e2", log_common=log_common,
+    )
+    assert controller._pending_submission.floor_milli == -5000
+    assert controller._pending_submission.attempts == 2
+
+    # Better floor: replaces.
+    await controller._queue_pending_submission(
+        _envelope(-6.0), key, error="e3", log_common=log_common,
+    )
+    assert controller._pending_submission.floor_milli == -6000
+    assert controller._pending_submission.attempts == 3
+
+
+def _seed_pending(controller, ctx, *, attempts=1, last_attempt_age_s=100.0):
+    """Install a pending submission directly (bypasses the queue path)."""
+    import time as _time
+    from substrate.miner_controller import _PendingSubmission, _work_key
+
+    envelope = _ResultEnvelope(
+        result=_mining_result(), context=ctx, handle_id="t",
+    )
+    now = _time.monotonic()
+    pending = _PendingSubmission(
+        envelope=envelope,
+        work_key=_work_key(ctx),
+        floor_milli=-1000,
+        queued_at_monotonic=now - last_attempt_age_s,
+        last_attempt_monotonic=now - last_attempt_age_s,
+        attempts=attempts,
+    )
+    controller._pending_submission = pending
+    return pending
+
+
+async def test_replay_on_recovery_hands_pending_to_result_path():
+    """With the pool fresh and backoff elapsed, the replay takes the
+    pending OUT and re-drives the full result path."""
+    import time as _time
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    pending = _seed_pending(controller, ctx)
+    controller.events = SimpleNamespace(
+        last_successful_poll_monotonic=_time.monotonic(),
+    )
+    controller._handle_result = AsyncMock()
+
+    await controller._maybe_replay_pending()
+
+    controller._handle_result.assert_awaited_once_with(pending.envelope)
+    assert controller._pending_submission is None
+
+
+async def test_replay_skipped_while_pool_stale():
+    """No replay while the pool is still dark — wait for reconnect."""
+    import time as _time
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    _seed_pending(controller, ctx)
+    controller.events = SimpleNamespace(
+        last_successful_poll_monotonic=_time.monotonic() - 100.0,
+    )
+    controller._handle_result = AsyncMock()
+
+    await controller._maybe_replay_pending()
+
+    controller._handle_result.assert_not_awaited()
+    assert controller._pending_submission is not None
+
+
+async def test_replay_respects_backoff():
+    import time as _time
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    _seed_pending(controller, ctx, last_attempt_age_s=0.0)  # just attempted
+    controller.events = SimpleNamespace(
+        last_successful_poll_monotonic=_time.monotonic(),
+    )
+    controller._handle_result = AsyncMock()
+
+    await controller._maybe_replay_pending()
+
+    controller._handle_result.assert_not_awaited()
+    assert controller._pending_submission is not None
+
+
+async def test_pending_dropped_on_work_key_roll():
+    """A pending bound to a rolled round is dropped, both by the replay
+    guard and by _evict_anticipatory_state."""
+    from unittest.mock import AsyncMock
+
+    controller = _bare_controller()
+    ctx_old = _context(b"\xaa" * 32)
+    pending = _seed_pending(controller, ctx_old)
+    # Round rolled: current key differs.
+    _set_current(controller, _context(b"\xbb" * 32))
+    controller._handle_result = AsyncMock()
+
+    await controller._maybe_replay_pending()
+    controller._handle_result.assert_not_awaited()
+    assert controller._pending_submission is None
+
+    # Eviction path drops it too.
+    controller._pending_submission = pending
+    controller._evict_anticipatory_state(pending.work_key)
+    assert controller._pending_submission is None
+
+
+async def test_replay_failure_requeues(monkeypatch):
+    """A replay that fails again on RPC lands back in the pending slot
+    with bumped attempts (bounded by the round roll, per policy)."""
+    import time as _time
+    from types import SimpleNamespace
+
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    controller.miner_handles = []
+    _seed_pending(controller, ctx, attempts=1)
+    controller.events = SimpleNamespace(
+        last_successful_poll_monotonic=_time.monotonic(),
+    )
+
+    async def fake_submit_proof(*args, **kwargs):
+        raise ConnectionError("still down")
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+
+    await controller._maybe_replay_pending()
+
+    assert controller._pending_submission is not None
+    assert controller._pending_submission.attempts == 2
+
+
+async def test_fire_suppressed_while_pending(monkeypatch):
+    """The anticipatory fire yields to a queued live-submittable result."""
+    controller = _bare_controller()
+    ctx, key = _seed_cadence_state(controller, valid_at_block=20)
+
+    now = asyncio.get_running_loop().time()
+    controller._timing.observe_head(
+        block_number=20,
+        chain_ts_s=1000.0,
+        monotonic_now=now - 100.0,
+        wallclock_now=1000.0,
+    )
+
+    fired = []
+
+    async def fake_fire(c, k, p, b):
+        fired.append((k, b))
+
+    monkeypatch.setattr(controller, "_fire_preview", fake_fire)
+    _seed_pending(controller, ctx)
+
+    await controller._maybe_fire_on_cadence()
+    assert fired == [], "fire must be suppressed while a pending exists"
+
+    # Sanity: with the pending cleared, the same state fires.
+    controller._pending_submission = None
+    await controller._maybe_fire_on_cadence()
+    assert len(fired) == 1
