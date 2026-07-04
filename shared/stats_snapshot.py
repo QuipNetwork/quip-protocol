@@ -178,7 +178,7 @@ def merge_snapshots(snapshots: Iterable[dict[str, Any]]) -> Optional[dict[str, A
         supplies one (it's per-pool; each child owns its own pool and
         the value isn't meaningful to aggregate).
       * `node_id`, `ss58_address`, `account_id_hex`, `descriptor`,
-        `miner_survey`, `attempts_dir` — taken from the first snapshot
+        `miner_survey`, `attempts_dir`, `sync_state` — taken from the first snapshot
         that supplies a non-empty value. These describe the container
         as a whole (same signer, same hardware host, same JSONL store)
         and merging beyond first-wins would invent contradictions.
@@ -245,5 +245,6 @@ def merge_snapshots(snapshots: Iterable[dict[str, Any]]) -> Optional[dict[str, A
         "descriptor": _first_nonempty("descriptor", default={}),
         "miner_survey": _first_nonempty("miner_survey", default={}),
         "attempts_dir": _first_nonempty("attempts_dir"),
+        "sync_state": _first_nonempty("sync_state"),
         "modes": modes,
     }

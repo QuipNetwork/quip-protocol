@@ -334,3 +334,12 @@ def test_merge_snapshots_single_snapshot_passes_through():
     assert merged["miners"] == [{"id": "rig-CPU-1", "type": "CPU"}]
     assert merged["node_id"] == "rig"
     assert set(merged["modes"].keys()) == {"cpu"}
+
+
+def test_merge_snapshots_takes_first_nonnull_sync_state():
+    """sync_state merges first-wins — all children share one validator."""
+    merged = merge_snapshots([
+        {"mode": "cpu", "controller": {}, "sync_state": None},
+        {"mode": "qpu", "controller": {}, "sync_state": {"is_syncing": True}},
+    ])
+    assert merged["sync_state"] == {"is_syncing": True}
