@@ -126,16 +126,42 @@ async def _no_sleep(_seconds):
 
 
 class _BalanceClient:
-    """Stub client returning a scripted sequence of balances (holds the last)."""
+    """Stub client returning a scripted sequence of balances (holds the last).
 
-    def __init__(self, balances):
+    Also answers ``get_sync_state`` so the faucet/node-disagreement path can
+    tell a lagging node (``syncing=True``, keep waiting) from a fully-synced
+    one on a different chain (``syncing=False``, fast-fail). ``sync_error``
+    forces the probe to raise, exercising the fail-open-to-retry guard.
+    """
+
+    def __init__(
+        self, balances, *, syncing=False, current_block=0,
+        highest_block=0, sync_error=None,
+    ):
         self._balances = list(balances)
         self.query_count = 0
+        self._syncing = syncing
+        self._current_block = current_block
+        self._highest_block = highest_block
+        self._sync_error = sync_error
+        self.sync_probe_count = 0
 
     async def query_balance(self, _account):
         idx = min(self.query_count, len(self._balances) - 1)
         self.query_count += 1
         return self._balances[idx]
+
+    async def get_sync_state(self):
+        self.sync_probe_count += 1
+        if self._sync_error is not None:
+            raise self._sync_error
+        return {
+            "is_syncing": self._syncing,
+            "peers": 1,
+            "current_block": self._current_block,
+            "highest_block": self._highest_block,
+            "starting_block": 0,
+        }
 
 
 def _stub_keystore():
@@ -205,7 +231,9 @@ async def test_ensure_funded_permanent_error_is_not_retried(monkeypatch):
 
 async def test_ensure_funded_already_funded_reconciles_via_balance(monkeypatch):
     # 403 "already funded" must NOT crash: the re-read balance is the truth and
-    # shows we cleared min_balance, so funding succeeds on the next loop.
+    # shows we cleared min_balance, so funding succeeds on the next loop. The
+    # node reads 0 then 5000 across the two loops — a lagging node catching up,
+    # so the sync probe reports syncing=True and the loop keeps waiting.
     monkeypatch.setattr(mb.asyncio, "sleep", _no_sleep)
     posts = []
 
@@ -215,9 +243,60 @@ async def test_ensure_funded_already_funded_reconciles_via_balance(monkeypatch):
 
     monkeypatch.setattr(mb, "_post_faucet", fake_post)
     # Initial check sees 0 (below min), then the post-403 re-read sees 5000.
-    bal = await mb.ensure_funded(_BalanceClient([0, 5000]), _stub_keystore(), _faucet_config())
+    client = _BalanceClient([0, 5000], syncing=True)
+    bal = await mb.ensure_funded(client, _stub_keystore(), _faucet_config())
     assert bal == 5000
-    assert len(posts) == 1, "already-funded should reconcile, not fast-fail"
+
+
+async def test_ensure_funded_faucet_funded_but_node_synced_fast_fails(monkeypatch):
+    # The observed production bug: faucet reports the account holds free=20000
+    # (>= min=1000) but our fully-synced node reports 0 for the SAME account and
+    # field. Retrying can't reconcile two synced reads that disagree — the miner
+    # and faucet are on different chains. Fail fast, don't spin the budget.
+    monkeypatch.setattr(mb.asyncio, "sleep", _no_sleep)
+    posts = []
+
+    def fake_post(_url, *, dest_hex, amount):
+        posts.append(1)
+        raise mb.FaucetAlreadyFunded(20000, "faucet returned 403: already funded")
+
+    monkeypatch.setattr(mb, "_post_faucet", fake_post)
+    client = _BalanceClient([0], syncing=False)
+    with pytest.raises(RuntimeError, match="different chain"):
+        await mb.ensure_funded(client, _stub_keystore(), _faucet_config())
+    assert len(posts) == 1, "synced-node contradiction must fail fast, not retry"
+
+
+async def test_ensure_funded_faucet_funded_but_node_syncing_waits(monkeypatch):
+    # Same faucet/node disagreement, but the node is still syncing and catches
+    # up to 20000 on the next loop. Must keep retrying (not fast-fail) and
+    # succeed once the local balance clears min.
+    monkeypatch.setattr(mb.asyncio, "sleep", _no_sleep)
+
+    def fake_post(_url, *, dest_hex, amount):
+        raise mb.FaucetAlreadyFunded(20000, "faucet returned 403: already funded")
+
+    monkeypatch.setattr(mb, "_post_faucet", fake_post)
+    # Pre-loop check reads 0, loop attempt-1 reads 0 (probes, still syncing),
+    # attempt-2 reads 20000 (node caught up → success).
+    client = _BalanceClient([0, 0, 20000], syncing=True, current_block=5, highest_block=9)
+    bal = await mb.ensure_funded(client, _stub_keystore(), _faucet_config())
+    assert bal == 20000
+    assert client.sync_probe_count >= 1, "disagreement must probe sync state"
+
+
+async def test_ensure_funded_faucet_funded_probe_error_keeps_retrying(monkeypatch):
+    # If the sync-state probe itself fails we can't prove the node is synced,
+    # so fail open to the retry budget rather than crashing or false fast-fail.
+    monkeypatch.setattr(mb.asyncio, "sleep", _no_sleep)
+
+    def fake_post(_url, *, dest_hex, amount):
+        raise mb.FaucetAlreadyFunded(20000, "faucet returned 403: already funded")
+
+    monkeypatch.setattr(mb, "_post_faucet", fake_post)
+    client = _BalanceClient([0], sync_error=RuntimeError("probe timeout"))
+    with pytest.raises(RuntimeError, match="did not fund within"):
+        await mb.ensure_funded(client, _stub_keystore(), _faucet_config(budget=10.0))
 
 
 async def test_ensure_funded_already_funded_below_min_bounds_not_crashes(monkeypatch):
