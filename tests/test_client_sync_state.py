@@ -66,8 +66,13 @@ async def test_get_sync_state_reports_synced_node():
         },
     })
     state = await client.get_sync_state()
-    assert state["is_syncing"] is False
-    assert state["current_block"] == 90_000
+    assert state == {
+        "is_syncing": False,
+        "peers": 8,
+        "current_block": 90_000,
+        "highest_block": 90_000,
+        "starting_block": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -96,3 +101,21 @@ async def test_get_sync_state_result_is_mp_picklable():
     })
     state = await client.get_sync_state()
     multiprocessing.reduction.ForkingPickler.dumps(state)  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_get_sync_state_propagates_health_rpc_failure():
+    """system_health failing means the node is not answering — propagate.
+
+    The pool's probe wraps this call in try/except and treats any
+    exception as "node genuinely down", so propagation (not fail-open)
+    is the contract for the health half of the probe.
+    """
+    client = _client_with_rpc({
+        "system_health": RuntimeError("health RPC failed"),
+        "system_syncState": {
+            "result": {"startingBlock": 0, "currentBlock": 1, "highestBlock": 2}
+        },
+    })
+    with pytest.raises(RuntimeError, match="health RPC failed"):
+        await client.get_sync_state()
