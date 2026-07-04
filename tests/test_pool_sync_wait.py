@@ -6,6 +6,7 @@ docs/superpowers/specs/2026-07-03-node-sync-progress-design.md.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Callable
 
 import pytest
@@ -263,5 +264,96 @@ async def test_sync_wait_aborts_when_probe_dies_mid_wait():
         # exactly like today's exhausted-retries path.
         with pytest.raises(TimeoutError):
             await pool.send("get_head", {})
+    finally:
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_senders_serialize_sync_wait():
+    """Two concurrent send() calls on a syncing node don't run overlapping
+    probe loops: the sync-wait lock parks the second caller, so it needs
+    exactly one post-recovery probe of its own.
+
+    Sequence (single URL "http://a"):
+      - Both callers fail get_head, each runs _record_sync_state (2 probes).
+      - Both callers call _swap_after_failure; each respawns on "http://a"
+        (same-URL idempotence check doesn't dedupe same-URL respawns — ok).
+      - Both enter _sync_wait. Caller 1 acquires _sync_wait_lock.
+        Caller 2 parks on it.
+      - Caller 1 polls: _syncing(600) then _synced() (2 more probes). Lock
+        released; _clear_sync_state() called.
+      - Caller 2 acquires lock, probes once: iterator exhausted → _synced().
+        Returns True immediately (1 probe).
+      - Both callers retry get_head; done["synced"]=True → both return b"head".
+      Total probes: 2 + 2 + 1 = 5, well within the ≤ 6 bound.
+    """
+    probe_count = {"n": 0}
+    sync_states = iter([_syncing(100), _syncing(100), _syncing(600), _synced()])
+    done = {"synced": False}
+
+    def script_a(op: str) -> Any:
+        if op == "get_sync_state":
+            probe_count["n"] += 1
+            try:
+                state = next(sync_states)
+            except StopIteration:
+                state = _synced()
+            if not state["is_syncing"]:
+                done["synced"] = True
+            return state
+        if not done["synced"]:
+            raise TimeoutError("runtime call timed out")
+        return b"head"
+
+    pool = _make_pool({"http://a": script_a})
+    await pool.start()
+    try:
+        results = await asyncio.gather(
+            pool.send("get_head", {}), pool.send("get_head", {})
+        )
+        assert results == [b"head", b"head"]
+        # Bounded probing: 2 classification probes (one per caller) +
+        # the winner's wait-loop probes + 1 post-recovery probe from the
+        # parked caller. Without the lock this grows unbounded/racy.
+        assert probe_count["n"] <= 6
+    finally:
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stale_syncing_record_cleared_when_node_goes_down():
+    """A syncing record left by a failed submit must not steer a later
+    genuinely-down failure into the quiet sync-wait branch.
+
+    Sequence:
+      - submit_signed_extrinsic fails → probe returns _syncing(100) →
+        _syncing_urls["http://a"] populated → NodeSyncing raised (no swap).
+      - phase["down"] = True
+      - get_head fails → probe raises ConnectionError → _record_sync_state
+        pops the stale entry → returns False → normal swap → AllUrlsDown
+        with empty _syncing_urls → backoff branch → retries exhaust →
+        ConnectionError propagates.
+    """
+    phase = {"down": False}
+
+    def script_a(op: str) -> Any:
+        if op == "get_sync_state":
+            if phase["down"]:
+                raise ConnectionError("node died")
+            return _syncing(100)
+        if op == "submit_signed_extrinsic":
+            raise TimeoutError("runtime call timed out")
+        raise ConnectionError("node died")
+
+    pool = _make_pool({"http://a": script_a})
+    await pool.start()
+    try:
+        with pytest.raises(NodeSyncing):
+            await pool.send("submit_signed_extrinsic", {"extrinsic_hex": "0xab"})
+        assert pool._syncing_urls  # stale record now present
+        phase["down"] = True
+        with pytest.raises(ConnectionError):
+            await pool.send("get_head", {})
+        assert pool._syncing_urls == {}  # probe-down cleared it
     finally:
         await pool.shutdown()

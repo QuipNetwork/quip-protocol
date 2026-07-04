@@ -143,6 +143,9 @@ class ValidatorPool:
         # URL → last get_sync_state dict for URLs found syncing during the
         # current failure cycle. Cleared on any successful op.
         self._syncing_urls: dict[str, dict[str, Any]] = {}
+        # Serializes sync-wait so concurrent send() callers don't run
+        # overlapping probe loops.
+        self._sync_wait_lock = asyncio.Lock()
         # Telemetry surface: last observed sync state (plus url/at); None
         # when healthy. The controller's stats snapshot writer reads this.
         self.last_sync_state: Optional[dict[str, Any]] = None
@@ -254,6 +257,11 @@ class ValidatorPool:
         """Probe after a connection-class error; record + report syncing nodes."""
         state = await self._probe_sync_state(handle)
         if state is None or not state.get("is_syncing"):
+            # Remove any stale entry: without this, a syncing record left by a
+            # failed non-idempotent op (NodeSyncing path, no swap) leaks here
+            # and mis-steers the AllUrlsDown branch into the quiet sync-wait
+            # path when the node is genuinely down.
+            self._syncing_urls.pop(handle.url, None)
             return False
         self._syncing_urls[handle.url] = state
         self._publish_sync_state(handle.url, state)
@@ -289,36 +297,41 @@ class ValidatorPool:
         wanted semantics, and the event manager sits quietly awaiting it
         instead of tracebacking every poll.
 
+        Serialized by ``_sync_wait_lock``: concurrent callers park on the
+        lock; when the winner finishes, the parked caller's first probe
+        sees ``is_syncing=False`` and returns True immediately.
+
         Returns:
             True when sync completed (caller retries the original op with
             a fresh retry budget); False when the probe died mid-wait
             (caller falls back to normal failure accounting).
         """
-        progress = SyncProgress()
-        logger.warning(
-            "validator node is syncing; mining paused until sync completes"
-        )
-        while True:
-            handle = self._active
-            if handle is None:
-                return False
-            state = await self._probe_sync_state(handle)
-            if state is None:
-                logger.warning(
-                    "pool: sync probe failed on %s; resuming normal failover",
-                    handle.url,
-                )
-                self._syncing_urls.pop(handle.url, None)
-                return False
-            self._publish_sync_state(handle.url, state)
-            if not state.get("is_syncing"):
-                logger.info(
-                    "pool: validator %s finished syncing; resuming", handle.url
-                )
-                self._clear_sync_state()
-                return True
-            logger.info("%s", progress.observe(state, time.monotonic()))
-            await asyncio.sleep(self._sync_poll_interval_s)
+        async with self._sync_wait_lock:
+            progress = SyncProgress()
+            logger.warning(
+                "validator node is syncing; mining paused until sync completes"
+            )
+            while True:
+                handle = self._active
+                if handle is None:
+                    return False
+                state = await self._probe_sync_state(handle)
+                if state is None:
+                    logger.warning(
+                        "pool: sync probe failed on %s; resuming normal failover",
+                        handle.url,
+                    )
+                    self._syncing_urls.pop(handle.url, None)
+                    return False
+                self._publish_sync_state(handle.url, state)
+                if not state.get("is_syncing"):
+                    logger.info(
+                        "pool: validator %s finished syncing; resuming", handle.url
+                    )
+                    self._clear_sync_state()
+                    return True
+                logger.info("%s", progress.observe(state, time.monotonic()))
+                await asyncio.sleep(self._sync_poll_interval_s)
 
     async def _swap_after_failure(self, failed_url: str) -> bool:
         """Internal: kill the current handle, rotate URL, spawn new handle.
