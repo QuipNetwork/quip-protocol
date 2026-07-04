@@ -7,6 +7,7 @@ docs/superpowers/specs/2026-07-03-node-sync-progress-design.md.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any, Callable
 
 import pytest
@@ -269,23 +270,27 @@ async def test_sync_wait_aborts_when_probe_dies_mid_wait():
 
 
 @pytest.mark.asyncio
-async def test_concurrent_senders_serialize_sync_wait():
-    """Two concurrent send() calls on a syncing node don't run overlapping
-    probe loops: the sync-wait lock parks the second caller, so it needs
-    exactly one post-recovery probe of its own.
+async def test_concurrent_senders_serialize_sync_wait(caplog):
+    """Two concurrent send() calls on a syncing node: the sync-wait lock
+    parks the second caller, and the post-lock short-circuit means only
+    the first caller runs a wait loop — one WARNING, bounded probes.
 
-    Sequence (single URL "http://a"):
-      - Both callers fail get_head, each runs _record_sync_state (2 probes).
-      - Both callers call _swap_after_failure; each respawns on "http://a"
-        (same-URL idempotence check doesn't dedupe same-URL respawns — ok).
-      - Both enter _sync_wait. Caller 1 acquires _sync_wait_lock.
-        Caller 2 parks on it.
-      - Caller 1 polls: _syncing(600) then _synced() (2 more probes). Lock
-        released; _clear_sync_state() called.
-      - Caller 2 acquires lock, probes once: iterator exhausted → _synced().
-        Returns True immediately (1 probe).
-      - Both callers retry get_head; done["synced"]=True → both return b"head".
-      Total probes: 2 + 2 + 1 = 5, well within the ≤ 6 bound.
+    Traced sequence (single URL "http://a"):
+      - Both callers fail get_head; each runs _record_sync_state:
+        caller 1 consumes _syncing(100), caller 2 consumes _syncing(100)
+        → 2 classification probes.
+      - Both call _swap_after_failure (same URL, both swap); both get
+        all_down=True with _syncing_urls non-empty → both enter _sync_wait.
+      - Caller 1 acquires _sync_wait_lock, logs WARNING "mining paused",
+        enters probe loop:
+          probe 3: _syncing(600) → logs progress, sleeps poll_interval.
+          probe 4: _synced()    → _clear_sync_state(), returns True.
+        Lock released; _syncing_urls is now empty.
+      - Caller 2 acquires lock, hits short-circuit (not self._syncing_urls)
+        → returns True immediately, 0 probes, no WARNING logged.
+      - Both retry get_head; done["synced"]=True → both return b"head".
+      Total probes: 4. len(paused) == 1 (only caller 1 warned).
+    Without the lock both callers enter the loop body and both warn.
     """
     probe_count = {"n": 0}
     sync_states = iter([_syncing(100), _syncing(100), _syncing(600), _synced()])
@@ -308,52 +313,66 @@ async def test_concurrent_senders_serialize_sync_wait():
     pool = _make_pool({"http://a": script_a})
     await pool.start()
     try:
-        results = await asyncio.gather(
-            pool.send("get_head", {}), pool.send("get_head", {})
-        )
+        with caplog.at_level(logging.WARNING, logger="substrate.pool"):
+            results = await asyncio.gather(
+                pool.send("get_head", {}), pool.send("get_head", {})
+            )
         assert results == [b"head", b"head"]
-        # Bounded probing: 2 classification probes (one per caller) +
-        # the winner's wait-loop probes + 1 post-recovery probe from the
-        # parked caller. Without the lock this grows unbounded/racy.
-        assert probe_count["n"] <= 6
+        paused = [r for r in caplog.records if "mining paused" in r.getMessage()]
+        assert len(paused) == 1  # parked caller short-circuits, never warns
+        # Expected: 2 classification probes + 2 winner wait-loop probes;
+        # parked caller does zero probes (short-circuit). Without the lock
+        # the second loop also probes and warns.
+        assert probe_count["n"] <= 5
     finally:
         await pool.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_stale_syncing_record_cleared_when_node_goes_down():
+async def test_stale_syncing_record_cleared_when_node_goes_down(caplog):
     """A syncing record left by a failed submit must not steer a later
-    genuinely-down failure into the quiet sync-wait branch.
+    failure into the quiet sync-wait branch once the node stops syncing.
 
-    Sequence:
+    The down-phase probe answers with a NOT-syncing dict (node process up,
+    chain stalled/ops failing) — the exact case where a stale record would
+    otherwise take the quiet branch.
+
+    Traced sequence:
       - submit_signed_extrinsic fails → probe returns _syncing(100) →
         _syncing_urls["http://a"] populated → NodeSyncing raised (no swap).
       - phase["down"] = True
-      - get_head fails → probe raises ConnectionError → _record_sync_state
-        pops the stale entry → returns False → normal swap → AllUrlsDown
-        with empty _syncing_urls → backoff branch → retries exhaust →
-        ConnectionError propagates.
+      - get_head fails → probe returns _synced(100) (not syncing) →
+        _record_sync_state pops the stale entry → returns False →
+        normal swap → AllUrlsDown with empty _syncing_urls → ERROR backoff
+        branch → retries exhaust → ConnectionError propagates.
+    With _syncing_urls.pop() reverted: stale record survives → quiet
+    "no healthy validator" branch → caplog assertion fails.
     """
     phase = {"down": False}
 
     def script_a(op: str) -> Any:
         if op == "get_sync_state":
             if phase["down"]:
-                raise ConnectionError("node died")
+                return _synced(100)  # alive, not syncing — ops still failing
             return _syncing(100)
         if op == "submit_signed_extrinsic":
             raise TimeoutError("runtime call timed out")
-        raise ConnectionError("node died")
+        raise ConnectionError("node flapping")
 
     pool = _make_pool({"http://a": script_a})
     await pool.start()
     try:
         with pytest.raises(NodeSyncing):
             await pool.send("submit_signed_extrinsic", {"extrinsic_hex": "0xab"})
-        assert pool._syncing_urls  # stale record now present
+        assert pool._syncing_urls  # stale record from the no-swap path
         phase["down"] = True
-        with pytest.raises(ConnectionError):
-            await pool.send("get_head", {})
-        assert pool._syncing_urls == {}  # probe-down cleared it
+        with caplog.at_level(logging.INFO, logger="substrate.pool"):
+            with pytest.raises(ConnectionError):
+                await pool.send("get_head", {})
+        assert pool._syncing_urls == {}
+        messages = [r.getMessage() for r in caplog.records]
+        # Backoff branch taken, quiet sync-wait branch NOT taken.
+        assert any("all validator URLs down" in m for m in messages)
+        assert not any("no healthy validator" in m for m in messages)
     finally:
         await pool.shutdown()

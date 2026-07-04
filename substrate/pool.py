@@ -298,8 +298,10 @@ class ValidatorPool:
         instead of tracebacking every poll.
 
         Serialized by ``_sync_wait_lock``: concurrent callers park on the
-        lock; when the winner finishes, the parked caller's first probe
-        sees ``is_syncing=False`` and returns True immediately.
+        lock; the winner runs the probe loop and clears ``_syncing_urls``
+        on completion. A parked caller that acquires the lock after the
+        winner finishes short-circuits immediately — the syncing records
+        are already gone, so there is nothing left to wait for.
 
         Returns:
             True when sync completed (caller retries the original op with
@@ -307,6 +309,11 @@ class ValidatorPool:
             (caller falls back to normal failure accounting).
         """
         async with self._sync_wait_lock:
+            # A caller that parked on the lock while another sync-wait ran
+            # to completion has nothing left to wait for — the finisher
+            # cleared the syncing records on its way out.
+            if not self._syncing_urls:
+                return True
             progress = SyncProgress()
             logger.warning(
                 "validator node is syncing; mining paused until sync completes"
