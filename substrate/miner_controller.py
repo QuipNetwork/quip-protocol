@@ -1344,6 +1344,15 @@ class SubstrateMinerController:
         if self._should_drop_result(envelope, envelope_key):
             return
 
+        # The solution number (resolved when this round was dispatched) is
+        # the archive key shared with the worker's attempts.
+        solution_number = self._solution_number_for_context(envelope.context)
+        # Fill the on-chain compute-time report before the proof is encoded
+        # for submission (spec-111 QuantumProof.device_access_time_us).
+        envelope.result.device_access_time_us = self._device_access_us(
+            envelope.result, solution_number
+        )
+
         # Encoder errors (ValueError on no-solutions / wrong-salt-length)
         # are code defects — retrying won't help. Keep them out of the
         # RPC-error catch below so they raise loudly instead of being
@@ -1352,10 +1361,6 @@ class SubstrateMinerController:
             encode_quantum_proof(envelope.result, envelope.context)
         except ValueError as exc:
             raise RuntimeError(f"proof encoding failed (bug): {exc}") from exc
-
-        # The solution number (resolved when this round was dispatched) is
-        # the archive key shared with the worker's attempts.
-        solution_number = self._solution_number_for_context(envelope.context)
         result_energy_milli = int(envelope.result.energy * 1000)
         result_diversity_milli = int(envelope.result.diversity * 1000)
         snapshot_threshold_milli = int(envelope.context.difficulty.max_energy_milli)
@@ -1824,6 +1829,26 @@ class SubstrateMinerController:
         except Exception as exc:  # noqa: BLE001 — observability path
             logger.debug("qpu spend sum failed (ignored): %s", exc)
             return None
+
+    def _device_access_us(
+        self, result: MiningResult, solution_number: Optional[int]
+    ) -> int:
+        """Compute time to report on-chain for this proof, in µs.
+
+        QPU wins report the node's summed per-attempt QPU access time for
+        the solution (``_sum_qpu_access_us``); CPU/GPU wins fall back to the
+        result's wall-clock ``mining_time`` (seconds → µs). Anticipatory
+        previews carry ``mining_time=0`` and so report 0 (= unreported)
+        unless QPU time exists. 0 on any failure — reporting is
+        observability, never a submit blocker.
+        """
+        qpu_us = self._sum_qpu_access_us(solution_number)
+        if qpu_us:
+            return int(qpu_us)
+        try:
+            return max(0, int(result.mining_time * 1_000_000))
+        except (TypeError, ValueError):
+            return 0
 
     def _mark_participating(self, msg: dict) -> None:
         """Submit a write-once participation extrinsic for this node + solution #.
@@ -2423,6 +2448,9 @@ class SubstrateMinerController:
         result = self._result_from_preview(ctx, preview)
         if result is None:
             return
+        result.device_access_time_us = self._device_access_us(
+            result, self._solution_number_for_context(ctx)
+        )
         # Mark mid-fire BEFORE awaiting so a worker result that lands during
         # the submit round-trip is de-duped (treated as confirmation).
         self._anticipatory_fired.add(key)

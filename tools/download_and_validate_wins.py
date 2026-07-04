@@ -300,6 +300,7 @@ async def _validate_one(
         "submitted_at": sol.submitted_at,
         "last_proof_block_hash": "0x" + sol.last_proof_block_hash.hex(),
         "difficulty": _difficulty_dict(sol.difficulty),
+        "device_access_time_us": sol.device_access_time_us,
         "topology_hash": "0x" + proof["topology_hash"].hex() if proof else None,
         "solutions_hex": ["0x" + s.hex() for s in proof["solutions"]] if proof else [],
     }

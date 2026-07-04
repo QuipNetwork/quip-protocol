@@ -97,6 +97,14 @@ class MiningResult:
     # ``None`` means the worst-case wasn't recomputed; fall back to
     # ``energy`` (legacy behavior) at the cost of possible chain rejection.
     submit_floor_energy: Optional[float] = None
+    # Miner-reported compute time for this proof, in microseconds — carried
+    # on-chain in the spec-111 ``QuantumProof.device_access_time_us`` and
+    # persisted on the winning ``QBlock``. QPU wins report the summed
+    # per-attempt D-Wave QPU access time for the solution; CPU/GPU wins
+    # report wall-clock mining time. The CONTROLLER fills this at submit
+    # time (both the result and the anticipatory fire paths); workers leave
+    # it None. None encodes as 0 = unreported.
+    device_access_time_us: Optional[int] = None
 
     @property
     def effective_floor(self) -> float:

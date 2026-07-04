@@ -207,8 +207,8 @@ class SubstrateMiningContext:
 class WinningSolution:
     """Mirror of `pallet_quantum_pow::types::WinningSolution`.
 
-    Persisted in `QuantumPow.WinningSolutions[block_number]` alongside the
-    `BlockWinner` event. ``difficulty`` is the *active* threshold the proof
+    Persisted in ``QuantumPow.WinningSolutions[block_number]`` alongside the
+    ``BlockWinner`` event. ``difficulty`` is the *active* threshold the proof
     had to clear (decay applied, pre-adjust); the next block's threshold
     is whatever ``QuantumPow.Difficulty`` storage holds after the post-win
     adjustment, which is NOT duplicated here.
@@ -218,6 +218,10 @@ class WinningSolution:
     nonce re-derivation self-contained — no chain-state lookup needed,
     so it stays correct even after the prior winning block is pruned
     beyond ``BlockHashCount``.
+
+    Spec 111 renamed the pallet type to ``QBlock`` and appended
+    ``topology_hash`` + ``device_access_time_us``; both decode as ``None``
+    from older runtimes.
     """
 
     miner: bytes
@@ -227,11 +231,20 @@ class WinningSolution:
     submitted_at: int
     difficulty: SubstrateDifficulty
     last_proof_block_hash: bytes
+    # Spec-111 additions (mirror `QBlock`'s trailing fields). ``None`` when
+    # decoded from a pre-111 runtime that doesn't carry them.
+    topology_hash: Optional[bytes] = None
+    # Miner-reported compute time for the winning proof, µs (QPU access
+    # time for QPU wins, wall clock for CPU/GPU). Self-reported; None on
+    # pre-111 chains.
+    device_access_time_us: Optional[int] = None
 
     def __post_init__(self) -> None:
         _require_len("miner", self.miner)
         _require_len("salt", self.salt)
         _require_len("last_proof_block_hash", self.last_proof_block_hash)
+        if self.topology_hash is not None:
+            _require_len("topology_hash", self.topology_hash)
 
 
 @dataclass(frozen=True)
