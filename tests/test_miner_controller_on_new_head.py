@@ -9,6 +9,7 @@ fail loud on topology mismatch.
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -75,6 +76,12 @@ def controller():
     ctrl._base_difficulty_by_key = {}
     ctrl._decay_schedule_by_key = {}
     ctrl._pow_constants = None
+    # Resilience state (dark-validator fallbacks).
+    ctrl.events = None
+    ctrl._pending_submission = None
+    ctrl._replaying = None
+    ctrl._schedule_retry_next_monotonic = 0.0
+    ctrl._decay_horizon_logged_key = None
     # Per-round solution-number cache (the on-disk archive key). The stub
     # returns a fixed WinningSolutions count so dispatch resolves a stable
     # solution number without hitting the network.
@@ -136,6 +143,244 @@ async def test_on_new_head_does_not_push_same_threshold(controller):
     ctx = _make_context(threshold_milli=-5000)
     await ctrl.on_new_head(ctx)
     assert handle.threshold_pushes == []
+
+
+# ----------------------------------------------------------------------
+# Local decay pushes (_maybe_push_local_decay) — the staleness fallback
+# that keeps the live threshold easing while the validator pool is dark.
+# ----------------------------------------------------------------------
+
+_KEY = ("proof-hash", "topo-hash")
+# max_energy_milli per decay step — monotonically easing (toward 0).
+_SCHEDULE = [-10000, -9500, -9000, -8500]
+
+
+def _seed_local_decay(
+    ctrl,
+    *,
+    poll_stale_s: float = 100.0,
+    est_block: int | None = 75,
+    last_proof_block: int = 50,
+    epoch_length: int = 10,
+    last_pushed: int = -11000,
+    schedule: list[int] | None = None,
+) -> None:
+    """Wire the minimum state ``_maybe_push_local_decay`` reads.
+
+    Defaults put the round at step (75-50)//10 = 2 → schedule[2] = -9000,
+    easing from a chain-pushed baseline of -11000.
+    """
+    now = time.monotonic()
+    ctrl.events = SimpleNamespace(
+        last_successful_poll_monotonic=now - poll_stale_s,
+    )
+    ctrl._timing = SimpleNamespace(
+        estimate_block=lambda *, now_monotonic: est_block,
+    )
+    ctrl._current_work_key = _KEY
+    ctrl._decay_schedule_by_key[_KEY] = (
+        list(_SCHEDULE) if schedule is None else schedule,
+        last_proof_block,
+        epoch_length,
+    )
+    ctrl._last_pushed_threshold_milli = last_pushed
+    ctrl._decay_horizon_logged_key = None
+
+
+@pytest.mark.asyncio
+async def test_local_decay_pushes_when_polls_stale(controller):
+    ctrl, handle = controller
+    _seed_local_decay(ctrl)
+    ctrl._maybe_push_local_decay()
+    assert handle.threshold_pushes == [-9000]
+    assert ctrl._last_pushed_threshold_milli == -9000
+    # Same tick state again → no duplicate push.
+    ctrl._maybe_push_local_decay()
+    assert handle.threshold_pushes == [-9000]
+
+
+@pytest.mark.asyncio
+async def test_local_decay_never_regresses_tighter(controller):
+    """A schedule step tighter than the last push must never be pushed —
+    max() on negative milli keeps the looser value."""
+    ctrl, handle = controller
+    _seed_local_decay(ctrl, last_pushed=-8000)  # looser than schedule[2]=-9000
+    ctrl._maybe_push_local_decay()
+    assert handle.threshold_pushes == []
+    assert ctrl._last_pushed_threshold_milli == -8000
+
+
+@pytest.mark.asyncio
+async def test_local_decay_skips_when_polls_fresh(controller):
+    ctrl, handle = controller
+    _seed_local_decay(ctrl, poll_stale_s=1.0)
+    ctrl._maybe_push_local_decay()
+    assert handle.threshold_pushes == []
+
+
+@pytest.mark.asyncio
+async def test_local_decay_skips_without_schedule(controller):
+    """A schedule-less round (dispatch-time RPC failure) never extrapolates."""
+    ctrl, handle = controller
+    _seed_local_decay(ctrl)
+    del ctrl._decay_schedule_by_key[_KEY]
+    ctrl._maybe_push_local_decay()
+    assert handle.threshold_pushes == []
+
+
+@pytest.mark.asyncio
+async def test_local_decay_skips_without_timing_anchor(controller):
+    """estimate_block is None until a head has been observed — no basis."""
+    ctrl, handle = controller
+    _seed_local_decay(ctrl, est_block=None)
+    ctrl._maybe_push_local_decay()
+    assert handle.threshold_pushes == []
+
+
+@pytest.mark.asyncio
+async def test_local_decay_skips_at_genesis_sentinel(controller):
+    ctrl, handle = controller
+    _seed_local_decay(ctrl, last_proof_block=0)
+    ctrl._maybe_push_local_decay()
+    assert handle.threshold_pushes == []
+
+
+@pytest.mark.asyncio
+async def test_local_decay_skips_without_chain_baseline(controller):
+    """_last_pushed_threshold_milli == 0 means no chain value was ever
+    pushed — there is nothing trustworthy to ease from."""
+    ctrl, handle = controller
+    _seed_local_decay(ctrl, last_pushed=0)
+    ctrl._maybe_push_local_decay()
+    assert handle.threshold_pushes == []
+
+
+@pytest.mark.asyncio
+async def test_local_decay_clamps_at_horizon(controller):
+    """Past the schedule horizon, hold the last (loosest) value."""
+    ctrl, handle = controller
+    _seed_local_decay(ctrl, est_block=50_000)
+    ctrl._maybe_push_local_decay()
+    assert handle.threshold_pushes == [_SCHEDULE[-1]]
+
+
+@pytest.mark.asyncio
+async def test_chain_push_resumes_after_local_decay(controller):
+    """After local decay, an equal chain value is a no-op and a tighter
+    chain value (new round) pushes unclamped — the chain stays authoritative."""
+    ctrl, handle = controller
+    _seed_local_decay(ctrl)
+    # Dispatch mechanics are not under test — a real scheduler would block
+    # preempting the fake handle (it never acks cancels).
+    ctrl._scheduler = SimpleNamespace(dispatch_pow=AsyncMock(return_value={}))
+    ctrl._maybe_push_local_decay()
+    assert handle.threshold_pushes == [-9000]
+
+    # Poll recovers with the same value the local model reached: no dup.
+    ctx_same = _make_context(threshold_milli=-9000)
+    await ctrl.on_new_head(ctx_same)
+    assert handle.threshold_pushes == [-9000]
+
+    # New round ratchets tighter: chain-sourced push is unclamped.
+    ctx_tighter = _make_context(
+        threshold_milli=-12000, last_proof_block_hash=b"\x02" * 32,
+    )
+    await ctrl.on_new_head(ctx_tighter)
+    assert handle.threshold_pushes == [-9000, -12000]
+
+
+# ----------------------------------------------------------------------
+# Mid-round schedule recovery (_maybe_refresh_schedule) — a dispatch-time
+# RPC failure must not leave the whole round schedule-less.
+# ----------------------------------------------------------------------
+
+
+def _seed_schedule_retry(ctrl, monkeypatch):
+    """Wire a schedule-less active round plus predictor inputs.
+
+    Returns ``(ctx, key, inputs)``. ``dataclasses_replace`` is stubbed
+    for SimpleNamespace contexts (production contexts are frozen
+    dataclasses; these tests follow the file's convention of skipping
+    dataclass validation).
+    """
+    from substrate.miner_controller import _work_key
+
+    ctx = SimpleNamespace(
+        last_proof_block_hash=b"\x01" * 32,
+        topology_hash=b"\xab" * 32,
+        decay_schedule=None,
+        last_proof_block=0,
+        epoch_length=0,
+    )
+    key = _work_key(ctx)
+    ctrl._current_work_key = key
+    ctrl._current_context = ctx
+    ctrl._schedule_retry_next_monotonic = 0.0
+    inputs = (
+        SimpleNamespace(max_energy_milli=-10000),  # base difficulty
+        1234,                                      # last_proof_block
+        SimpleNamespace(epoch_length=10),          # constants
+        object(),                                  # curve
+    )
+    monkeypatch.setattr(
+        "substrate.miner_controller.build_decay_schedule",
+        lambda base_milli, curve, limit: [-10000, -9500, -9000],
+    )
+    monkeypatch.setattr(
+        "substrate.miner_controller.dataclasses_replace",
+        lambda c, **kw: SimpleNamespace(**{**vars(c), **kw}),
+    )
+    return ctx, key, inputs
+
+
+@pytest.mark.asyncio
+async def test_schedule_retry_populates_cache_mid_round(controller, monkeypatch):
+    """A failed dispatch-time build recovers on a later fire-loop tick."""
+    ctrl, _handle = controller
+    _ctx, key, inputs = _seed_schedule_retry(ctrl, monkeypatch)
+    ctrl._anticipatory_inputs = AsyncMock(side_effect=[None, inputs])
+
+    await ctrl._maybe_refresh_schedule()
+    assert ctrl._decay_schedule_by_key.get(key) is None  # first try failed
+
+    ctrl._schedule_retry_next_monotonic = 0.0  # bypass throttle for the test
+    await ctrl._maybe_refresh_schedule()
+    assert ctrl._decay_schedule_by_key[key] == ([-10000, -9500, -9000], 1234, 10)
+    # The frozen context is enriched so later re-dispatches carry the
+    # schedule to workers.
+    assert ctrl._current_context.decay_schedule == [-10000, -9500, -9000]
+    assert ctrl._current_context.last_proof_block == 1234
+    assert ctrl._current_context.epoch_length == 10
+
+
+@pytest.mark.asyncio
+async def test_schedule_retry_throttled(controller, monkeypatch):
+    """Failed retries back off — no chain read storm from the 1s tick."""
+    ctrl, _handle = controller
+    _seed_schedule_retry(ctrl, monkeypatch)
+    ctrl._anticipatory_inputs = AsyncMock(return_value=None)
+
+    await ctrl._maybe_refresh_schedule()
+    await ctrl._maybe_refresh_schedule()
+    assert ctrl._anticipatory_inputs.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_schedule_retry_discards_after_roll(controller, monkeypatch):
+    """Inputs that land after the round rolled are discarded, and the
+    stale base re-cached by _anticipatory_inputs is dropped."""
+    ctrl, _handle = controller
+    _ctx, key, inputs = _seed_schedule_retry(ctrl, monkeypatch)
+    ctrl._base_difficulty_by_key[key] = "stale-base"
+
+    async def roll_then_answer(ctx, k):
+        ctrl._current_work_key = (b"\x02" * 32, b"\xab" * 32)
+        return inputs
+
+    ctrl._anticipatory_inputs = roll_then_answer
+    await ctrl._maybe_refresh_schedule()
+    assert key not in ctrl._decay_schedule_by_key
+    assert key not in ctrl._base_difficulty_by_key
 
 
 @pytest.mark.asyncio
