@@ -215,3 +215,110 @@ def test_pool_constructor_rejects_empty_urls():
     """Empty URL list is a usage error — fail fast."""
     with pytest.raises(ValueError, match="at least one validator URL"):
         ValidatorPool(urls=[])
+
+
+# ---------------------------------------------------------------------------
+# ValidatorSwapped from a concurrently-shutdown handle: retry (idempotent) /
+# propagate (non-idempotent), bounded by max_swap_retries.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_idempotent_op_retries_when_captured_handle_reports_swapped():
+    """A handle shut down under us raises ValidatorSwapped; the pool must
+    re-read self._active and retry idempotent ops rather than propagate."""
+    state = {"n": 0}
+
+    def once_swapped():
+        state["n"] += 1
+        if state["n"] == 1:
+            raise ValidatorSwapped("shut down by a concurrent swap")
+        return b"head"
+
+    pool = _make_pool([{"url": "http://a", "behaviour": {"get_head": once_swapped}}])
+    await pool.start()
+    try:
+        assert await pool.send("get_head", {}) == b"head"
+    finally:
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_non_idempotent_op_propagates_validator_swapped():
+    """submit_signed_extrinsic must surface ValidatorSwapped (caller re-signs);
+    the pool must not silently retry a non-idempotent op."""
+    pool = _make_pool([
+        {
+            "url": "http://a",
+            "behaviour": {"submit_signed_extrinsic": ValidatorSwapped("swapped")},
+        },
+    ])
+    await pool.start()
+    try:
+        with pytest.raises(ValidatorSwapped):
+            await pool.send(
+                "submit_signed_extrinsic",
+                {"extrinsic_hex": "0xabcd", "wait_for": "inblock"},
+            )
+        # Raised on the first call; no hidden retry.
+        assert len(pool._fakes_by_url["http://a"].calls) == 1
+    finally:
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_validator_swapped_retry_is_bounded_by_max_swap_retries():
+    """A handle that always reports swapped must not loop forever — the pool
+    re-raises after exactly max_swap_retries attempts."""
+    pool = _make_pool([
+        {"url": "http://a", "behaviour": {"get_head": ValidatorSwapped("swapped")}},
+    ])
+    await pool.start()
+    try:
+        with pytest.raises(ValidatorSwapped):
+            await pool.send("get_head", {})
+        assert len(pool._fakes_by_url["http://a"].calls) == pool._max_swap_retries
+    finally:
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_single_url_racing_swap_does_not_teardown_fresh_handle():
+    """Two callers race a swap on a single URL. The loser holds a stale handle
+    whose URL equals the fresh handle's URL; the identity guard must make the
+    loser's swap a no-op instead of tearing down the freshly-spawned handle."""
+    spawned: list[_FakeHandle] = []
+
+    def factory(url: str) -> _FakeHandle:
+        handle = _FakeHandle(url)
+        spawned.append(handle)
+        return handle
+
+    failover = SubstrateUrlFailover(
+        ["http://a"], initial_backoff_s=0.01, max_backoff_s=0.05
+    )
+    pool = ValidatorPool(
+        urls=["http://a"],
+        failover=failover,
+        handle_factory=factory,
+        max_swap_retries=3,
+        reconnect_backoff_s=0.0,
+    )
+    await pool.start()
+    try:
+        h0 = pool._active
+        # Winner swaps h0 → h1 (fresh handle on the same URL).
+        await pool._swap_after_failure(h0)
+        h1 = pool._active
+        assert h1 is not h0
+        assert h0.is_shutdown
+        assert not h1.is_shutdown
+        assert len(spawned) == 2  # start + one swap
+
+        # Loser still holds h0; its swap must be a no-op — h1 survives.
+        assert await pool._swap_after_failure(h0) is False
+        assert pool._active is h1
+        assert not h1.is_shutdown
+        assert len(spawned) == 2  # no extra spawn
+    finally:
+        await pool.shutdown()
