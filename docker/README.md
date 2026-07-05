@@ -43,9 +43,14 @@ every process the config declares.
 mkdir -p ~/quip-miner-data
 
 docker run -d --pull always --name quip-miner \
+  --shm-size=2g \
   -v ~/quip-miner-data:/data \
   registry.gitlab.com/quip.network/quip-protocol/quip-miner-cpu:latest
 ```
+
+`--shm-size=2g` is required: Docker's 64 MiB `/dev/shm` default cannot
+back the miner's shared-memory rings (see
+[Shared memory](#shared-memory-devshm)).
 
 On first start the entrypoint:
 
@@ -69,6 +74,7 @@ For CUDA:
 
 ```bash
 docker run -d --pull always --gpus all --name quip-miner-gpu \
+  --shm-size=2g \
   -v ~/quip-miner-data:/data \
   registry.gitlab.com/quip.network/quip-protocol/quip-miner-cuda:latest
 ```
@@ -166,6 +172,27 @@ docker run -d --name quip-miner \
 
 curl http://localhost:8086/api/v1/status
 ```
+
+## Shared memory (/dev/shm)
+
+Miner workers stream problems and samples between processes through
+POSIX shared-memory rings. Each worker's sample ring can grow to
+~80 MiB on the default Advantage2 topology (32 slots × 512 adaptive
+reads × 4,577 nodes), so total usage scales with the worker count —
+`num_cpus = 12` needs up to ~1 GiB.
+
+Docker caps `/dev/shm` at **64 MiB** by default. Because tmpfs is
+sparse, allocation succeeds and the miner instead dies later with
+**SIGBUS (`exitcode=-7`)** when a writer touches a page tmpfs can't
+back. The miner logs a `shared-memory ring needs … MiB` warning at
+ring creation when it detects this.
+
+Fix: pass `--shm-size=2g` to `docker run` (the compose file already
+sets `shm_size: "2gb"`). The cap is not a reservation — tmpfs pages
+are only consumed as they are written — so a generous value costs
+nothing. Budget ~80 MiB per CPU worker if you tune it down. This
+applies on Windows and macOS Docker Desktop too, where containers run
+in a Linux VM with the same 64 MiB default.
 
 ## Environment variables
 

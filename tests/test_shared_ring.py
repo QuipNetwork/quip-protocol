@@ -82,3 +82,41 @@ def test_nonowner_without_free_q_raises():
             SharedRing(slots=1, slot_bytes=16, names=owner.names, free_q=None)
     finally:
         owner.close_unlink()
+
+
+def test_owner_warns_when_dev_shm_too_small(monkeypatch, caplog):
+    """Under-provisioned /dev/shm logs the SIGBUS/--shm-size warning."""
+    monkeypatch.setattr(
+        "shared.shared_ring._dev_shm_free_bytes", lambda: 16
+    )
+    with caplog.at_level("WARNING", logger="shared.shared_ring"):
+        ring = SharedRing(slots=2, slot_bytes=32)
+        ring.close_unlink()
+    assert any("--shm-size" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("free", [None, 1 << 30])
+def test_owner_silent_when_dev_shm_ok_or_unknown(monkeypatch, caplog, free):
+    """No warning when /dev/shm has room or is unmeasurable (non-Linux)."""
+    monkeypatch.setattr(
+        "shared.shared_ring._dev_shm_free_bytes", lambda: free
+    )
+    with caplog.at_level("WARNING", logger="shared.shared_ring"):
+        ring = SharedRing(slots=2, slot_bytes=32)
+        ring.close_unlink()
+    assert not caplog.records
+
+
+def test_nonowner_attach_skips_shm_preflight(monkeypatch, caplog):
+    """Attaching to existing segments allocates nothing — never warn."""
+    owner = SharedRing(slots=1, slot_bytes=16)
+    try:
+        monkeypatch.setattr(
+            "shared.shared_ring._dev_shm_free_bytes", lambda: 0
+        )
+        with caplog.at_level("WARNING", logger="shared.shared_ring"):
+            attached = SharedRing(**owner.attach_args())
+            attached.close()
+        assert not caplog.records
+    finally:
+        owner.close_unlink()
