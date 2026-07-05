@@ -118,6 +118,7 @@ class ValidatorPool:
         max_swap_retries: int = 3,
         sync_probe_timeout_s: float = _SYNC_PROBE_TIMEOUT_S,
         sync_poll_interval_s: float = _SYNC_POLL_INTERVAL_S,
+        reconnect_backoff_s: float = 0.5,
     ) -> None:
         # Accept tuples/lists; normalise to list for internal mutation.
         urls_list = list(urls) if urls is not None else []
@@ -140,6 +141,11 @@ class ValidatorPool:
         self._swap_lock = asyncio.Lock()
         self._sync_probe_timeout_s = float(sync_probe_timeout_s)
         self._sync_poll_interval_s = float(sync_poll_interval_s)
+        # Short backoff before respawning the child on a single-URL
+        # deployment. A one-node miner has nowhere to rotate, so a
+        # transient client-socket blip is a fast reconnect, not the
+        # escalating all-down backoff used when a real fleet is exhausted.
+        self._reconnect_backoff_s = float(reconnect_backoff_s)
         # URL → last get_sync_state dict for URLs found syncing during the
         # current failure cycle. Cleared on any successful op.
         self._syncing_urls: dict[str, dict[str, Any]] = {}
@@ -192,6 +198,24 @@ class ValidatorPool:
                 self._failover.confirm_success()
                 self._clear_sync_state()
                 return result
+            except ValidatorSwapped:
+                # Our captured handle was shut down by a CONCURRENT swap
+                # (another send()/force_swap already replaced self._active).
+                # No swap is needed — retry idempotent ops against the now-
+                # fresh active handle. Non-idempotent ops surface to the
+                # caller, who must re-decide (a submit needs a fresh nonce).
+                if op not in _IDEMPOTENT_OPS:
+                    raise
+                attempts += 1
+                if attempts >= self._max_swap_retries:
+                    logger.error(
+                        "pool: idempotent op %s exhausted retries after "
+                        "concurrent swaps (attempts=%d)",
+                        op,
+                        attempts,
+                    )
+                    raise
+                continue
             except _CONNECTION_ERRORS as conn_exc:
                 # A syncing node accepts connections but stalls runtime
                 # calls — probe node-level RPCs to tell "down" from
@@ -210,12 +234,19 @@ class ValidatorPool:
                         op,
                         conn_exc,
                     )
-                all_down = await self._swap_after_failure(handle.url)
+                all_down = await self._swap_after_failure(handle)
                 if op not in _IDEMPOTENT_OPS:
                     raise ValidatorSwapped(
                         f"swapped during non-idempotent op {op}; caller must decide"
                     ) from conn_exc
-                if all_down and self._syncing_urls and await self._sync_wait():
+                # A single-URL pool never reports all_down (it fast-reconnects
+                # instead), so include len==1 to route a still-syncing local
+                # node into the quiet sync-wait rather than churning children.
+                if (
+                    self._syncing_urls
+                    and (all_down or len(self._urls) == 1)
+                    and await self._sync_wait()
+                ):
                     # Sync finished — retry the op with a fresh budget.
                     attempts = 0
                     continue
@@ -234,8 +265,7 @@ class ValidatorPool:
         """Kill the active handle and spawn the next URL (no retry logic)."""
         if self._active is None:
             return
-        current_url = self._active.url
-        await self._swap_after_failure(current_url)
+        await self._swap_after_failure(self._active)
 
     async def _probe_sync_state(self, handle: ValidatorHandle) -> Optional[dict[str, Any]]:
         """Fetch node sync state from `handle`; None on any failure.
@@ -340,17 +370,24 @@ class ValidatorPool:
                 logger.info("%s", progress.observe(state, time.monotonic()))
                 await asyncio.sleep(self._sync_poll_interval_s)
 
-    async def _swap_after_failure(self, failed_url: str) -> bool:
+    async def _swap_after_failure(self, failed_handle: ValidatorHandle) -> bool:
         """Internal: kill the current handle, rotate URL, spawn new handle.
+
+        Takes the *handle object* the caller was using, not its URL, so the
+        idempotency check is identity-based: a racing caller whose handle was
+        already swapped out — even to the same URL, the single-URL case where
+        URL comparison can never detect it — is a no-op and must not tear down
+        the freshly-spawned handle.
 
         Returns:
             True if all URLs were exhausted (AllUrlsDown fired), False otherwise.
         """
         async with self._swap_lock:
-            # Idempotent within the lock — multiple racing callers
-            # only swap once.
-            if self._active is None or self._active.url != failed_url:
+            # Identity-based idempotency: only the caller still holding the
+            # current active handle performs the swap.
+            if self._active is None or self._active is not failed_handle:
                 return False
+            failed_url = failed_handle.url
             old = self._active
             all_down = False
             try:
@@ -371,6 +408,23 @@ class ValidatorPool:
                         len(self._syncing_urls),
                         next_url,
                     )
+                elif len(self._urls) == 1:
+                    # Single-URL deployment: a failure means "respawn my child
+                    # on the ONLY node", not a fleet-wide outage. Skip the
+                    # escalating all-down backoff (a transient client-socket
+                    # blip must not become a 60s stall, nor hold _swap_lock for
+                    # a minute). all_down stays False so the idempotent caller
+                    # retries the fresh handle within its max_swap_retries
+                    # budget instead of being forced to raise.
+                    all_down = False
+                    self._failover.reset_after_backoff()
+                    next_url = self._failover.current()
+                    logger.info(
+                        "pool: reconnecting single validator %s after "
+                        "transient failure",
+                        failed_url,
+                    )
+                    await asyncio.sleep(self._reconnect_backoff_s)
                 else:
                     logger.error(
                         "pool: all validator URLs down; backing off %.2fs",

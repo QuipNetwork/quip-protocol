@@ -270,6 +270,84 @@ async def test_sync_wait_aborts_when_probe_dies_mid_wait():
 
 
 @pytest.mark.asyncio
+async def test_single_url_transient_blip_reconnects_without_all_down_backoff():
+    """Single-URL deployment, healthy node, transient client-socket blip: the
+    first spawned handle fails get_head AND the sync probe (looks 'down'); the
+    pool must respawn its child on the same URL and retry seamlessly, NOT enter
+    the 60s all-down backoff. Before the fix this hangs on the backoff sleep."""
+    spawns = {"n": 0}
+
+    def factory(url: str) -> _ScriptedHandle:
+        idx = spawns["n"]
+        spawns["n"] += 1
+
+        def script(op: str) -> Any:
+            if idx == 0:
+                raise ConnectionError("client socket dropped")
+            return b"head"
+
+        return _ScriptedHandle(url, script)
+
+    failover = SubstrateUrlFailover(
+        ["http://a"], initial_backoff_s=60.0, max_backoff_s=60.0
+    )
+    pool = ValidatorPool(
+        urls=["http://a"],
+        failover=failover,
+        handle_factory=factory,
+        max_swap_retries=3,
+        reconnect_backoff_s=0.0,
+    )
+    await pool.start()
+    try:
+        result = await asyncio.wait_for(pool.send("get_head", {}), timeout=2.0)
+        assert result == b"head"
+        assert spawns["n"] == 2  # original + one fast reconnect
+    finally:
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_single_url_submit_blip_raises_validator_swapped_fast():
+    """Single-URL non-idempotent submit on a transient blip: the pool respawns
+    the child fast and raises ValidatorSwapped so the caller re-signs — it must
+    NOT stall on the 60s all-down backoff."""
+    spawns = {"n": 0}
+
+    def factory(url: str) -> _ScriptedHandle:
+        idx = spawns["n"]
+        spawns["n"] += 1
+
+        def script(op: str) -> Any:
+            if idx == 0:
+                raise ConnectionError("client socket dropped")
+            return "receipt"
+
+        return _ScriptedHandle(url, script)
+
+    failover = SubstrateUrlFailover(
+        ["http://a"], initial_backoff_s=60.0, max_backoff_s=60.0
+    )
+    pool = ValidatorPool(
+        urls=["http://a"],
+        failover=failover,
+        handle_factory=factory,
+        max_swap_retries=3,
+        reconnect_backoff_s=0.0,
+    )
+    await pool.start()
+    try:
+        with pytest.raises(ValidatorSwapped):
+            await asyncio.wait_for(
+                pool.send("submit_signed_extrinsic", {"extrinsic_hex": "0xab"}),
+                timeout=2.0,
+            )
+        assert spawns["n"] == 2  # original + one fast reconnect
+    finally:
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_senders_serialize_sync_wait(caplog):
     """Two concurrent send() calls on a syncing node: the sync-wait lock
     parks the second caller, and the post-lock short-circuit means only
@@ -279,8 +357,11 @@ async def test_concurrent_senders_serialize_sync_wait(caplog):
       - Both callers fail get_head; each runs _record_sync_state:
         caller 1 consumes _syncing(100), caller 2 consumes _syncing(100)
         → 2 classification probes.
-      - Both call _swap_after_failure (same URL, both swap); both get
-        all_down=True with _syncing_urls non-empty → both enter _sync_wait.
+      - Caller 1 wins _swap_after_failure (identity guard: self._active is
+        its captured handle) and swaps; caller 2's handle is now stale, so
+        its _swap_after_failure short-circuits (self._active is not its
+        handle) without a second swap. Both see _syncing_urls non-empty and
+        enter _sync_wait.
       - Caller 1 acquires _sync_wait_lock, logs WARNING "mining paused",
         enters probe loop:
           probe 3: _syncing(600) → logs progress, sleeps poll_interval.
@@ -343,8 +424,8 @@ async def test_stale_syncing_record_cleared_when_node_goes_down(caplog):
       - phase["down"] = True
       - get_head fails → probe returns _synced(100) (not syncing) →
         _record_sync_state pops the stale entry → returns False →
-        normal swap → AllUrlsDown with empty _syncing_urls → ERROR backoff
-        branch → retries exhaust → ConnectionError propagates.
+        normal swap → AllUrlsDown with empty _syncing_urls → single-URL
+        reconnect branch → retries exhaust → ConnectionError propagates.
     With _syncing_urls.pop() reverted: stale record survives → quiet
     "no healthy validator" branch → caplog assertion fails.
     """
@@ -371,8 +452,9 @@ async def test_stale_syncing_record_cleared_when_node_goes_down(caplog):
                 await pool.send("get_head", {})
         assert pool._syncing_urls == {}
         messages = [r.getMessage() for r in caplog.records]
-        # Backoff branch taken, quiet sync-wait branch NOT taken.
-        assert any("all validator URLs down" in m for m in messages)
+        # Non-syncing reconnect branch taken (single URL); quiet sync-wait
+        # "no healthy validator" branch NOT taken.
+        assert any("reconnecting single validator" in m for m in messages)
         assert not any("no healthy validator" in m for m in messages)
     finally:
         await pool.shutdown()
