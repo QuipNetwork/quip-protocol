@@ -58,6 +58,14 @@ logger = logging.getLogger(__name__)
 # scheduler ticks.
 _SNAPSHOT_FRESHNESS_S = 5.0
 
+# Snapshot age (seconds) above which the aggregator drops a per-kind
+# file from the merged view entirely. A controller that stops (config
+# change, restart, crash) leaves its snapshot behind; without this gate
+# telemetry keeps reporting that dead child's miners/modes forever. Set
+# well above the writer's 1s interval so a briefly-stalled live child
+# is never flapped out of the inventory.
+_STALE_SNAPSHOT_MAX_AGE_S = 30.0
+
 
 def telemetry_main(
     listen_host: str,
@@ -317,7 +325,7 @@ def _read_snapshot_or_503(
     """
     snapshot_dir: Optional[Path] = request.app["snapshot_dir"]
     if snapshot_dir is not None:
-        snaps = read_all_snapshots(snapshot_dir)
+        snaps = read_all_snapshots(snapshot_dir, max_age_s=_STALE_SNAPSHOT_MAX_AGE_S)
         snap = merge_snapshots(snaps)
     else:
         path: Path = request.app["stats_snapshot_path"]

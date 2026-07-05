@@ -34,6 +34,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
@@ -82,19 +83,39 @@ class StatsSnapshotWriter:
         self._interval_s = float(interval_s)
 
     async def run(self, shutdown_event: asyncio.Event) -> None:
-        """Run the writer loop until `shutdown_event` is set."""
+        """Run the writer loop until `shutdown_event` is set.
+
+        On graceful shutdown the snapshot file is removed so the
+        aggregator directory reflects only live controllers — a stopped
+        child must not leave a stale file the telemetry sibling keeps
+        merging into `/api/v1/*`. Hard crashes (SIGKILL) skip this
+        cleanup; the reader's `max_age_s` gate covers that case.
+        """
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        while not shutdown_event.is_set():
+        try:
+            while not shutdown_event.is_set():
+                try:
+                    snapshot = self._get_snapshot()
+                    self._write_atomic(snapshot)
+                except Exception:
+                    logger.exception("stats snapshot write failed; will retry next interval")
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=self._interval_s)
+                    return
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            self._remove_snapshot()
+
+    def _remove_snapshot(self) -> None:
+        """Best-effort removal of the snapshot (and any leftover tmp) file."""
+        for path in (self._path, self._tmp_path):
             try:
-                snapshot = self._get_snapshot()
-                self._write_atomic(snapshot)
-            except Exception:
-                logger.exception("stats snapshot write failed; will retry next interval")
-            try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=self._interval_s)
-                return
-            except asyncio.TimeoutError:
+                path.unlink()
+            except FileNotFoundError:
                 pass
+            except OSError:
+                logger.exception("stats snapshot cleanup failed for %s", path)
 
     def _write_atomic(self, snapshot: dict[str, Any]) -> None:
         with open(self._tmp_path, "w", encoding="utf-8") as fh:
@@ -123,7 +144,10 @@ def read_snapshot(path: os.PathLike) -> Optional[dict[str, Any]]:
         return None
 
 
-def read_all_snapshots(snapshot_dir: os.PathLike) -> list[dict[str, Any]]:
+def read_all_snapshots(
+    snapshot_dir: os.PathLike,
+    max_age_s: Optional[float] = None,
+) -> list[dict[str, Any]]:
     """Read every `telemetry-stats-*.json` file in `snapshot_dir`.
 
     Returns a list of parsed snapshot dicts in deterministic order
@@ -132,16 +156,34 @@ def read_all_snapshots(snapshot_dir: os.PathLike) -> list[dict[str, Any]]:
     step degrades gracefully when a child is starting up or its
     writer is mid-replace.
 
+    Args:
+        snapshot_dir: Directory the per-kind controllers write into.
+        max_age_s: When set, skip any file whose mtime is older than
+            ``now - max_age_s``. A controller that stops writing (config
+            change, restart, or crash) leaves its snapshot file behind;
+            without this gate the aggregator keeps merging that dead
+            child's `miners`/`modes` forever, reporting phantom miners.
+            The snapshot dict carries no internal timestamp, so file
+            mtime is the only liveness signal. ``None`` (default) keeps
+            every parseable file regardless of age.
+
     Returns `[]` when the directory doesn't exist or contains no
-    matching files; the caller treats that the same as "no snapshots
-    available" (stale 503 from the API surface).
+    matching (fresh) files; the caller treats that the same as "no
+    snapshots available" (stale 503 from the API surface).
     """
     snap_dir = Path(snapshot_dir)
     if not snap_dir.is_dir():
         return []
+    cutoff = (time.time() - max_age_s) if max_age_s is not None else None
     out: list[dict[str, Any]] = []
     pattern = f"{SNAPSHOT_FILENAME_PREFIX}*{SNAPSHOT_FILENAME_SUFFIX}"
     for path in sorted(snap_dir.glob(pattern)):
+        if cutoff is not None:
+            try:
+                if path.stat().st_mtime < cutoff:
+                    continue
+            except OSError:
+                continue
         snap = read_snapshot(path)
         if snap is not None:
             out.append(snap)

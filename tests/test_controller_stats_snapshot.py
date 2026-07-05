@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 
 import pytest
@@ -30,14 +29,17 @@ async def test_controller_writes_stats_snapshot(tmp_path: Path):
         interval_s=0.01,
     )
     shutdown = asyncio.Event()
+    seen: dict = {}
 
     async def stop_after_one_write():
         await asyncio.sleep(0.05)
+        # Read before shutdown: graceful shutdown removes the file.
+        seen["snap"] = read_snapshot(snapshot_path)
         shutdown.set()
 
     await asyncio.gather(writer.run(shutdown), stop_after_one_write())
 
-    snap = read_snapshot(snapshot_path)
+    snap = seen["snap"]
     assert snap is not None
     assert snap["controller"]["heads_observed"] == 100
     assert snap["controller"]["proofs_submitted"] == 17
