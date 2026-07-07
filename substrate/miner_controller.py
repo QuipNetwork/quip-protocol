@@ -245,6 +245,13 @@ _PARTICIPATION_RETENTION = 2048
 # is the number of *additional* attempts after the first (total ≤ RETRIES + 1).
 _PARTICIPATION_REMARK_RETRIES = 3
 _PARTICIPATION_REMARK_BACKOFF_S = 0.25
+# Watch timeout for a single participation-marker submit. Mirrors the result
+# path's ``_RESULT_SUBMIT_TIMEOUT_S``: a half-dead validator that accepts the
+# extrinsic but never reports inclusion must not hang this fire-and-forget
+# task forever — an unbounded ``wait_for="inblock"`` submit once silently
+# froze the on-chain marker while the chain advanced. On timeout the attempt
+# is treated as a transient failure and retried, then swallowed.
+_PARTICIPATION_SUBMIT_TIMEOUT_S = 90.0
 
 
 # How far ahead (in blocks) the anticipatory predictor looks for the
@@ -1909,6 +1916,7 @@ class SubstrateMinerController:
         payload: dict,
         *,
         sleeper: Optional[Callable[[float], Awaitable[None]]] = None,
+        submit_timeout: Optional[float] = None,
     ) -> None:
         """Submit one participation extrinsic (best-effort, retried, never raises).
 
@@ -1919,12 +1927,20 @@ class SubstrateMinerController:
         for the current candidate qblock id, so stale-nonce and block-boundary
         races can clear on retry. Retries transient submit exceptions up to
         ``_PARTICIPATION_REMARK_RETRIES`` times with linear backoff, then logs
-        and swallows the final failure so mining continues. ``sleeper`` is
-        injected so tests run with zero real delay (defaults to :func:`asyncio.sleep`).
+        and swallows the final failure so mining continues. Each submit is
+        watch-timed (``submit_timeout``, default
+        ``_PARTICIPATION_SUBMIT_TIMEOUT_S``) so a validator that never reports
+        inclusion raises :class:`asyncio.TimeoutError` and is retried rather
+        than hanging this task forever. ``sleeper`` is injected so tests run
+        with zero real delay (defaults to :func:`asyncio.sleep`).
         """
         if self.build_client is None or self.pool_client is None:
             return
         sleep = sleeper if sleeper is not None else asyncio.sleep
+        timeout = (
+            submit_timeout if submit_timeout is not None
+            else _PARTICIPATION_SUBMIT_TIMEOUT_S
+        )
         total_attempts = _PARTICIPATION_REMARK_RETRIES + 1
         for attempt in range(1, total_attempts + 1):
             try:
@@ -1934,12 +1950,15 @@ class SubstrateMinerController:
                     kind=payload.get("kind"),
                     budget_seconds=payload.get("budget_seconds"),
                 )
-                receipt = await self.build_client.submit_extrinsic(
-                    "MinerRegistry",
-                    "participate",
-                    call_params,
-                    self.signer,
-                    wait_for="inblock",
+                receipt = await asyncio.wait_for(
+                    self.build_client.submit_extrinsic(
+                        "MinerRegistry",
+                        "participate",
+                        call_params,
+                        self.signer,
+                        wait_for="inblock",
+                    ),
+                    timeout=timeout,
                 )
             except Exception as exc:  # noqa: BLE001 — observability path; retry then swallow
                 if attempt < total_attempts:

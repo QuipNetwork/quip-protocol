@@ -2255,6 +2255,45 @@ async def test_participation_remark_swallows_persistent_failure():
     )
 
 
+async def test_participation_remark_times_out_a_hung_submit():
+    """A submit that never returns is bounded, retried, then swallowed.
+
+    Regression: a half-dead validator that accepts the extrinsic but never
+    reports inclusion once froze the fire-and-forget marker task forever
+    (no timeout on the ``wait_for="inblock"`` submit), silently pinning the
+    on-chain participation marker while the chain advanced. The submit must
+    be watch-timed like the win path so a hang becomes a transient failure.
+    """
+    from substrate.miner_controller import _PARTICIPATION_REMARK_RETRIES
+
+    controller = _bare_controller()
+    controller.pool_client.query_latest_qblock_id = AsyncMock(return_value=2)
+
+    async def _never_returns(*_args, **_kwargs):
+        await asyncio.Event().wait()  # blocks forever
+
+    controller.build_client.submit_extrinsic = AsyncMock(side_effect=_never_returns)
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    # Test-level guard: without the fix the coroutine hangs and this fires.
+    await asyncio.wait_for(
+        controller._submit_participation_remark(
+            {"schema": "quip-participation", "solution": 2, "miner": "5Test",
+             "kind": "qpu"},
+            sleeper=_no_sleep,
+            submit_timeout=0.01,
+        ),
+        timeout=5.0,
+    )
+    # Each hung attempt times out and is retried the bounded number of times.
+    assert (
+        controller.build_client.submit_extrinsic.await_count
+        == _PARTICIPATION_REMARK_RETRIES + 1
+    )
+
+
 async def test_mark_participating_dedups_per_solution_across_instances():
     controller = _bare_controller()
     controller._submit_participation_remark = AsyncMock(return_value=None)
