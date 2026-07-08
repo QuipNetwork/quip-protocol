@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "quip_protocol",
+  "project_id": "066c00d0-4108-4ac5-a455-2a93cdc133f3"
+}
