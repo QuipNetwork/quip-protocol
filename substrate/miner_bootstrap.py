@@ -74,6 +74,13 @@ DEV_CHAIN_PREFIXES: Tuple[str, ...] = (
     "quip-local",
 )
 
+# Canonical public testnet faucet, used as the fallback when no faucet_url
+# is configured and the connected chain identifies as the public testnet.
+# The chain name must match `system_chain` exactly — anything else (dev
+# chains, future networks) keeps the fail-fast `Underfunded` behavior.
+TESTNET_CHAIN_NAME = "Quip Testnet"
+DEFAULT_TESTNET_FAUCET_URL = "https://faucet.testnet.quip.network"
+
 
 # Well-known dev master seeds for the hybrid signature scheme. Captured
 # from `cargo run --example dump_dev_seeds -p quip-transaction-crypto`
@@ -513,7 +520,9 @@ async def ensure_funded_via_faucet(
 
     Raises:
         Underfunded: balance is below ``min_balance`` and ``faucet_url`` is
-            ``None`` — nothing to top up from.
+            ``None`` on a chain other than the public testnet — nothing to
+            top up from. On ``TESTNET_CHAIN_NAME`` the canonical
+            ``DEFAULT_TESTNET_FAUCET_URL`` is used as the fallback instead.
         FaucetPermanentError: the faucet rejected the request as malformed
             (propagated without retry).
         RuntimeError: the faucet did not settle within ``timeout_seconds``.
@@ -525,7 +534,15 @@ async def ensure_funded_via_faucet(
         return balance
 
     if faucet_url is None:
-        raise Underfunded(balance, min_balance)
+        faucet_url = await _default_faucet_for_chain(client)
+        if faucet_url is None:
+            raise Underfunded(balance, min_balance)
+        logger.info(
+            "no faucet_url configured; chain is %r — using the canonical "
+            "testnet faucet %s",
+            TESTNET_CHAIN_NAME,
+            faucet_url,
+        )
 
     logger.info(
         "requesting %d plancks from faucet for %s (retrying up to %.0fs)",
@@ -582,6 +599,24 @@ async def ensure_funded_via_faucet(
         f"after {attempt} attempt(s); balance is still {balance} "
         f"(last status: {last_note})"
     )
+
+
+async def _default_faucet_for_chain(client: SubstrateClient) -> Optional[str]:
+    """Return the canonical testnet faucet URL when connected to the public
+    testnet, else ``None``.
+
+    A failed chain-name probe also returns ``None`` — an unidentifiable
+    chain keeps the fail-fast ``Underfunded`` behavior rather than guessing
+    at a faucet that funds a different network.
+    """
+    try:
+        chain_name = await client._run(lambda: client._iface.chain)  # noqa: SLF001
+    except Exception:  # noqa: BLE001 — fail open to the legacy Underfunded path
+        logger.warning("could not identify chain for faucet fallback", exc_info=True)
+        return None
+    if chain_name == TESTNET_CHAIN_NAME:
+        return DEFAULT_TESTNET_FAUCET_URL
+    return None
 
 
 async def _try_fund_once(

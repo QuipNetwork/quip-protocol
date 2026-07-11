@@ -44,8 +44,9 @@ signer_key = "~/.quip-miner/signing.json"
 # mempool_min_reward = 0
 
 # Optional. When set, an underfunded wallet is topped up through this
-# faucet bot at startup instead of failing fast. Leave commented out
-# in production (the faucet is dev-only).
+# faucet bot at startup instead of failing fast. Unset, the miner falls
+# back to the canonical testnet faucet (https://faucet.testnet.quip.network)
+# when the chain is the public testnet; on any other chain it fails fast.
 # faucet_url = "http://localhost:8087"
 
 # Optional telemetry REST API (/api/v1/*). Off by default (rest_port=-1).
