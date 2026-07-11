@@ -21,9 +21,10 @@
 signer_key = "/data/keystore.json"
 
 # Optional faucet bot for auto-topup when the wallet is underfunded at
-# startup. Without it, an underfunded wallet fails fast with
-# `wallet-underfunded`.
-# faucet_url = "http://faucet.quip.network"
+# startup. Unset, the miner falls back to the canonical faucet below when
+# the chain is the public testnet; on any other chain an underfunded
+# wallet fails fast with `wallet-underfunded`.
+# faucet_url = "https://faucet.testnet.quip.network"
 
 # Operator-facing /api/v1 telemetry surface, served by the container's
 # aggregator process. 0.0.0.0 binds all interfaces; publish with

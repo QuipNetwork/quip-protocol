@@ -532,15 +532,18 @@ def _faucet_url_option(f):
     """Optional `--faucet-url URL` for auto-topup on underfunded wallets.
 
     When set, Guard C tops up the wallet through the configured faucet
-    bot before refusing to start. When unset, an underfunded wallet
-    fails fast with `wallet-underfunded`.
+    bot before refusing to start. When unset, Guard C falls back to the
+    canonical testnet faucet if the chain is the public testnet; on any
+    other chain an underfunded wallet fails fast with `wallet-underfunded`.
     """
     return click.option(
         "--faucet-url",
         default=None,
         help="If set, request funding from this faucet bot when balance "
-        "is below the registration threshold. Without --faucet-url, "
-        "underfunded wallets fail fast with `wallet-underfunded`.",
+        "is below the registration threshold. Without --faucet-url, the "
+        "public-testnet faucet is used when the chain is the public "
+        "testnet; otherwise underfunded wallets fail fast with "
+        "`wallet-underfunded`.",
     )(f)
 
 
@@ -621,6 +624,8 @@ def _resolve_runtime_config(
 #   wallet-load-failed        — keystore exists but couldn't be parsed
 #   validators-unreachable    — every URL in the rotation refused connect
 #   wallet-underfunded        — balance below threshold, no faucet wired
+#                               (and not on the public testnet, whose
+#                               canonical faucet is the built-in fallback)
 #   wallet-faucet-failed      — faucet was configured but the top-up failed
 
 

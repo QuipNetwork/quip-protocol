@@ -136,7 +136,8 @@ class _BalanceClient:
 
     def __init__(
         self, balances, *, syncing=False, current_block=0,
-        highest_block=0, sync_error=None,
+        highest_block=0, sync_error=None, chain="Development",
+        chain_error=None,
     ):
         self._balances = list(balances)
         self.query_count = 0
@@ -145,6 +146,13 @@ class _BalanceClient:
         self._highest_block = highest_block
         self._sync_error = sync_error
         self.sync_probe_count = 0
+        self._chain_error = chain_error
+        self._iface = SimpleNamespace(chain=chain)
+
+    async def _run(self, fn):
+        if self._chain_error is not None:
+            raise self._chain_error
+        return fn()
 
     async def query_balance(self, _account):
         idx = min(self.query_count, len(self._balances) - 1)
@@ -195,6 +203,40 @@ async def test_ensure_funded_no_faucet_url_raises():
     client = _BalanceClient([0])
     with pytest.raises(RuntimeError, match="no --faucet-url"):
         await mb.ensure_funded(client, _stub_keystore(), _faucet_config(faucet_url=None))
+
+
+async def test_ensure_funded_no_faucet_url_defaults_to_testnet_faucet(monkeypatch):
+    posted_urls = []
+
+    def fake_post(url, *, dest_hex, amount):
+        posted_urls.append(url)
+        return {"ok": True}
+
+    monkeypatch.setattr(mb, "_post_faucet", fake_post)
+    client = _BalanceClient([0, 5000], chain=mb.TESTNET_CHAIN_NAME)
+    bal = await mb.ensure_funded(
+        client, _stub_keystore(), _faucet_config(faucet_url=None)
+    )
+    assert bal == 5000
+    assert posted_urls == [mb.DEFAULT_TESTNET_FAUCET_URL]
+
+
+async def test_ensure_funded_no_faucet_url_non_testnet_still_raises(monkeypatch):
+    posted = []
+    monkeypatch.setattr(mb, "_post_faucet", lambda *a, **k: posted.append(1))
+    client = _BalanceClient([0], chain="Development")
+    with pytest.raises(mb.Underfunded):
+        await mb.ensure_funded(client, _stub_keystore(), _faucet_config(faucet_url=None))
+    assert posted == [], "non-testnet chains must not fall back to the public faucet"
+
+
+async def test_ensure_funded_no_faucet_url_chain_probe_failure_raises(monkeypatch):
+    posted = []
+    monkeypatch.setattr(mb, "_post_faucet", lambda *a, **k: posted.append(1))
+    client = _BalanceClient([0], chain_error=RuntimeError("rpc down"))
+    with pytest.raises(mb.Underfunded):
+        await mb.ensure_funded(client, _stub_keystore(), _faucet_config(faucet_url=None))
+    assert posted == [], "an unidentifiable chain must fail fast, not guess a faucet"
 
 
 async def test_ensure_funded_retries_transient_then_succeeds(monkeypatch):
