@@ -80,8 +80,10 @@ from substrate.pool_client import PoolClient
 from substrate.decay_timing import TimingTracker
 from substrate.difficulty_decay import EnergyCurve, build_decay_schedule
 from substrate.submitter import (
+    RuntimeIncompatibleError,
     SubmitRetryAction,
     encode_quantum_proof,
+    runtime_incompat_reason,
     submit_proof,
     submit_with_retry,
 )
@@ -157,6 +159,10 @@ def build_stats_snapshot_for_telemetry(controller) -> dict[str, Any]:
         "last_successful_submission": getattr(
             getattr(controller, "_pool", None), "last_successful_submission", None
         ),
+        # gh-20 liveness: consecutive failed submits since the last landed
+        # proof, and a set reason when the client is too old for the runtime.
+        "consecutive_submit_failures": _g("consecutive_submit_failures"),
+        "runtime_incompatible": getattr(s, "runtime_incompatible", None),
     }
 
     core = getattr(controller, "core", None)
@@ -412,6 +418,18 @@ class ControllerStats:
     # trigger cancel+re-dispatch; the in-flight mining attempt is
     # allowed to continue. Counts the cancel churn we no longer waste.
     heads_same_key_skipped: int = 0
+    # Consecutive failed submit_proof attempts since the last landed proof;
+    # reset to 0 on any accepted submission. Surfaced on /api/v1/status so the
+    # "container Up + is_mining=true but zero extrinsics land" failure class
+    # (gh-20) is self-diagnosing — a large value means the node mines but wins
+    # nothing.
+    consecutive_submit_failures: int = 0
+    # Set to a human-readable reason when a submit fails with a runtime-schema
+    # mismatch (this client build is too old for the chain's current runtime —
+    # e.g. a required extrinsic field or a storage item the client depends on
+    # no longer matches). None while compatible. When set, the controller has
+    # failed fast rather than retrying an unencodable proof indefinitely.
+    runtime_incompatible: Optional[str] = None
 
 
 @dataclass
@@ -1406,7 +1424,25 @@ class SubstrateMinerController:
             )
         except Exception as exc:  # noqa: BLE001 — surface RPC errors to logs
             self.stats.submission_errors += 1
+            self.stats.consecutive_submit_failures += 1
             self.stats.last_submission_error = f"{type(exc).__name__}: {exc}"
+            # Fail fast on a runtime-schema mismatch: this build cannot follow
+            # the chain's current runtime, so every submit will fail the same
+            # way. Retrying (the gh-20 failure: 22,794 dropped submits over 5
+            # days) only hides it. Raise loudly so the process exits with a
+            # clear "upgrade the miner" message instead of silently mining and
+            # landing nothing.
+            reason = runtime_incompat_reason(exc)
+            if reason is not None:
+                self.stats.runtime_incompatible = reason
+                logger.error(
+                    "FATAL: client too old for the current chain runtime — "
+                    "submit_proof cannot encode against it (%s). This build "
+                    "cannot follow the runtime upgrade; upgrade the miner "
+                    "image to a build matching the current runtime.",
+                    reason,
+                )
+                raise RuntimeIncompatibleError(reason) from exc
             logger.exception(
                 "submit_proof RPC failed for result from %s: %s",
                 envelope.handle_id,
@@ -1457,6 +1493,7 @@ class SubstrateMinerController:
             )
         else:  # FATAL
             self.stats.submission_errors += 1
+            self.stats.consecutive_submit_failures += 1
             self.stats.last_submission_error = str(receipt.error or "")
             pow_seq_fatal = await self._query_proofs_submitted_safe()
             self._record_submission(
@@ -1514,6 +1551,8 @@ class SubstrateMinerController:
             )
             return
         self.stats.proofs_submitted += 1
+        # A landed proof clears the consecutive-failure streak (gh-20 liveness).
+        self.stats.consecutive_submit_failures = 0
         # Resolve the receipt's block hash → block number so the
         # work-key record can distinguish stale subscription heads
         # (number <= accepted) from current already-won heads. The

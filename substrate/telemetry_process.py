@@ -541,6 +541,16 @@ async def _handle_status(request: web.Request) -> web.Response:
             "last_successful_submission": snapshot.get("controller", {}).get(
                 "last_successful_submission"
             ),
+            # Consecutive failed submits since the last landed proof, and a
+            # reason string when this build is too old for the chain runtime.
+            # A large counter or a non-null reason means "mining but landing
+            # nothing" even while is_mining reads true (gh-20).
+            "consecutive_submit_failures": snapshot.get("controller", {}).get(
+                "consecutive_submit_failures"
+            ),
+            "runtime_incompatible": snapshot.get("controller", {}).get(
+                "runtime_incompatible"
+            ),
             "uptime_seconds": uptime_seconds,
             "chain": chain_payload,
             "miner_registered": miner_registered,

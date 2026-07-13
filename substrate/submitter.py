@@ -67,6 +67,48 @@ FATAL_SUBMISSION_ERRORS = (
 )
 
 
+class RuntimeIncompatibleError(RuntimeError):
+    """This client build is too old for the chain's current runtime.
+
+    Raised (fail-fast) when a submit fails with a schema mismatch that no
+    amount of retrying can fix — a required extrinsic field the client never
+    populates, or a storage/call item the client depends on that the runtime
+    renamed or removed. The alternative (the gh-20 failure) is retrying an
+    unencodable proof tens of thousands of times while the node silently lands
+    nothing and still reports ``is_mining=true``.
+    """
+
+
+# Substrate-interface / scale-codec substrings that identify a runtime-schema
+# mismatch rather than a transient RPC or a bad candidate. These are
+# deterministic: the same client + runtime reproduces them every time.
+_RUNTIME_INCOMPAT_SIGNATURES = (
+    # scalecodec: a required struct field the client did not supply, e.g. the
+    # runtime added `device_access_time_us` to the proof (gh-20).
+    "is missing in given value",
+    # substrate-interface: a storage item the client reads was renamed/removed,
+    # e.g. `QuantumPow.Difficulty` moving under a new runtime.
+    "StorageFunctionNotFound",
+    # substrate-interface: the call module/function is no longer in metadata.
+    "not found in metadata",
+)
+
+
+def runtime_incompat_reason(exc: BaseException) -> Optional[str]:
+    """Return a reason string if ``exc`` is a runtime-schema mismatch, else None.
+
+    Matches the deterministic encode/lookup failures a too-old client hits
+    against a newer runtime (see :data:`_RUNTIME_INCOMPAT_SIGNATURES`). Used to
+    turn those from silently-retried per-submit errors into a single fail-fast
+    :class:`RuntimeIncompatibleError`.
+    """
+    text = f"{type(exc).__name__}: {exc}"
+    for sig in _RUNTIME_INCOMPAT_SIGNATURES:
+        if sig in text:
+            return text
+    return None
+
+
 class SubmitRetryAction(str, Enum):
     """Outcome taxonomy a fire loop branches on after one submit attempt.
 
