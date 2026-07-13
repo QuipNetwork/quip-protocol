@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quip-protocol"
-version = "0.2.1rc47"
+version = "0.2.1rc48"
 description = "Quantum mining stack (Substrate-integrated successor to the legacy quip-protocol P2P node)"
 readme = "README.md"
 requires-python = ">=3.10"
