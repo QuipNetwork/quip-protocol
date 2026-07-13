@@ -15,7 +15,6 @@ Control layout per nonce (CTRL_STRIDE=8 ints):
 from __future__ import annotations
 
 import abc
-import dataclasses
 import logging
 import os
 import time
@@ -37,6 +36,7 @@ from GPU.sampler_utils import (
     compute_beta_schedule,
     unpack_packed_results,
 )
+from GPU.slot_rotation import SlotState
 
 # Minimum CUDA runtime version (runtimeGetVersion()) for each
 # GPU architecture. Used for PTX fallback when NVRTC is older
@@ -55,22 +55,6 @@ def _best_fallback_arch(cuda_ver: int) -> int:
          if v <= cuda_ver),
         default=80,
     )
-
-
-@dataclasses.dataclass(slots=True)
-class _SlotState:
-    """Per-kernel slot assignment for streaming API.
-
-    Tracks which slot holds the active model (being computed),
-    which holds the next model (preloaded), and which is free
-    for upload.
-    """
-
-    active_slot: int
-    active_model: Optional[IsingModel]
-    next_slot: int
-    next_model: Optional[IsingModel]
-    free_slot: int
 
 
 class BaseCudaSampler(abc.ABC):
@@ -912,34 +896,34 @@ class BaseCudaSampler(abc.ABC):
                 return models.try_pop()
             return _pull_blocking()
 
-        def _try_fill_free_slot(
-            nonce_id: int, ss: '_SlotState',
-        ) -> bool:
-            """Pull one model and upload it into ss.free_slot.
+        def _try_queue(nonce_id: int, ss: SlotState) -> bool:
+            """Pull one model into a free slot for ``nonce_id``.
 
-            Returns True if a model was queued, False if none
-            was available.
+            Fills the ACTIVE slot if the nonce is idle (reviving a nonce whose
+            feeder was momentarily empty at its last completion), otherwise the
+            NEXT slot. Returns True if a model was queued, False if the feeder
+            was empty or the nonce already has both roles filled.
             """
+            slot = ss.free_slot()
+            if slot < 0:
+                return False
             m = _pull_nonblocking()
             if m is None:
                 return False
-            self.upload_slot(nonce_id, ss.free_slot, m.h, m.J)
-            ss.next_slot = ss.free_slot
-            ss.next_model = m
-            ss.free_slot = -1
+            self.upload_slot(nonce_id, slot, m.h, m.J)
+            if ss.is_idle:
+                ss.assign_active(slot, m)
+            else:
+                ss.assign_next(slot, m)
             return True
 
-        # Build per-kernel slot state
-        # Slots: 0=active, 1=next, 2=free
-        slots: list[_SlotState] = []
-        for _ in range(num_k):
-            slots.append(_SlotState(
-                active_slot=0, active_model=None,
-                next_slot=1, next_model=None,
-                free_slot=2,
-            ))
+        # Per-nonce slot bookkeeping (free slots derived, never leaked).
+        slots: list[SlotState] = [
+            SlotState(slots_per_nonce=self.SLOTS_PER_NONCE)
+            for _ in range(num_k)
+        ]
 
-        # Cold start: fill active slots (slot 0) — blocking
+        # Cold start: fill active slots — blocking
         pending_models: list[IsingModel] = []
         for _ in range(num_k):
             m = _pull_blocking()
@@ -951,21 +935,21 @@ class BaseCudaSampler(abc.ABC):
             return
 
         for i, m in enumerate(pending_models):
-            self.upload_slot(
-                i, slots[i].active_slot, m.h, m.J,
-            )
-            slots[i].active_model = m
+            ss = slots[i]
+            slot = ss.free_slot()
+            self.upload_slot(i, slot, m.h, m.J)
+            ss.assign_active(slot, m)
 
-        # Fill next slots (slot 1) — blocking to ensure
-        # the kernel has work queued when it finishes slot 0
+        # Fill next slots — blocking to ensure the kernel has work
+        # queued when it finishes the active slot
         for i in range(len(pending_models)):
             m = _pull_blocking()
             if m is None:
                 break
-            self.upload_slot(
-                i, slots[i].next_slot, m.h, m.J,
-            )
-            slots[i].next_model = m
+            ss = slots[i]
+            slot = ss.free_slot()
+            self.upload_slot(i, slot, m.h, m.J)
+            ss.assign_next(slot, m)
 
         # Launch kernel
         self._sf_kernel_running = False
@@ -978,30 +962,30 @@ class BaseCudaSampler(abc.ABC):
         try:
             last_completion = time.monotonic()
             while True:
-                # Check if any kernels still have work
-                any_active = any(
-                    s.active_model is not None
-                    for s in slots
-                )
-                if not any_active:
-                    break
-
-                # Try to fill any empty next-slots before
-                # polling, so the GPU doesn't stall waiting
+                # Revive idle nonces (fill ACTIVE) and preload NEXT for active
+                # nonces before polling, so the GPU doesn't stall. Done BEFORE
+                # the termination check so a transiently-empty feeder that
+                # recovers restarts idle nonces instead of ending the stream.
                 for nonce_id, ss in enumerate(slots):
-                    if (
-                        ss.active_model is not None
-                        and ss.next_model is None
-                        and ss.free_slot >= 0
-                    ):
-                        _try_fill_free_slot(nonce_id, ss)
+                    if not _exhausted and (ss.is_idle or ss.needs_next()):
+                        _try_queue(nonce_id, ss)
+
+                # Terminate only when the feeder is exhausted AND nothing is in
+                # flight or queued. A transient empty feeder (try_pop -> None)
+                # is NOT termination — idle nonces are revived above once it
+                # recovers, so a momentary starvation can no longer end the
+                # stream or permanently drop a nonce (gh-19 / QUI-828).
+                if _exhausted and all(
+                    s.is_idle and s.next_model is None for s in slots
+                ):
+                    break
 
                 # Single DMA read of ctrl array
                 ctrl = cp.asnumpy(self._d_sf_ctrl)
                 found = False
 
                 for nonce_id, ss in enumerate(slots):
-                    if ss.active_model is None:
+                    if ss.is_idle:
                         continue
                     state = ctrl[
                         self._ctrl_index(
@@ -1020,16 +1004,13 @@ class BaseCudaSampler(abc.ABC):
                     )
                     completed_model = ss.active_model
 
-                    # Rotate: active -> free,
-                    # next -> active
-                    ss.free_slot = ss.active_slot
-                    ss.active_slot = ss.next_slot
-                    ss.active_model = ss.next_model
-                    ss.next_slot = -1
-                    ss.next_model = None
+                    # Rotate: promote NEXT -> ACTIVE if queued, else go idle
+                    # (kept alive; revived by _try_queue when the feeder
+                    # recovers). Never advances ACTIVE into an empty slot.
+                    ss.rotate_on_completion()
 
-                    # Non-blocking fill of freed slot
-                    _try_fill_free_slot(nonce_id, ss)
+                    # Opportunistically refill the just-freed slot.
+                    _try_queue(nonce_id, ss)
 
                     yield (completed_model, result_ss)
 
