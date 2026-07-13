@@ -19,8 +19,10 @@ from shared.miner_types import MiningResult
 from shared.packed_solution import unpack_solution
 from substrate.submitter import (
     MILLI_SCALE,
+    RuntimeIncompatibleError,
     _normalize_spins,
     encode_quantum_proof,
+    runtime_incompat_reason,
 )
 from substrate.types import (
     SubstrateDifficulty,
@@ -169,3 +171,55 @@ def test_normalize_spins_spin_convention():
 def test_normalize_spins_rejects_invalid_value():
     with pytest.raises(ValueError, match="cannot normalize"):
         _normalize_spins([0, 1, 2])
+
+
+# --- runtime-incompatibility classifier (gh-20) --------------------------
+
+
+def test_runtime_incompat_reason_missing_struct_field():
+    """The exact encode failure a too-old client hits when the runtime adds a
+    required proof field (gh-20: device_access_time_us)."""
+    exc = ValueError(
+        'Element "device_access_time_us" of struct is missing in given value'
+    )
+    reason = runtime_incompat_reason(exc)
+    assert reason is not None
+    assert "device_access_time_us" in reason
+
+
+def test_runtime_incompat_reason_storage_function_not_found():
+    class StorageFunctionNotFound(Exception):
+        pass
+
+    reason = runtime_incompat_reason(
+        StorageFunctionNotFound('Storage function "QuantumPow.Difficulty" not found')
+    )
+    assert reason is not None
+    assert "QuantumPow.Difficulty" in reason
+
+
+def test_runtime_incompat_reason_call_not_in_metadata():
+    reason = runtime_incompat_reason(
+        RuntimeError("Call function 'submit_proof' not found in metadata")
+    )
+    assert reason is not None
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        BrokenPipeError("broken pipe"),
+        TimeoutError("timed out"),
+        ConnectionError("connection reset"),
+        RuntimeError("Priority is too low (1014)"),
+        ValueError("cannot normalize spin 2"),
+    ],
+)
+def test_runtime_incompat_reason_ignores_transient_and_other_errors(exc):
+    """Transient RPC failures and unrelated bugs must NOT be misclassified as a
+    runtime mismatch — those still retry / fail as before."""
+    assert runtime_incompat_reason(exc) is None
+
+
+def test_runtime_incompatible_error_is_runtime_error():
+    assert issubclass(RuntimeIncompatibleError, RuntimeError)
