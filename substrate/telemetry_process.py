@@ -534,6 +534,13 @@ async def _handle_status(request: web.Request) -> web.Response:
             "account_id_hex": account_hex,
             "node_id": snapshot.get("node_id"),
             "is_mining": is_mining,
+            # Wall-clock (epoch seconds) of the last landed submit, or None
+            # if the node has never landed one. A node reporting is_mining
+            # True with a stale/None value here is mining but not winning
+            # (QUI-829 / gh-18) — the one field that makes that self-evident.
+            "last_successful_submission": snapshot.get("controller", {}).get(
+                "last_successful_submission"
+            ),
             "uptime_seconds": uptime_seconds,
             "chain": chain_payload,
             "miner_registered": miner_registered,

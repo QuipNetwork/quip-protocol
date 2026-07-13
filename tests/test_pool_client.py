@@ -31,6 +31,12 @@ class _RecordingPool:
             return value
         return None
 
+    async def send_write(self, op: str, args: dict) -> Any:
+        # Writes (submit_signed_extrinsic) route through the dedicated
+        # write handle; record identically so submit assertions on
+        # ``calls`` keep working.
+        return await self.send(op, args)
+
 
 @pytest.mark.asyncio
 async def test_get_head_forwards_empty_args():

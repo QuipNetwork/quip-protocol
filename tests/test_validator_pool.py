@@ -6,6 +6,7 @@ failure with idempotent-only auto-retry.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -320,5 +321,200 @@ async def test_single_url_racing_swap_does_not_teardown_fresh_handle():
         assert pool._active is h1
         assert not h1.is_shutdown
         assert len(spawned) == 2  # no extra spawn
+    finally:
+        await pool.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Dedicated write handle (QUI-829 / gh-18): submits ride a WRITE handle that
+# read-path (snapshot-poll) swaps can never tear down. Unlike _make_pool,
+# these tests use a factory that returns a FRESH handle per call, mirroring
+# the real ValidatorHandle (a new child process each spawn) so the read and
+# write handles are distinct objects even on a single URL.
+# ---------------------------------------------------------------------------
+
+
+class _BlockableHandle:
+    """Fresh-per-spawn fake whose ``send`` can block on a per-op event."""
+
+    def __init__(self, url: str, *, gates: dict[str, asyncio.Event] | None = None,
+                 fail_first_ensure: bool = False) -> None:
+        self.url = url
+        self.is_shutdown = False
+        self.calls: list[tuple[str, dict]] = []
+        self._gates = gates or {}
+        self._fail_first_ensure = fail_first_ensure
+        self._ensure_calls = 0
+
+    def start(self) -> None:
+        pass
+
+    async def send(self, op: str, args: dict) -> Any:
+        self.calls.append((op, args))
+        if self.is_shutdown:
+            raise ValidatorSwapped(f"{self.url} already shut down")
+        if op == "ensure_connected":
+            self._ensure_calls += 1
+            if self._fail_first_ensure and self._ensure_calls == 1:
+                raise ConnectionError("stale idle write socket")
+            return True
+        gate = self._gates.get(op)
+        if gate is not None:
+            await gate.wait()
+        return f"{self.url}:{op}"
+
+    async def shutdown(self) -> None:
+        self.is_shutdown = True
+
+
+def _make_pool_fresh(url: str = "http://a", **handle_kwargs) -> ValidatorPool:
+    """Pool whose factory spawns a distinct handle per call (like production)."""
+    spawned: list[_BlockableHandle] = []
+
+    def factory(u: str) -> _BlockableHandle:
+        h = _BlockableHandle(u, **handle_kwargs)
+        spawned.append(h)
+        return h
+
+    pool = ValidatorPool(
+        urls=[url],
+        failover=SubstrateUrlFailover([url], initial_backoff_s=0.01, max_backoff_s=0.05),
+        handle_factory=factory,
+        max_swap_retries=3,
+        reconnect_backoff_s=0.0,
+    )
+    pool._spawned = spawned  # for assertions
+    return pool
+
+
+@pytest.mark.asyncio
+async def test_send_write_uses_dedicated_handle_not_read_handle():
+    """A submit rides a separate handle from the read/snapshot path."""
+    pool = _make_pool_fresh()
+    await pool.start()
+    try:
+        await pool.send("get_head", {})  # read handle
+        receipt = await pool.send_write("submit_signed_extrinsic", {"extrinsic_hex": "0x01"})
+        assert receipt == "http://a:submit_signed_extrinsic"
+        read_handle, write_handle = pool._active, pool._write_active
+        assert read_handle is not write_handle
+        # Read handle only saw the read; write handle saw ensure + submit.
+        assert read_handle.calls == [("get_head", {})]
+        assert write_handle.calls == [
+            ("ensure_connected", {}),
+            ("submit_signed_extrinsic", {"extrinsic_hex": "0x01"}),
+        ]
+    finally:
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_read_swap_does_not_teardown_inflight_write():
+    """The regression (QUI-829): a snapshot-poll swap while a submit is in
+    flight must NOT cancel the submit. With the dedicated write handle the
+    read swap only touches ``_active``, so the in-flight write completes."""
+    gate = asyncio.Event()
+    pool = _make_pool_fresh(gates={"submit_signed_extrinsic": gate})
+    await pool.start()
+    try:
+        # Launch a submit that blocks inside the write handle's send().
+        write_task = asyncio.create_task(
+            pool.send_write("submit_signed_extrinsic", {"extrinsic_hex": "0x01"})
+        )
+        # Wait until the write handle is actually mid-submit.
+        while pool._write_active is None or (
+            "submit_signed_extrinsic",
+            {"extrinsic_hex": "0x01"},
+        ) not in pool._write_active.calls:
+            await asyncio.sleep(0)
+        write_handle = pool._write_active
+        read_handle = pool._active
+
+        # A concurrent read-path connection failure swaps the READ handle.
+        await pool._swap_after_failure(read_handle)
+        assert read_handle.is_shutdown
+        assert pool._active is not read_handle
+        # The write handle must be untouched.
+        assert pool._write_active is write_handle
+        assert not write_handle.is_shutdown
+
+        # Release the submit; it completes successfully on the same handle.
+        gate.set()
+        assert await write_task == "http://a:submit_signed_extrinsic"
+        assert not write_handle.is_shutdown
+        assert pool.last_successful_submission is not None
+    finally:
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_send_write_reconnects_stale_idle_socket():
+    """Submits are rare, so the write socket is usually stale. The write path
+    health-reconnects on demand: a failed first ensure respawns the handle,
+    and the submit lands on the fresh one."""
+    # Handle 0 = read (start), handle 1 = stale first write handle, handle 2+
+    # = healthy reconnect. Only handle 1's socket is stale.
+    spawned: list[_BlockableHandle] = []
+
+    def factory(u: str) -> _BlockableHandle:
+        h = _BlockableHandle(u, fail_first_ensure=(len(spawned) == 1))
+        spawned.append(h)
+        return h
+
+    pool = ValidatorPool(
+        urls=["http://a"],
+        failover=SubstrateUrlFailover(["http://a"], initial_backoff_s=0.01, max_backoff_s=0.05),
+        handle_factory=factory,
+        max_swap_retries=3,
+        reconnect_backoff_s=0.0,
+    )
+    await pool.start()
+    try:
+        receipt = await pool.send_write("submit_signed_extrinsic", {"extrinsic_hex": "0x01"})
+        assert receipt == "http://a:submit_signed_extrinsic"
+        # First write handle (spawned[1]) failed ensure and was shut down; a
+        # fresh one (spawned[2]) carried the submit.
+        assert spawned[1].is_shutdown
+        assert pool._write_active is spawned[2]
+        assert not pool._write_active.is_shutdown
+        assert ("submit_signed_extrinsic", {"extrinsic_hex": "0x01"}) in pool._write_active.calls
+    finally:
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_send_write_raises_validator_swapped_on_connection_error():
+    """A connection-class failure during the submit itself surfaces as
+    ValidatorSwapped (caller re-signs) and reconnects the write handle."""
+
+    class _FailSubmitHandle(_BlockableHandle):
+        async def send(self, op: str, args: dict) -> Any:
+            if op == "submit_signed_extrinsic" and not self.is_shutdown:
+                self.calls.append((op, args))
+                raise ConnectionError("broken pipe mid-submit")
+            return await super().send(op, args)
+
+    spawned: list[_FailSubmitHandle] = []
+
+    def factory(u: str) -> _FailSubmitHandle:
+        h = _FailSubmitHandle(u)
+        spawned.append(h)
+        return h
+
+    pool = ValidatorPool(
+        urls=["http://a"],
+        failover=SubstrateUrlFailover(["http://a"], initial_backoff_s=0.01, max_backoff_s=0.05),
+        handle_factory=factory,
+        max_swap_retries=3,
+        reconnect_backoff_s=0.0,
+    )
+    await pool.start()
+    try:
+        with pytest.raises(ValidatorSwapped):
+            await pool.send_write("submit_signed_extrinsic", {"extrinsic_hex": "0x01"})
+        # The failed write handle was reconnected (a fresh one is active).
+        assert pool._write_active is not None
+        assert not pool._write_active.is_shutdown
+        assert pool.last_successful_submission is None
     finally:
         await pool.shutdown()

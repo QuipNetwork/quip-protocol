@@ -139,6 +139,18 @@ class ValidatorPool:
         self._max_swap_retries = max_swap_retries
         self._active: Optional[ValidatorHandle] = None
         self._swap_lock = asyncio.Lock()
+        # Dedicated WRITE handle, isolated from the read/snapshot path. A
+        # connection-class failure on a read op swaps only ``self._active``,
+        # never this handle — so a high-frequency snapshot poll can no longer
+        # tear an in-flight submit off its socket (QUI-829 / gh-18). Created
+        # lazily on the first write; writes serialize on ``_write_lock`` so
+        # only one submit at a time touches the single write handle.
+        self._write_active: Optional[ValidatorHandle] = None
+        self._write_lock = asyncio.Lock()
+        # Wall-clock time of the last landed write (submit). None until the
+        # first success. Surfaced on /api/v1/status so a node that mines but
+        # never lands a proof is diagnosable instead of silently stuck.
+        self.last_successful_submission: Optional[float] = None
         self._sync_probe_timeout_s = float(sync_probe_timeout_s)
         self._sync_poll_interval_s = float(sync_poll_interval_s)
         # Short backoff before respawning the child on a single-URL
@@ -176,10 +188,13 @@ class ValidatorPool:
         self._active.start()
 
     async def shutdown(self) -> None:
-        """Shut down the active handle (if any)."""
+        """Shut down the active read handle and the write handle (if any)."""
         if self._active is not None:
             await self._active.shutdown()
             self._active = None
+        if self._write_active is not None:
+            await self._write_active.shutdown()
+            self._write_active = None
 
     async def send(self, op: str, args: dict[str, Any]) -> Any:
         """Route an RPC call to the active handle, with swap-on-failure.
@@ -266,6 +281,80 @@ class ValidatorPool:
         if self._active is None:
             return
         await self._swap_after_failure(self._active)
+
+    # ------------------------------------------------------------------
+    # Dedicated write path (submits) — isolated from read-path swaps.
+    # ------------------------------------------------------------------
+
+    async def send_write(self, op: str, args: dict[str, Any]) -> Any:
+        """Route a non-idempotent write (submit) through a dedicated handle.
+
+        The write handle never shares a socket with the read/snapshot path,
+        so a snapshot-poll connection swap can no longer cancel an in-flight
+        submit (QUI-829 / gh-18). Submits are rare, so the write handle is
+        created lazily and its (often-idle, possibly-stale) socket is
+        health-reconnected on demand before each write. Writes serialize on
+        ``_write_lock`` — one submit at a time touches the single handle.
+
+        On a connection-class failure the write handle is reconnected and
+        ``ValidatorSwapped`` is raised: the caller re-composes with a fresh
+        nonce and retries (same contract as the old shared-handle submit,
+        which surfaced ``ValidatorSwapped`` on a mid-flight swap).
+        """
+        async with self._write_lock:
+            handle = await self._ensure_write_handle_connected()
+            try:
+                result = await handle.send(op, args)
+            except ValidatorSwapped:
+                # The handle was shut down under us (only pool shutdown does
+                # this to a write handle). Surface so the caller re-decides;
+                # never silently retry a non-idempotent write.
+                raise
+            except _CONNECTION_ERRORS as conn_exc:
+                await self._reconnect_write_handle(handle)
+                raise ValidatorSwapped(
+                    f"write handle swapped during {op}; caller must re-sign"
+                ) from conn_exc
+            self._failover.confirm_success()
+            self._clear_sync_state()
+            self.last_successful_submission = time.time()
+            return result
+
+    async def _ensure_write_handle_connected(self) -> ValidatorHandle:
+        """Return the write handle with a freshly health-probed connection.
+
+        Lazily spawns the write handle on the current failover URL. Because
+        submits are rare the socket is usually idle/stale, so we drive the
+        child's own ``ensure_connected`` (which reconnects a dead socket in
+        place); if the child process itself is unreachable, respawn it once.
+        Called only while holding ``_write_lock``.
+        """
+        if self._write_active is None:
+            self._write_active = self._handle_factory(self._failover.current())
+            self._write_active.start()
+        handle = self._write_active
+        try:
+            await handle.send("ensure_connected", {})
+        except (ValidatorSwapped, *_CONNECTION_ERRORS):
+            await self._reconnect_write_handle(handle)
+            handle = self._write_active
+            await handle.send("ensure_connected", {})
+        return handle
+
+    async def _reconnect_write_handle(self, failed: ValidatorHandle) -> None:
+        """Shut a dead write handle and respawn it on the current URL.
+
+        Called only while holding ``_write_lock`` (writes are serialized), so
+        no separate swap lock is needed. Identity-guarded so a stale reference
+        can't tear down an already-respawned handle.
+        """
+        if self._write_active is not failed:
+            return
+        old = self._write_active
+        self._write_active = None
+        await old.shutdown()
+        self._write_active = self._handle_factory(self._failover.current())
+        self._write_active.start()
 
     async def _probe_sync_state(self, handle: ValidatorHandle) -> Optional[dict[str, Any]]:
         """Fetch node sync state from `handle`; None on any failure.
