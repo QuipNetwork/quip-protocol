@@ -151,6 +151,12 @@ def build_stats_snapshot_for_telemetry(controller) -> dict[str, Any]:
         "duplicate_result_drops": _g("duplicate_result_drops"),
         "proofs_unverified": _g("proofs_unverified"),
         "active_url": getattr(controller, "pool_active_url", None),
+        # Wall-clock time of the last landed submit (proof/mempool). None
+        # until the first success. Lets /api/v1/status distinguish a node
+        # that mines but lands nothing (QUI-829) from a healthy one.
+        "last_successful_submission": getattr(
+            getattr(controller, "_pool", None), "last_successful_submission", None
+        ),
     }
 
     core = getattr(controller, "core", None)

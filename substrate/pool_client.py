@@ -166,13 +166,15 @@ class PoolClient:
         extrinsic_hex: str,
         wait_for: str = "inblock",
     ):
-        """Submit pre-built signed extrinsic via the active validator child.
+        """Submit pre-built signed extrinsic via the dedicated write child.
 
-        The pool routes this through the swap-aware ``send()`` path. As a
-        non-idempotent op, a mid-flight swap raises ``ValidatorSwapped``
-        — the caller must re-sign (with a fresh nonce) and resubmit.
+        The pool routes this through ``send_write`` — a WRITE handle that is
+        isolated from the read/snapshot path, so a snapshot-poll connection
+        swap can never tear this submit off its socket (QUI-829 / gh-18). As a
+        non-idempotent op, a connection failure raises ``ValidatorSwapped`` —
+        the caller must re-sign (with a fresh nonce) and resubmit.
         """
-        return await self._pool.send(
+        return await self._pool.send_write(
             "submit_signed_extrinsic",
             {"extrinsic_hex": extrinsic_hex, "wait_for": wait_for},
         )
