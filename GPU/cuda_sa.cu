@@ -373,10 +373,17 @@ __global__ void cuda_sa_self_feeding(
                     ctrl_base + CTRL_EXIT_NOW]) {
                 s_active_slot = -1;
             } else {
-                // Find next READY slot
+                // Find next READY slot. Wait through transient feeder
+                // starvation instead of the old bounded ~100ms retry
+                // (10000 x 10us): that cap let a momentarily-empty feeder
+                // kill the block, after which the nonce was dropped
+                // permanently and the miner's attempt rate decayed
+                // block-by-block until restart (QUI-828). Only an explicit
+                // host EXIT_NOW ends the block now -- the host always raises
+                // it on stream teardown (signal_exit, in both the streaming
+                // loop's finally and the batch path), so this cannot hang.
                 int next_slot = -1;
-                for (int retry = 0;
-                     retry < 10000; retry++) {
+                while (true) {
                     for (int s = 0; s < 3; s++) {
                         int old = atomicCAS(
                             (int*)&nonce_ctrl[
@@ -390,6 +397,10 @@ __global__ void cuda_sa_self_feeding(
                         }
                     }
                     if (next_slot >= 0) break;
+                    if (nonce_ctrl[
+                            ctrl_base + CTRL_EXIT_NOW]) {
+                        break;  // host ended the stream
+                    }
                     __nanosleep(10000);  // 10us
                 }
 
