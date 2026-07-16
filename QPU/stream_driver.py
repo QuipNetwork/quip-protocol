@@ -44,7 +44,8 @@ log = logging.getLogger(__name__)
 def stream_driver_main(ring_args: Dict[str, Any], desc_q, ctl_q, stop_event,
                        stream_factory_dotted: str,
                        factory_kwargs: Dict[str, Any],
-                       log_queue: Any = None) -> None:
+                       log_queue: Any = None,
+                       drops: Any = None) -> None:
     """Long-lived stream driver: persist the context, switch rounds via ctl_q.
 
     ``stream_factory_dotted`` resolves to a context factory
@@ -58,6 +59,14 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, ctl_q, stop_event,
     spawned process with no inherited handlers, so without configuring it here
     every producer-side INFO diagnostic (stream depth, feeder pop-wait) is
     silently dropped.
+
+    ``drops`` is an optional shared counter (``multiprocessing.Value``) the
+    consumer reads to surface ring drops on ``/api/v1/status``. A dropped
+    sample never reaches the worker, so a win it carried is lost with no other
+    signal. It is a shared counter rather than a field on the descriptor
+    because a saturated ring drops *every* result and therefore emits no
+    descriptor at all — a piggybacked count would go silent exactly when drops
+    peak. Inherited via ``Process(args=...)``; never sent over a queue.
     """
     setup_child_process_logging(log_queue)
     # Orphan guard: if the parent dies ungracefully, stop instead of burning
@@ -67,6 +76,16 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, ctl_q, stop_event,
     ctx = None
     dropped = 0
     shutdown = False
+
+    def _drop() -> int:
+        """Count one dropped sample locally and on the shared counter."""
+        nonlocal dropped
+        dropped += 1
+        if drops is not None:
+            with drops.get_lock():
+                drops.value += 1
+        return dropped
+
     # Context construction can raise on D-Wave auth/topology errors; keep it
     # inside the try so the finally always sends the end-of-stream sentinel.
     try:
@@ -99,7 +118,7 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, ctl_q, stop_event,
                         "(slot capacity %dx%d)",
                         n_rows, n_cols, ring.max_rows, ring.max_cols,
                     )
-                    dropped += 1
+                    _drop()
                     continue
                 # Always give the claim a real wait budget. This was
                 # ``timeout=0.0 if dropped else 0.005``, but ``dropped`` is the
@@ -110,7 +129,7 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, ctl_q, stop_event,
                 # silently (QUI-867).
                 slot = ring.claim_free(timeout=0.005)
                 if slot is None:
-                    dropped += 1
+                    _drop()
                     continue
                 ring.write(slot, sample, energy)
                 try:
@@ -126,7 +145,7 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, ctl_q, stop_event,
                 except _queue.Full:
                     # Consumer backpressure: release the slot and drop.
                     ring.release(slot)
-                    dropped += 1
+                    _drop()
             # iter_results returned. If stop/shutdown, fall through to cleanup;
             # otherwise the driver paused-and-drained (or the round ended) —
             # idle until the next switch (resume) or None (shutdown).

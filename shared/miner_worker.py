@@ -296,6 +296,12 @@ def miner_worker_main(
             def _emit_budget(stats: Dict[str, Any]) -> None:
                 _emit("budget", stats)
 
+            # Ring-drop channel, same worker-initiated push shape as budget.
+            # A dropped sample never reaches this worker, so this counter is
+            # the only live signal that mined attempts are being discarded.
+            def _emit_drops(stats: Dict[str, Any]) -> None:
+                _emit("drops", stats)
+
             # Write-once participation channel. The miner calls this exactly
             # once per accepted dispatch (after its budget gate passes) with the
             # solution number + backend-specific extras (QPU: budget_seconds).
@@ -322,6 +328,7 @@ def miner_worker_main(
                     context, stop_event, preview_cb=_emit_preview,
                     budget_cb=_emit_budget,
                     participating_cb=_emit_participating,
+                    drops_cb=_emit_drops,
                 )
             except Exception as exc:
                 logger.error(

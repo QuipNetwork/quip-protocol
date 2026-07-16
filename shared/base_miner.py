@@ -639,6 +639,7 @@ class BaseMiner(ABC):
         preview_cb: Optional[Any] = None,
         budget_cb: Optional[Any] = None,
         participating_cb: Optional[Any] = None,
+        drops_cb: Optional[Any] = None,
         **kwargs,
     ) -> Optional[MiningResult]:
         """Protocol-neutral mining loop.
@@ -684,6 +685,12 @@ class BaseMiner(ABC):
                 ``QPUTimeManager.get_stats`` shape) so the controller can
                 surface live usage on telemetry. Default ``None`` = no-op. A
                 failing callback never breaks mining.
+            drops_cb: Optional callable invoked at the progress-log cadence
+                with ``{"ring_drops": int}`` so the controller can surface ring
+                drops on telemetry. Skipped entirely when the count is
+                unavailable (no driver, or the split QPU path), so a missing
+                signal is never reported as zero drops. Default ``None`` =
+                no-op. A failing callback never breaks mining.
             participating_cb: Optional callable invoked exactly once per
                 accepted dispatch (after ``_pre_mine_setup`` passes its gate,
                 so a budget-starved QPU dispatch that aborts never fires it).
@@ -843,6 +850,17 @@ class BaseMiner(ABC):
 
                 progress += 1
                 if progress % PROGRESS_LOG_INTERVAL == 0:
+                    # Ring drops ride the general progress cadence, not the
+                    # QPU-only budget branch below: drops matter most on the
+                    # CPU/GPU path, which never reaches that branch.
+                    n_drops = self.ring_drops
+                    if drops_cb is not None and n_drops is not None:
+                        try:
+                            drops_cb({"ring_drops": n_drops})
+                        except Exception as exc:  # noqa: BLE001
+                            self.logger.debug(
+                                "drops_cb failed (ignored): %s", exc,
+                            )
                     budget = self._midstream_budget_ok(
                         loop_state.solution_number_for_log,
                     )
@@ -1285,18 +1303,30 @@ class BaseMiner(ABC):
         desc_q = ctx.Queue(maxsize=self.RESULT_QUEUE_MAXSIZE)
         ctl_q = ctx.Queue()
         driver_stop = ctx.Event()
+        # Ring drops, counted by the driver and read here for telemetry. A
+        # dropped sample never reaches this process, so without a shared
+        # counter the loss is invisible until the driver's exit warning.
+        # Lives across driver respawns is NOT wanted: a respawned driver
+        # starts a fresh count, matching the "per driver process" semantics
+        # the operator sees.
+        drops = ctx.Value("L", 0)
         factory_kwargs = self._stream_factory_kwargs(sample_ctx, nodes)
         if self.USES_SUBMITTER_SPLIT:
             self._spawn_split_driver(
                 ctx, ring, desc_q, ctl_q, driver_stop, factory_kwargs,
                 sample_ctx, nodes,
             )
+            # The split QPU path drops in its own feeder/submitter processes,
+            # which don't take this counter. Report "unknown" rather than a
+            # zero that would read as a clean bill of health.
+            drops = None
         else:
             from QPU.stream_driver import stream_driver_main
             self._driver_proc = spawn_worker(
                 stream_driver_main,
                 (ring.attach_args(), desc_q, ctl_q, driver_stop,
-                 self.STREAM_FACTORY_DOTTED, factory_kwargs, self._log_queue),
+                 self.STREAM_FACTORY_DOTTED, factory_kwargs, self._log_queue,
+                 drops),
                 name=f"qpu-stream-driver-{self.miner_id}",
                 # Non-daemon: the driver's RandomIsingFeeder forks pool children,
                 # which a daemon process is forbidden from doing. _close_driver
@@ -1307,6 +1337,7 @@ class BaseMiner(ABC):
         self._desc_q = desc_q
         self._ctl_q = ctl_q
         self._driver_stop = driver_stop
+        self._drops = drops
         self._ring_dims = dims
         self._driver_spawned_at = time.monotonic()
         self._last_forwarded_threshold_milli = None
@@ -2467,6 +2498,24 @@ class BaseMiner(ABC):
             f"Sampling error: {error}\n{traceback.format_exc()}"
         )
         return False
+
+    @property
+    def ring_drops(self) -> Optional[int]:
+        """Samples the stream driver dropped, or None if not counted.
+
+        A drop means the sampleset never reached this process and was never
+        evaluated, so a winning solution it carried is lost. Counted per driver
+        process: a respawn restarts the count.
+
+        Returns None (not 0) when no driver is running or on the split QPU
+        path, which drops in processes that don't share this counter. A zero
+        there would read as "no drops" rather than "not measured".
+        """
+        drops = getattr(self, "_drops", None)
+        if drops is None:
+            return None
+        with drops.get_lock():
+            return int(drops.value)
 
     def evaluate_sampleset(self, sampleset: dimod.SampleSet, requirements: BlockRequirements, nodes: List[int], edges: List[Tuple[int, int]], nonce: int, salt: bytes, prev_timestamp: int, start_time: float, *, h: Optional[Dict[int, float]] = None, J: Optional[Dict[Tuple[int, int], float]] = None, strict_energy: bool = True, live_threshold_energy: Optional[float] = None) -> Optional[MiningResult]:
         """Convert a sample set into a mining result if it meets requirements, otherwise return None.

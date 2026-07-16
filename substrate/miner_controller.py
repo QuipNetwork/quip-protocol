@@ -175,11 +175,15 @@ def build_stats_snapshot_for_telemetry(controller) -> dict[str, Any]:
     if core is not None:
         node_id = getattr(core, "node_id", None)
         latest_budget = getattr(controller, "_latest_budget", {})
+        latest_drops = getattr(controller, "_latest_drops", {})
         miners_list = [
             {
                 "id": h.miner_id,
                 "type": h.miner_type,
                 "qpu_budget": latest_budget.get(h.miner_id),
+                # None = not measured (no driver yet, or the split QPU path),
+                # which must stay distinguishable from a measured zero.
+                "ring_drops": latest_drops.get(h.miner_id),
             }
             for h in getattr(core, "miner_handles", [])
         ]
@@ -616,6 +620,11 @@ class SubstrateMinerController:
         # ``{"op": "budget"}`` pushes). Surfaced in the telemetry snapshot so
         # operators can see live daily-budget usage; never drives submission.
         self._latest_budget: dict[str, Any] = {}
+        # Latest ring-drop count per miner id (worker-initiated
+        # ``{"op": "drops"}`` pushes). Surfaced in the telemetry snapshot so a
+        # node silently discarding mined attempts is visible without log
+        # scraping. Absent id = not measured, which is not the same as zero.
+        self._latest_drops: dict[str, int] = {}
         # Write-once participation dedup: solution #s the node has already
         # published a participation marker for. Node-level (one marker per solution#),
         # keyed by solution# alone — not by per-instance miner id. Insertion-
@@ -1243,6 +1252,9 @@ class SubstrateMinerController:
         elif op == "budget":
             # Live QPU budget snapshot for telemetry.
             self._store_budget(handle, msg)
+        elif op == "drops":
+            # Live ring-drop count for telemetry.
+            self._store_drops(handle, msg)
         elif op == "participating":
             # Write-once participation marker (best-effort extrinsic task).
             self._mark_participating(msg)
@@ -1852,6 +1864,33 @@ class SubstrateMinerController:
             )
             return
         self._latest_budget[handle.miner_id] = data
+
+    def _store_drops(self, handle: MinerHandle, msg: dict) -> None:
+        """Stash a worker's latest ring-drop count, keyed by miner id.
+
+        Surfaced as ``miners[].ring_drops``. A drop means a mined sampleset
+        never reached the worker and was never evaluated, so a win it carried
+        is lost; before this the only signal was the driver's exit warning.
+        A malformed payload is ignored so a stray message can't poison the
+        dashboard. Never submits, never blocks.
+        """
+        data = msg.get("data")
+        if not isinstance(data, dict):
+            logger.warning(
+                "drops from %s ignored: malformed data (type=%s)",
+                handle.miner_id,
+                type(data).__name__,
+            )
+            return
+        count = data.get("ring_drops")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            logger.warning(
+                "drops from %s ignored: bad ring_drops (%r)",
+                handle.miner_id,
+                count,
+            )
+            return
+        self._latest_drops[handle.miner_id] = count
 
     def _sum_qpu_access_us(self, solution_number: Optional[int]) -> Optional[int]:
         """Precise QPU access time the node spent on a solution #, in µs.
