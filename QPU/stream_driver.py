@@ -101,7 +101,14 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, ctl_q, stop_event,
                     )
                     dropped += 1
                     continue
-                slot = ring.claim_free(timeout=0.0 if dropped else 0.005)
+                # Always give the claim a real wait budget. This was
+                # ``timeout=0.0 if dropped else 0.005``, but ``dropped`` is the
+                # cumulative counter, so a single drop disabled waiting for the
+                # life of the process and every later momentary ring-full was
+                # discarded instantly. A dropped sample never reaches the
+                # worker and is never evaluated, so a win it carried is lost
+                # silently (QUI-867).
+                slot = ring.claim_free(timeout=0.005)
                 if slot is None:
                     dropped += 1
                     continue
