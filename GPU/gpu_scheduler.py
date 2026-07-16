@@ -21,6 +21,8 @@ import os
 import time
 from typing import Any
 
+from GPU.driver_budget import record_throttle
+
 _THROTTLE_SLEEP_S = 0.5
 
 
@@ -37,6 +39,9 @@ def throttle_if_busy(
     """
     if scheduler is not None and scheduler.should_throttle():
         sleep_fn(sleep_s)
+        # QUI-867: this sleep runs while the driver generator is suspended, so
+        # it is GPU idle time. Attribute it (no-op unless QUIP_DRIVER_BUDGET=1).
+        record_throttle(sleep_s)
 
 
 def throttled_stream(gen: Any, scheduler: Any) -> Any:
