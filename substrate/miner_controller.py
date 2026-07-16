@@ -1246,10 +1246,6 @@ class SubstrateMinerController:
         elif op == "participating":
             # Write-once participation marker (best-effort extrinsic task).
             self._mark_participating(msg)
-        elif op == "stats":
-            # Stats responses are pulled by handle.get_stats() callers; one
-            # landing here means nobody was listening — drop and continue.
-            pass
         else:
             logger.warning(
                 "handle %s sent unrecognized message type=dict op=%s; dropping",

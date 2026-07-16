@@ -316,17 +316,6 @@ class BaseMiner(ABC):
             'blocks_attempted': 0
         }
 
-        # Track timing history for graphing (block_number, timing_value)
-        self.timing_history = {
-            'block_numbers': [],
-            'preprocessing_times': [],
-            'sampling_times': [],
-            'postprocessing_times': [],
-            'total_times': [],
-            'win_rates': [],
-            'adaptive_params_history': []  # Track adaptive params over time
-        }
-
         # Track participation in current round
         self.current_round_attempted = False
 
@@ -414,70 +403,6 @@ class BaseMiner(ABC):
         # each work-tag still surfaces; repeats are suppressed until the
         # tag is evicted from the bounded cache.
         self._setup_abort_throttle = _SetupAbortThrottle()
-
-    def capture_partial_timing(self):
-        """Capture timing for current mining attempt, including partial progress."""
-        current_time = time.time()
-
-        # Initialize with zeros
-        preprocessing_time = 0
-        sampling_time = 0
-        postprocessing_time = 0
-
-        # If we have completed preprocessing
-        if len(self.timing_stats['preprocessing']) > len(self.timing_stats['sampling']):
-            # Preprocessing was completed
-            preprocessing_time = self.timing_stats['preprocessing'][-1]
-
-            # Check if sampling was started
-            if self.current_stage == 'sampling' and self.current_stage_start:
-                # Sampling was in progress
-                sampling_time = (current_time - self.current_stage_start) * 1e6
-                postprocessing_time = 0  # Not started
-            elif self.current_stage == 'postprocessing' and self.current_stage_start:
-                # Sampling was completed, postprocessing in progress
-                if self.timing_stats['sampling']:
-                    sampling_time = self.timing_stats['sampling'][-1]
-                postprocessing_time = (current_time - self.current_stage_start) * 1e6
-        elif self.current_stage == 'preprocessing' and self.current_stage_start:
-            # Still in preprocessing
-            preprocessing_time = (current_time - self.current_stage_start) * 1e6
-            sampling_time = 0
-            postprocessing_time = 0
-
-        return preprocessing_time, sampling_time, postprocessing_time
-
-    def get_timing_summary(self) -> str:
-        """Generate a summary of timing statistics for this miner."""
-        summary_lines = [f"\nTiming Statistics for {self.miner_id}:"]
-
-        if self.timing_stats['blocks_attempted'] > 0:
-            summary_lines.append(f"  Blocks Attempted: {self.timing_stats['blocks_attempted']}")
-            summary_lines.append(f"  Total Samples: {self.timing_stats['total_samples']}")
-            summary_lines.append(f"  Blocks Won: {self.blocks_won}")
-            summary_lines.append(f"  Win Rate: {self.blocks_won / self.timing_stats['blocks_attempted'] * 100:.1f}%")
-
-        # Calculate averages for each timing component
-        for component in ['preprocessing', 'sampling', 'postprocessing']:
-            if self.timing_stats[component]:
-                avg_time = np.mean(self.timing_stats[component])
-                std_time = np.std(self.timing_stats[component])
-                summary_lines.append(f"  {component.capitalize()} Time: {avg_time:.2f} ± {std_time:.2f} μs")
-
-        # QPU-specific timing
-        if self.timing_stats['quantum_annealing_time']:
-            avg_anneal = np.mean(self.timing_stats['quantum_annealing_time'])
-            summary_lines.append(f"  Quantum Annealing Time: {avg_anneal:.2f} μs")
-
-        # Show adaptive parameters
-        if self.miner_type == "QPU":
-            summary_lines.append(f"  Current Annealing Time: {self.adaptive_params['quantum_annealing_time']:.2f} μs")
-        else:
-            summary_lines.append(f"  Current Num Sweeps: {self.adaptive_params['num_sweeps']}")
-            summary_lines.append(f"  Beta Range: {self.adaptive_params['beta_range']}")
-            summary_lines.append(f"  Beta Schedule: {self.adaptive_params['beta_schedule']}")
-
-        return "\n".join(summary_lines)
 
     # --- Feeder buffer size (override in subclasses) ---
     # ``BaseMiner.mine_work_item`` builds a feeder via
@@ -2542,15 +2467,6 @@ class BaseMiner(ABC):
             f"Sampling error: {error}\n{traceback.format_exc()}"
         )
         return False
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Return machine-readable stats for this miner."""
-        stats = dict(self.timing_stats)
-        stats.update({
-            "miner_id": self.miner_id,
-            "miner_type": self.miner_type,
-        })
-        return stats
 
     def evaluate_sampleset(self, sampleset: dimod.SampleSet, requirements: BlockRequirements, nodes: List[int], edges: List[Tuple[int, int]], nonce: int, salt: bytes, prev_timestamp: int, start_time: float, *, h: Optional[Dict[int, float]] = None, J: Optional[Dict[Tuple[int, int], float]] = None, strict_energy: bool = True, live_threshold_energy: Optional[float] = None) -> Optional[MiningResult]:
         """Convert a sample set into a mining result if it meets requirements, otherwise return None.
