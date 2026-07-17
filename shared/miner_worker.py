@@ -2,7 +2,6 @@
 
 This worker runs a loop handling commands from the parent process:
 - mine_work_item {context}
-- get_stats
 - shutdown
 
 It constructs the correct concrete miner from a simple picklable spec dict:
@@ -228,9 +227,6 @@ def miner_worker_main(
             except Exception:  # noqa: BLE001 — best-effort
                 pass
             return
-        elif op == "get_stats":
-            data = miner.get_stats()
-            resp_q.put({"op": "stats", "data": data, "id": spec.get("id")})
         elif op == "mine_work_item":
             # Substrate-mode entry point. The controller pushes a
             # SubstrateMiningContext (or MempoolJobContext) through the
@@ -294,9 +290,17 @@ def miner_worker_main(
             # Live QPU budget channel. The miner calls this at the progress-log
             # cadence with its ``QPUTimeManager.get_stats`` snapshot; we forward
             # it to the controller as a worker-initiated ``{"op": "budget"}``
-            # push (never blocks the serial op-loop, unlike a get_stats RPC).
+            # push, which never blocks the serial op-loop. Worker-initiated
+            # push is the pattern for every live counter here; the old
+            # controller-pulls-an-RPC path is gone.
             def _emit_budget(stats: Dict[str, Any]) -> None:
                 _emit("budget", stats)
+
+            # Ring-drop channel, same worker-initiated push shape as budget.
+            # A dropped sample never reaches this worker, so this counter is
+            # the only live signal that mined attempts are being discarded.
+            def _emit_drops(stats: Dict[str, Any]) -> None:
+                _emit("drops", stats)
 
             # Write-once participation channel. The miner calls this exactly
             # once per accepted dispatch (after its budget gate passes) with the
@@ -324,6 +328,7 @@ def miner_worker_main(
                     context, stop_event, preview_cb=_emit_preview,
                     budget_cb=_emit_budget,
                     participating_cb=_emit_participating,
+                    drops_cb=_emit_drops,
                 )
             except Exception as exc:
                 logger.error(
@@ -490,12 +495,3 @@ class MinerHandle:
         with self.live_max_energy_milli.get_lock():
             self.live_max_energy_milli.value = int(max_energy_milli)
 
-    def get_stats(self) -> dict:
-        self.req.put({"op": "get_stats"})
-        msg = self.resp.get(timeout=2.0)
-        if isinstance(msg, dict) and msg.get("op") == "stats":
-            return msg.get("data", {})
-        else:
-            raise ValueError(
-                f"Miner {self.miner_id} did not respond to get_stats: {msg}"
-            )

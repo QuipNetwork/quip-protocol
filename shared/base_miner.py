@@ -316,17 +316,6 @@ class BaseMiner(ABC):
             'blocks_attempted': 0
         }
 
-        # Track timing history for graphing (block_number, timing_value)
-        self.timing_history = {
-            'block_numbers': [],
-            'preprocessing_times': [],
-            'sampling_times': [],
-            'postprocessing_times': [],
-            'total_times': [],
-            'win_rates': [],
-            'adaptive_params_history': []  # Track adaptive params over time
-        }
-
         # Track participation in current round
         self.current_round_attempted = False
 
@@ -414,70 +403,6 @@ class BaseMiner(ABC):
         # each work-tag still surfaces; repeats are suppressed until the
         # tag is evicted from the bounded cache.
         self._setup_abort_throttle = _SetupAbortThrottle()
-
-    def capture_partial_timing(self):
-        """Capture timing for current mining attempt, including partial progress."""
-        current_time = time.time()
-
-        # Initialize with zeros
-        preprocessing_time = 0
-        sampling_time = 0
-        postprocessing_time = 0
-
-        # If we have completed preprocessing
-        if len(self.timing_stats['preprocessing']) > len(self.timing_stats['sampling']):
-            # Preprocessing was completed
-            preprocessing_time = self.timing_stats['preprocessing'][-1]
-
-            # Check if sampling was started
-            if self.current_stage == 'sampling' and self.current_stage_start:
-                # Sampling was in progress
-                sampling_time = (current_time - self.current_stage_start) * 1e6
-                postprocessing_time = 0  # Not started
-            elif self.current_stage == 'postprocessing' and self.current_stage_start:
-                # Sampling was completed, postprocessing in progress
-                if self.timing_stats['sampling']:
-                    sampling_time = self.timing_stats['sampling'][-1]
-                postprocessing_time = (current_time - self.current_stage_start) * 1e6
-        elif self.current_stage == 'preprocessing' and self.current_stage_start:
-            # Still in preprocessing
-            preprocessing_time = (current_time - self.current_stage_start) * 1e6
-            sampling_time = 0
-            postprocessing_time = 0
-
-        return preprocessing_time, sampling_time, postprocessing_time
-
-    def get_timing_summary(self) -> str:
-        """Generate a summary of timing statistics for this miner."""
-        summary_lines = [f"\nTiming Statistics for {self.miner_id}:"]
-
-        if self.timing_stats['blocks_attempted'] > 0:
-            summary_lines.append(f"  Blocks Attempted: {self.timing_stats['blocks_attempted']}")
-            summary_lines.append(f"  Total Samples: {self.timing_stats['total_samples']}")
-            summary_lines.append(f"  Blocks Won: {self.blocks_won}")
-            summary_lines.append(f"  Win Rate: {self.blocks_won / self.timing_stats['blocks_attempted'] * 100:.1f}%")
-
-        # Calculate averages for each timing component
-        for component in ['preprocessing', 'sampling', 'postprocessing']:
-            if self.timing_stats[component]:
-                avg_time = np.mean(self.timing_stats[component])
-                std_time = np.std(self.timing_stats[component])
-                summary_lines.append(f"  {component.capitalize()} Time: {avg_time:.2f} ± {std_time:.2f} μs")
-
-        # QPU-specific timing
-        if self.timing_stats['quantum_annealing_time']:
-            avg_anneal = np.mean(self.timing_stats['quantum_annealing_time'])
-            summary_lines.append(f"  Quantum Annealing Time: {avg_anneal:.2f} μs")
-
-        # Show adaptive parameters
-        if self.miner_type == "QPU":
-            summary_lines.append(f"  Current Annealing Time: {self.adaptive_params['quantum_annealing_time']:.2f} μs")
-        else:
-            summary_lines.append(f"  Current Num Sweeps: {self.adaptive_params['num_sweeps']}")
-            summary_lines.append(f"  Beta Range: {self.adaptive_params['beta_range']}")
-            summary_lines.append(f"  Beta Schedule: {self.adaptive_params['beta_schedule']}")
-
-        return "\n".join(summary_lines)
 
     # --- Feeder buffer size (override in subclasses) ---
     # ``BaseMiner.mine_work_item`` builds a feeder via
@@ -714,6 +639,7 @@ class BaseMiner(ABC):
         preview_cb: Optional[Any] = None,
         budget_cb: Optional[Any] = None,
         participating_cb: Optional[Any] = None,
+        drops_cb: Optional[Any] = None,
         **kwargs,
     ) -> Optional[MiningResult]:
         """Protocol-neutral mining loop.
@@ -759,6 +685,12 @@ class BaseMiner(ABC):
                 ``QPUTimeManager.get_stats`` shape) so the controller can
                 surface live usage on telemetry. Default ``None`` = no-op. A
                 failing callback never breaks mining.
+            drops_cb: Optional callable invoked at the progress-log cadence
+                with ``{"ring_drops": int}`` so the controller can surface ring
+                drops on telemetry. Skipped entirely when the count is
+                unavailable (no driver, or the split QPU path), so a missing
+                signal is never reported as zero drops. Default ``None`` =
+                no-op. A failing callback never breaks mining.
             participating_cb: Optional callable invoked exactly once per
                 accepted dispatch (after ``_pre_mine_setup`` passes its gate,
                 so a budget-starved QPU dispatch that aborts never fires it).
@@ -918,6 +850,17 @@ class BaseMiner(ABC):
 
                 progress += 1
                 if progress % PROGRESS_LOG_INTERVAL == 0:
+                    # Ring drops ride the general progress cadence, not the
+                    # QPU-only budget branch below: drops matter most on the
+                    # CPU/GPU path, which never reaches that branch.
+                    n_drops = self.ring_drops
+                    if drops_cb is not None and n_drops is not None:
+                        try:
+                            drops_cb({"ring_drops": n_drops})
+                        except Exception as exc:  # noqa: BLE001
+                            self.logger.debug(
+                                "drops_cb failed (ignored): %s", exc,
+                            )
                     budget = self._midstream_budget_ok(
                         loop_state.solution_number_for_log,
                     )
@@ -1360,18 +1303,30 @@ class BaseMiner(ABC):
         desc_q = ctx.Queue(maxsize=self.RESULT_QUEUE_MAXSIZE)
         ctl_q = ctx.Queue()
         driver_stop = ctx.Event()
+        # Ring drops, counted by the driver and read here for telemetry. A
+        # dropped sample never reaches this process, so without a shared
+        # counter the loss is invisible until the driver's exit warning.
+        # Lives across driver respawns is NOT wanted: a respawned driver
+        # starts a fresh count, matching the "per driver process" semantics
+        # the operator sees.
+        drops = ctx.Value("L", 0)
         factory_kwargs = self._stream_factory_kwargs(sample_ctx, nodes)
         if self.USES_SUBMITTER_SPLIT:
             self._spawn_split_driver(
                 ctx, ring, desc_q, ctl_q, driver_stop, factory_kwargs,
                 sample_ctx, nodes,
             )
+            # The split QPU path drops in its own feeder/submitter processes,
+            # which don't take this counter. Report "unknown" rather than a
+            # zero that would read as a clean bill of health.
+            drops = None
         else:
             from QPU.stream_driver import stream_driver_main
             self._driver_proc = spawn_worker(
                 stream_driver_main,
                 (ring.attach_args(), desc_q, ctl_q, driver_stop,
-                 self.STREAM_FACTORY_DOTTED, factory_kwargs, self._log_queue),
+                 self.STREAM_FACTORY_DOTTED, factory_kwargs, self._log_queue,
+                 drops),
                 name=f"qpu-stream-driver-{self.miner_id}",
                 # Non-daemon: the driver's RandomIsingFeeder forks pool children,
                 # which a daemon process is forbidden from doing. _close_driver
@@ -1382,6 +1337,7 @@ class BaseMiner(ABC):
         self._desc_q = desc_q
         self._ctl_q = ctl_q
         self._driver_stop = driver_stop
+        self._drops = drops
         self._ring_dims = dims
         self._driver_spawned_at = time.monotonic()
         self._last_forwarded_threshold_milli = None
@@ -2543,14 +2499,23 @@ class BaseMiner(ABC):
         )
         return False
 
-    def get_stats(self) -> Dict[str, Any]:
-        """Return machine-readable stats for this miner."""
-        stats = dict(self.timing_stats)
-        stats.update({
-            "miner_id": self.miner_id,
-            "miner_type": self.miner_type,
-        })
-        return stats
+    @property
+    def ring_drops(self) -> Optional[int]:
+        """Samples the stream driver dropped, or None if not counted.
+
+        A drop means the sampleset never reached this process and was never
+        evaluated, so a winning solution it carried is lost. Counted per driver
+        process: a respawn restarts the count.
+
+        Returns None (not 0) when no driver is running or on the split QPU
+        path, which drops in processes that don't share this counter. A zero
+        there would read as "no drops" rather than "not measured".
+        """
+        drops = getattr(self, "_drops", None)
+        if drops is None:
+            return None
+        with drops.get_lock():
+            return int(drops.value)
 
     def evaluate_sampleset(self, sampleset: dimod.SampleSet, requirements: BlockRequirements, nodes: List[int], edges: List[Tuple[int, int]], nonce: int, salt: bytes, prev_timestamp: int, start_time: float, *, h: Optional[Dict[int, float]] = None, J: Optional[Dict[Tuple[int, int], float]] = None, strict_energy: bool = True, live_threshold_energy: Optional[float] = None) -> Optional[MiningResult]:
         """Convert a sample set into a mining result if it meets requirements, otherwise return None.
