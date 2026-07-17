@@ -29,6 +29,7 @@ import numpy as np
 
 from shared.ising_model import IsingModel
 
+from GPU.driver_budget import DriverBudget
 from GPU.gpu_scheduler import throttled_stream
 from GPU.sampler_utils import (
     build_csr_structure_from_edges,
@@ -959,6 +960,7 @@ class BaseCudaSampler(abc.ABC):
             active_nonce_count=len(pending_models),
         )
 
+        budget = DriverBudget.from_env()
         try:
             last_completion = time.monotonic()
             while True:
@@ -966,9 +968,10 @@ class BaseCudaSampler(abc.ABC):
                 # nonces before polling, so the GPU doesn't stall. Done BEFORE
                 # the termination check so a transiently-empty feeder that
                 # recovers restarts idle nonces instead of ending the stream.
-                for nonce_id, ss in enumerate(slots):
-                    if not _exhausted and (ss.is_idle or ss.needs_next()):
-                        _try_queue(nonce_id, ss)
+                with budget.phase("upload"):
+                    for nonce_id, ss in enumerate(slots):
+                        if not _exhausted and (ss.is_idle or ss.needs_next()):
+                            _try_queue(nonce_id, ss)
 
                 # Terminate only when the feeder is exhausted AND nothing is in
                 # flight or queued. A transient empty feeder (try_pop -> None)
@@ -981,7 +984,8 @@ class BaseCudaSampler(abc.ABC):
                     break
 
                 # Single DMA read of ctrl array
-                ctrl = cp.asnumpy(self._d_sf_ctrl)
+                with budget.phase("poll"):
+                    ctrl = cp.asnumpy(self._d_sf_ctrl)
                 found = False
 
                 for nonce_id, ss in enumerate(slots):
@@ -999,9 +1003,10 @@ class BaseCudaSampler(abc.ABC):
                     last_completion = time.monotonic()
 
                     # Download completed results
-                    result_ss = self.download_slot(
-                        nonce_id, ss.active_slot,
-                    )
+                    with budget.phase("download"):
+                        result_ss = self.download_slot(
+                            nonce_id, ss.active_slot,
+                        )
                     completed_model = ss.active_model
 
                     # Rotate: promote NEXT -> ACTIVE if queued, else go idle
@@ -1010,9 +1015,16 @@ class BaseCudaSampler(abc.ABC):
                     ss.rotate_on_completion()
 
                     # Opportunistically refill the just-freed slot.
-                    _try_queue(nonce_id, ss)
+                    with budget.phase("upload"):
+                        _try_queue(nonce_id, ss)
 
+                    # The generator is suspended for the whole of the
+                    # consumer's ring write. _try_queue cannot run while it is,
+                    # so this span is GPU idle time (QUI-867).
+                    _t_yield = time.monotonic()
                     yield (completed_model, result_ss)
+                    budget.tick_consumer(time.monotonic() - _t_yield)
+                    budget.tick_result()
 
                 if not found:
                     if (
@@ -1025,9 +1037,11 @@ class BaseCudaSampler(abc.ABC):
                             f"No completion after "
                             f"{poll_timeout}s"
                         )
-                    time.sleep(0.001)
+                    with budget.phase("spin"):
+                        time.sleep(0.001)
 
         finally:
+            budget.close()
             self.signal_exit(wait=False)
 
     # ----------------------------------------------------------
