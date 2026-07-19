@@ -24,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import socket
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Tuple
@@ -38,6 +37,8 @@ from substrate.miner_bootstrap import BootstrapConfig, _maybe_seed_chain, _resol
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from substrate.client import SubstrateClient
+from chain_probe import chain_reachable as _chain_reachable
+from chain_probe import dev_chain_reachable as _dev_chain_reachable
 from substrate.miner_controller import (
     EARLY_SUBMISSION_ERRORS,
     FATAL_SUBMISSION_ERRORS,
@@ -656,15 +657,6 @@ async def test_verify_proof_recorded_rpc_failure_returns_none():
 DEFAULT_URL = os.environ.get("QUIP_SUBSTRATE_URL", "ws://localhost:9944")
 
 
-def _chain_reachable(url: str) -> bool:
-    bare = url.split("://", 1)[1]
-    host, _, port_str = bare.partition(":")
-    port = int(port_str) if port_str else 9944
-    try:
-        with socket.create_connection((host, port), timeout=0.5):
-            return True
-    except (OSError, socket.timeout):
-        return False
 
 
 def _chain_requires_hybrid_signer(url: str) -> bool:
@@ -888,8 +880,8 @@ async def _live_controller(
 
 
 @pytest.mark.skipif(
-    not _chain_reachable(DEFAULT_URL),
-    reason=f"substrate chain not reachable at {DEFAULT_URL}",
+    not _dev_chain_reachable(DEFAULT_URL),
+    reason=f"no dev substrate chain at {DEFAULT_URL}",
 )
 @pytest.mark.skipif(
     not _CHAIN_HAS_PER_TOPOLOGY_DIFFICULTY,
@@ -924,8 +916,8 @@ async def test_controller_submits_proof_end_to_end(tmp_path):
 
 
 @pytest.mark.skipif(
-    not _chain_reachable(DEFAULT_URL),
-    reason=f"substrate chain not reachable at {DEFAULT_URL}",
+    not _dev_chain_reachable(DEFAULT_URL),
+    reason=f"no dev substrate chain at {DEFAULT_URL}",
 )
 @pytest.mark.skipif(
     not _CHAIN_HAS_PER_TOPOLOGY_DIFFICULTY,
@@ -2740,3 +2732,108 @@ async def test_fire_suppressed_while_pending(monkeypatch):
     controller._pending_submission = None
     await controller._maybe_fire_on_cadence()
     assert len(fired) == 1
+
+
+# ----------------------------------------------------------------------
+# consecutive_submit_failures on the anticipatory-fire path (QUI-899)
+#
+# The gh-20 counter is the signal an operator uses to tell "mining but
+# landing nothing" from a healthy miner. It was only ever wired into the
+# worker-result path, so a miner stuck in the QUI-899 loop — anticipatory
+# fire, RETRY-exhausted, repeat every tick — left it frozen at whatever the
+# last worker-path submission set. The counter read healthy while the bug
+# was live, which is what made the failure so hard to see from outside.
+# ----------------------------------------------------------------------
+
+
+async def test_retry_exhausted_counts_a_submit_failure(monkeypatch):
+    """RETRY-exhausted is a failed submit and must move the gh-20 counter.
+
+    Without this the QUI-899 loop is invisible on /api/v1/status.
+    """
+    controller = _bare_controller()
+    _stub_predictor_inputs(controller)
+    ctx = _ctx_at_block(b"\xaa" * 32, 19)
+    _store_preview_entry(controller, ctx)
+    from substrate.miner_controller import _work_key
+    key = _work_key(ctx)
+    preview = controller._latest_preview[key]
+
+    async def fake_submit_with_retry(*args, **kwargs):
+        from substrate.submitter import SubmitResult, SubmitRetryAction
+        return SubmitResult(
+            action=SubmitRetryAction.RETRY, attempts=4, error="TimeoutError"
+        )
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
+    )
+
+    await controller._fire_preview(ctx, key, preview, 20)
+    assert controller.stats.consecutive_submit_failures == 1
+
+    # A miner stuck in this loop keeps climbing, which is what makes the
+    # stuck state distinguishable from a quiet-but-healthy one.
+    await controller._fire_preview(ctx, key, preview, 21)
+    assert controller.stats.consecutive_submit_failures == 2
+    assert controller.stats.last_submission_error == "TimeoutError"
+
+
+async def test_anticipatory_success_clears_the_failure_streak(monkeypatch):
+    """A landed anticipatory proof must reset the streak to 0.
+
+    Otherwise a miner whose wins all come through the anticipatory path
+    carries a stale non-zero count forever and reads as broken.
+    """
+    controller = _bare_controller()
+    _stub_predictor_inputs(controller)
+    controller._verify_proof_recorded = AsyncMock(return_value=42)
+    ctx = _ctx_at_block(b"\xaa" * 32, 19)
+    _store_preview_entry(controller, ctx)
+    from substrate.miner_controller import _work_key
+    key = _work_key(ctx)
+    preview = controller._latest_preview[key]
+    controller.stats.consecutive_submit_failures = 7
+
+    async def fake_submit_with_retry(*args, **kwargs):
+        from substrate.submitter import SubmitResult, SubmitRetryAction
+        return SubmitResult(
+            action=SubmitRetryAction.SUCCESS,
+            receipt=ExtrinsicReceipt(extrinsic_hash="0xabc"),
+        )
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
+    )
+
+    await controller._fire_preview(ctx, key, preview, 20)
+
+    assert controller.stats.proofs_submitted == 1
+    assert controller.stats.consecutive_submit_failures == 0
+
+
+async def test_stop_fatal_counts_a_submit_failure(monkeypatch):
+    """STOP_FATAL must move the counter, matching _handle_result's FATAL
+    branch which increments both submission_errors and the streak."""
+    controller = _bare_controller()
+    _stub_predictor_inputs(controller)
+    ctx = _ctx_at_block(b"\xaa" * 32, 19)
+    _store_preview_entry(controller, ctx)
+    from substrate.miner_controller import _work_key
+    key = _work_key(ctx)
+    preview = controller._latest_preview[key]
+
+    async def fake_submit_with_retry(*args, **kwargs):
+        from substrate.submitter import SubmitResult, SubmitRetryAction
+        return SubmitResult(
+            action=SubmitRetryAction.STOP_FATAL, error="BadProof"
+        )
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
+    )
+
+    await controller._fire_preview(ctx, key, preview, 20)
+
+    assert controller.stats.submission_errors == 1
+    assert controller.stats.consecutive_submit_failures == 1

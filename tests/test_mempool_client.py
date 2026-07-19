@@ -14,7 +14,6 @@ Auto-skips when the docker chain at `ws://localhost:9944` isn't reachable.
 from __future__ import annotations
 
 import os
-import socket
 from pathlib import Path
 
 import pytest
@@ -30,25 +29,19 @@ from substrate.mempool_types import (
 )
 from substrate.miner_bootstrap import _resolve_dev_signer, _sudo_call
 from substrate.client import SubstrateClient
+from chain_probe import dev_chain_reachable
 
 
 DEFAULT_URL = os.environ.get("QUIP_SUBSTRATE_URL", "ws://localhost:9944")
 
 
-def _chain_reachable(url: str) -> bool:
-    bare = url.split("://", 1)[1]
-    host, _, port_str = bare.partition(":")
-    port = int(port_str) if port_str else 9944
-    try:
-        with socket.create_connection((host, port), timeout=0.5):
-            return True
-    except (OSError, socket.timeout):
-        return False
-
-
+# These tests seed chain state via //Alice sudo, which `miner_bootstrap`
+# refuses against a non-dev chain. Gate on the same condition that guard
+# enforces, so a developer running the public-testnet stack locally skips
+# rather than erroring.
 pytestmark = pytest.mark.skipif(
-    not _chain_reachable(DEFAULT_URL),
-    reason=f"substrate chain not reachable at {DEFAULT_URL}",
+    not dev_chain_reachable(DEFAULT_URL),
+    reason=f"no dev substrate chain at {DEFAULT_URL}",
 )
 
 

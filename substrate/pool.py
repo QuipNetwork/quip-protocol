@@ -25,6 +25,8 @@ import logging
 import time
 from typing import Any, Callable, Optional
 
+from websocket import WebSocketException
+
 from substrate.sync_progress import SyncProgress
 from substrate.url_failover import AllUrlsDown, SubstrateUrlFailover
 from substrate.validator_handle import ValidatorHandle, ValidatorSwapped
@@ -38,11 +40,19 @@ logger = logging.getLogger(__name__)
 # and ConnectionAbortedError. We intentionally do NOT catch generic
 # ``OSError`` here — that would treat FileNotFoundError, PermissionError,
 # etc. as connection failures and trigger spurious swaps.
+#
+# ``asyncio.CancelledError`` deliberately does NOT belong here. It derives
+# from ``BaseException``, and the write path converts anything in this tuple
+# into ``ValidatorSwapped`` — which would swallow a cancellation and break
+# shutdown. `send_write` handles it in its own clause and re-raises.
 _CONNECTION_ERRORS: tuple[type[BaseException], ...] = (
     ConnectionError,
     TimeoutError,
-    # WebSocketException and substrate-interface's own connection errors
-    # will be added here when wiring against the real client.
+    # substrate-interface's transport raises this for a dropped or
+    # half-open websocket; it is not an OSError, so it needs naming here
+    # explicitly or a genuine socket failure propagates raw and the pool
+    # never swaps.
+    WebSocketException,
 )
 
 
@@ -147,6 +157,10 @@ class ValidatorPool:
         # only one submit at a time touches the single write handle.
         self._write_active: Optional[ValidatorHandle] = None
         self._write_lock = asyncio.Lock()
+        # Set when a submit was cancelled mid-call, leaving the write child
+        # still running the abandoned request. The next submit rebuilds the
+        # handle instead of queueing behind it (QUI-899).
+        self._write_handle_suspect: bool = False
         # Wall-clock time of the last landed write (submit). None until the
         # first success. Surfaced on /api/v1/status so a node that mines but
         # never lands a proof is diagnosable instead of silently stuck.
@@ -315,6 +329,17 @@ class ValidatorPool:
                 raise ValidatorSwapped(
                     f"write handle swapped during {op}; caller must re-sign"
                 ) from conn_exc
+            except asyncio.CancelledError:
+                # An outer `wait_for` gave up on this submit. The child is
+                # still running the abandoned call, so the next submit must
+                # not queue behind it (QUI-899). Flag for teardown rather
+                # than awaiting cleanup here — awaiting inside a cancellation
+                # is its own hazard — and re-raise, because converting a
+                # cancellation into a normal error breaks shutdown. This is
+                # also why `CancelledError` must never join
+                # `_CONNECTION_ERRORS`: that path swallows it.
+                self._write_handle_suspect = True
+                raise
             self._failover.confirm_success()
             self._clear_sync_state()
             self.last_successful_submission = time.time()
@@ -329,6 +354,12 @@ class ValidatorPool:
         place); if the child process itself is unreachable, respawn it once.
         Called only while holding ``_write_lock``.
         """
+        if self._write_handle_suspect:
+            # A previous submit was cancelled mid-call; that child may still
+            # be busy with it. Rebuild before reusing (QUI-899).
+            self._write_handle_suspect = False
+            if self._write_active is not None:
+                await self._reconnect_write_handle(self._write_active)
         if self._write_active is None:
             self._write_active = self._handle_factory(self._failover.current())
             self._write_active.start()

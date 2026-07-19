@@ -2585,6 +2585,14 @@ class SubstrateMinerController:
             # the mid-fire mark so a later head (decay only eases further)
             # can fire again. Do NOT abandon.
             self._anticipatory_fired.discard(key)
+            # Retries exhausted is a failed submit, so it moves the gh-20
+            # streak counter exactly like `_handle_result`'s except-branch.
+            # Without this a miner stuck in the QUI-899 loop (fire, exhaust,
+            # repeat every tick) leaves the counter frozen at whatever the
+            # last worker-path submission set, so /api/v1/status reads
+            # healthy while nothing lands.
+            self.stats.consecutive_submit_failures += 1
+            self.stats.last_submission_error = submit_result.error
             logger.info(
                 "anticipatory fire RETRY-exhausted for work_key 0x%s... "
                 "(attempts=%d, error=%s); will retry on a later head",
@@ -2613,6 +2621,8 @@ class SubstrateMinerController:
         # STOP_FATAL — this candidate is genuinely bad; discard it and wait
         # for a better preview to supersede it.
         self.stats.submission_errors += 1
+        # Parity with `_handle_result`'s FATAL branch, which moves both.
+        self.stats.consecutive_submit_failures += 1
         self.stats.last_submission_error = submit_result.error
         logger.warning(
             "anticipatory fire STOP_FATAL for work_key 0x%s... (error=%s); "
@@ -2817,6 +2827,11 @@ class SubstrateMinerController:
             return
 
         self.stats.proofs_submitted += 1
+        # A landed proof clears the streak (gh-20 liveness), same as
+        # `_finalize_accepted_proof`. A miner whose wins all arrive through
+        # the anticipatory path would otherwise carry a stale non-zero
+        # count forever and read as broken.
+        self.stats.consecutive_submit_failures = 0
         accepted_block_hash, accepted_block_number = (
             await self._resolve_accepted_block(receipt_block)
         )

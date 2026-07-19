@@ -131,7 +131,10 @@ async def test_mining_snapshot_either_returns_or_none(client):
     # a populated context. Both outcomes are correct in Phase 1.
     if snapshot is None:
         return
-    assert len(snapshot.parent_hash) == 32
+    # Renamed from `parent_hash` when the context started carrying the
+    # LastProofBlock hash rather than the head's parent. The test only runs
+    # against a live chain, so the stale name went unnoticed until now.
+    assert len(snapshot.last_proof_block_hash) == 32
     assert len(snapshot.topology_hash) == 32
     assert snapshot.block_number >= 0
     assert len(snapshot.nodes) > 0
