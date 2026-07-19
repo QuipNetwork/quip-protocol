@@ -184,6 +184,19 @@ class TopologyBinding:
 # `WinningSolutions`). 1000 is the conventional substrate RPC page cap.
 _KEYS_PAGE_SIZE = 1000
 
+# Socket-level read timeout handed to websocket-client via
+# `SubstrateInterface(ws_options=...)`. Without it a black-holed TCP
+# connection — no RST/FIN, routine behind NAT and idle load-balancer drops —
+# blocks inside `recv()` forever and never raises, so nothing above the
+# transport ever learns the connection is dead (QUI-899).
+#
+# The value must clear normal inter-block latency, not just a single RPC
+# round-trip: `submit_extrinsic(wait_for="inblock")` idles on this same
+# socket between blocks while a tx waits for inclusion. At a 6s blocktime a
+# healthy inclusion lands well inside this bound, while a genuinely dead
+# socket still surfaces an error in under a minute.
+_SOCKET_READ_TIMEOUT_S = 45.0
+
 
 def _count_map_keys(
     iface,
@@ -281,6 +294,14 @@ class SubstrateClient:
         # time). Don't move this to `SubstrateClient.__init__` — clients
         # are typically constructed before the loop is set up.
         self._call_lock: Optional[asyncio.Lock] = None
+        # Set when a call was cancelled while its blocking work was already
+        # running on an executor thread. Cancelling a started executor job
+        # is a documented no-op, so that thread may still be using
+        # `self._iface` after we unwind — and the lock above is released by
+        # normal unwinding, so the next caller would otherwise dispatch a
+        # second thread against the same iface. Once set, the iface is
+        # abandoned rather than reused (QUI-899).
+        self._iface_maybe_occupied: bool = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -319,8 +340,11 @@ class SubstrateClient:
                 # NOT trigger the failover-from-_run path; we're already
                 # iterating validators ourselves.
                 self._iface = await self._raw_run(
-                    lambda u=candidate: SubstrateInterface(url=u)
+                    lambda u=candidate: SubstrateInterface(
+                        url=u, ws_options={"timeout": _SOCKET_READ_TIMEOUT_S}
+                    )
                 )
+                self._iface_maybe_occupied = False
             except Exception as exc:  # noqa: BLE001 — logged + collected below
                 attempts.append(
                     ValidatorAttempt(
@@ -342,6 +366,32 @@ class SubstrateClient:
             return
         raise NoValidatorReachable(attempts)
 
+    async def _abandon_occupied_iface(self) -> bool:
+        """Drop an iface a cancelled worker thread may still be using.
+
+        Deliberately does NOT call `close()` on the old iface: that would be
+        a second concurrent touch of the very object we suspect a zombie
+        thread is inside, which is the corruption this avoids. We drop our
+        reference and let the thread finish against an object nobody else
+        holds; it is garbage once that thread returns.
+
+        Returns ``True`` if an iface was abandoned and rebuilt.
+        """
+        if not self._iface_maybe_occupied:
+            return False
+        logger.warning(
+            "rebuilding substrate connection to %s: previous iface was "
+            "abandoned after a cancelled call",
+            self.current_url,
+        )
+        self._iface = None
+        self._iface_maybe_occupied = False
+        # Rotate rather than reconnecting in place — if this URL just
+        # black-holed us, the next one is the better bet.
+        start = (self._current_index + 1) % len(self._urls)
+        await self._connect_from_index(start)
+        return True
+
     async def ensure_connected(self) -> bool:
         """Cheap pre-submit liveness probe; reconnect if the socket is dead.
 
@@ -358,6 +408,8 @@ class SubstrateClient:
         ``NoValidatorReachable`` when reconnect finds no live validator —
         the caller cannot submit anyway, so failing loud here is correct.
         """
+        if await self._abandon_occupied_iface():
+            return False
         if self._iface is None:
             await self.connect()
             return False
@@ -1626,6 +1678,9 @@ class SubstrateClient:
         ``reconnect()`` itself can raise ``NoValidatorReachable`` if no
         URL in the failover list comes back up; that propagates instead.
         """
+        # A previous call was cancelled mid-flight; rebuild before reusing
+        # a connection a worker thread may still hold (QUI-899).
+        await self._abandon_occupied_iface()
         try:
             return await self._raw_run(fn)
         except (WebSocketException, ConnectionError, json.JSONDecodeError) as exc:
@@ -1665,10 +1720,26 @@ class SubstrateClient:
         threaded setup) and the lock would be redundant.
         """
         loop = self._loop or asyncio.get_running_loop()
-        if self._call_lock is None:
-            return await loop.run_in_executor(None, fn)
-        async with self._call_lock:
-            return await loop.run_in_executor(None, fn)
+        try:
+            if self._call_lock is None:
+                return await loop.run_in_executor(None, fn)
+            async with self._call_lock:
+                return await loop.run_in_executor(None, fn)
+        except asyncio.CancelledError:
+            # An outer `wait_for` gave up on us. `CancelledError` is a
+            # BaseException, so it matches none of the connection-error
+            # tuples upstack and no reconnect would otherwise run — while
+            # the executor thread keeps running against `self._iface`,
+            # because cancelling a started executor job does nothing.
+            # Mark the iface unusable so the next call rebuilds instead of
+            # racing that thread.
+            self._iface_maybe_occupied = True
+            logger.warning(
+                "substrate call cancelled on %s; abandoning iface (a worker "
+                "thread may still hold it)",
+                self.current_url,
+            )
+            raise
 
 
 # ----------------------------------------------------------------------
