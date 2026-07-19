@@ -42,10 +42,12 @@ from substrate.mempool_types import MinerType, qpu_miner_kind
 from substrate.miner_bootstrap import (
     DEFAULT_MIN_BALANCE_PLANCKS,
     BootstrapConfig,
+    ChainSyncStalled,
     Underfunded,
     _ensure_registered,
     bootstrap,
     ensure_funded_via_faucet,
+    wait_for_sync,
 )
 from shared.miner_config import (
     GPU_BACKEND_SECTIONS,
@@ -623,6 +625,9 @@ def _resolve_runtime_config(
 #   wallet-not-configured     — keystore path doesn't exist
 #   wallet-load-failed        — keystore exists but couldn't be parsed
 #   validators-unreachable    — every URL in the rotation refused connect
+#   chain-sync-stalled        — validator has no peers and stopped advancing
+#                               (never reaches sync; distinct from a wallet
+#                               that only reads empty because sync isn't done)
 #   wallet-underfunded        — balance below threshold, no faucet wired
 #                               (and not on the public testnet, whose
 #                               canonical faucet is the built-in fallback)
@@ -665,6 +670,26 @@ async def _connect_or_fail(urls: tuple[str, ...]) -> SubstrateClient:
     except NoValidatorReachable as exc:
         raise _validators_unreachable(exc) from exc
     return client
+
+
+async def _wait_for_sync_or_fail(client: SubstrateClient) -> None:
+    """Guard B+ — validator finished major sync.
+
+    A still-syncing validator serves genesis/early state, so a balance read in
+    Guard C returns 0 and the miner mis-exits ``wallet-underfunded`` (QUI-825).
+    Delegates to ``substrate.miner_bootstrap.wait_for_sync``, which blocks
+    while the node catches up (logging progress). A peerless, non-advancing
+    node raises ``ChainSyncStalled`` → ``chain-sync-stalled``, kept distinct
+    from ``wallet-underfunded`` so an operator isn't sent chasing a funding
+    problem that is really an unsynced node.
+    """
+    try:
+        await wait_for_sync(client)
+    except ChainSyncStalled as exc:
+        raise click.ClickException(
+            f"chain-sync-stalled current_block={exc.current_block} "
+            f"highest_block={exc.highest_block}"
+        ) from exc
 
 
 async def _ensure_funded_or_fail(
@@ -1776,9 +1801,9 @@ async def _run_startup_guards(
     mempool_enabled: bool = False,
     miner_kind: str = "cpu",
 ) -> bool:
-    """Run the fund / register / solver / descriptor guards (C, D, D+, E).
+    """Run the sync / fund / register / solver / descriptor guards (B+, C, D, D+, E).
 
-    Guards C, D, and E raise ``click.ClickException`` (or a descriptor-*
+    Guards B+, C, D, and E raise ``click.ClickException`` (or a descriptor-*
     code) on ultimate failure, so they must pass before any mining starts.
     Guard D+ (mempool solver registration) is NON-fatal by contract: any
     outcome other than success logs loudly and disables mempool for this
@@ -1788,6 +1813,11 @@ async def _run_startup_guards(
     Returns the effective mempool flag: ``mempool_enabled`` AND Guard D+
     succeeded.
     """
+    # Guard B+ — validator synced. A still-syncing node serves early state, so
+    # the balance read in Guard C would return 0 and mis-exit
+    # `wallet-underfunded`; wait it out first (a peerless stall fails distinctly).
+    await _wait_for_sync_or_fail(client)
+
     # Guard C — wallet funded (with optional faucet top-up).
     await _ensure_funded_or_fail(
         client,
