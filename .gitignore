@@ -83,3 +83,6 @@ telemetry/
 
 # Downloaded + validated PoW win archives (tools/download_and_validate_wins.py)
 qpu_results_wins/
+
+# Local planning docs (kept out of git per project convention)
+newplan.md
