@@ -47,11 +47,79 @@ else
     echo "Using existing keystore at $KEYSTORE_FILE"
 fi
 
-# ── GPU diagnostic (cuda image only — nvidia-smi absent elsewhere) ──
+# ── GPU diagnostic + CUDA forward-compat guard (cuda image only) ──
+# The nvidia/cuda:12.9.1 base image ships /usr/local/cuda/compat/
+# libcuda.so (~575). The NVIDIA Container Toolkit's enable-cuda-compat
+# hook prepends it to the ldcache whenever it is newer than the host
+# driver. Forward compat is datacenter-only; on a consumer GPU it fails
+# CUDA init with error 804 (cudaErrorCompatNotSupportedOnDevice) and the
+# miner crash-loops. We probe once as root; on 804 we drop the compat
+# libs so the host-mounted libcuda.so wins — our kernels JIT against the
+# host driver via CUDA minor-version compatibility, so no driver upgrade
+# is needed. Datacenter GPUs never raise 804, so their forward-compat
+# path is left untouched. See QUI-896.
 if command -v nvidia-smi >/dev/null 2>&1; then
     echo "----------------------------------------"
     nvidia-smi --query-gpu=gpu_name,compute_cap --format=csv,noheader || true
     echo "----------------------------------------"
+
+    if command -v python3 >/dev/null 2>&1; then
+        # Prints one of: OK | COMPAT_UNSUPPORTED | FAIL:<detail>
+        cuda_probe() {
+            python3 - <<'PY'
+try:
+    import cupy as cp
+
+    cp.cuda.Device(0).use()
+    _ = cp.zeros(1)
+    print("OK")
+except Exception as exc:  # probe reports status, never handles it
+    msg = str(exc).lower()
+    status = getattr(exc, "status", None)
+    if status == 804 or "forward compatibility" in msg or "compatnotsupported" in msg:
+        print("COMPAT_UNSUPPORTED")
+    else:
+        print("FAIL:" + type(exc).__name__ + ": " + str(exc))
+PY
+        }
+
+        cuda_status="$(cuda_probe)"
+        if [ "$cuda_status" = "COMPAT_UNSUPPORTED" ]; then
+            echo "CUDA init hit forward-compat error 804 (consumer GPU) —" \
+                 "neutralizing compat libs (QUI-896)"
+            for conf in /etc/ld.so.conf.d/*.conf; do
+                [ -e "$conf" ] || continue
+                if grep -qE '/usr/local/cuda.*/compat' "$conf" 2>/dev/null; then
+                    echo "  removing compat ldconfig entry: $conf"
+                    rm -f "$conf"
+                fi
+            done
+            if compgen -G "/usr/local/cuda/compat/libcuda.so*" >/dev/null; then
+                echo "  masking /usr/local/cuda/compat/libcuda.so*"
+                mkdir -p /usr/local/cuda/compat/.disabled
+                mv /usr/local/cuda/compat/libcuda.so* \
+                    /usr/local/cuda/compat/.disabled/ 2>/dev/null || true
+            fi
+            ldconfig
+            cuda_status="$(cuda_probe)"
+        fi
+
+        if [ "$cuda_status" = "OK" ]; then
+            echo "CUDA init OK."
+        else
+            driver="$(nvidia-smi --query-gpu=driver_version \
+                --format=csv,noheader 2>/dev/null | head -1 || true)"
+            {
+                echo "WARNING: CUDA is not usable (probe: $cuda_status;" \
+                     "host driver: ${driver:-unknown})."
+                echo "  This image is built on CUDA 12.9 and needs an NVIDIA"
+                echo "  driver >= 575 (open kernel module) for GPU mining."
+                echo "  Upgrade the host driver, or run a non-GPU backend."
+                echo "  Continuing startup; GPU backends will fail to init."
+                echo "  See QUI-896."
+            } >&2
+        fi
+    fi
 fi
 
 # ── Privilege drop ─────────────────────────────────────────────────
