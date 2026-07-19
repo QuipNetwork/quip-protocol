@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Canary + parameter-sweep tool for QPU throughput tuning.
+"""Canary + parameter-sweep + full-archive tool for QPU throughput tuning.
 
-Two modes:
+Three modes:
 
   ``--mode canary`` (default)
       Submit a small batch of production-size Ising problems at a fixed
@@ -20,6 +20,16 @@ Two modes:
       submission QPU access time, and (if ``--energy-threshold`` is set
       or derivable) a normalized time-to-solution estimate. Prints a
       recommendation line and a CSV body for further analysis.
+
+  ``--mode archive``
+      Full-sampleset capture cell for the reads x diversity x count
+      study: every per-read energy + bit-packed spin vector + the
+      verbatim D-Wave timing dict + nonce/salt, committed as atomic npz
+      shards + meta.jsonl (schema ``qpu_reads_diversity.v1``). Because
+      problem generation is target-independent and answer_mode is raw,
+      the entire (target energy x reads-ladder x k x D) grid is then
+      re-scorable offline at zero additional QPU cost. ``--resume``
+      continues a cell from its committed rows (also the top-up path).
 
 The tool reuses ``QPU.dwave_sampler.DWaveSamplerWrapper`` (so it picks
 up the same solver / region / token plumbing as the miner) and
@@ -46,11 +56,14 @@ import math
 import multiprocessing
 import os
 import random
+import shutil
 import statistics
 import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import numpy as np
 
 # Make repo modules importable when run as a script.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -70,10 +83,45 @@ from shared.quantum_proof_of_work import (
     evaluate_sampleset,
     pack_spins_hex,
 )
+from shared.allowed_value_spec import (
+    AllowedValueSet,
+    AllowedValueSpec,
+    MILLI_SCALE,
+)
 from shared.miner_types import BlockRequirements
 from shared.ising_feeder import RandomIsingFeeder
 from QPU.dwave_miner import DWaveMiner
 from QPU.stream_driver import qpu_access_time_us
+
+ARCHIVE_SCHEMA = "qpu_reads_diversity.v1"
+# Chain ternary default in milli units — when --h-spec resolves to this,
+# the feeder gets allowed_h=None so canary/sweep behavior is bit-identical
+# to the pre-archive tool.
+_TERNARY_MILLI = (-MILLI_SCALE, 0, MILLI_SCALE)
+
+
+def _parse_h_spec(spec: str) -> Tuple[Optional[AllowedValueSpec], bool, str]:
+    """Parse ``--h-spec`` into ``(allowed_h, zero_field, label)``.
+
+    ``"-1,0,1"`` (the chain ternary default) maps to ``allowed_h=None`` so
+    the feeder path stays identical to the legacy tool; ``"0"`` selects the
+    zero-field (J-only) class and the returned ``zero_field`` flag drives
+    the flip-invariant (gauge-fixed) advisory count gate.
+    """
+    vals = [float(x) for x in spec.split(",") if x.strip()]
+    if not vals:
+        raise ValueError(
+            "--h-spec must list at least one value, e.g. '-1,0,1' or '0'"
+        )
+    milli = tuple(sorted(int(round(v * MILLI_SCALE)) for v in vals))
+    zero_field = all(m == 0 for m in milli)
+    label = ",".join(
+        str(int(v)) if float(v).is_integer() else repr(v)
+        for v in sorted(vals)
+    )
+    if milli == _TERNARY_MILLI:
+        return None, False, label
+    return AllowedValueSet(milli), zero_field, label
 
 
 # ---------------------------------------------------------------------
@@ -129,6 +177,308 @@ def _make_energy_only_validator(threshold: float) -> Callable:
 
 
 
+class SubmissionArchiver:
+    """Durable full-sampleset capture for one archive-mode cell.
+
+    Per submission: all per-read energies + bit-packed spins (column order
+    = topology node order; bit 1 = spin +1, big bit order, zero-padded
+    tail — same convention as ``pack_spins_hex``) buffered and committed
+    as atomic npz shards, plus one ``meta.jsonl`` line carrying nonce/salt
+    and the **verbatim** D-Wave timing dict.
+
+    Durability contract: a shard is renamed into place *before* its meta
+    lines are appended, and resume trusts only ``meta.jsonl`` — so a crash
+    at any point leaves a valid prefix (at most one flush window of QPU
+    submissions lost, shard rows past the last meta line are unreferenced
+    and harmless). Resume never truncates; it counts committed meta lines
+    and continues from there after validating ``metadata.json`` against
+    the CLI parameters (one schema, no silent drift between sessions).
+    """
+
+    def __init__(
+        self,
+        cell_dir: Path,
+        *,
+        nodes: List[int],
+        num_reads: int,
+        annealing_time_us: float,
+        n_target: int,
+        metadata_extra: Dict[str, Any],
+        flush_every: int = 250,
+        resume: bool = False,
+        edges: Optional[List[Tuple[int, int]]] = None,
+    ):
+        self.dir = Path(cell_dir)
+        self.shard_dir = self.dir / "shards"
+        self.meta_path = self.dir / "meta.jsonl"
+        self.metadata_path = self.dir / "metadata.json"
+        self.nodes = [int(v) for v in nodes]
+        self.n_nodes = len(self.nodes)
+        self.bytes_per_read = (self.n_nodes + 7) // 8
+        self.num_reads = int(num_reads)
+        self.annealing_time_us = float(annealing_time_us)
+        self.flush_every = int(flush_every)
+        self._cached_vars: Optional[List[int]] = None
+        self._perm: Optional[np.ndarray] = None
+        self._buf_spins: List[np.ndarray] = []
+        self._buf_energies: List[np.ndarray] = []
+        self._buf_idx: List[int] = []
+        self._buf_meta: List[Dict[str, Any]] = []
+        self.n_errors = 0
+
+        self.shard_dir.mkdir(parents=True, exist_ok=True)
+        params = {
+            "schema": ARCHIVE_SCHEMA,
+            "num_reads": self.num_reads,
+            "annealing_time_us": self.annealing_time_us,
+            "n_nodes": self.n_nodes,
+            "bytes_per_read": self.bytes_per_read,
+            "packing": {
+                "bit_one_means": "+1",
+                "bitorder": "big",
+                "pad": "zero",
+                "column_order": "topology_nodes",
+            },
+            "read_order": "raw_answer_mode_preserved",
+        }
+        if self.metadata_path.exists():
+            if not resume:
+                raise SystemExit(
+                    f"[archive] {self.dir} already holds an archive; "
+                    "pass --resume to continue it (archives are never "
+                    "truncated)."
+                )
+            existing = json.loads(self.metadata_path.read_text())
+            mismatched = {
+                k: (existing.get(k), v)
+                for k, v in params.items()
+                if existing.get(k) != v
+            }
+            if mismatched:
+                raise SystemExit(
+                    f"[archive] resume refused — metadata.json disagrees "
+                    f"with CLI params on {sorted(mismatched)}: {mismatched}"
+                )
+        else:
+            meta = dict(params)
+            meta["n_target"] = n_target
+            meta.update(metadata_extra)
+            tmp = self.metadata_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(meta, indent=2, default=str))
+            os.replace(tmp, self.metadata_path)
+        # Self-describing archive: persist the exact topology so offline
+        # re-scoring (h/J regeneration, evaluate_sampleset replay) never
+        # depends on repo snapshots that may drift or vanish.
+        topo_path = self.dir / "topology.json"
+        if not topo_path.exists():
+            tmp = topo_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({
+                "nodes": self.nodes,
+                "edges": (
+                    [[int(a), int(b)] for a, b in edges]
+                    if edges is not None else None
+                ),
+            }))
+            os.replace(tmp, topo_path)
+
+        if resume:
+            self._heal_torn_tail()
+        self.start_idx = self._count_committed()
+        remaining = max(0, n_target - self.start_idx)
+        projected = remaining * self.num_reads * (self.bytes_per_read + 8)
+        free = shutil.disk_usage(self.dir).free
+        if projected > 0 and free < 2 * projected:
+            raise SystemExit(
+                f"[archive] refusing to start: {free/1e9:.1f} GB free < "
+                f"2x projected {projected/1e9:.1f} GB — don't burn QPU "
+                "budget into ENOSPC."
+            )
+
+    def _heal_torn_tail(self) -> None:
+        """Terminate a torn final line so future appends start clean.
+
+        A crash mid-append leaves meta.jsonl without a trailing newline;
+        appending straight after would corrupt the first new record.
+        Adding "\\n" turns the torn fragment into its own unparseable
+        line, which the counter and all loaders skip.
+        """
+        if not self.meta_path.exists():
+            return
+        with open(self.meta_path, "rb+") as fh:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                return
+            fh.seek(-1, os.SEEK_END)
+            if fh.read(1) != b"\n":
+                fh.write(b"\n")
+
+    def _count_committed(self) -> int:
+        """Highest committed submission index + 1, from meta.jsonl only.
+
+        Unparseable lines (torn fragments healed by ``_heal_torn_tail``)
+        are skipped: those submissions re-run, and any shard rows they
+        left behind are unreferenced and harmless — loaders follow
+        meta.jsonl pointers only.
+        """
+        if not self.meta_path.exists():
+            return 0
+        last = -1
+        with open(self.meta_path) as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                last = max(last, int(rec.get("idx", -1)))
+        return last + 1
+
+    def _column_perm(self, sampleset) -> Optional[np.ndarray]:
+        """Permutation mapping sampleset columns -> topology node order.
+
+        Cached per distinct variable ordering. Hard-fails on a variable
+        SET mismatch — a mid-study solver retune must abort the run, not
+        silently shift columns.
+        """
+        vars_list = [int(v) for v in sampleset.variables]
+        if vars_list == self._cached_vars:
+            return self._perm
+        if vars_list == self.nodes:
+            self._cached_vars, self._perm = vars_list, None
+            return None
+        pos = {v: i for i, v in enumerate(vars_list)}
+        if len(pos) != self.n_nodes or any(v not in pos for v in self.nodes):
+            raise RuntimeError(
+                f"[archive] sampleset variable set ({len(pos)} vars) does "
+                f"not match the {self.n_nodes}-node topology — solver "
+                "retune mid-study? Aborting before columns shift."
+            )
+        self._cached_vars = vars_list
+        self._perm = np.asarray([pos[v] for v in self.nodes], dtype=np.intp)
+        return self._perm
+
+    def record(
+        self, model, sampleset, qpu_us: int, local_idx: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Buffer one submission; returns its (mutable) meta line.
+
+        The returned dict stays in the write buffer until the *next*
+        record/record_error call (flushes happen before appending, never
+        after), so the caller may set ``valid_live`` /
+        ``validator_error`` on it after validation runs. Raises OSError
+        upward — a capture that cannot persist must stop spending QPU
+        time.
+        """
+        if len(self._buf_meta) >= self.flush_every:
+            self.flush()
+        record = sampleset.record
+        samples = np.asarray(record.sample)
+        if samples.ndim != 2 or samples.shape[0] != self.num_reads:
+            self.record_error(
+                local_idx,
+                f"short sampleset: shape {samples.shape} != "
+                f"({self.num_reads}, {self.n_nodes})",
+            )
+            return None
+        perm = self._column_perm(sampleset)
+        if perm is not None:
+            samples = samples[:, perm]
+        packed = np.packbits((samples > 0).astype(np.uint8), axis=1)
+        energies = np.asarray(record.energy, dtype=np.float64)
+
+        info = getattr(sampleset, "info", None) or {}
+        defect_info = info.get("defect_info")
+        entry = {
+            "schema": ARCHIVE_SCHEMA,
+            "idx": self.start_idx + local_idx,
+            "ts_ns": time.time_ns(),
+            "nonce_hex": model.nonce.hex(),
+            "salt_hex": model.salt.hex(),
+            "problem_id": info.get("problem_id"),
+            "shard": None,  # filled at flush
+            "shard_row": None,
+            "num_reads": self.num_reads,
+            "annealing_time_us": self.annealing_time_us,
+            "qpu_access_us": int(qpu_us),
+            "best_energy": float(energies.min()),
+            "timing": info.get("timing"),
+            "defect": _summarize_defect(defect_info),
+            "valid_live": None,
+            "error": None,
+        }
+        self._buf_spins.append(packed)
+        self._buf_energies.append(energies)
+        self._buf_idx.append(self.start_idx + local_idx)
+        self._buf_meta.append(entry)
+        return entry
+
+    def record_error(self, local_idx: int, msg: str) -> None:
+        """Meta-only line for an errored submission (no shard row)."""
+        if len(self._buf_meta) >= self.flush_every:
+            self.flush()
+        self.n_errors += 1
+        self._buf_meta.append({
+            "schema": ARCHIVE_SCHEMA,
+            "idx": self.start_idx + local_idx,
+            "ts_ns": time.time_ns(),
+            "shard": None,
+            "shard_row": None,
+            "num_reads": self.num_reads,
+            "annealing_time_us": self.annealing_time_us,
+            "valid_live": None,
+            "error": msg,
+        })
+
+    def flush(self) -> None:
+        """Commit the buffer: shard rename first, then meta append."""
+        if self._buf_idx:
+            lo, hi = self._buf_idx[0], self._buf_idx[-1]
+            name = f"spins_{lo:06d}_{hi:06d}.npz"
+            row = 0
+            for entry in self._buf_meta:
+                if entry.get("error") is None and entry["shard"] is None:
+                    entry["shard"] = name
+                    entry["shard_row"] = row
+                    row += 1
+            tmp = self.shard_dir / f".tmp-{name}"
+            with open(tmp, "wb") as fh:
+                np.savez(
+                    fh,
+                    spins_packed=np.stack(self._buf_spins),
+                    energies=np.stack(self._buf_energies),
+                    idx=np.asarray(self._buf_idx, dtype=np.int64),
+                    schema=ARCHIVE_SCHEMA,
+                )
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.shard_dir / name)
+        if self._buf_meta:
+            with open(self.meta_path, "a") as fh:
+                for entry in self._buf_meta:
+                    fh.write(json.dumps(entry, default=str) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        self._buf_spins, self._buf_energies = [], []
+        self._buf_idx, self._buf_meta = [], []
+
+
+def _summarize_defect(defect_info) -> Optional[Dict[str, Any]]:
+    """Compact, schema-agnostic summary of a defect_info payload."""
+    if defect_info is None:
+        return None
+    out: Dict[str, Any] = {}
+    try:
+        for k, v in dict(defect_info).items():
+            if isinstance(v, (int, float, str, bool)) or v is None:
+                out[k] = v
+            elif isinstance(v, (list, tuple, set, dict)):
+                out[f"n_{k}"] = len(v)
+            else:
+                out[f"type_{k}"] = type(v).__name__
+    except Exception:  # noqa: BLE001 — diagnostics only, never fatal
+        return {"unparsed": True}
+    return out
+
+
 def _run_batch(
     miner: DWaveMiner,
     *,
@@ -142,6 +492,9 @@ def _run_batch(
     validator: Callable,
     log_every: int = 50,
     stored_solutions_path: Optional[Path] = None,
+    archiver: Optional[SubmissionArchiver] = None,
+    allowed_h: Optional[AllowedValueSpec] = None,
+    gauge_fix: bool = False,
 ) -> Dict[str, Any]:
     """Run n submissions through ``DWaveSamplerWrapper.sample_ising_streaming``.
 
@@ -172,6 +525,7 @@ def _run_batch(
         nodes=nodes,
         edges=edges,
         buffer_size=feeder_buffer_size,
+        allowed_h=allowed_h,
     )
     # stop_event is passed into the pump so it can cancel in-flight D-Wave
     # futures when we reach n_submissions or on KeyboardInterrupt.
@@ -222,6 +576,11 @@ def _run_batch(
                 qpu_us = 0
                 best_energy = float("nan")
             except Exception as exc:  # noqa: BLE001
+                if archiver is not None:
+                    archiver.record_error(
+                        completed,
+                        f"sampleset: {type(exc).__name__}: {exc}",
+                    )
                 per_submission.append({
                     "idx": completed,
                     "error": f"sampleset: {type(exc).__name__}: {exc}",
@@ -230,11 +589,29 @@ def _run_batch(
                 if completed >= n_submissions:
                     break
                 continue
+            # Archive BEFORE validation so capture never depends on the
+            # validator. OSError from the archiver intentionally
+            # propagates: spending QPU time without durable capture is
+            # the one unacceptable failure mode.
+            arch_entry = None
+            if archiver is not None:
+                if best_energy == best_energy:  # NaN filter
+                    arch_entry = archiver.record(
+                        model, sampleset, qpu_us, completed,
+                    )
+                else:
+                    archiver.record_error(
+                        completed, "no record/energy on sampleset",
+                    )
             try:
                 valid = validator(
                     sampleset, model.h, model.J, model.nonce, model.salt,
                 )
             except Exception as exc:  # noqa: BLE001
+                if arch_entry is not None:
+                    arch_entry["validator_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
                 per_submission.append({
                     "idx": completed,
                     "error": f"validator: {type(exc).__name__}: {exc}",
@@ -243,8 +620,10 @@ def _run_batch(
                 if completed >= n_submissions:
                     break
                 continue
+            if arch_entry is not None:
+                arch_entry["valid_live"] = bool(valid)
             meta, top_5_sols, top_5_es = compute_solution_meta(
-                sampleset, energy_threshold,
+                sampleset, energy_threshold, gauge_fix=gauge_fix,
             )
             per_submission.append({
                 "idx": completed,
@@ -342,6 +721,8 @@ def _run_batch(
                 pass
         except Exception:  # noqa: BLE001
             pass
+        if archiver is not None:
+            archiver.flush()
         feeder.stop()
 
     overall_wall = time.monotonic() - overall_start
@@ -576,6 +957,165 @@ def cmd_canary(
     )
 
 
+def _scrubbed_argv() -> List[str]:
+    """sys.argv with any --token value masked — safe to persist."""
+    out: List[str] = []
+    mask_next = False
+    for a in sys.argv:
+        if mask_next:
+            out.append("***")
+            mask_next = False
+        elif a == "--token":
+            out.append(a)
+            mask_next = True
+        elif a.startswith("--token="):
+            out.append("--token=***")
+        else:
+            out.append(a)
+    return out
+
+
+def _git_commit() -> Optional[str]:
+    import subprocess
+
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=_REPO_ROOT, capture_output=True, text=True, timeout=5,
+        ).stdout.strip() or None
+    except Exception:  # noqa: BLE001 — provenance only, never fatal
+        return None
+
+
+def cmd_archive(
+    miner: DWaveMiner, args, validator: Callable, energy_threshold: float,
+) -> Dict[str, Any]:
+    """Full-sampleset capture cell: pre-canary, archived batch, post-canary.
+
+    Everything except (num_reads, annealing_time, h regime) is post-hoc:
+    the archive holds all per-read energies + spins, so target energy,
+    reads-ladder subsampling, k, and D are re-scored offline at zero
+    additional QPU cost. The live validator result is recorded per
+    submission as ``valid_live`` (advisory only).
+    """
+    allowed_h, zero_field, h_label = _parse_h_spec(args.h_spec)
+    gauge_fix = zero_field or args.gauge_fix_count
+    cell_dir = Path(args.archive_dir)
+    cell_dir.mkdir(parents=True, exist_ok=True)
+
+    canary_pre = canary_post = None
+    if args.canary_n > 0:
+        canary_pre = _run_batch(
+            miner,
+            num_reads=args.ref_num_reads,
+            annealing_time_us=args.ref_annealing_time_us,
+            n_submissions=args.canary_n,
+            queue_depth=args.queue_depth,
+            feeder_buffer_size=args.feeder_buffer_size,
+            energy_threshold=energy_threshold,
+            label_prefix="canary-pre",
+            validator=validator,
+            log_every=args.log_every,
+        )
+        (cell_dir / "canary_pre.json").write_text(
+            json.dumps(canary_pre, indent=2, default=str)
+        )
+
+    archiver = SubmissionArchiver(
+        cell_dir,
+        nodes=miner.sampler.nodes,
+        edges=miner.sampler.edges,
+        num_reads=args.num_reads,
+        annealing_time_us=args.annealing_time_us,
+        n_target=args.n,
+        flush_every=args.archive_flush_every,
+        resume=args.resume,
+        metadata_extra={
+            "cell": cell_dir.name,
+            "h_spec": h_label,
+            "zero_field": zero_field,
+            "gauge_fix_advisory": gauge_fix,
+            "solver": (
+                getattr(miner.sampler, "solver_name", None) or args.solver
+            ),
+            "region": args.region,
+            "advisory_energy_threshold": energy_threshold,
+            "queue_depth": args.queue_depth,
+            "feeder_buffer_size": args.feeder_buffer_size,
+            "git_commit": _git_commit(),
+            "argv": _scrubbed_argv(),
+            "started_ts_ns": time.time_ns(),
+        },
+    )
+    n_remaining = args.n - archiver.start_idx
+    if n_remaining <= 0:
+        print(
+            f"[archive] {cell_dir.name}: {archiver.start_idx} submissions "
+            f"already committed >= target {args.n}; nothing to do.",
+            file=sys.stderr,
+        )
+        batch = None
+    else:
+        if archiver.start_idx:
+            print(
+                f"[archive] {cell_dir.name}: resuming at submission "
+                f"{archiver.start_idx}/{args.n}",
+                file=sys.stderr,
+            )
+        batch = _run_batch(
+            miner,
+            num_reads=args.num_reads,
+            annealing_time_us=args.annealing_time_us,
+            n_submissions=n_remaining,
+            queue_depth=args.queue_depth,
+            feeder_buffer_size=args.feeder_buffer_size,
+            energy_threshold=energy_threshold,
+            label_prefix=f"archive-{cell_dir.name}",
+            validator=validator,
+            log_every=args.log_every,
+            archiver=archiver,
+            allowed_h=allowed_h,
+            gauge_fix=gauge_fix,
+        )
+
+    if args.canary_post and args.canary_n > 0:
+        canary_post = _run_batch(
+            miner,
+            num_reads=args.ref_num_reads,
+            annealing_time_us=args.ref_annealing_time_us,
+            n_submissions=args.canary_n,
+            queue_depth=args.queue_depth,
+            feeder_buffer_size=args.feeder_buffer_size,
+            energy_threshold=energy_threshold,
+            label_prefix="canary-post",
+            validator=validator,
+            log_every=args.log_every,
+        )
+        (cell_dir / "canary_post.json").write_text(
+            json.dumps(canary_post, indent=2, default=str)
+        )
+
+    if batch is not None:
+        # Drop raw per-submission arrays from the JSON output — the
+        # archive itself is the durable record; the summary is enough.
+        batch.pop("qpu_samples", None)
+        batch.pop("valid_flags", None)
+        batch.pop("per_submission", None)
+    return {
+        "mode": "archive",
+        "cell": cell_dir.name,
+        "archive_dir": str(cell_dir),
+        "committed_through": archiver.start_idx + (
+            batch["summary"]["submissions_completed"] if batch else 0
+        ),
+        "n_target": args.n,
+        "archive_errors": archiver.n_errors,
+        "batch": batch,
+        "canary_pre": canary_pre["summary"] if canary_pre else None,
+        "canary_post": canary_post["summary"] if canary_post else None,
+    }
+
+
 def cmd_sweep(
     miner: DWaveMiner, args, validator: Callable, energy_threshold: float,
 ) -> Dict[str, Any]:
@@ -735,13 +1275,17 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog="See module docstring for full usage examples.",
     )
     p.add_argument(
-        "--mode", choices=("canary", "sweep"), default="canary",
+        "--mode", choices=("canary", "sweep", "archive"), default="canary",
         help="canary (default): single batch at ref params; "
-             "sweep: grid over (num_reads, annealing_time)",
+             "sweep: grid over (num_reads, annealing_time); "
+             "archive: full-sampleset capture cell (all per-read "
+             "energies + spins + timing) for offline (E', r, k, D) "
+             "re-scoring",
     )
     p.add_argument(
         "--n", type=int, default=30,
-        help="canary mode: total submissions (default 30)",
+        help="canary mode: total submissions (default 30); "
+             "archive mode: cell target size (resume counts toward it)",
     )
     p.add_argument(
         "--m", type=int, default=15,
@@ -836,6 +1380,44 @@ def _build_parser() -> argparse.ArgumentParser:
              "(default 50). Independent of the miner's own logging — "
              "DWaveMiner.sample_ising_streaming prints its [QPU] stream "
              "depth line every 100 completions regardless.",
+    )
+    # --- archive mode ---------------------------------------------------
+    p.add_argument(
+        "--archive-dir", default=None,
+        help="archive mode: cell directory (metadata.json + meta.jsonl + "
+             "shards/). Required for --mode archive.",
+    )
+    p.add_argument(
+        "--num-reads", type=int, default=112,
+        help="archive mode: pinned num_reads per submission "
+             "(default 112, the production value)",
+    )
+    p.add_argument(
+        "--annealing-time-us", type=float, default=80.0,
+        help="archive mode: pinned annealing time in us "
+             "(default 80.0, the production value)",
+    )
+    p.add_argument(
+        "--h-spec", default="-1,0,1",
+        help="comma-separated allowed per-node h values for problem "
+             "generation (archive mode). '-1,0,1' = chain ternary "
+             "default; '0' = zero-field class (auto-enables the "
+             "flip-invariant advisory count gate).",
+    )
+    p.add_argument(
+        "--gauge-fix-count", action="store_true",
+        help="force the gauge-fixed (flip-invariant) advisory count "
+             "gate even when --h-spec is not all-zero",
+    )
+    p.add_argument(
+        "--archive-flush-every", type=int, default=250,
+        help="archive mode: submissions per committed shard "
+             "(default 250 — the max loss window on a crash)",
+    )
+    p.add_argument(
+        "--canary-post", action="store_true",
+        help="archive mode: run a trailing canary block after the cell "
+             "so it carries closing contention context",
     )
     return p
 
@@ -963,10 +1545,14 @@ def main() -> int:
     # Resolve stored-solutions sidecar path. Defaults to
     # <output>.stored.jsonl when --output is set, off otherwise (we
     # can't pair a sidecar with stdout output).
+    if args.mode == "archive" and not args.archive_dir:
+        raise SystemExit("--mode archive requires --archive-dir")
     stored_path: Optional[Path] = None
     if args.store_solutions:
         stored_path = Path(args.store_solutions)
-    elif args.output:
+    elif args.output and args.mode != "archive":
+        # Archive mode supersedes the top-5 sidecar — the full archive
+        # holds every read; don't double-write.
         stored_path = Path(args.output).with_suffix(
             Path(args.output).suffix + ".stored.jsonl"
         )
@@ -1021,7 +1607,21 @@ def main() -> int:
         or val_meta.get("energy_threshold")
     )
 
-    if args.mode == "canary":
+    if args.mode == "archive":
+        result = cmd_archive(miner, args, validator, energy_threshold)
+        bs = (result["batch"] or {}).get("summary")
+        if bs:
+            print(
+                f"[archive] {result['cell']}: committed_through="
+                f"{result['committed_through']}/{result['n_target']} | "
+                f"qpu_mean="
+                f"{bs['qpu_access_per_submission_us']['mean']:.0f}us | "
+                f"best_energy_min={bs['best_energy_min']} | "
+                f"p_valid_live={bs['p_success_chain']:.4f} | "
+                f"archive_errors={result['archive_errors']}",
+                file=sys.stderr,
+            )
+    elif args.mode == "canary":
         result = cmd_canary(miner, args, validator, energy_threshold)
         s = result["summary"]
         print(
