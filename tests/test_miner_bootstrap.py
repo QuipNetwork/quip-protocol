@@ -475,3 +475,85 @@ async def test_ensure_registered_raises_on_receipt_error():
     client = _RegClient(None, receipt_error="DispatchError")
     with pytest.raises(RuntimeError, match="register_miner failed"):
         await mb._ensure_registered(client, _stub_keystore())
+
+
+# ---------------------------------------------------------------------------
+# Sync gate (wait_for_sync) — QUI-825 / gh#28
+# ---------------------------------------------------------------------------
+
+
+class _SyncClient:
+    """Client stub replaying a scripted sequence of get_sync_state() dicts.
+
+    Holds the last state once the script is exhausted, so a test can leave a
+    node "stuck syncing" by ending on a syncing entry.
+    """
+
+    def __init__(self, states):
+        self._states = list(states)
+        self.probe_count = 0
+
+    async def get_sync_state(self):
+        idx = min(self.probe_count, len(self._states) - 1)
+        self.probe_count += 1
+        return self._states[idx]
+
+
+def _sync_state(is_syncing, *, current_block=0, highest_block=100, peers=1):
+    return {
+        "is_syncing": is_syncing,
+        "peers": peers,
+        "current_block": current_block,
+        "highest_block": highest_block,
+        "starting_block": 0,
+    }
+
+
+async def test_wait_for_sync_returns_immediately_when_not_syncing():
+    # A synced node (or one lacking system_syncState, which reports
+    # is_syncing=False) must not block startup.
+    client = _SyncClient([_sync_state(False)])
+    await mb.wait_for_sync(client, poll_interval=0)
+    assert client.probe_count == 1
+
+
+async def test_wait_for_sync_blocks_until_node_catches_up():
+    # Reproduces QUI-825: the node is in major sync for several polls (during
+    # which Guard C would read balance 0 and mis-exit `wallet-underfunded`),
+    # advancing blocks the whole time, then finishes. wait_for_sync must keep
+    # waiting until is_syncing flips False and must not raise.
+    client = _SyncClient([
+        _sync_state(True, current_block=10),
+        _sync_state(True, current_block=40),
+        _sync_state(True, current_block=90),
+        _sync_state(False, current_block=100),
+    ])
+    await mb.wait_for_sync(client, poll_interval=0)
+    assert client.probe_count == 4
+
+
+async def test_wait_for_sync_raises_when_peerless_and_stalled():
+    # A node with zero peers that never advances will never sync on its own —
+    # fail fast with a DISTINCT error rather than hang or mis-report funding.
+    client = _SyncClient([_sync_state(True, current_block=5, peers=0)])
+    ticks = iter(range(0, 100_000, 100))
+    with pytest.raises(mb.ChainSyncStalled):
+        await mb.wait_for_sync(
+            client, poll_interval=0, stall_timeout=300, _clock=lambda: next(ticks)
+        )
+
+
+async def test_wait_for_sync_waits_through_no_progress_when_peers_present():
+    # No block advance for a stretch but peers are connected (importing /
+    # verifying) — that is live sync, not a stall, so we keep waiting even as
+    # wall-clock races far past stall_timeout, then it completes.
+    client = _SyncClient([
+        _sync_state(True, current_block=5, peers=3),
+        _sync_state(True, current_block=5, peers=3),
+        _sync_state(False, current_block=6, peers=3),
+    ])
+    ticks = iter(range(0, 1_000_000, 100_000))
+    await mb.wait_for_sync(
+        client, poll_interval=0, stall_timeout=300, _clock=lambda: next(ticks)
+    )
+    assert client.probe_count == 3

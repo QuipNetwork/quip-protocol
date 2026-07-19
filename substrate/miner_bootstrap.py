@@ -34,11 +34,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import dwave_networkx as dnx
 
@@ -478,6 +479,90 @@ def _build_seed_topology(
 
 
 # ----------------------------------------------------------------------
+# Sync gate
+# ----------------------------------------------------------------------
+
+SYNC_POLL_INTERVAL_SECONDS = 5.0
+SYNC_STALL_TIMEOUT_SECONDS = 600.0  # 10 min with no block progress AND no peers
+
+
+class ChainSyncStalled(RuntimeError):
+    """The node stopped advancing and has no peers to sync from.
+
+    Distinct from a slow-but-live sync (which the miner waits out): a node
+    with zero peers that hasn't imported a block in
+    ``SYNC_STALL_TIMEOUT_SECONDS`` will never catch up on its own, so failing
+    fast beats hanging forever.
+    """
+
+    def __init__(self, current_block: int, highest_block: int, stalled_for: float):
+        self.current_block = current_block
+        self.highest_block = highest_block
+        self.stalled_for = stalled_for
+        super().__init__(
+            f"validator sync stalled at block {current_block}/{highest_block} "
+            f"with no peers for {stalled_for:.0f}s"
+        )
+
+
+async def wait_for_sync(
+    client: SubstrateClient,
+    *,
+    poll_interval: float = SYNC_POLL_INTERVAL_SECONDS,
+    stall_timeout: float = SYNC_STALL_TIMEOUT_SECONDS,
+    _clock: Callable[[], float] = time.monotonic,
+) -> None:
+    """Block until the node reports it is no longer in major sync.
+
+    A miner started against a still-syncing validator reads genesis/early
+    state — balance 0, no registration — at the node's current best head, and
+    would otherwise fail its startup guards for reasons that clear themselves
+    once the node catches up (the ``wallet-underfunded`` mis-exit in QUI-825).
+    This gate waits out a live sync, logging block progress, and only gives up
+    when the node stalls: no block advance AND zero peers for ``stall_timeout``
+    (a node with no peers will never sync), raising :class:`ChainSyncStalled`.
+
+    A node that doesn't expose ``system_syncState`` reports ``is_syncing=False``
+    (see :meth:`SubstrateClient.get_sync_state`) and returns immediately — fail
+    open to the prior behavior rather than block on data we don't have.
+
+    Args:
+        client: connected substrate client to probe.
+        poll_interval: seconds between ``get_sync_state`` probes.
+        stall_timeout: seconds of no-progress-and-no-peers before giving up.
+        _clock: monotonic clock source, injectable for tests.
+    """
+    last_block: Optional[int] = None
+    last_progress_at = _clock()
+    while True:
+        state = await client.get_sync_state()
+        if not state.get("is_syncing"):
+            if last_block is not None:
+                logger.info(
+                    "validator sync complete at block %d",
+                    int(state.get("current_block") or 0),
+                )
+            return
+        current = int(state.get("current_block") or 0)
+        highest = int(state.get("highest_block") or 0)
+        peers = int(state.get("peers") or 0)
+        now = _clock()
+        if last_block is None or current > last_block:
+            last_block = current
+            last_progress_at = now
+        elif peers == 0 and (now - last_progress_at) >= stall_timeout:
+            raise ChainSyncStalled(current, highest, now - last_progress_at)
+        logger.info(
+            "waiting for validator sync: block %d/%d (%d remaining), %d peer(s)",
+            current,
+            highest,
+            max(highest - current, 0),
+            peers,
+        )
+        await asyncio.sleep(poll_interval)
+
+
+# ----------------------------------------------------------------------
 # Funding
 # ----------------------------------------------------------------------
 
@@ -807,8 +892,10 @@ __all__ = [
     "FaucetAlreadyFunded",
     "FaucetPermanentError",
     "FaucetTransientError",
+    "ChainSyncStalled",
     "Underfunded",
     "bootstrap",
     "ensure_funded",
     "ensure_funded_via_faucet",
+    "wait_for_sync",
 ]

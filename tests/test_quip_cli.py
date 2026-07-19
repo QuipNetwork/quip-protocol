@@ -407,6 +407,39 @@ def test_guard_c_wallet_funded_returns_balance():
     asyncio.run(_do())
 
 
+def test_guard_bplus_chain_sync_stalled_maps_to_click_error(monkeypatch):
+    """Guard B+ turns a `ChainSyncStalled` into the structured
+    `chain-sync-stalled` CLI code — kept distinct from `wallet-underfunded`
+    so an operator isn't sent chasing a funding problem that is really an
+    unsynced, peerless node."""
+    import asyncio
+
+    async def _boom(_client):
+        raise quip_cli.ChainSyncStalled(5, 100, 700.0)
+
+    monkeypatch.setattr(quip_cli, "wait_for_sync", _boom)
+
+    async def _do():
+        with pytest.raises(
+            click.ClickException,
+            match=r"chain-sync-stalled current_block=5 highest_block=100",
+        ):
+            await quip_cli._wait_for_sync_or_fail(object())
+
+    asyncio.run(_do())
+
+
+def test_guard_bplus_passes_when_synced(monkeypatch):
+    """A synced node clears Guard B+ without raising."""
+    import asyncio
+
+    async def _ok(_client):
+        return None
+
+    monkeypatch.setattr(quip_cli, "wait_for_sync", _ok)
+    asyncio.run(quip_cli._wait_for_sync_or_fail(object()))
+
+
 def test_quip_miner_no_longer_accepts_node_url(monkeypatch):
     """--node-url was removed in v0.2; passing it must fail with click's
     'No such option' error so operators see the rename clearly."""
@@ -2329,6 +2362,9 @@ def test_startup_guards_return_effective_mempool(monkeypatch):
 
     from substrate.solver_registration import SolverGuardOutcome
 
+    monkeypatch.setattr(
+        quip_cli, "_wait_for_sync_or_fail", AsyncMock(return_value=None)
+    )
     monkeypatch.setattr(
         quip_cli, "_ensure_funded_or_fail", AsyncMock(return_value=1)
     )
