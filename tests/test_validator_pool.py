@@ -518,3 +518,111 @@ async def test_send_write_raises_validator_swapped_on_connection_error():
         assert pool.last_successful_submission is None
     finally:
         await pool.shutdown()
+
+
+# ----------------------------------------------------------------------
+# Cancellation on the write path (QUI-899)
+#
+# When an outer `wait_for` gives up on a submit, the child process is left
+# mid-call. `CancelledError` derives from BaseException, so it matches
+# neither `_CONNECTION_ERRORS` nor `ValidatorSwapped`, and the write
+# handle's reconnect never runs — the next submit reuses a child that is
+# still busy with the abandoned call.
+#
+# Note it must NOT simply be added to `_CONNECTION_ERRORS`: that tuple is
+# caught and converted into `ValidatorSwapped`, which would swallow the
+# cancellation and break shutdown.
+# ----------------------------------------------------------------------
+
+
+def _pool_with_fresh_handles(url: str, behaviour_by_generation: list[dict]):
+    """Pool whose factory hands back a NEW fake handle on every call.
+
+    The shared `_make_pool` returns one fake per URL, so a respawn is
+    indistinguishable from a reuse — which is the exact thing under test.
+    """
+    made: list[_FakeHandle] = []
+
+    def handle_factory(u: str) -> _FakeHandle:
+        idx = min(len(made), len(behaviour_by_generation) - 1)
+        h = _FakeHandle(u, behaviour=behaviour_by_generation[idx])
+        made.append(h)
+        return h
+
+    pool = ValidatorPool(
+        urls=[url],
+        failover=SubstrateUrlFailover([url], initial_backoff_s=0.01,
+                                      max_backoff_s=0.05),
+        handle_factory=handle_factory,
+        max_swap_retries=3,
+    )
+    pool._made_handles = made
+    return pool
+
+
+@pytest.mark.asyncio
+async def test_cancelled_write_reraises_rather_than_swallowing():
+    """A cancellation must propagate as CancelledError.
+
+    Converting it to ValidatorSwapped would make a cancelled task look like
+    a routine swap to the caller, and shutdown would stop working.
+    """
+    def _cancel():
+        raise asyncio.CancelledError()
+
+    pool = _pool_with_fresh_handles(
+        "ws://a:9944", [{"submit_signed_extrinsic": _cancel}]
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await pool.send_write("submit_signed_extrinsic", {"x": 1})
+
+
+@pytest.mark.asyncio
+async def test_cancelled_write_does_not_reuse_the_busy_child():
+    """The next submit after a cancellation must not land on the same child.
+
+    That child may still be running the abandoned call; reusing it is the
+    QUI-899 durable-bad-state path on the write side.
+    """
+    def _cancel():
+        raise asyncio.CancelledError()
+
+    pool = _pool_with_fresh_handles(
+        "ws://a:9944",
+        [{"submit_signed_extrinsic": _cancel}, {}],  # gen 0 cancels, gen 1 fine
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await pool.send_write("submit_signed_extrinsic", {"x": 1})
+
+    first = pool._write_active
+    await pool.send_write("submit_signed_extrinsic", {"x": 2})
+
+    assert pool._write_active is not first, (
+        "write path reused the child that was cancelled mid-call"
+    )
+
+
+@pytest.mark.asyncio
+async def test_websocket_exception_is_treated_as_connection_class():
+    """`WebSocketException` must trigger the swap like any dead socket.
+
+    `_CONNECTION_ERRORS` carried an unfinished note saying substrate-
+    interface's own websocket errors "will be added here when wiring
+    against the real client." Until they were, a genuine websocket failure
+    surfacing from the child propagated raw instead of swapping, so the
+    pool's recovery never ran for that failure class.
+    """
+    from websocket import WebSocketException
+
+    pool = _make_pool([
+        {"url": "http://a", "behaviour": {"get_head": WebSocketException("dead")}},
+        {"url": "http://b", "behaviour": {"get_head": b"\xab" * 32}},
+    ])
+    await pool.start()
+    try:
+        assert await pool.send("get_head", {}) == b"\xab" * 32
+        assert pool._fakes_by_url["http://a"].is_shutdown
+    finally:
+        await pool.shutdown()
