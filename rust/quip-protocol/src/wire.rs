@@ -1,6 +1,17 @@
 #[derive(Debug, PartialEq)]
 pub enum WireError { BadLength, BadSpinByte(u8) }
 
+impl std::fmt::Display for WireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WireError::BadLength => write!(f, "byte length is not a multiple of 4"),
+            WireError::BadSpinByte(b) => write!(f, "invalid spin byte: 0x{b:02X}"),
+        }
+    }
+}
+
+impl std::error::Error for WireError {}
+
 pub fn encode_i32_le(values: &[i32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() * 4);
     for v in values { out.extend_from_slice(&v.to_le_bytes()); }
@@ -8,7 +19,7 @@ pub fn encode_i32_le(values: &[i32]) -> Vec<u8> {
 }
 
 pub fn decode_i32_le(bytes: &[u8]) -> Result<Vec<i32>, WireError> {
-    if bytes.len() % 4 != 0 { return Err(WireError::BadLength); }
+    if !bytes.len().is_multiple_of(4) { return Err(WireError::BadLength); }
     Ok(bytes.chunks_exact(4)
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())

@@ -3,6 +3,17 @@ use quip_proto::v1::{Configure, Hello, JobKind};
 #[derive(Debug, PartialEq)]
 pub enum SessionError { MissingToken, BadWelcome(u32) }
 
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionError::MissingToken => write!(f, "QUIP_SESSION_TOKEN environment variable not set"),
+            SessionError::BadWelcome(v) => write!(f, "unexpected protocol version in Welcome: {v}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionError {}
+
 #[repr(i32)]
 pub enum ExitCode { Clean = 0, ConfigInvalid = 64, EnvIncompatible = 69, InternalFatal = 70, TokenRejected = 77 }
 
