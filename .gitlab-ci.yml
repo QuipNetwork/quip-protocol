@@ -75,42 +75,54 @@ check-version:
 # Docker image builds (Kaniko — no daemon required)
 # ---------------------------------------------------------------------------
 
-# Shared trigger rules + per-tag mutable tags. Referenced from every
-# image-build job so the Docker pipelines move in lockstep. Image pushes
-# happen ONLY on git tags — branch merges (main/v0.2) run tests but never
-# push images. MUTABLE_TAGS is a space-separated list; each entry becomes
-# an additional registry tag:
-#   git tag v0.2.0rc7     -> :v0.2 :v0.2.0rc7        (pre-release: rolls the
-#                                        :v0.2 pointer and pins the immutable
-#                                        :<tag>. Must NOT move :latest, which
-#                                        the production node manager tracks)
-#   git tag v0.2.0        -> :latest :v0.2 :v0.2.0   (stable release: also
-#                                        advances :latest and rolls :v0.2)
-# The immutable :CI_COMMIT_SHA tag is pushed unconditionally so downstream
-# can pin to a specific build regardless of branch.
+# Shared trigger rules for image jobs. Image pushes happen ONLY on git tags —
+# branch merges (main/v0.2) run tests but never push images.
+#
+# MUTABLE_TAGS is resolved at script time by the resolve-tags job (git ancestry
+# cannot be tested in rules:if). Space-separated; each entry is an extra
+# registry tag beyond the unconditional :$CI_COMMIT_SHA:
+#   pre-release (vX.Y.Z-rcN or vX.Y.ZrcN)  -> :$CI_COMMIT_TAG only
+#   stable vX.Y.Z reachable from origin/main -> :latest :vX.Y :$CI_COMMIT_TAG
+#   stable vX.Y.Z NOT on main              -> :$CI_COMMIT_TAG only
+#   any other tag                          -> :$CI_COMMIT_TAG only
 .shared_image_rules:
   rules:
-    # Pre-release tag — STANDARD form: SemVer hyphenated (vX.Y.Z-rcN), e.g.
-    # v0.2.1-rc17. This is the only pre-release form quip-node-manager's SemVer
-    # parser (parse_semver) recognizes, so all releases MUST use it — see
-    # docs/VERSIONING.md. Rolls :v0.2 + pins :<tag>, never :latest.
+    # Pre-release — SemVer hyphenated (vX.Y.Z-rcN). Preferred form; see
+    # docs/VERSIONING.md. Does not move :latest or :vX.Y.
     - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+-(rc|alpha|beta)[0-9]*$/
-      variables:
-        MUTABLE_TAGS: "v0.2 $CI_COMMIT_TAG"
-    # Legacy pre-release tag — PEP 440 no-hyphen (vX.Y.ZrcN). Still builds + pins
-    # so old tags don't break, but quip-node-manager CANNOT parse it for native
-    # binary updates (it collapses to vX.Y.0). Do NOT cut new releases this way.
+    # Legacy pre-release — PEP 440 no-hyphen (vX.Y.ZrcN). Still builds.
     - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(rc|alpha|beta)[0-9]*$/
-      variables:
-        MUTABLE_TAGS: "v0.2 $CI_COMMIT_TAG"
-    # Stable release tag (vX.Y.Z): advance :latest, roll :v0.2, pin :<tag>.
+    # Stable release tag (vX.Y.Z). Mutable tags decided by resolve-tags.
     - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
-      variables:
-        MUTABLE_TAGS: "latest v0.2 $CI_COMMIT_TAG"
-    # Any other tag: legacy fallback to :latest.
+    # Any other tag: build and pin :$CI_COMMIT_TAG only (no :latest).
     - if: $CI_COMMIT_TAG
-      variables:
-        MUTABLE_TAGS: latest
+
+# Runtime ancestry gate: only stable tags reachable from origin/main publish
+# :latest and :vX.Y. Exports MUTABLE_TAGS via dotenv for manifest/cuda jobs.
+resolve-tags:
+  stage: build
+  needs: []
+  rules: !reference [.shared_image_rules, rules]
+  image:
+    name: alpine/git:latest
+    entrypoint: [""]
+  tags: [linux, amd64]
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    - git fetch origin main
+    - |
+      MUTABLE_TAGS="$CI_COMMIT_TAG"
+      if printf '%s' "$CI_COMMIT_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+         && git merge-base --is-ancestor "$CI_COMMIT_SHA" origin/main; then
+        MINOR=$(printf '%s' "$CI_COMMIT_TAG" | sed -E 's/^(v[0-9]+\.[0-9]+).*/\1/')
+        MUTABLE_TAGS="latest $MINOR $CI_COMMIT_TAG"
+      fi
+      echo "MUTABLE_TAGS=$MUTABLE_TAGS" > tags.env
+      echo "resolved MUTABLE_TAGS=$MUTABLE_TAGS"
+  artifacts:
+    reports:
+      dotenv: tags.env
 
 .docker_build:
   stage: build
@@ -184,6 +196,7 @@ manifest-cpu:
     entrypoint: [""]
   tags: [linux, amd64]
   needs:
+    - resolve-tags
     - build-cpu-amd64
     - build-cpu-arm64
   rules: !reference [.shared_image_rules, rules]
@@ -203,6 +216,8 @@ manifest-cpu:
 build-cuda:
   extends: .docker_build
   tags: [linux, amd64]
+  needs:
+    - resolve-tags
   script:
     # Immutable SHA destination, then one --destination per MUTABLE_TAGS entry.
     - |
