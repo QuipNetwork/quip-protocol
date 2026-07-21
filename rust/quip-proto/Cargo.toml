@@ -1,0 +1,11 @@
+[package]
+name = "quip-proto"
+version = "0.3.0"
+edition = "2021"
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }

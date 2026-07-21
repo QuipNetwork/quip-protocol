@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["quip-proto"]
+# quip-protocol, quip-mock-coordinator, quip-mock-miner are added by later tasks
+# as their crates land; listing not-yet-created members breaks `cargo` entirely.
+
+[workspace.dependencies]
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
+tonic-build = "0.12"
