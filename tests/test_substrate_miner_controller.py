@@ -24,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import socket
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Tuple
@@ -34,11 +33,14 @@ import pytest
 
 from dwave_topologies.topologies.zephyr import zephyr
 from shared.keystore_hybrid import generate
-from shared.miner_bootstrap import BootstrapConfig, _maybe_seed_chain, _resolve_dev_signer
+from substrate.miner_bootstrap import BootstrapConfig, _maybe_seed_chain, _resolve_dev_signer
 from shared.miner_types import MiningResult
 from shared.miner_worker import MinerHandle
 from substrate.client import SubstrateClient
+from chain_probe import chain_reachable as _chain_reachable
+from chain_probe import dev_chain_reachable as _dev_chain_reachable
 from substrate.miner_controller import (
+    EARLY_SUBMISSION_ERRORS,
     FATAL_SUBMISSION_ERRORS,
     STALE_SUBMISSION_ERRORS,
     ControllerStats,
@@ -123,10 +125,55 @@ def _set_current(controller, ctx) -> None:
     )
 
 
+class _StubScheduler:
+    """Minimal WorkScheduler stand-in for bare-controller unit tests.
+
+    Reads the controller's live ``miner_handles`` / ``_dispatch_contexts``
+    at call time (tests reassign both after construction) and mirrors the
+    real scheduler's dispatch surface: ``dispatch_pow`` broadcasts,
+    ``fill_idle`` dispatches to idle handles only, ``dispatch_context``
+    resolves the immutable per-dispatch context map.
+    """
+
+    def __init__(self, controller) -> None:
+        self._controller = controller
+        # Handles the "active mempool job" owns; cancel_pow_siblings
+        # spares them exactly like the real scheduler.
+        self.job_owned: set[str] = set()
+
+    def dispatch_context(self, handle_id, dispatch_id):
+        return self._controller._dispatch_contexts.get((handle_id, dispatch_id))
+
+    def cancel_pow_siblings(self, winning_handle_id):
+        for h in self._controller.miner_handles:
+            if h.miner_id == winning_handle_id or h.miner_id in self.job_owned:
+                continue
+            h.cancel()
+
+    async def dispatch_pow(self, context, *, solution_number=None):
+        return {
+            h.miner_id: h.mine_work_item(context, solution_number=solution_number)
+            for h in self._controller.miner_handles
+        }
+
+    async def fill_idle(self, context, *, solution_number=None):
+        return {
+            h.miner_id: h.mine_work_item(context, solution_number=solution_number)
+            for h in self._controller.miner_handles
+            if h._active_dispatch_id == 0
+        }
+
+
 def _bare_controller() -> SubstrateMinerController:
     """Controller without calling __init__ — for unit tests that only
     exercise a single method. Sets up the attributes that method needs."""
     c = SubstrateMinerController.__new__(SubstrateMinerController)
+    # T7: handle ops delegate to the scheduler; the stub reads the
+    # controller's mutable handle list / context map at call time.
+    # (`_dispatch_contexts` below is now test-only seed data the stub
+    # scheduler's dispatch_context resolves — the real map lives on the
+    # WorkScheduler.)
+    c._scheduler = _StubScheduler(c)
     # After the pool.get("rpc") removal: parent owns build_client (compose+
     # sign only) and pool_client (swap-aware reads + submit).
     c.build_client = MagicMock()
@@ -134,6 +181,7 @@ def _bare_controller() -> SubstrateMinerController:
     # Default get_block_number returns 0; tests override as needed.
     c.pool_client.get_head = AsyncMock(return_value=b"\xff" * 32)
     c.pool_client.get_block_number = AsyncMock(return_value=0)
+    c.pool_client.query_latest_qblock_id = AsyncMock(return_value=None)
     # Default: no on-chain timestamp anchor (best-effort; tests override).
     c.pool_client.query_block_timestamp_ms = AsyncMock(return_value=None)
     c._shutdown_event = asyncio.Event()
@@ -170,7 +218,7 @@ def _bare_controller() -> SubstrateMinerController:
     # Anticipatory-submission state (Task 6b).
     c._latest_preview = {}
     c._latest_budget = {}
-    c._participated = set()
+    c._participated = OrderedDict()
     c._pow_constants = None
     c._base_difficulty_by_key = {}
     c._decay_schedule_by_key = {}  # WorkKey -> (schedule, last_proof_block, epoch_length)
@@ -181,6 +229,13 @@ def _bare_controller() -> SubstrateMinerController:
     c._timing = TimingTracker()
     c._fire_timer_task = None
     c._last_fire_status_key = None
+    # Resilience state (dark-validator fallbacks): no event manager, no
+    # pending submission, schedule retry unthrottled, horizon log unarmed.
+    c.events = None
+    c._pending_submission = None
+    c._replaying = None
+    c._schedule_retry_next_monotonic = 0.0
+    c._decay_horizon_logged_key = None
     # Per-round solution-number cache (on-disk archive key). Empty by
     # default; _set_current seeds it for the active round so submissions
     # land under the matching {solution_number}/ dir.
@@ -602,15 +657,6 @@ async def test_verify_proof_recorded_rpc_failure_returns_none():
 DEFAULT_URL = os.environ.get("QUIP_SUBSTRATE_URL", "ws://localhost:9944")
 
 
-def _chain_reachable(url: str) -> bool:
-    bare = url.split("://", 1)[1]
-    host, _, port_str = bare.partition(":")
-    port = int(port_str) if port_str else 9944
-    try:
-        with socket.create_connection((host, port), timeout=0.5):
-            return True
-    except (OSError, socket.timeout):
-        return False
 
 
 def _chain_requires_hybrid_signer(url: str) -> bool:
@@ -638,6 +684,35 @@ def _chain_requires_hybrid_signer(url: str) -> bool:
         return False
     except Exception:
         return False
+
+
+def _chain_has_per_topology_difficulty(url: str) -> bool:
+    """True if the chain's runtime exposes per-topology difficulty.
+
+    `quip-protocol-rs` MR !42 replaced the global `QuantumPow.Difficulty`
+    value with a per-topology `QuantumPow.Difficulties` storage map. The live
+    controller tests drive `_maybe_seed_chain`, which queries/sets difficulty
+    through that map; against an older runtime the seed path raises
+    `StorageFunctionNotFound` deep in bootstrap. Probe the metadata so those
+    tests skip cleanly (rather than hard-fail) until the runtime is deployed.
+    """
+    if not _chain_reachable(url):
+        return False
+    try:
+        from substrateinterface import SubstrateInterface
+        si = SubstrateInterface(url=url)
+        pallet = si.get_metadata().get_metadata_pallet("QuantumPow")
+        return (
+            pallet is not None
+            and pallet.get_storage_function("Difficulties") is not None
+        )
+    except Exception:
+        return False
+
+
+# Evaluated once at collection time; the live controller tests below gate on
+# it so they skip cleanly against a pre-MR!42 runtime.
+_CHAIN_HAS_PER_TOPOLOGY_DIFFICULTY = _chain_has_per_topology_difficulty(DEFAULT_URL)
 
 
 @asynccontextmanager
@@ -686,7 +761,7 @@ async def _live_controller(
 
         # //Alice resolves to the HybridSigner derived from
         # DEV_HYBRID_SEEDS — not substrate-interface URI derivation — on
-        # hybrid chains. See shared.miner_bootstrap._resolve_dev_signer.
+        # hybrid chains. See substrate.miner_bootstrap._resolve_dev_signer.
         alice = _resolve_dev_signer("//Alice")
         balance = await setup_client.query_balance(
             keystore.signer.account_id_bytes()
@@ -742,6 +817,7 @@ async def _live_controller(
         handle = MinerHandle(spec=spec)
 
     from substrate.pool import ValidatorPool
+    from substrate.work_scheduler import WorkScheduler
     pool = ValidatorPool(urls=[DEFAULT_URL])
     controller = SubstrateMinerController(
         pool=pool,
@@ -750,6 +826,16 @@ async def _live_controller(
         topology_hash=chain_topology_hash,
         core=core,
     )
+    # T7 wiring: the WorkScheduler owns the handle's drainer and all
+    # dispatch; the controller delegates (mirrors _build_scheduler_stack).
+    scheduler = WorkScheduler(
+        [handle],
+        on_pow_result=controller.enqueue_pow_result,
+        on_worker_message=controller.handle_worker_message,
+        provide_pow_context=controller.provide_pow_context,
+        on_fatal=lambda _hid, _reason: controller.shutdown(),
+    )
+    controller.attach_scheduler(scheduler)
 
     # Tests that use the yielded ``client`` (e.g., to query the chain
     # after a submission) need a direct SubstrateClient — the controller
@@ -757,6 +843,7 @@ async def _live_controller(
     # the swap-aware pool.
     client = SubstrateClient(urls=[DEFAULT_URL])
     await client.connect()
+    scheduler.start()
     run_task = asyncio.create_task(controller.run())
     try:
         # Yield after one scheduler tick so controller.run() has reached
@@ -778,8 +865,9 @@ async def _live_controller(
             logging.getLogger(__name__).exception(
                 "controller.run() raised during _live_controller teardown"
             )
+        await scheduler.stop()
         await client.close()
-        await pool.close()
+        await pool.shutdown()
         # When `core` owns the handle, let `core.close()` tear it down; the
         # caller is responsible for that. Otherwise we built the handle
         # ourselves and own its lifecycle.
@@ -792,8 +880,12 @@ async def _live_controller(
 
 
 @pytest.mark.skipif(
-    not _chain_reachable(DEFAULT_URL),
-    reason=f"substrate chain not reachable at {DEFAULT_URL}",
+    not _dev_chain_reachable(DEFAULT_URL),
+    reason=f"no dev substrate chain at {DEFAULT_URL}",
+)
+@pytest.mark.skipif(
+    not _CHAIN_HAS_PER_TOPOLOGY_DIFFICULTY,
+    reason="chain runtime lacks per-topology QuantumPow.Difficulties (pre-MR!42)",
 )
 @pytest.mark.timeout(180)
 async def test_controller_submits_proof_end_to_end(tmp_path):
@@ -824,8 +916,12 @@ async def test_controller_submits_proof_end_to_end(tmp_path):
 
 
 @pytest.mark.skipif(
-    not _chain_reachable(DEFAULT_URL),
-    reason=f"substrate chain not reachable at {DEFAULT_URL}",
+    not _dev_chain_reachable(DEFAULT_URL),
+    reason=f"no dev substrate chain at {DEFAULT_URL}",
+)
+@pytest.mark.skipif(
+    not _CHAIN_HAS_PER_TOPOLOGY_DIFFICULTY,
+    reason="chain runtime lacks per-topology QuantumPow.Difficulties (pre-MR!42)",
 )
 @pytest.mark.timeout(360)
 async def test_controller_long_haul_multi_block(tmp_path):
@@ -961,6 +1057,83 @@ async def test_handle_result_cancels_siblings_on_ok(monkeypatch):
     assert winner.cancel_calls == 0  # don't cancel the winner
     assert sibling_a.cancel_calls == 1
     assert sibling_b.cancel_calls == 1
+
+
+async def test_won_work_sibling_cancel_spares_job_owned_handles(monkeypatch):
+    """T7 regression: post-cutover `miner_handles` is ALL handles, so the
+    won-work sibling cancel must route through the scheduler — a direct
+    handle.cancel() would steal an active mempool job's dispatches (burning
+    its single requeue; paid samples on opted-in QPU)."""
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+
+    winner = _FakeHandle("winner")
+    pow_sibling = _FakeHandle("pow-sibling")
+    job_handle = _FakeHandle("job-handle")
+    winner._active_dispatch_id = 1
+    pow_sibling._active_dispatch_id = 1
+    job_handle._active_dispatch_id = 1
+    controller.miner_handles = [winner, pow_sibling, job_handle]
+    controller._scheduler.job_owned = {"job-handle"}
+
+    async def fake_submit_proof(*args, **kwargs):
+        return ExtrinsicReceipt(extrinsic_hash="0xabc")  # OK
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+
+    envelope = _ResultEnvelope(
+        result=_mining_result(), context=ctx, handle_id="winner"
+    )
+    await controller._handle_result(envelope)
+
+    assert pow_sibling.cancel_calls == 1
+    assert job_handle.cancel_calls == 0  # the job's handle is spared
+    assert winner.cancel_calls == 0
+
+
+async def test_handle_result_redispatches_idle_handle_on_verify_mismatch(monkeypatch):
+    """OK receipt but the runtime recorded someone else's proof
+    (_verify_proof_recorded returns -1): the controller must NOT close the
+    work key, and must re-dispatch the SAME context to IDLE handles only —
+    skipping a busy handle — while bumping contexts_dispatched. This is the
+    anti-deadlock guarantee that keeps an idle worker from sitting forever
+    after a silent rejection. It exercises _finalize_accepted_proof's
+    mismatch branch and _redispatch_after_verify_fail (gate_idle=True), which
+    are reachable only through _handle_result's OK path."""
+    from substrate.miner_controller import _work_key
+
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+
+    idle = _FakeHandle("idle")            # _active_dispatch_id == 0 → eligible
+    busy = _FakeHandle("busy")
+    busy._active_dispatch_id = 7          # active → must be skipped
+    controller.miner_handles = [idle, busy]
+
+    async def fake_submit_proof(*args, **kwargs):
+        return ExtrinsicReceipt(extrinsic_hash="0xabc")  # classifies OK
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+    controller._verify_proof_recorded = AsyncMock(return_value=-1)  # type: ignore[assignment]
+
+    await controller._handle_result(
+        _ResultEnvelope(result=_mining_result(), context=ctx, handle_id="idle")
+    )
+
+    # Anti-deadlock invariant: the work key stays open (not won by us).
+    assert _work_key(ctx) not in controller._closed_work_keys
+    assert controller.stats.proofs_submitted == 0
+    # Only the idle handle was re-dispatched; the busy one was skipped.
+    assert len(idle.mine_calls) == 1
+    assert idle.mine_calls[0][1] is ctx
+    assert len(busy.mine_calls) == 0
+    assert controller.stats.contexts_dispatched == 1
 
 
 async def test_handle_result_drops_duplicate_after_ok(monkeypatch):
@@ -1152,6 +1325,141 @@ async def test_handle_result_not_won_pow_sequence_none_on_rpc_failure(monkeypatc
         "pow_sequence must be None (not absent, not an exception) when the "
         "chain RPC is unavailable at submission time"
     )
+
+
+async def test_handle_result_fills_device_access_time_from_qpu_sum(monkeypatch):
+    """QPU path: the submitted MiningResult carries the summed per-attempt
+    QPU access time, not the wall clock."""
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    monkeypatch.setattr(controller, "_sum_qpu_access_us", lambda n: 555_000)
+
+    captured = {}
+
+    async def fake_submit_proof(bc, pc, signer, result, context, **kw):
+        captured["device"] = result.device_access_time_us
+        return ExtrinsicReceipt(
+            extrinsic_hash="0xabc",
+            error="Module(error=InvalidNonce, pallet='QuantumPow', index=0)",
+        )
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+    controller.pool_client.query_proofs_submitted = AsyncMock(return_value=0)
+    envelope = _ResultEnvelope(result=_mining_result(), context=ctx, handle_id="t-0")
+    await controller._handle_result(envelope)
+    assert captured["device"] == 555_000
+
+
+async def test_handle_result_falls_back_to_wall_clock(monkeypatch):
+    """No QPU time recorded -> wall clock seconds * 1e6."""
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    monkeypatch.setattr(controller, "_sum_qpu_access_us", lambda n: None)
+
+    captured = {}
+
+    async def fake_submit_proof(bc, pc, signer, result, context, **kw):
+        captured["device"] = result.device_access_time_us
+        return ExtrinsicReceipt(
+            extrinsic_hash="0xabc",
+            error="Module(error=InvalidNonce, pallet='QuantumPow', index=0)",
+        )
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+    controller.pool_client.query_proofs_submitted = AsyncMock(return_value=0)
+    result = _mining_result()
+    # mining_time is typed int but dataclasses don't enforce it; use a float
+    # to pin that sub-second precision is preserved (the old floor-then-scale
+    # bug would report 7_000_000 instead of 7_500_000).
+    result.mining_time = 7.5
+    envelope = _ResultEnvelope(result=result, context=ctx, handle_id="t-0")
+    await controller._handle_result(envelope)
+    assert captured["device"] == 7_500_000
+
+
+_RECORD_SUBMISSION_LOG_COMMON = {
+    "solution_number": _TEST_SOLUTION_NUMBER,
+    "miner_id": "miner-7",
+    "miner_type": "cpu",
+    "energy_milli": -1234,
+    "diversity_milli": 250,
+    "threshold_milli": -1000,
+    "last_proof_block_hash_hex": "0x" + "ab" * 32,
+    "num_valid": 5,
+}
+
+
+@pytest.mark.parametrize(
+    "outcome,extra",
+    [
+        # chain_error / RPC-error
+        ("chain_error", {"pow_sequence": 11, "error": "RuntimeError: boom"}),
+        # submitted_inblock / OK
+        (
+            "submitted_inblock",
+            {
+                "extrinsic_hash": "0xext",
+                "chain_block_hash": "0xblk",
+                "chain_block_number": 999,
+                "qpu_access_us_total": 61000,
+            },
+        ),
+        # rejected_stale / STALE
+        (
+            "rejected_stale",
+            {"extrinsic_hash": "0xext", "pow_sequence": 12, "error": "stale"},
+        ),
+        # chain_error / FATAL
+        (
+            "chain_error",
+            {"extrinsic_hash": "0xext", "pow_sequence": 13, "error": "fatal"},
+        ),
+    ],
+)
+def test_record_submission_forwards_kwargs(outcome, extra):
+    """``_record_submission`` writes the same row as a flat ``record(...)`` call.
+
+    Guards the helper that collapsed the four formerly inline
+    ``self._submission_log.record(...)`` blocks in ``_handle_result``: the row
+    it writes must be byte-identical (modulo the always-changing ``ts_ns``) to
+    a direct ``record(**log_common, outcome=outcome, **extra)`` call.
+    """
+    import tempfile
+
+    from shared.mining_attempt_log import SubmissionLogger
+
+    controller = _bare_controller()
+    controller._record_submission(
+        dict(_RECORD_SUBMISSION_LOG_COMMON), outcome, **extra
+    )
+    helper_path = (
+        controller._submission_log.log_dir
+        / str(_TEST_SOLUTION_NUMBER)
+        / "submission.json"
+    )
+    helper_record = json.loads(helper_path.read_text())
+
+    direct_log = SubmissionLogger(
+        log_dir=Path(tempfile.mkdtemp(prefix="quip-test-direct-")),
+    )
+    direct_log.record(
+        **_RECORD_SUBMISSION_LOG_COMMON, outcome=outcome, **extra
+    )
+    direct_path = (
+        direct_log.log_dir / str(_TEST_SOLUTION_NUMBER) / "submission.json"
+    )
+    direct_record = json.loads(direct_path.read_text())
+
+    # ts_ns is wall-clock and necessarily differs between the two writes.
+    helper_record.pop("ts_ns", None)
+    direct_record.pop("ts_ns", None)
+    assert helper_record == direct_record
 
 
 # ----------------------------------------------------------------------
@@ -1849,89 +2157,242 @@ def test_evict_resets_fire_status_key():
 
 
 # ----------------------------------------------------------------------
-# Participation marker (write-once System.remark per (miner, solution#))
+# Participation marker (write-once MinerRegistry.participate per solution#, node-level)
 # ----------------------------------------------------------------------
 
 
-async def test_participation_remark_submits_with_payload():
+async def test_participation_marker_submits_with_call_params():
     controller = _bare_controller()
-    controller.build_client.has_call = AsyncMock(return_value=True)
     controller.build_client.submit_extrinsic = AsyncMock(
         return_value=MagicMock(error=None)
     )
+    controller.pool_client.query_latest_qblock_id = AsyncMock(return_value=4)
     await controller._submit_participation_remark(
         {"schema": "quip-participation", "solution": 7, "miner": "qpu-0",
          "kind": "qpu", "budget_seconds": 90.0}
     )
     controller.build_client.submit_extrinsic.assert_awaited_once()
     args, kwargs = controller.build_client.submit_extrinsic.call_args
-    assert args[0] == "System"
-    assert args[1] == "remark_with_event"
-    body = args[2]["remark"]
-    payload = json.loads(body)
-    assert payload["schema"] == "quip-participation"
-    assert payload["solution"] == 7
-    assert payload["miner"] == "qpu-0"
-    assert payload["kind"] == "qpu"
-    assert payload["budget_seconds"] == 90.0
+    assert args[0] == "MinerRegistry"
+    assert args[1] == "participate"
+    assert args[2] == {
+        "qblock_id": 5,
+        "kind": "QpuDwave",
+        "budget_seconds": 90,
+    }
+    assert kwargs["wait_for"] == "inblock"
 
 
-async def test_participation_remark_falls_back_to_plain_remark():
+async def test_participation_marker_uses_first_qblock_when_no_latest_id():
     controller = _bare_controller()
-    controller.build_client.has_call = AsyncMock(return_value=True)
-    # remark_with_event raises; plain remark succeeds.
+    controller.pool_client.query_latest_qblock_id = AsyncMock(return_value=None)
     controller.build_client.submit_extrinsic = AsyncMock(
-        side_effect=[RuntimeError("no event variant"), MagicMock(error=None)]
+        return_value=MagicMock(error=None)
     )
     await controller._submit_participation_remark(
         {"schema": "quip-participation", "solution": 1, "miner": "cpu-0",
          "kind": "cpu"}
     )
-    assert controller.build_client.submit_extrinsic.await_count == 2
-    second_call = controller.build_client.submit_extrinsic.call_args_list[1]
-    assert second_call.args[1] == "remark"
+    args, _kwargs = controller.build_client.submit_extrinsic.call_args
+    assert args[2]["qblock_id"] == 1
+    assert args[2]["kind"] == "Cpu"
 
 
-async def test_participation_remark_swallows_failure():
+async def test_participation_remark_retries_transient_then_succeeds():
     controller = _bare_controller()
-    controller.build_client.has_call = AsyncMock(return_value=False)
+    controller.pool_client.query_latest_qblock_id = AsyncMock(return_value=2)
+    # First attempt fails with a stale-nonce "outdated" error (the reported
+    # 1010 Invalid Transaction); the retry re-composes a fresh nonce and lands.
+    controller.build_client.submit_extrinsic = AsyncMock(
+        side_effect=[
+            RuntimeError("1010 Invalid Transaction: Transaction is outdated"),
+            MagicMock(error=None),
+        ]
+    )
+    slept: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    await controller._submit_participation_remark(
+        {"schema": "quip-participation", "solution": 3, "miner": "5Test",
+         "kind": "cpu"},
+        sleeper=_record_sleep,
+    )
+    assert controller.build_client.submit_extrinsic.await_count == 2
+    assert len(slept) == 1  # one backoff between the two attempts
+
+
+async def test_participation_remark_swallows_persistent_failure():
+    from substrate.miner_controller import _PARTICIPATION_REMARK_RETRIES
+
+    controller = _bare_controller()
+    controller.pool_client.query_latest_qblock_id = AsyncMock(return_value=2)
     controller.build_client.submit_extrinsic = AsyncMock(
         side_effect=RuntimeError("rpc down")
     )
-    # Must not raise — observability path.
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    # Must not raise — retries the bounded number of times, then gives up.
     await controller._submit_participation_remark(
-        {"schema": "quip-participation", "solution": 2, "miner": "qpu-0",
-         "kind": "qpu"}
+        {"schema": "quip-participation", "solution": 2, "miner": "5Test",
+         "kind": "qpu"},
+        sleeper=_no_sleep,
+    )
+    assert (
+        controller.build_client.submit_extrinsic.await_count
+        == _PARTICIPATION_REMARK_RETRIES + 1
     )
 
 
-async def test_mark_participating_dedups_per_solution():
+async def test_participation_remark_times_out_a_hung_submit():
+    """A submit that never returns is bounded, retried, then swallowed.
+
+    Regression: a half-dead validator that accepts the extrinsic but never
+    reports inclusion once froze the fire-and-forget marker task forever
+    (no timeout on the ``wait_for="inblock"`` submit), silently pinning the
+    on-chain participation marker while the chain advanced. The submit must
+    be watch-timed like the win path so a hang becomes a transient failure.
+    """
+    from substrate.miner_controller import _PARTICIPATION_REMARK_RETRIES
+
+    controller = _bare_controller()
+    controller.pool_client.query_latest_qblock_id = AsyncMock(return_value=2)
+
+    async def _never_returns(*_args, **_kwargs):
+        await asyncio.Event().wait()  # blocks forever
+
+    controller.build_client.submit_extrinsic = AsyncMock(side_effect=_never_returns)
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    # Test-level guard: without the fix the coroutine hangs and this fires.
+    await asyncio.wait_for(
+        controller._submit_participation_remark(
+            {"schema": "quip-participation", "solution": 2, "miner": "5Test",
+             "kind": "qpu"},
+            sleeper=_no_sleep,
+            submit_timeout=0.01,
+        ),
+        timeout=5.0,
+    )
+    # Each hung attempt times out and is retried the bounded number of times.
+    assert (
+        controller.build_client.submit_extrinsic.await_count
+        == _PARTICIPATION_REMARK_RETRIES + 1
+    )
+
+
+async def test_mark_participating_dedups_per_solution_across_instances():
     controller = _bare_controller()
     controller._submit_participation_remark = AsyncMock(return_value=None)
-    msg = {"solution_number": 5, "kind": "qpu", "budget_seconds": 90.0}
-    controller._mark_participating("qpu-0", msg)
-    controller._mark_participating("qpu-0", dict(msg))  # duplicate
+    # Two different miner instances report the SAME solution # → exactly one
+    # node-level marker (deduped on solution#, not on the per-instance worker).
+    controller._mark_participating(
+        {"solution_number": 5, "kind": "qpu", "budget_seconds": 90.0}
+    )
+    controller._mark_participating({"solution_number": 5, "kind": "cpu"})
     await asyncio.sleep(0)  # let the spawned task run
     controller._submit_participation_remark.assert_awaited_once()
     payload = controller._submit_participation_remark.call_args.args[0]
     assert payload == {
-        "schema": "quip-participation", "solution": 5, "miner": "qpu-0",
+        "schema": "quip-participation", "solution": 5, "miner": "5Test",
         "kind": "qpu", "budget_seconds": 90.0,
     }
-    # A different solution # for the same miner fires again.
-    controller._mark_participating("qpu-0", {"solution_number": 6, "kind": "qpu"})
+    # A different solution # fires again.
+    controller._mark_participating({"solution_number": 6, "kind": "qpu"})
     await asyncio.sleep(0)
     assert controller._submit_participation_remark.await_count == 2
 
 
-async def test_mark_participating_cpu_omits_budget():
+async def test_mark_participating_uses_node_id_and_omits_budget():
     controller = _bare_controller()
     controller._submit_participation_remark = AsyncMock(return_value=None)
-    controller._mark_participating("cpu-0", {"solution_number": 9, "kind": "cpu"})
+    controller._mark_participating({"solution_number": 9, "kind": "cpu"})
     await asyncio.sleep(0)
     payload = controller._submit_participation_remark.call_args.args[0]
     assert "budget_seconds" not in payload
     assert payload["kind"] == "cpu"
+    # Node identity (signer ss58), not the per-instance worker id.
+    assert payload["miner"] == "5Test"
+
+
+async def test_mark_participating_skips_when_signer_address_unavailable():
+    controller = _bare_controller()
+    controller._submit_participation_remark = AsyncMock(return_value=None)
+    # _mark_participating runs unguarded on the drain loop; a signer failure
+    # must NOT propagate (the drain loop's broad except would shut the
+    # controller down — an observability failure crashing mining).
+    controller.signer.ss58_address.side_effect = RuntimeError("keystore locked")
+    controller._mark_participating({"solution_number": 11, "kind": "cpu"})
+    await asyncio.sleep(0)
+    controller._submit_participation_remark.assert_not_awaited()
+    # The solution must NOT be pre-marked done, so a recovered later report
+    # still fires (no permanent suppression from a transient signer failure).
+    controller.signer.ss58_address.side_effect = None
+    controller.signer.ss58_address.return_value = "5Test"
+    controller._mark_participating({"solution_number": 11, "kind": "cpu"})
+    await asyncio.sleep(0)
+    controller._submit_participation_remark.assert_awaited_once()
+
+
+async def test_mark_participating_evicts_oldest_deterministically(monkeypatch):
+    import substrate.miner_controller as mc
+    monkeypatch.setattr(mc, "_PARTICIPATION_RETENTION", 3)
+    controller = _bare_controller()
+    controller._submit_participation_remark = AsyncMock(return_value=None)
+    # Add 4 with retention 3 → the OLDEST (1) is evicted, never an arbitrary
+    # (possibly still-active) entry that would re-fire its marker.
+    for sol in (1, 2, 3, 4):
+        controller._mark_participating({"solution_number": sol, "kind": "cpu"})
+    await asyncio.sleep(0)
+    assert list(controller._participated.keys()) == [2, 3, 4]
+
+
+async def test_participation_remark_receipt_error_is_terminal():
+    controller = _bare_controller()
+    controller.pool_client.query_latest_qblock_id = AsyncMock(return_value=2)
+    controller.build_client.submit_extrinsic = AsyncMock(
+        return_value=MagicMock(error="System.ExtrinsicFailed")
+    )
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    # An included-but-rejected marker won't be fixed by resubmitting the same
+    # call — it's terminal, not retried (no pointless resubmission storm).
+    await controller._submit_participation_remark(
+        {"schema": "quip-participation", "solution": 4, "miner": "5Test",
+         "kind": "cpu"},
+        sleeper=_no_sleep,
+    )
+    assert controller.build_client.submit_extrinsic.await_count == 1
+
+
+async def test_participation_remark_retries_when_fallback_path_also_fails():
+    controller = _bare_controller()
+    controller.pool_client.query_latest_qblock_id = AsyncMock(side_effect=[2, 3])
+    # Attempt 1 loses a stale-nonce race. Attempt 2 re-reads LatestQBlockId and
+    # recomposes for the new candidate qblock before landing.
+    controller.build_client.submit_extrinsic = AsyncMock(side_effect=[
+        RuntimeError("1010 Transaction is outdated"),
+        MagicMock(error=None),
+    ])
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    await controller._submit_participation_remark(
+        {"schema": "quip-participation", "solution": 8, "miner": "5Test",
+         "kind": "qpu"},
+        sleeper=_no_sleep,
+    )
+    assert controller.build_client.submit_extrinsic.await_count == 2
+    assert controller.build_client.submit_extrinsic.call_args_list[0].args[2]["qblock_id"] == 3
+    assert controller.build_client.submit_extrinsic.call_args_list[1].args[2]["qblock_id"] == 4
 
 
 
@@ -1980,3 +2441,399 @@ def test_sum_qpu_access_us_swallows_read_errors(monkeypatch):
         "substrate.miner_controller.query_by_solution_number", _boom
     )
     assert controller._sum_qpu_access_us(7) is None
+
+
+# ----------------------------------------------------------------------
+# Pending submissions (optimistic submit-on-reconnect) + EARLY outcome
+# ----------------------------------------------------------------------
+
+
+class _IdleHandle:
+    """Idle fake handle: records fill_idle re-dispatches."""
+
+    def __init__(self, miner_id: str = "h0") -> None:
+        self.miner_id = miner_id
+        self._active_dispatch_id = 0
+        self.dispatched: list = []
+
+    def mine_work_item(self, context, *, solution_number=None) -> int:
+        self.dispatched.append(context)
+        self._active_dispatch_id += 1
+        return self._active_dispatch_id
+
+
+@pytest.mark.parametrize("error_name", EARLY_SUBMISSION_ERRORS)
+def test_classify_early_error_names_substrate_format(error_name):
+    """EARLY beats the unknown→FATAL default: a local-decay overshoot
+    submission must queue-and-retry, never crash the controller."""
+    receipt = ExtrinsicReceipt(
+        extrinsic_hash="0xabc",
+        error=f"Module(error={error_name}, pallet='QuantumPow', index=0)",
+    )
+    assert classify_submission(receipt) is SubmissionOutcome.EARLY
+
+
+async def test_submit_failure_queues_pending_and_fills_idle(monkeypatch):
+    """An RPC-failed submit holds the result for replay (not a drop) and
+    resumes mining the round on the now-idle emitter."""
+    from substrate.miner_controller import _work_key
+
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    handle = _IdleHandle()
+    controller.miner_handles = [handle]
+
+    async def fake_submit_proof(*args, **kwargs):
+        raise ConnectionError("websocket disconnected")
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+
+    envelope = _ResultEnvelope(
+        result=_mining_result(), context=ctx, handle_id="test-0",
+    )
+    await controller._handle_result(envelope)
+
+    pending = controller._pending_submission
+    assert pending is not None
+    assert pending.work_key == _work_key(ctx)
+    assert pending.attempts == 1
+    # effective_floor falls back to energy (-1.0) => -1000 milli.
+    assert pending.floor_milli == -1000
+    assert handle.dispatched == [ctx], "fill_idle must resume the round"
+    assert controller.stats.submission_errors == 1
+
+
+async def test_early_receipt_queues_pending(monkeypatch):
+    """An EARLY receipt (threshold not yet decayed to the floor) queues the
+    result instead of raising like the former unknown→FATAL path."""
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    controller.miner_handles = []
+
+    async def fake_submit_proof(*args, **kwargs):
+        return ExtrinsicReceipt(
+            extrinsic_hash="0xabc",
+            error="Module(error=InsufficientEnergy, pallet='QuantumPow', index=0)",
+        )
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+
+    envelope = _ResultEnvelope(
+        result=_mining_result(), context=ctx, handle_id="test-0",
+    )
+    await controller._handle_result(envelope)  # must not raise
+    assert controller._pending_submission is not None
+
+
+async def test_pending_keeps_lower_floor():
+    """A better (lower-floor) sibling replaces the held envelope; a worse
+    one only bumps attempt/backoff state."""
+    import dataclasses as _dc
+
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    controller.miner_handles = []
+    from substrate.miner_controller import _work_key
+    key = _work_key(ctx)
+    log_common = {"solution_number": 1, "miner_id": "t", "miner_type": "CPU",
+                  "energy_milli": 0, "diversity_milli": 0, "threshold_milli": 0,
+                  "last_proof_block_hash_hex": "0x", "num_valid": 1}
+
+    def _envelope(floor):
+        result = _dc.replace(_mining_result(), submit_floor_energy=floor)
+        return _ResultEnvelope(result=result, context=ctx, handle_id="t")
+
+    await controller._queue_pending_submission(
+        _envelope(-5.0), key, error="e1", log_common=log_common,
+    )
+    assert controller._pending_submission.floor_milli == -5000
+
+    # Worse floor: state bumps, envelope kept.
+    await controller._queue_pending_submission(
+        _envelope(-4.0), key, error="e2", log_common=log_common,
+    )
+    assert controller._pending_submission.floor_milli == -5000
+    assert controller._pending_submission.attempts == 2
+
+    # Better floor: replaces.
+    await controller._queue_pending_submission(
+        _envelope(-6.0), key, error="e3", log_common=log_common,
+    )
+    assert controller._pending_submission.floor_milli == -6000
+    assert controller._pending_submission.attempts == 3
+
+
+def _seed_pending(controller, ctx, *, attempts=1, last_attempt_age_s=100.0):
+    """Install a pending submission directly (bypasses the queue path)."""
+    import time as _time
+    from substrate.miner_controller import _PendingSubmission, _work_key
+
+    envelope = _ResultEnvelope(
+        result=_mining_result(), context=ctx, handle_id="t",
+    )
+    now = _time.monotonic()
+    pending = _PendingSubmission(
+        envelope=envelope,
+        work_key=_work_key(ctx),
+        floor_milli=-1000,
+        queued_at_monotonic=now - last_attempt_age_s,
+        last_attempt_monotonic=now - last_attempt_age_s,
+        attempts=attempts,
+    )
+    controller._pending_submission = pending
+    return pending
+
+
+async def test_replay_on_recovery_hands_pending_to_result_path():
+    """With the pool fresh and backoff elapsed, the replay takes the
+    pending OUT and re-drives the full result path."""
+    import time as _time
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    pending = _seed_pending(controller, ctx)
+    controller.events = SimpleNamespace(
+        last_successful_poll_monotonic=_time.monotonic(),
+    )
+    controller._handle_result = AsyncMock()
+
+    await controller._maybe_replay_pending()
+
+    controller._handle_result.assert_awaited_once_with(pending.envelope)
+    assert controller._pending_submission is None
+
+
+async def test_replay_skipped_while_pool_stale():
+    """No replay while the pool is still dark — wait for reconnect."""
+    import time as _time
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    _seed_pending(controller, ctx)
+    controller.events = SimpleNamespace(
+        last_successful_poll_monotonic=_time.monotonic() - 100.0,
+    )
+    controller._handle_result = AsyncMock()
+
+    await controller._maybe_replay_pending()
+
+    controller._handle_result.assert_not_awaited()
+    assert controller._pending_submission is not None
+
+
+async def test_replay_respects_backoff():
+    import time as _time
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    _seed_pending(controller, ctx, last_attempt_age_s=0.0)  # just attempted
+    controller.events = SimpleNamespace(
+        last_successful_poll_monotonic=_time.monotonic(),
+    )
+    controller._handle_result = AsyncMock()
+
+    await controller._maybe_replay_pending()
+
+    controller._handle_result.assert_not_awaited()
+    assert controller._pending_submission is not None
+
+
+async def test_pending_dropped_on_work_key_roll():
+    """A pending bound to a rolled round is dropped, both by the replay
+    guard and by _evict_anticipatory_state."""
+    from unittest.mock import AsyncMock
+
+    controller = _bare_controller()
+    ctx_old = _context(b"\xaa" * 32)
+    pending = _seed_pending(controller, ctx_old)
+    # Round rolled: current key differs.
+    _set_current(controller, _context(b"\xbb" * 32))
+    controller._handle_result = AsyncMock()
+
+    await controller._maybe_replay_pending()
+    controller._handle_result.assert_not_awaited()
+    assert controller._pending_submission is None
+
+    # Eviction path drops it too.
+    controller._pending_submission = pending
+    controller._evict_anticipatory_state(pending.work_key)
+    assert controller._pending_submission is None
+
+
+async def test_replay_failure_requeues(monkeypatch):
+    """A replay that fails again on RPC lands back in the pending slot
+    with bumped attempts (bounded by the round roll, per policy)."""
+    import time as _time
+    from types import SimpleNamespace
+
+    controller = _bare_controller()
+    ctx = _context(b"\xaa" * 32)
+    _set_current(controller, ctx)
+    controller.miner_handles = []
+    _seed_pending(controller, ctx, attempts=1)
+    controller.events = SimpleNamespace(
+        last_successful_poll_monotonic=_time.monotonic(),
+    )
+
+    async def fake_submit_proof(*args, **kwargs):
+        raise ConnectionError("still down")
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_proof", fake_submit_proof
+    )
+
+    await controller._maybe_replay_pending()
+
+    assert controller._pending_submission is not None
+    assert controller._pending_submission.attempts == 2
+
+
+async def test_fire_suppressed_while_pending(monkeypatch):
+    """The anticipatory fire yields to a queued live-submittable result."""
+    controller = _bare_controller()
+    ctx, key = _seed_cadence_state(controller, valid_at_block=20)
+
+    now = asyncio.get_running_loop().time()
+    controller._timing.observe_head(
+        block_number=20,
+        chain_ts_s=1000.0,
+        monotonic_now=now - 100.0,
+        wallclock_now=1000.0,
+    )
+
+    fired = []
+
+    async def fake_fire(c, k, p, b):
+        fired.append((k, b))
+
+    monkeypatch.setattr(controller, "_fire_preview", fake_fire)
+    _seed_pending(controller, ctx)
+
+    await controller._maybe_fire_on_cadence()
+    assert fired == [], "fire must be suppressed while a pending exists"
+
+    # Sanity: with the pending cleared, the same state fires.
+    controller._pending_submission = None
+    await controller._maybe_fire_on_cadence()
+    assert len(fired) == 1
+
+
+# ----------------------------------------------------------------------
+# consecutive_submit_failures on the anticipatory-fire path (QUI-899)
+#
+# The gh-20 counter is the signal an operator uses to tell "mining but
+# landing nothing" from a healthy miner. It was only ever wired into the
+# worker-result path, so a miner stuck in the QUI-899 loop — anticipatory
+# fire, RETRY-exhausted, repeat every tick — left it frozen at whatever the
+# last worker-path submission set. The counter read healthy while the bug
+# was live, which is what made the failure so hard to see from outside.
+# ----------------------------------------------------------------------
+
+
+async def test_retry_exhausted_counts_a_submit_failure(monkeypatch):
+    """RETRY-exhausted is a failed submit and must move the gh-20 counter.
+
+    Without this the QUI-899 loop is invisible on /api/v1/status.
+    """
+    controller = _bare_controller()
+    _stub_predictor_inputs(controller)
+    ctx = _ctx_at_block(b"\xaa" * 32, 19)
+    _store_preview_entry(controller, ctx)
+    from substrate.miner_controller import _work_key
+    key = _work_key(ctx)
+    preview = controller._latest_preview[key]
+
+    async def fake_submit_with_retry(*args, **kwargs):
+        from substrate.submitter import SubmitResult, SubmitRetryAction
+        return SubmitResult(
+            action=SubmitRetryAction.RETRY, attempts=4, error="TimeoutError"
+        )
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
+    )
+
+    await controller._fire_preview(ctx, key, preview, 20)
+    assert controller.stats.consecutive_submit_failures == 1
+
+    # A miner stuck in this loop keeps climbing, which is what makes the
+    # stuck state distinguishable from a quiet-but-healthy one.
+    await controller._fire_preview(ctx, key, preview, 21)
+    assert controller.stats.consecutive_submit_failures == 2
+    assert controller.stats.last_submission_error == "TimeoutError"
+
+
+async def test_anticipatory_success_clears_the_failure_streak(monkeypatch):
+    """A landed anticipatory proof must reset the streak to 0.
+
+    Otherwise a miner whose wins all come through the anticipatory path
+    carries a stale non-zero count forever and reads as broken.
+    """
+    controller = _bare_controller()
+    _stub_predictor_inputs(controller)
+    controller._verify_proof_recorded = AsyncMock(return_value=42)
+    ctx = _ctx_at_block(b"\xaa" * 32, 19)
+    _store_preview_entry(controller, ctx)
+    from substrate.miner_controller import _work_key
+    key = _work_key(ctx)
+    preview = controller._latest_preview[key]
+    controller.stats.consecutive_submit_failures = 7
+
+    async def fake_submit_with_retry(*args, **kwargs):
+        from substrate.submitter import SubmitResult, SubmitRetryAction
+        return SubmitResult(
+            action=SubmitRetryAction.SUCCESS,
+            receipt=ExtrinsicReceipt(extrinsic_hash="0xabc"),
+        )
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
+    )
+
+    await controller._fire_preview(ctx, key, preview, 20)
+
+    assert controller.stats.proofs_submitted == 1
+    assert controller.stats.consecutive_submit_failures == 0
+
+
+async def test_stop_fatal_counts_a_submit_failure(monkeypatch):
+    """STOP_FATAL must move the counter, matching _handle_result's FATAL
+    branch which increments both submission_errors and the streak."""
+    controller = _bare_controller()
+    _stub_predictor_inputs(controller)
+    ctx = _ctx_at_block(b"\xaa" * 32, 19)
+    _store_preview_entry(controller, ctx)
+    from substrate.miner_controller import _work_key
+    key = _work_key(ctx)
+    preview = controller._latest_preview[key]
+
+    async def fake_submit_with_retry(*args, **kwargs):
+        from substrate.submitter import SubmitResult, SubmitRetryAction
+        return SubmitResult(
+            action=SubmitRetryAction.STOP_FATAL, error="BadProof"
+        )
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
+    )
+
+    await controller._fire_preview(ctx, key, preview, 20)
+
+    assert controller.stats.submission_errors == 1
+    assert controller.stats.consecutive_submit_failures == 1

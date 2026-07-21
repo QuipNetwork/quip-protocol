@@ -66,24 +66,27 @@ def test_connectionless_finalize_sample_reconstructs_with_defect():
     its own — it has no D-Wave connection (self.sampler is None), so it must
     NOT depend on a live sampler instance to do this.
     """
-    import dimod
+    import numpy as np
     from QPU.dwave_miner import DWaveMiner
     from QPU.dwave_sampler import DefectInfo
+    from shared.base_miner import _SharedSampleSet
 
     m = DWaveMiner(miner_id="worker-orchestrator", connect=False)
     assert m.sampler is None  # the precondition that triggered the crash
 
-    # Topology has 3 qubits; qubit 2 went offline and was clamped to +1.
-    reduced = dimod.SampleSet.from_samples(
-        [{0: -1, 1: 1}], vartype=dimod.SPIN, energy=[-5.0],
+    # Topology has 3 qubits; qubit 2 went offline and was clamped to +1. The
+    # stream driver ships a label-less _SharedSampleSet (raw int8 matrix), so
+    # reconstruction is positional against ``nodes``. Live columns map to the
+    # non-clamped nodes [0, 1] and carry [-1, 1].
+    reduced = _SharedSampleSet(
+        np.array([[-1, 1]], dtype=np.int8), np.array([-5.0], dtype=np.float64),
     )
     defect_info = DefectInfo(
         fixed_spins={2: 1}, energy_offset=2.0, removed_edges={},
     )
 
-    full = m._finalize_sample(reduced, defect_info)
+    full = m._finalize_sample(reduced, defect_info, [0, 1, 2])
 
-    sample = full.first.sample
-    assert set(sample) == {0, 1, 2}, "clamped qubit must reappear in full sample"
-    assert sample[2] == 1, "clamped qubit must carry its fixed spin"
-    assert full.first.energy == -3.0, "energy must be reduced energy + offset"
+    row = full.record.sample[0]
+    assert list(row) == [-1, 1, 1], "clamped qubit must reappear with its spin"
+    assert full.record.energy[0] == -3.0, "energy must be reduced energy + offset"

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -19,9 +20,14 @@ from shared.stats_snapshot import StatsSnapshotWriter, read_snapshot
 
 @pytest.mark.asyncio
 async def test_writer_writes_initial_snapshot(tmp_path: Path):
-    """One pass through the writer's loop produces the JSON file."""
+    """One pass through the writer's loop produces the JSON file.
+
+    The file is inspected *while the writer is running* — graceful
+    shutdown removes it (see ``test_writer_removes_snapshot_on_shutdown``).
+    """
     snapshot_path = tmp_path / "stats.json"
     snapshot_data = {"heads_observed": 7, "active_url": "http://a"}
+    seen: dict = {}
 
     writer = StatsSnapshotWriter(
         path=snapshot_path,
@@ -32,13 +38,37 @@ async def test_writer_writes_initial_snapshot(tmp_path: Path):
 
     async def stop_after_one_write():
         await asyncio.sleep(0.05)  # let writer run ≥ once
+        assert snapshot_path.exists()
+        seen["loaded"] = json.loads(snapshot_path.read_text())
         shutdown_event.set()
 
     await asyncio.gather(writer.run(shutdown_event), stop_after_one_write())
 
-    assert snapshot_path.exists()
-    loaded = json.loads(snapshot_path.read_text())
-    assert loaded == snapshot_data
+    assert seen["loaded"] == snapshot_data
+
+
+@pytest.mark.asyncio
+async def test_writer_removes_snapshot_on_shutdown(tmp_path: Path):
+    """On graceful shutdown the writer deletes its own snapshot file so
+    the aggregator dir stays truthful — a stopped controller must not
+    leave a stale file behind that telemetry would keep merging."""
+    snapshot_path = tmp_path / "telemetry-stats-cpu.json"
+
+    writer = StatsSnapshotWriter(
+        path=snapshot_path,
+        get_snapshot=lambda: {"mode": "cpu"},
+        interval_s=0.01,
+    )
+    shutdown_event = asyncio.Event()
+
+    async def stop_after_one_write():
+        await asyncio.sleep(0.05)  # let writer create the file at least once
+        assert snapshot_path.exists()
+        shutdown_event.set()
+
+    await asyncio.gather(writer.run(shutdown_event), stop_after_one_write())
+
+    assert not snapshot_path.exists()
 
 
 @pytest.mark.asyncio
@@ -57,15 +87,17 @@ async def test_writer_updates_snapshot_each_interval(tmp_path: Path):
         interval_s=0.01,
     )
     shutdown_event = asyncio.Event()
+    seen: dict = {}
 
     async def stop_after_several_writes():
         await asyncio.sleep(0.1)  # at least ~10 writes at 0.01s interval
+        # Read before shutdown: graceful shutdown removes the file.
+        seen["loaded"] = json.loads(snapshot_path.read_text())
         shutdown_event.set()
 
     await asyncio.gather(writer.run(shutdown_event), stop_after_several_writes())
 
-    loaded = json.loads(snapshot_path.read_text())
-    assert loaded["value"] >= 3  # latest write should be at least the 3rd
+    assert seen["loaded"]["value"] >= 3  # latest write should be at least the 3rd
 
 
 def test_read_snapshot_returns_dict_when_file_exists(tmp_path: Path):
@@ -215,6 +247,34 @@ def test_read_all_snapshots_missing_dir_returns_empty(tmp_path):
     assert read_all_snapshots(tmp_path / "does-not-exist") == []
 
 
+def test_read_all_snapshots_skips_stale_files(tmp_path):
+    """A snapshot from a controller that stopped writing (config change,
+    restart, or crash) must be dropped so the aggregator never reports
+    phantom miners from a dead child. Staleness is judged by file mtime
+    because the snapshot dict carries no internal timestamp."""
+    fresh = tmp_path / "telemetry-stats-gpu.json"
+    stale = tmp_path / "telemetry-stats-cpu.json"
+    fresh.write_text(json.dumps({"mode": "gpu", "controller": {}}))
+    stale.write_text(json.dumps({"mode": "cpu", "controller": {}}))
+    # Age the cpu file well past the gate (dead child from a prior run).
+    old = time.time() - 600
+    os.utime(stale, (old, old))
+
+    snaps = read_all_snapshots(tmp_path, max_age_s=30.0)
+    assert [s["mode"] for s in snaps] == ["gpu"]
+
+
+def test_read_all_snapshots_no_max_age_keeps_all(tmp_path):
+    """Default (max_age_s=None) preserves legacy behavior: no staleness
+    gate, every parseable file is returned regardless of age."""
+    stale = tmp_path / "telemetry-stats-cpu.json"
+    stale.write_text(json.dumps({"mode": "cpu", "controller": {}}))
+    old = time.time() - 600
+    os.utime(stale, (old, old))
+
+    assert len(read_all_snapshots(tmp_path)) == 1
+
+
 def test_merge_snapshots_empty_returns_none():
     assert merge_snapshots([]) is None
     assert merge_snapshots([{}, None]) is None  # type: ignore[list-item]
@@ -334,3 +394,12 @@ def test_merge_snapshots_single_snapshot_passes_through():
     assert merged["miners"] == [{"id": "rig-CPU-1", "type": "CPU"}]
     assert merged["node_id"] == "rig"
     assert set(merged["modes"].keys()) == {"cpu"}
+
+
+def test_merge_snapshots_takes_first_nonnull_sync_state():
+    """sync_state merges first-wins — all children share one validator."""
+    merged = merge_snapshots([
+        {"mode": "cpu", "controller": {}, "sync_state": None},
+        {"mode": "qpu", "controller": {}, "sync_state": {"is_syncing": True}},
+    ])
+    assert merged["sync_state"] == {"is_syncing": True}

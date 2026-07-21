@@ -5,8 +5,9 @@ the float-to-milli boundary — stays reviewable independently of the RPC
 plumbing. Phase 4's controller orchestrates: it calls into here, but neither
 the client nor the controller knows about the proof shape.
 
-Post-MR-!20: the on-chain ``QuantumProof`` carries only
-``{topology_hash, nonce (U256), salt ([u8; 32]), solutions (BoundedVec<BoundedVec<u8>>)}``.
+Post-MR-!20: the on-chain ``QuantumProof`` carries
+``{topology_hash, nonce (U256), salt ([u8; 32]),
+solutions (BoundedVec<BoundedVec<u8>>), device_access_time_us (u64)}``.
 Nodes, edges, and h-values are looked up from ``RegisteredTopologies`` by
 ``topology_hash``. Each solution is bit-packed under the registered
 ``allowed_spin_values`` spec (1 byte per 8 binary spins).
@@ -18,13 +19,15 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Awaitable, Callable, List, Optional
 
-from shared.allowed_value_spec import MILLI_SCALE as _MILLI_SCALE
+from substrateinterface.exceptions import SubstrateRequestException
+
+from shared.allowed_value_spec import MILLI_SCALE
 from shared.logging_config import get_logger
 from shared.miner_types import MiningResult
 from substrate.validator_handle import ValidatorSwapped
 from shared.packed_solution import pack_solution
 from shared.signer import Signer
-from substrate.client import SubstrateClient
+from substrate.client import ExtrinsicRejected, SubstrateClient
 from substrate.pool_client import PoolClient
 from substrate.types import ExtrinsicReceipt, SubstrateMiningContext
 
@@ -62,6 +65,48 @@ FATAL_SUBMISSION_ERRORS = (
     "BadSignature",
     "BadProof",
 )
+
+
+class RuntimeIncompatibleError(RuntimeError):
+    """This client build is too old for the chain's current runtime.
+
+    Raised (fail-fast) when a submit fails with a schema mismatch that no
+    amount of retrying can fix — a required extrinsic field the client never
+    populates, or a storage/call item the client depends on that the runtime
+    renamed or removed. The alternative (the gh-20 failure) is retrying an
+    unencodable proof tens of thousands of times while the node silently lands
+    nothing and still reports ``is_mining=true``.
+    """
+
+
+# Substrate-interface / scale-codec substrings that identify a runtime-schema
+# mismatch rather than a transient RPC or a bad candidate. These are
+# deterministic: the same client + runtime reproduces them every time.
+_RUNTIME_INCOMPAT_SIGNATURES = (
+    # scalecodec: a required struct field the client did not supply, e.g. the
+    # runtime added `device_access_time_us` to the proof (gh-20).
+    "is missing in given value",
+    # substrate-interface: a storage item the client reads was renamed/removed,
+    # e.g. `QuantumPow.Difficulty` moving under a new runtime.
+    "StorageFunctionNotFound",
+    # substrate-interface: the call module/function is no longer in metadata.
+    "not found in metadata",
+)
+
+
+def runtime_incompat_reason(exc: BaseException) -> Optional[str]:
+    """Return a reason string if ``exc`` is a runtime-schema mismatch, else None.
+
+    Matches the deterministic encode/lookup failures a too-old client hits
+    against a newer runtime (see :data:`_RUNTIME_INCOMPAT_SIGNATURES`). Used to
+    turn those from silently-retried per-submit errors into a single fail-fast
+    :class:`RuntimeIncompatibleError`.
+    """
+    text = f"{type(exc).__name__}: {exc}"
+    for sig in _RUNTIME_INCOMPAT_SIGNATURES:
+        if sig in text:
+            return text
+    return None
 
 
 class SubmitRetryAction(str, Enum):
@@ -108,18 +153,15 @@ class SubmitResult:
     attempts: int = 0
 
 
-# Same convention the Rust pallet uses everywhere: milli = ×1000.
-MILLI_SCALE: int = _MILLI_SCALE
-
-
 def encode_quantum_proof(
     result: MiningResult,
     context: SubstrateMiningContext,
 ) -> dict:
     """Build the `QuantumProof` payload expected by `QuantumPow.submit_proof`.
 
-    The returned dict matches the post-MR-!20 SCALE struct field-for-field —
-    ``compose_call`` serializes it for us.
+    The returned dict matches the spec-111 SCALE struct field-for-field —
+    ``compose_call`` serializes it for us. Fields: ``topology_hash``,
+    ``nonce``, ``salt``, ``solutions``, ``device_access_time_us (u64)``.
 
     Each solution is bit-packed against ``context.allowed_spin_values`` via
     :func:`shared.packed_solution.pack_solution`. For the default binary
@@ -166,6 +208,11 @@ def encode_quantum_proof(
         "nonce": int.from_bytes(result.nonce, "big"),
         "salt": [int(b) for b in result.salt],
         "solutions": ([([int(b) for b in packed],) for packed in packed_solutions],),
+        # Always included: scalecodec's Struct.process_encode iterates the
+        # CHAIN metadata's field list, so a pre-111 node ignores this key
+        # and a 111 node requires it. No spec-version gating needed.
+        # Clamp to zero: negative values would fail u64 SCALE encoding.
+        "device_access_time_us": max(0, int(result.device_access_time_us or 0)),
     }
 
 
@@ -288,7 +335,9 @@ async def submit_with_retry(
     Retry policy:
       - Transient exceptions (``BrokenPipeError`` / ``TimeoutError`` /
         ``ConnectionError`` / ``OSError`` / generic ``RuntimeError`` from an
-        RPC) → RETRY. ``submit_proof`` already reconnects first via its
+        RPC, and ``SubstrateRequestException`` txpool rejections such as
+        1010 stale-nonce races with a sibling extrinsic from the same
+        account) → RETRY. ``submit_proof`` already reconnects first via its
         ``ensure_live`` probe.
       - ``ValidatorSwapped`` (the pool hot-swapped validators mid-submit) →
         RETRY. This is safe here *only* because each attempt re-composes
@@ -320,19 +369,27 @@ async def submit_with_retry(
         raise ValueError(f"max_retries must be non-negative, got {max_retries}")
     sleep = sleeper if sleeper is not None else asyncio.sleep
     last_error: Optional[str] = None
-    last_receipt: Optional[ExtrinsicReceipt] = None
     total_attempts = max_retries + 1
 
     for attempt in range(1, total_attempts + 1):
         try:
-            receipt = await submit_proof(
-                build_client,
-                pool_client,
-                signer,
-                result,
-                context,
-                wait_for=wait_for,
-                tip=tip,
+            # Watch-timeout cap: a submit-and-watch subscription can die
+            # without ever delivering a terminal status (observed live —
+            # it froze the anticipatory fire timer mid-await, silently
+            # stopping all head/result processing while the run task
+            # looked alive). asyncio.TimeoutError is transient, so a dead
+            # watch becomes a fresh-compose retry instead of a hang.
+            receipt = await asyncio.wait_for(
+                submit_proof(
+                    build_client,
+                    pool_client,
+                    signer,
+                    result,
+                    context,
+                    wait_for=wait_for,
+                    tip=tip,
+                ),
+                timeout=_SUBMIT_WATCH_TIMEOUT_S,
             )
         except _TRANSIENT_SUBMIT_EXCEPTIONS as exc:
             last_error = f"{type(exc).__name__}: {exc}"
@@ -340,17 +397,13 @@ async def submit_with_retry(
                 "submit_with_retry: transient failure on attempt %d/%d: %s",
                 attempt, total_attempts, last_error,
             )
-            if attempt < total_attempts:
-                await sleep(_backoff_seconds(attempt, retry_backoff_ms))
-                continue
-            return SubmitResult(
-                action=SubmitRetryAction.RETRY,
-                receipt=None,
-                error=last_error,
-                attempts=attempt,
+            terminal = await _retry_or_exhausted(
+                attempt, total_attempts, None, last_error, retry_backoff_ms, sleep,
             )
+            if terminal is None:
+                continue
+            return terminal
 
-        last_receipt = receipt
         action = _classify_receipt(receipt)
         if action is SubmitRetryAction.RETRY:
             last_error = receipt.error
@@ -358,29 +411,18 @@ async def submit_with_retry(
                 "submit_with_retry: retryable receipt on attempt %d/%d: %s",
                 attempt, total_attempts, receipt.error,
             )
-            if attempt < total_attempts:
-                await sleep(_backoff_seconds(attempt, retry_backoff_ms))
-                continue
-            return SubmitResult(
-                action=SubmitRetryAction.RETRY,
-                receipt=receipt,
-                error=receipt.error,
-                attempts=attempt,
+            terminal = await _retry_or_exhausted(
+                attempt, total_attempts, receipt, receipt.error, retry_backoff_ms, sleep,
             )
+            if terminal is None:
+                continue
+            return terminal
         return SubmitResult(
             action=action,
             receipt=receipt,
             error=receipt.error,
             attempts=attempt,
         )
-
-    # Unreachable: the loop always returns. Defensive fallthrough.
-    return SubmitResult(
-        action=SubmitRetryAction.RETRY,
-        receipt=last_receipt,
-        error=last_error,
-        attempts=total_attempts,
-    )
 
 
 # Exception classes that mean "the submit failed in a way a later attempt
@@ -398,12 +440,57 @@ _TRANSIENT_SUBMIT_EXCEPTIONS = (
     asyncio.TimeoutError,
     RuntimeError,
     ValidatorSwapped,
+    # Txpool-level rejections raised by substrate-interface (e.g. 1010
+    # "Transaction is outdated" when a sibling extrinsic from the same
+    # account — a participation remark, or the result-path submission of
+    # the same candidate — consumed the composed nonce first). Safe to
+    # retry for the same reason ValidatorSwapped is: every attempt
+    # re-composes and re-signs with a freshly-read nonce. Without this,
+    # the exception escaped `_fire_preview` AFTER the mid-fire mark was
+    # set, permanently wedging the round's submissions (found live by
+    # tests/test_mempool_priority_integration.py).
+    SubstrateRequestException,
+    # Terminal watch statuses (usurped / dropped / retracted / ...). With
+    # the mempool submitter tipping to outrank same-account pow traffic,
+    # usurpation of a pooled pow extrinsic is a NORMAL pool outcome — the
+    # retry recomposes against the advanced nonce and coexists.
+    ExtrinsicRejected,
 )
+
+# Hard cap on one submit attempt (compose + submit + watch-to-inclusion).
+# Inclusion is 1-2 blocks; a watch alive past this is a dead subscription.
+_SUBMIT_WATCH_TIMEOUT_S = 90.0
 
 
 def _backoff_seconds(attempt: int, retry_backoff_ms: int) -> float:
     """Linear backoff in seconds for the Nth attempt (1-indexed)."""
     return (retry_backoff_ms * attempt) / 1000.0
+
+
+async def _retry_or_exhausted(
+    attempt: int,
+    total_attempts: int,
+    receipt: Optional[ExtrinsicReceipt],
+    error: Optional[str],
+    retry_backoff_ms: int,
+    sleep: Callable[[float], Awaitable[None]],
+) -> Optional[SubmitResult]:
+    """Sleep and return None (caller should continue) or return a terminal RETRY result.
+
+    Shared by the transient-exception branch and the retryable-receipt branch of
+    :func:`submit_with_retry` — both share the same sleep+continue / else-RETRY shape.
+    Returns ``None`` when another attempt should be made (sleep has already fired);
+    returns a :class:`SubmitResult` when retries are exhausted.
+    """
+    if attempt < total_attempts:
+        await sleep(_backoff_seconds(attempt, retry_backoff_ms))
+        return None
+    return SubmitResult(
+        action=SubmitRetryAction.RETRY,
+        receipt=receipt,
+        error=error,
+        attempts=attempt,
+    )
 
 
 # ----------------------------------------------------------------------

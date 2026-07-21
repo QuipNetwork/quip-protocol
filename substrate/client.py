@@ -47,45 +47,56 @@ our model of chain state. Consumers of `get_events_at` and
 (`module_id` / `pallet_name`, etc.) so a future renaming on the
 chain-side surfaces as "no match" rather than a crash.
 """
+
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Optional, Sequence
+from typing import Any, Literal, Optional, Sequence
 
 from scalecodec.base import ScaleBytes
 from scalecodec.types import GenericExtrinsic
-from scalecodec.utils.ss58 import ss58_decode
 from substrateinterface import SubstrateInterface
 from websocket import WebSocketException
 
 from shared.hybrid_signer import HybridSigner
 from shared.logging_config import get_logger
+
 # Aliased: `topology_hash` is also a local param/field name throughout this
 # module, so import the canonical-hash function under a distinct name.
 from shared.topology_hash import topology_hash as compute_topology_hash
-from shared.mempool_types import (
+from substrate.mempool_types import (
     IsingParams,
-    JobMode,
     JobOrder,
     MempoolSolverInfo,
     MinerType,
     OrderStatus,
     OrderTiming,
-    ResultDelivery,
     RewardResolution,
 )
-from shared.signer import Signer
+from shared.signer import Signer, strip_0x
 from substrate.types import (
     ExtrinsicReceipt,
     MinerInfo,
     PowConstants,
     SubstrateDifficulty,
     SubstrateMiningContext,
-    WinningSolution,
     WinningSolutionWithNonce,
+)
+
+
+from substrate.scale_codec import (
+    _build_hybrid_signed_extrinsic,
+    _decode_account_id,
+    _decode_difficulty_config,
+    _decode_h256_vec,
+    _decode_hash,
+    _decode_job_mode,
+    _decode_mining_snapshot,
+    _decode_result_delivery,
+    _decode_winning_solution_with_nonce,
 )
 
 
@@ -124,6 +135,19 @@ class NoValidatorReachable(RuntimeError):
         return "\n".join(lines)
 
 
+class ExtrinsicRejected(ValueError):
+    """The submit-and-watch subscription reported a terminal pool failure.
+
+    Raised for ``usurped`` / ``dropped`` / ``invalid`` / ``retracted`` /
+    ``finalityTimeout`` watch statuses. Typed (vs a bare ``ValueError``)
+    so retry layers can treat it as transient: every retry re-composes
+    and re-signs with a freshly read nonce, and usurpation by a
+    higher-priority sibling from the same account (e.g. a tipped mempool
+    extrinsic outranking pow traffic) is a normal pool outcome, not a
+    programming error.
+    """
+
+
 class NoRegisteredTopology(RuntimeError):
     """Raised when the chain has no registered topology to mine against.
 
@@ -160,10 +184,26 @@ class TopologyBinding:
 # `WinningSolutions`). 1000 is the conventional substrate RPC page cap.
 _KEYS_PAGE_SIZE = 1000
 
+# Socket-level read timeout handed to websocket-client via
+# `SubstrateInterface(ws_options=...)`. Without it a black-holed TCP
+# connection — no RST/FIN, routine behind NAT and idle load-balancer drops —
+# blocks inside `recv()` forever and never raises, so nothing above the
+# transport ever learns the connection is dead (QUI-899).
+#
+# The value must clear normal inter-block latency, not just a single RPC
+# round-trip: `submit_extrinsic(wait_for="inblock")` idles on this same
+# socket between blocks while a tx waits for inclusion. At a 6s blocktime a
+# healthy inclusion lands well inside this bound, while a genuinely dead
+# socket still surfaces an error in under a minute.
+_SOCKET_READ_TIMEOUT_S = 45.0
+
 
 def _count_map_keys(
-    iface, storage_module: str, storage_function: str,
-    *, page_size: int = _KEYS_PAGE_SIZE,
+    iface,
+    storage_module: str,
+    storage_function: str,
+    *,
+    page_size: int = _KEYS_PAGE_SIZE,
 ) -> int:
     """Count the keys of a storage map via ``state_getKeysPaged``.
 
@@ -172,7 +212,8 @@ def _count_map_keys(
     in ``_run``. Returns ``0`` for an empty map.
     """
     prefix = iface.generate_storage_hash(
-        storage_module=storage_module, storage_function=storage_function,
+        storage_module=storage_module,
+        storage_function=storage_function,
     )
     total = 0
     start = None
@@ -230,9 +271,8 @@ class SubstrateClient:
         else:
             url_list = [url]  # type: ignore[list-item]
         self._urls: tuple[str, ...] = tuple(url_list)
-        # `url` retained for back-compat reads — points at whichever URL is
-        # currently connected (or the first one before connect()).
-        self.url: str = self._urls[0]
+        # Points at whichever URL is currently connected (or the first one
+        # before connect()).
         self.current_url: str = self._urls[0]
         # Public read-only view of the validator rotation. Controllers
         # propagate this to their separate subscription clients so both
@@ -254,6 +294,14 @@ class SubstrateClient:
         # time). Don't move this to `SubstrateClient.__init__` — clients
         # are typically constructed before the loop is set up.
         self._call_lock: Optional[asyncio.Lock] = None
+        # Set when a call was cancelled while its blocking work was already
+        # running on an executor thread. Cancelling a started executor job
+        # is a documented no-op, so that thread may still be using
+        # `self._iface` after we unwind — and the lock above is released by
+        # normal unwinding, so the next caller would otherwise dispatch a
+        # second thread against the same iface. Once set, the iface is
+        # abandoned rather than reused (QUI-899).
+        self._iface_maybe_occupied: bool = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -292,8 +340,11 @@ class SubstrateClient:
                 # NOT trigger the failover-from-_run path; we're already
                 # iterating validators ourselves.
                 self._iface = await self._raw_run(
-                    lambda u=candidate: SubstrateInterface(url=u)
+                    lambda u=candidate: SubstrateInterface(
+                        url=u, ws_options={"timeout": _SOCKET_READ_TIMEOUT_S}
+                    )
                 )
+                self._iface_maybe_occupied = False
             except Exception as exc:  # noqa: BLE001 — logged + collected below
                 attempts.append(
                     ValidatorAttempt(
@@ -309,12 +360,37 @@ class SubstrateClient:
                     exc,
                 )
                 continue
-            self.url = candidate
             self.current_url = candidate
             self._current_index = idx
             logger.info("substrate client connected: url=%s", candidate)
             return
         raise NoValidatorReachable(attempts)
+
+    async def _abandon_occupied_iface(self) -> bool:
+        """Drop an iface a cancelled worker thread may still be using.
+
+        Deliberately does NOT call `close()` on the old iface: that would be
+        a second concurrent touch of the very object we suspect a zombie
+        thread is inside, which is the corruption this avoids. We drop our
+        reference and let the thread finish against an object nobody else
+        holds; it is garbage once that thread returns.
+
+        Returns ``True`` if an iface was abandoned and rebuilt.
+        """
+        if not self._iface_maybe_occupied:
+            return False
+        logger.warning(
+            "rebuilding substrate connection to %s: previous iface was "
+            "abandoned after a cancelled call",
+            self.current_url,
+        )
+        self._iface = None
+        self._iface_maybe_occupied = False
+        # Rotate rather than reconnecting in place — if this URL just
+        # black-holed us, the next one is the better bet.
+        start = (self._current_index + 1) % len(self._urls)
+        await self._connect_from_index(start)
+        return True
 
     async def ensure_connected(self) -> bool:
         """Cheap pre-submit liveness probe; reconnect if the socket is dead.
@@ -332,15 +408,20 @@ class SubstrateClient:
         ``NoValidatorReachable`` when reconnect finds no live validator —
         the caller cannot submit anyway, so failing loud here is correct.
         """
+        if await self._abandon_occupied_iface():
+            return False
         if self._iface is None:
             await self.connect()
             return False
         try:
-            await self._raw_run(
-                lambda: self._iface.rpc_request("system_health", [])
-            )
+            await self._raw_run(lambda: self._iface.rpc_request("system_health", []))
             return True
-        except (WebSocketException, ConnectionError, OSError, json.JSONDecodeError) as exc:
+        except (
+            WebSocketException,
+            ConnectionError,
+            OSError,
+            json.JSONDecodeError,
+        ) as exc:
             logger.warning(
                 "ensure_connected: health probe failed on %s (%s: %s); "
                 "reconnecting before submit",
@@ -350,6 +431,52 @@ class SubstrateClient:
             )
             await self.reconnect()
             return False
+
+    async def get_sync_state(self) -> dict[str, Any]:
+        """Node-level sync status — answers fast even during major sync.
+
+        Wraps ``system_health`` (``isSyncing``, ``peers``) and
+        ``system_syncState`` (``startingBlock``/``currentBlock``/
+        ``highestBlock``). Runtime API calls stall while the node is in
+        major sync, but these node RPCs do not — the pool uses this to
+        distinguish "node down" from "node syncing" after a timeout.
+
+        Returns a plain picklable dict (the value crosses the validator
+        child's ``mp.Queue`` boundary)::
+
+            {"is_syncing": bool, "peers": int, "current_block": int,
+             "highest_block": int, "starting_block": int}
+
+        A node without ``system_syncState`` reports ``is_syncing=False``
+        — fail open to the pool's existing swap behavior rather than
+        entering a sync-wait on data we don't have.
+        """
+        def _do():
+            health = self._iface.rpc_request("system_health", [])
+            try:
+                sync = self._iface.rpc_request("system_syncState", [])
+            except Exception:  # noqa: BLE001 — RPC absent on some nodes
+                sync = None
+            return health, sync
+
+        health_raw, sync_raw = await self._run(_do, idempotent=True)
+        health = (health_raw or {}).get("result") or {}
+        sync = (sync_raw or {}).get("result") if isinstance(sync_raw, dict) else None
+        if not isinstance(sync, dict):
+            return {
+                "is_syncing": False,
+                "peers": int(health.get("peers") or 0),
+                "current_block": 0,
+                "highest_block": 0,
+                "starting_block": 0,
+            }
+        return {
+            "is_syncing": bool(health.get("isSyncing", False)),
+            "peers": int(health.get("peers") or 0),
+            "current_block": int(sync.get("currentBlock") or 0),
+            "highest_block": int(sync.get("highestBlock") or 0),
+            "starting_block": int(sync.get("startingBlock") or 0),
+        }
 
     async def close(self) -> None:
         await self._close_iface()
@@ -374,30 +501,90 @@ class SubstrateClient:
     async def get_head(self) -> bytes:
         """Best block hash as raw bytes."""
         return bytes.fromhex(
-            _strip_0x(await self._run(lambda: self._iface.get_chain_head()))
+            strip_0x(await self._run(lambda: self._iface.get_chain_head()))
         )
 
     async def has_call(self, module: str, function: str) -> bool:
         """Return True iff the runtime metadata exposes ``module.function``.
 
-        Used by the ``identify`` flow to prefer ``System.remark_with_event``
-        over plain ``System.remark`` when the runtime supports it.
+        Used by compatibility commands that need to branch on live runtime
+        metadata before composing a call.
         substrate-interface raises ``ValueError`` from
         ``get_metadata_call_function`` when the call is absent — we treat
         any exception as "not present" so an unreachable metadata cache
         falls back rather than crashing the caller.
         """
+
         def _probe() -> bool:
             try:
                 self._iface.get_metadata_call_function(module, function)
                 return True
             except Exception:
                 return False
+
+        return await self._run(_probe)
+
+    async def descriptor_schema_version(self) -> int:
+        """Highest ``MinerRegistry`` descriptor schema the runtime accepts.
+
+        Returns ``2`` when ``set_descriptor``'s ``NodeDescriptorInput`` enum
+        exposes a ``V2`` variant (system_info + runtime block), else ``1``
+        (the always-present V1). Any metadata hiccup degrades to ``1`` so
+        descriptor filing falls back to the compatible variant rather than
+        crashing on the probe. The chain upgrades runtime-first, so a miner
+        sees V2 only once the runtime carrying it is live.
+        """
+
+        def _probe() -> int:
+            try:
+                call = self._iface.get_metadata_call_function(
+                    "MinerRegistry", "set_descriptor",
+                )
+                # set_descriptor takes one arg (the NodeDescriptorInput enum);
+                # resolve its variant names from the portable type registry.
+                field = call["fields"][0]
+                type_id = field.value["type"] if hasattr(field, "value") else field["type"]
+                names = self._enum_variant_names(type_id)
+                return 2 if "V2" in names else 1
+            except Exception:
+                return 1
+
+        return await self._run(_probe)
+
+    def _enum_variant_names(self, type_id: int) -> set:
+        """Return the variant names of the portable-registry enum ``type_id``."""
+        for entry in self._iface.metadata.portable_registry["types"]:
+            ident = entry["id"].value if hasattr(entry["id"], "value") else entry["id"]
+            if ident != type_id:
+                continue
+            defn = entry["type"]["def"]
+            d = defn.value if hasattr(defn, "value") else defn
+            return {v["name"] for v in d["variant"]["variants"]}
+        return set()
+
+    async def has_storage(self, module: str, function: str) -> bool:
+        """Return True iff the runtime metadata exposes storage ``module.function``.
+
+        Mirrors :meth:`has_call` for storage items: substrate-interface returns
+        ``None`` (or raises) for an absent storage function, so we treat both as
+        "not present". Used to pick the right winning-solution counter across the
+        ``WinningSolutions``→``QBlockCount`` rename (quip-protocol-rs MR !35).
+        """
+
+        def _probe() -> bool:
+            try:
+                return (
+                    self._iface.get_metadata_storage_function(module, function)
+                    is not None
+                )
+            except Exception:
+                return False
+
         return await self._run(_probe)
 
     async def get_finalized_head(self) -> bytes:
         return bytes.fromhex(
-            _strip_0x(await self._run(lambda: self._iface.get_chain_finalised_head()))
+            strip_0x(await self._run(lambda: self._iface.get_chain_finalised_head()))
         )
 
     async def get_block_number(self, at: Optional[bytes] = None) -> int:
@@ -453,7 +640,7 @@ class SubstrateClient:
         # to "let the RPC pick"; we have to read the head ourselves.
         if at is None:
             resolved_block_hash = bytes.fromhex(
-                _strip_0x(await self._run(lambda: self._iface.get_chain_head()))
+                strip_0x(await self._run(lambda: self._iface.get_chain_head()))
             )
         else:
             if len(at) != 32:
@@ -470,20 +657,12 @@ class SubstrateClient:
                 )
             scale_param = "0x01" + topology_hash.hex()
 
-        raw = await self._run(
-            lambda: self._iface.rpc_request(
-                "state_call",
-                ["QuantumPowApi_mining_snapshot", scale_param, block_hash],
-            )
-        )
         # Distinguish RPC-level errors (transport, bad method, bad params)
         # from `Option::None` ("no topology registered yet"). Both used to
         # look like `result is None`, which silently swallowed real failures.
-        if "error" in raw:
-            raise RuntimeError(
-                f"state_call mining_snapshot rpc error: {raw['error']}"
-            )
-        encoded = raw.get("result")
+        encoded = await self._state_call(
+            "QuantumPowApi_mining_snapshot", scale_param, block_hash
+        )
         if encoded is None:
             return None
         decoded = _decode_mining_snapshot(encoded)
@@ -538,7 +717,8 @@ class SubstrateClient:
         """
         head = await self.get_head()
         snapshot = await self.get_mining_snapshot(
-            at=head, miner_account_bytes=miner_account_bytes,
+            at=head,
+            miner_account_bytes=miner_account_bytes,
         )
         if snapshot is None:
             raise NoRegisteredTopology("chain has no registered topology")
@@ -566,9 +746,9 @@ class SubstrateClient:
         result = await self._run(
             lambda: self._iface.query("QuantumPow", "Miners", [account])
         )
-        if result is None or result.value is None:
+        v = _storage_value(result)
+        if v is None:
             return None
-        v = result.value
         return MinerInfo(
             registered_at=int(v["registered_at"]),
             deposit=int(v["deposit"]),
@@ -576,6 +756,52 @@ class SubstrateClient:
             proofs_won=int(v["proofs_won"]),
             rewards_earned=int(v["rewards_earned"]),
         )
+
+    async def query_descriptor_payload_hash(self, account: bytes) -> Optional[bytes]:
+        """Return ``MinerRegistry.NodeDescriptors[account].payload_hash``, or ``None``.
+
+        The runtime stores ``blake2_256`` of the SCALE-encoded
+        ``set_descriptor`` argument, so comparing this against a locally
+        computed digest (:func:`substrate.miner_registry.descriptor_payload_hash`
+        over :meth:`encode_call_args`) tells whether the on-chain record
+        already matches what this node would submit. ``None`` means no
+        descriptor is filed.
+        """
+        if len(account) != 32:
+            raise ValueError(f"account must be 32 bytes, got {len(account)}")
+        result = await self._run(
+            lambda: self._iface.query("MinerRegistry", "NodeDescriptors", [account])
+        )
+        v = _storage_value(result)
+        if v is None:
+            return None
+        stored = v.get("payload_hash")
+        if not isinstance(stored, str) or not stored.startswith("0x"):
+            return None
+        return bytes.fromhex(stored[2:])
+
+    async def encode_call_args(
+        self, module: str, function: str, call_params: dict
+    ) -> bytes:
+        """Return the SCALE encoding of ``call_params`` for ``module.function``.
+
+        Composes the call against live metadata and strips the 2-byte call
+        index, leaving exactly the concatenated encoded arguments — the bytes
+        the runtime sees as the extrinsic's parameters (and, for
+        ``set_descriptor``, the input to its stored ``payload_hash``).
+        """
+
+        def _encode() -> bytes:
+            call = self._iface.compose_call(
+                call_module=module,
+                call_function=function,
+                call_params=call_params,
+            )
+            # ``call.data`` is a ScaleBytes wrapper (not bytes-convertible);
+            # its ``.data`` bytearray holds the raw encoding.
+            return bytes(call.data.data)[2:]
+
+        return await self._run(_encode)
 
     async def query_proofs_submitted(self, account: bytes) -> Optional[int]:
         """Return ``QuantumPow.Miners[account].proofs_submitted``, or ``None``.
@@ -589,22 +815,48 @@ class SubstrateClient:
             return None
         return info.proofs_submitted
 
-    async def query_difficulty(self) -> Optional[SubstrateDifficulty]:
-        """Return the raw `QuantumPow.Difficulty` storage value.
+    async def query_difficulty(
+        self, topology_hash: Optional[bytes] = None
+    ) -> Optional[SubstrateDifficulty]:
+        """Return the raw ``QuantumPow.Difficulties[topology_hash]`` map entry.
 
-        This is the *post-adjust baseline* — the value set after the most
-        recent winning proof, **without** decay applied. Use
-        :meth:`query_current_difficulty` for the live threshold a fresh
-        proof would have to clear right now.
+        This is the *post-adjust baseline* — the value recorded after the most
+        recent winning proof for the given topology, **without** decay applied.
+        Use :meth:`query_current_difficulty` for the live threshold a fresh
+        proof would have to clear right now, or :meth:`query_difficulty_for`
+        for the decayed value from the runtime API.
 
-        Suitable for "is the chain seeded?" checks and historical
-        comparisons; not suitable for deciding what difficulty a miner
-        currently faces.
+        When ``topology_hash`` is ``None``, the chain's ``DefaultTopology``
+        storage value is read first; if that is also absent the method returns
+        ``None`` without querying the map.
+
+        Suitable for "is the chain seeded?" checks and historical comparisons;
+        not suitable for deciding what difficulty a miner currently faces.
+
+        Args:
+            topology_hash: 32-byte topology hash to look up, or ``None`` to
+                resolve from ``QuantumPow.DefaultTopology``.
+
+        Returns:
+            The stored difficulty config, or ``None`` if the map entry is
+            absent or no default topology has been set.
         """
-        result = await self._run(lambda: self._iface.query("QuantumPow", "Difficulty"))
-        if result is None or not _result_was_found(result) or result.value is None:
+        if topology_hash is None:
+            default_result = await self._run(
+                lambda: self._iface.query("QuantumPow", "DefaultTopology")
+            )
+            resolved = _storage_value(default_result, check_found=True)
+            if resolved is None:
+                return None
+            topology_hash = _decode_hash(resolved)
+        result = await self._run(
+            lambda: self._iface.query(
+                "QuantumPow", "Difficulties", ["0x" + topology_hash.hex()]
+            )
+        )
+        v = _storage_value(result, check_found=True)
+        if v is None:
             return None
-        v = result.value
         return SubstrateDifficulty(
             min_solutions=int(v["min_solutions"]),
             max_energy_milli=int(v["max_energy_milli"]),
@@ -627,21 +879,11 @@ class SubstrateClient:
         needs to reason about the active threshold.
         """
         block_hash = _hex(at) if at is not None else None
-        raw = await self._run(
-            lambda: self._iface.rpc_request(
-                "state_call",
-                ["QuantumPowApi_current_difficulty", "0x", block_hash],
-            )
+        encoded = await self._state_call(
+            "QuantumPowApi_current_difficulty", "0x", block_hash
         )
-        if "error" in raw:
-            raise RuntimeError(
-                f"state_call current_difficulty rpc error: {raw['error']}"
-            )
-        encoded = raw.get("result")
         if encoded is None:
-            raise RuntimeError(
-                "state_call current_difficulty returned no result"
-            )
+            raise RuntimeError("state_call current_difficulty returned no result")
         data = ScaleBytes(encoded)
         difficulty = _decode_difficulty_config(data)
         if data.get_remaining_length() != 0:
@@ -650,6 +892,163 @@ class SubstrateClient:
                 f"{data.get_remaining_length()} bytes"
             )
         return difficulty
+
+    async def query_mineable_topologies(
+        self, *, at: Optional[bytes] = None
+    ) -> list[bytes]:
+        """Call ``QuantumPowApi_mineable_topologies`` for the set of mineable hashes.
+
+        Returns the full list of topology hashes that are currently whitelisted
+        for mining. On a fresh chain with no topologies registered this is an
+        empty list (not an error).
+
+        Args:
+            at: Optional 32-byte block hash to query at. ``None`` uses the
+                current best head.
+
+        Returns:
+            List of 32-byte topology hashes, in the order the runtime returns them.
+        """
+        block_hash = _hex(at) if at is not None else None
+        encoded = await self._state_call(
+            "QuantumPowApi_mineable_topologies", "0x", block_hash
+        )
+        if encoded is None:
+            raise RuntimeError(
+                "state_call QuantumPowApi_mineable_topologies returned no result"
+            )
+        data = ScaleBytes(encoded)
+        hashes = _decode_h256_vec(data)
+        if data.get_remaining_length() != 0:
+            raise ValueError(
+                "trailing bytes after mineable_topologies decode: "
+                f"{data.get_remaining_length()} bytes"
+            )
+        return hashes
+
+    async def query_difficulty_for(
+        self, topology_hash: bytes, *, at: Optional[bytes] = None
+    ) -> Optional[SubstrateDifficulty]:
+        """Call ``QuantumPowApi_difficulty_for(topology_hash)`` for the decayed value.
+
+        Unlike :meth:`query_difficulty`, which reads the raw map entry, this
+        method calls the runtime API so decay is applied for elapsed blocks
+        since the last winning proof. Returns ``None`` when the topology is
+        not registered.
+
+        The SCALE parameter is the raw 32-byte H256 topology hash (no compact
+        prefix — the runtime API receives it as a fixed-size value).
+
+        Args:
+            topology_hash: 32-byte topology hash to query.
+            at: Optional 32-byte block hash to query at. ``None`` uses the
+                current best head.
+
+        Returns:
+            Decayed difficulty config, or ``None`` if the topology is absent.
+        """
+        if len(topology_hash) != 32:
+            raise ValueError(
+                f"topology_hash must be 32 bytes, got {len(topology_hash)}"
+            )
+        block_hash = _hex(at) if at is not None else None
+        encoded = await self._state_call(
+            "QuantumPowApi_difficulty_for",
+            "0x" + topology_hash.hex(),
+            block_hash,
+        )
+        if encoded is None:
+            raise RuntimeError(
+                "state_call QuantumPowApi_difficulty_for returned no result"
+            )
+        data = ScaleBytes(encoded)
+        tag = data.get_next_bytes(1)
+        if not tag:
+            raise ValueError("empty response from QuantumPowApi_difficulty_for")
+        if tag[0] == 0x00:
+            if data.get_remaining_length() != 0:
+                raise ValueError(
+                    "trailing bytes after difficulty_for Option::None: "
+                    f"{data.get_remaining_length()} bytes"
+                )
+            return None
+        if tag[0] != 0x01:
+            raise ValueError(
+                f"unknown Option variant tag for difficulty_for: 0x{tag[0]:02x}"
+            )
+        difficulty = _decode_difficulty_config(data)
+        if data.get_remaining_length() != 0:
+            raise ValueError(
+                "trailing bytes after difficulty_for decode: "
+                f"{data.get_remaining_length()} bytes"
+            )
+        return difficulty
+
+    async def add_mineable_topology(
+        self,
+        topology_hash: bytes,
+        signer: "Signer",
+        *,
+        wait_for: "WaitFor" = "inblock",
+    ) -> "ExtrinsicReceipt":
+        """Submit ``QuantumPow.add_mineable_topology(topology_hash)`` via sudo.
+
+        Adds ``topology_hash`` to the on-chain whitelist of mineable topologies.
+        Requires a root/sudo key.
+
+        Args:
+            topology_hash: 32-byte hash of the topology to whitelist.
+            signer: Root/sudo signer for the extrinsic.
+            wait_for: Submission stage — ``"sent"``, ``"inblock"``, or
+                ``"finalized"``.
+
+        Returns:
+            Extrinsic receipt at the requested stage.
+        """
+        if len(topology_hash) != 32:
+            raise ValueError(
+                f"topology_hash must be 32 bytes, got {len(topology_hash)}"
+            )
+        return await self.submit_extrinsic(
+            call_module="QuantumPow",
+            call_function="add_mineable_topology",
+            call_params={"topology_hash": "0x" + topology_hash.hex()},
+            signer=signer,
+            wait_for=wait_for,
+        )
+
+    async def remove_mineable_topology(
+        self,
+        topology_hash: bytes,
+        signer: "Signer",
+        *,
+        wait_for: "WaitFor" = "inblock",
+    ) -> "ExtrinsicReceipt":
+        """Submit ``QuantumPow.remove_mineable_topology(topology_hash)`` via sudo.
+
+        Removes ``topology_hash`` from the on-chain whitelist of mineable
+        topologies. Requires a root/sudo key.
+
+        Args:
+            topology_hash: 32-byte hash of the topology to remove.
+            signer: Root/sudo signer for the extrinsic.
+            wait_for: Submission stage — ``"sent"``, ``"inblock"``, or
+                ``"finalized"``.
+
+        Returns:
+            Extrinsic receipt at the requested stage.
+        """
+        if len(topology_hash) != 32:
+            raise ValueError(
+                f"topology_hash must be 32 bytes, got {len(topology_hash)}"
+            )
+        return await self.submit_extrinsic(
+            call_module="QuantumPow",
+            call_function="remove_mineable_topology",
+            call_params={"topology_hash": "0x" + topology_hash.hex()},
+            signer=signer,
+            wait_for=wait_for,
+        )
 
     async def query_pow_constants(self) -> PowConstants:
         """Read the four ``pallet_quantum_pow`` constants needed for decay.
@@ -695,22 +1094,12 @@ class SubstrateClient:
         clients from running BLAKE3 over `(parent_hash, miner, block, salt)`.
         """
         if not 0 <= block_number < 2**32:
-            raise ValueError(
-                f"block_number must fit in u32, got {block_number}"
-            )
+            raise ValueError(f"block_number must fit in u32, got {block_number}")
         block_hash = _hex(at) if at is not None else None
         scale_param = "0x" + block_number.to_bytes(4, "little").hex()
-        raw = await self._run(
-            lambda: self._iface.rpc_request(
-                "state_call",
-                ["QuantumPowApi_winning_solution", scale_param, block_hash],
-            )
+        encoded = await self._state_call(
+            "QuantumPowApi_winning_solution", scale_param, block_hash
         )
-        if "error" in raw:
-            raise RuntimeError(
-                f"state_call winning_solution rpc error: {raw['error']}"
-            )
-        encoded = raw.get("result")
         if encoded is None:
             return None
         return _decode_winning_solution_with_nonce(encoded)
@@ -726,9 +1115,10 @@ class SubstrateClient:
         result = await self._run(
             lambda: self._iface.query("QuantumPow", "LastProofBlock")
         )
-        if result is None or not _result_was_found(result) or result.value is None:
+        v = _storage_value(result, check_found=True)
+        if v is None:
             return None
-        return int(result.value)
+        return int(v)
 
     async def query_block_timestamp_ms(self, block_hash: bytes) -> Optional[int]:
         """Return the ``Timestamp.Now`` storage value at ``block_hash``.
@@ -761,23 +1151,49 @@ class SubstrateClient:
             return None
 
     async def query_winning_solution_count(self) -> int:
-        """Return the number of recorded ``QuantumPow.WinningSolutions``.
+        """Return the number of recorded winning solutions (qblocks).
 
-        The chain stores no solution counter — solutions are keyed in the
-        ``WinningSolutions`` map by the block number they won at. The ordinal
-        *solution number* is therefore the count of that map's keys, and the
-        solution currently being mined is ``count + 1`` (computed by the
-        controller, cached per round). Enumerates *keys only* via
-        ``state_getKeysPaged`` over the storage prefix — one cheap RPC per
-        ``KEYS_PAGE_SIZE`` keys, not a full value scan. Returns ``0`` on a
-        fresh chain with no winners yet.
+        The ordinal *solution number* is this count; the solution currently
+        being mined is ``count + 1`` (computed by the controller, cached per
+        round). Returns ``0`` on a fresh chain with no winners yet.
+
+        Two runtime layouts are supported (quip-protocol-rs MR !35 renamed the
+        storage ``WinningSolutions``→``QBlocks`` and added a direct counter):
+
+        - New runtime: ``QBlockCount`` is a ``u64`` ``StorageValue`` — one O(1)
+          read.
+        - Old runtime: solutions are keyed in the ``WinningSolutions`` map by
+          the block number they won at; count its keys via ``state_getKeysPaged``
+          (*keys only* — one cheap RPC per ``KEYS_PAGE_SIZE`` keys, no value
+          scan).
         """
-
+        if await self.has_storage("QuantumPow", "QBlockCount"):
+            result = await self._run(
+                lambda: self._iface.query("QuantumPow", "QBlockCount")
+            )
+            value = _storage_value(result)
+            return int(value) if value is not None else 0
         return await self._run(
             lambda: _count_map_keys(
-                self._iface, "QuantumPow", "WinningSolutions",
+                self._iface,
+                "QuantumPow",
+                "WinningSolutions",
             )
         )
+
+    async def query_latest_qblock_id(self) -> Optional[int]:
+        """Return the latest assigned qblock id, or ``None`` before the first win.
+
+        The runtime exposes no ``LatestQBlockId`` storage. Because qblock ids are
+        1-based ordinals, the accepted-qblock count *is* the latest assigned id
+        when non-zero — quip-protocol-rs MR !35 documents ``QBlockCount`` exactly
+        this way. Reuse :meth:`query_winning_solution_count` (which already
+        handles the ``QBlockCount``/legacy-``WinningSolutions`` layouts) and map a
+        count of 0 to ``None`` so the participation path targets candidate
+        qblock 1 on a fresh chain.
+        """
+        count = await self.query_winning_solution_count()
+        return count if count > 0 else None
 
     async def query_balance(self, account: bytes) -> int:
         if len(account) != 32:
@@ -785,9 +1201,10 @@ class SubstrateClient:
         result = await self._run(
             lambda: self._iface.query("System", "Account", [account])
         )
-        if result is None or result.value is None:
+        v = _storage_value(result)
+        if v is None:
             return 0
-        return int(result.value["data"]["free"])
+        return int(v["data"]["free"])
 
     # ------------------------------------------------------------------
     # QuantumComputeMempool storage queries
@@ -798,13 +1215,11 @@ class SubstrateClient:
         if len(account) != 32:
             raise ValueError(f"account must be 32 bytes, got {len(account)}")
         result = await self._run(
-            lambda: self._iface.query(
-                "QuantumComputeMempool", "Solvers", [account]
-            )
+            lambda: self._iface.query("QuantumComputeMempool", "Solvers", [account])
         )
-        if result is None or result.value is None:
+        v = _storage_value(result)
+        if v is None:
             return None
-        v = result.value
         return MempoolSolverInfo(
             account=_decode_account_id(v["account"]),
             solver_type=MinerType.from_scale_variant(str(v["solver_type"])),
@@ -849,13 +1264,11 @@ class SubstrateClient:
         without a follow-on query.
         """
         result = await self._run(
-            lambda: self._iface.query(
-                "QuantumComputeMempool", "JobOrders", [order_id]
-            )
+            lambda: self._iface.query("QuantumComputeMempool", "JobOrders", [order_id])
         )
-        if result is None or result.value is None:
+        v = _storage_value(result)
+        if v is None:
             return None
-        v = result.value
 
         # The decoded value tree mixes raw bytes (e.g. spec_id), hex strings,
         # ints, dicts (for IsingParams), and strings (for OrderStatus + the
@@ -913,7 +1326,9 @@ class SubstrateClient:
         out: list[dict] = []
         for er in raw or []:
             value = getattr(er, "value", er)
-            event_field = value.get("event", value) if isinstance(value, dict) else value
+            event_field = (
+                value.get("event", value) if isinstance(value, dict) else value
+            )
             if not isinstance(event_field, dict):
                 logger.debug(
                     "get_events_at: skipping non-dict event record: %s",
@@ -933,13 +1348,16 @@ class SubstrateClient:
             if attrs is None and module_id:
                 logger.debug(
                     "get_events_at: no attributes/params for %s.%s",
-                    module_id, event_id,
+                    module_id,
+                    event_id,
                 )
-            out.append({
-                "module_id": str(module_id) if module_id is not None else "",
-                "event_id": str(event_id) if event_id is not None else "",
-                "attributes": attrs,
-            })
+            out.append(
+                {
+                    "module_id": str(module_id) if module_id is not None else "",
+                    "event_id": str(event_id) if event_id is not None else "",
+                    "attributes": attrs,
+                }
+            )
         return out
 
     # ------------------------------------------------------------------
@@ -962,7 +1380,10 @@ class SubstrateClient:
         ship the hex through ``ValidatorPool`` — see ``PoolClient``.
         """
         ext_hex = await self.build_signed_extrinsic(
-            call_module, call_function, call_params, signer,
+            call_module,
+            call_function,
+            call_params,
+            signer,
         )
         return await self.submit_signed_extrinsic(ext_hex, wait_for=wait_for)
 
@@ -1000,11 +1421,19 @@ class SubstrateClient:
         kind = signer.signature_kind()
         if kind == "Sr25519":
             return await self._build_sr25519_extrinsic_hex(
-                call_module, call_function, call_params, signer, tip=tip,
+                call_module,
+                call_function,
+                call_params,
+                signer,
+                tip=tip,
             )
         if kind == "Hybrid":
             return await self._build_hybrid_extrinsic_hex(
-                call_module, call_function, call_params, signer, tip=tip,
+                call_module,
+                call_function,
+                call_params,
+                signer,
+                tip=tip,
             )
         raise NotImplementedError(
             f"build_signed_extrinsic does not support signature_kind={kind}"
@@ -1028,7 +1457,9 @@ class SubstrateClient:
                 call_params=call_params,
             )
             extrinsic: GenericExtrinsic = self._iface.create_signed_extrinsic(
-                call=call, keypair=keypair, tip=tip,
+                call=call,
+                keypair=keypair,
+                tip=tip,
             )
             return extrinsic.data.to_hex()
 
@@ -1141,11 +1572,15 @@ class SubstrateClient:
                     # `dropped` / `invalid` / `usurped` / `retracted` /
                     # `finalityTimeout` are all terminal — without raising
                     # here the subscription would silently keep waiting and
-                    # callers would hang forever.
+                    # callers would hang forever. Typed so retry layers can
+                    # distinguish a pool-level rejection (retry-safe with a
+                    # fresh compose — usurpation by a tipped sibling is a
+                    # NORMAL outcome of priority replacement) from a real
+                    # programming-error ValueError.
                     self._iface.rpc_request(
                         "author_unwatchExtrinsic", [subscription_id]
                     )
-                    raise ValueError(f"extrinsic rejected: {result}")
+                    raise ExtrinsicRejected(f"extrinsic rejected: {result}")
                 return None  # non-terminal status — keep waiting
 
             return self._iface.rpc_request(
@@ -1185,10 +1620,36 @@ class SubstrateClient:
             error=error_msg,
         )
 
-
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    async def _state_call(
+        self, method: str, scale_param: str, block_hash: Optional[str]
+    ) -> Optional[str]:
+        """Dispatch a ``state_call`` RPC and return the hex-encoded result.
+
+        Raises ``RuntimeError`` on an RPC-level error (transport, bad method,
+        bad params).  Returns ``None`` when the runtime returns
+        ``Option::None`` — callers apply their own None semantics on top.
+
+        Args:
+            method: Runtime API method name, e.g. ``QuantumPowApi_mining_snapshot``.
+            scale_param: SCALE-encoded hex parameter string (e.g. ``"0x00"``).
+            block_hash: Block hash hex string or ``None`` for the current best head.
+
+        Returns:
+            Hex-encoded result string, or ``None`` if the runtime returned no value.
+        """
+        raw = await self._run(
+            lambda: self._iface.rpc_request(
+                "state_call",
+                [method, scale_param, block_hash],
+            )
+        )
+        if "error" in raw:
+            raise RuntimeError(f"state_call {method} rpc error: {raw['error']}")
+        return raw.get("result")
 
     async def _run(self, fn, *, idempotent: bool = False):
         """Run a blocking substrate-interface call with failover-on-loss.
@@ -1217,6 +1678,9 @@ class SubstrateClient:
         ``reconnect()`` itself can raise ``NoValidatorReachable`` if no
         URL in the failover list comes back up; that propagates instead.
         """
+        # A previous call was cancelled mid-flight; rebuild before reusing
+        # a connection a worker thread may still hold (QUI-899).
+        await self._abandon_occupied_iface()
         try:
             return await self._raw_run(fn)
         except (WebSocketException, ConnectionError, json.JSONDecodeError) as exc:
@@ -1256,10 +1720,26 @@ class SubstrateClient:
         threaded setup) and the lock would be redundant.
         """
         loop = self._loop or asyncio.get_running_loop()
-        if self._call_lock is None:
-            return await loop.run_in_executor(None, fn)
-        async with self._call_lock:
-            return await loop.run_in_executor(None, fn)
+        try:
+            if self._call_lock is None:
+                return await loop.run_in_executor(None, fn)
+            async with self._call_lock:
+                return await loop.run_in_executor(None, fn)
+        except asyncio.CancelledError:
+            # An outer `wait_for` gave up on us. `CancelledError` is a
+            # BaseException, so it matches none of the connection-error
+            # tuples upstack and no reconnect would otherwise run — while
+            # the executor thread keeps running against `self._iface`,
+            # because cancelling a started executor job does nothing.
+            # Mark the iface unusable so the next call rebuilds instead of
+            # racing that thread.
+            self._iface_maybe_occupied = True
+            logger.warning(
+                "substrate call cancelled on %s; abandoning iface (a worker "
+                "thread may still hold it)",
+                self.current_url,
+            )
+            raise
 
 
 # ----------------------------------------------------------------------
@@ -1282,8 +1762,18 @@ def _canonical_hex(value: Any) -> Optional[str]:
     if isinstance(value, (bytes, bytearray)):
         return bytes(value).hex()
     if isinstance(value, str):
-        return _strip_0x(value).lower()
+        return strip_0x(value).lower()
     return None
+
+
+def _as_int_or_none(x: Any) -> Optional[int]:
+    """Return ``int(x)`` or ``None`` if *x* is ``None`` or non-coercible."""
+    if x is None:
+        return None
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
 
 
 def _phase_extrinsic_idx(phase: Any) -> Optional[int]:
@@ -1306,19 +1796,10 @@ def _phase_extrinsic_idx(phase: Any) -> Optional[int]:
             idx = applied.get("extrinsic_idx")
             if idx is None:
                 idx = applied.get("index")
-            try:
-                return int(idx) if idx is not None else None
-            except (TypeError, ValueError):
-                return None
-        try:
-            return int(applied)
-        except (TypeError, ValueError):
-            return None
+            return _as_int_or_none(idx)
+        return _as_int_or_none(applied)
     if isinstance(phase, (int, str)):
-        try:
-            return int(phase)
-        except (TypeError, ValueError):
-            return None
+        return _as_int_or_none(phase)
     return None
 
 
@@ -1382,7 +1863,7 @@ def _fetch_extrinsic_dispatch_error(
         # this block, so callers must NOT close the work key.
         return (
             f"unclassified: extrinsic {target_hash[:16]}… not found in "
-            f"block {_strip_0x(block_hash)[:16]}… "
+            f"block {strip_0x(block_hash)[:16]}… "
             f"({len(extrinsics)} extrinsics)"
         )
     events = iface.get_events(block_hash=block_hash) or []
@@ -1390,14 +1871,20 @@ def _fetch_extrinsic_dispatch_error(
         v = ev.value if hasattr(ev, "value") else (ev if isinstance(ev, dict) else None)
         if not isinstance(v, dict):
             continue
-        applied_idx = _phase_extrinsic_idx(v.get("phase") or {})
+        # The current substrate-interface decoder surfaces the phase as the
+        # bare string 'ApplyExtrinsic' with the index in a SIBLING
+        # `extrinsic_idx` field — phase parsing alone matched nothing, so a
+        # real in-block ExtrinsicFailed produced a false-OK receipt for
+        # every failed hybrid extrinsic (found live by T9). Prefer the
+        # explicit field; fall back to the phase-variant shapes.
+        applied_idx = _as_int_or_none(v.get("extrinsic_idx"))
+        if applied_idx is None:
+            applied_idx = _phase_extrinsic_idx(v.get("phase") or {})
         if applied_idx != ext_idx:
             continue
         event = v.get("event") or v
         module_id = (
-            event.get("module_id")
-            or event.get("pallet")
-            or event.get("pallet_name")
+            event.get("module_id") or event.get("pallet") or event.get("pallet_name")
         )
         event_id = (
             event.get("event_id")
@@ -1407,6 +1894,14 @@ def _fetch_extrinsic_dispatch_error(
         )
         if module_id == "System" and event_id == "ExtrinsicFailed":
             attrs = event.get("attributes") or event.get("fields") or {}
+            name = _decode_module_error_name(
+                iface,
+                attrs.get("dispatch_error") if isinstance(attrs, dict) else None,
+            )
+            if name is not None:
+                # `Module(error=<Name>)` — the shape the submit/claim
+                # classifiers match error-name substrings against.
+                return f"Module(error={name})"
             return f"Module(ExtrinsicFailed, attrs={attrs!r})"
         if module_id == "System" and event_id == "ExtrinsicSuccess":
             # Authoritative success for this extrinsic — short-circuit.
@@ -1414,239 +1909,38 @@ def _fetch_extrinsic_dispatch_error(
     return None
 
 
-def _strip_0x(s: str) -> str:
-    return s[2:] if s.startswith("0x") else s
+def _decode_module_error_name(iface, dispatch_error: Any) -> Optional[str]:
+    """Resolve ``{'Module': {'index': i, 'error': ...}}`` to the error name.
 
-
-def _decode_hash(value) -> bytes:
-    """Decode a substrate Hash storage field to 32 raw bytes."""
-    if isinstance(value, bytes):
-        return value
-    if isinstance(value, str):
-        return bytes.fromhex(_strip_0x(value))
-    raise ValueError(f"unrecognized Hash shape: {value!r}")
-
-
-def _decode_account_id(value) -> bytes:
-    """Decode an `AccountId32` storage field to 32 raw bytes.
-
-    substrate-interface may surface accounts as raw bytes, hex strings, or
-    SS58 strings depending on the field's typedef. We canonicalize to raw
-    bytes so callers compare with `signer.account_id_bytes()` cleanly.
+    The event decoder surfaces module errors as raw pallet/variant indexes;
+    the metadata maps them back to names (e.g. ``SolverNotRegistered``).
+    Best-effort: any unexpected shape or lookup failure returns ``None``
+    and the caller falls back to the raw-attrs error string.
     """
-    if isinstance(value, bytes):
-        return value
-    if isinstance(value, str):
-        if value.startswith("0x"):
-            return bytes.fromhex(value[2:])
-        # SS58 — decode via scalecodec's helper.
-        return bytes.fromhex(ss58_decode(value))
-    raise ValueError(f"unrecognized AccountId shape: {value!r}")
-
-
-def _decode_job_mode(value) -> JobMode:
-    """Decode a `JobMode` tagged-enum storage value."""
-    if isinstance(value, str):
-        # Bare-string SCALE encoding for the no-field variant.
-        if value == "Open":
-            return JobMode.open()
-        raise ValueError(f"unrecognized JobMode variant: {value!r}")
-    if isinstance(value, dict) and len(value) == 1:
-        (tag, inner), = value.items()
-        if tag == "Open":
-            return JobMode.open()
-        if tag == "Bid":
-            miners_raw = inner.get("miners") if isinstance(inner, dict) else None
-            types_raw = inner.get("miner_types") if isinstance(inner, dict) else None
-            miners = (
-                tuple(_decode_account_id(a) for a in miners_raw)
-                if miners_raw is not None
-                else None
-            )
-            mtypes = (
-                tuple(MinerType.from_scale_variant(str(mt)) for mt in types_raw)
-                if types_raw is not None
-                else None
-            )
-            return JobMode.bid(miners=miners, miner_types=mtypes)
-    raise ValueError(f"unrecognized JobMode shape: {value!r}")
-
-
-def _decode_result_delivery(value) -> ResultDelivery:
-    """Decode a `ResultDelivery` tagged-enum storage value."""
-    if isinstance(value, str):
-        if value == "OnChainOnly":
-            return ResultDelivery.on_chain_only()
-        raise ValueError(f"unrecognized ResultDelivery variant: {value!r}")
-    if isinstance(value, dict) and len(value) == 1:
-        (tag, inner), = value.items()
-        if tag == "OnChainOnly":
-            return ResultDelivery.on_chain_only()
-        endpoint = inner.get("endpoint") if isinstance(inner, dict) else inner
-        if isinstance(endpoint, str):
-            endpoint = bytes.fromhex(_strip_0x(endpoint))
-        elif isinstance(endpoint, list):
-            endpoint = bytes(endpoint)
-        if endpoint is None:
-            raise ValueError(
-                f"_decode_result_delivery: {tag!r} requires a non-None endpoint"
-            )
-        if tag == "Callback":
-            return ResultDelivery.callback(endpoint)
-        if tag == "CallbackWithPoll":
-            return ResultDelivery.callback_with_poll(endpoint)
-    raise ValueError(f"unrecognized ResultDelivery shape: {value!r}")
-
-
-def _encode_compact_u32(n: int) -> bytes:
-    """SCALE compact encoding for u32. Mirrors substrate's `Compact<u32>`.
-
-    For values below 2^30 this is identical to ``_encode_compact_u128``;
-    the only divergence is the narrower u32 ceiling, which is kept as an
-    explicit guard before delegating to the shared encoder.
-    """
-    if n < 0:
-        raise ValueError(f"compact u32 must be non-negative, got {n}")
-    if n >= 0x4000_0000:
-        raise NotImplementedError("compact u32 big-int mode not needed here")
-    return _encode_compact_u128(n)
-
-
-def _encode_compact_u128(n: int) -> bytes:
-    """SCALE compact encoding for u128 — the tip field is `Compact<Balance>`
-    and balances are u128. For values up to 2^30 the layout matches u32."""
-    if n < 0:
-        raise ValueError(f"compact must be non-negative, got {n}")
-    if n < 0x40:
-        return bytes([n << 2])
-    if n < 0x4000:
-        return ((n << 2) | 0b01).to_bytes(2, "little")
-    if n < 0x4000_0000:
-        return ((n << 2) | 0b10).to_bytes(4, "little")
-    # Big-int mode: top 6 bits of first byte encode `(n_bytes - 4)`, low 2
-    # bits are 0b11. Then little-endian bytes of the value.
-    raw = n.to_bytes((n.bit_length() + 7) // 8, "little")
-    # SCALE compact big-int mode caps at 67 bytes: the top 6 bits of the
-    # mode byte encode `n_bytes - 4`, so max n_bytes = (0xff >> 2) + 4 = 67.
-    if len(raw) > 67:
-        raise OverflowError(
-            f"compact value needs {len(raw)} bytes, exceeds 67-byte SCALE limit"
-        )
-    return bytes([((len(raw) - 4) << 2) | 0b11]) + raw
-
-
-def _build_hybrid_signed_extrinsic(
-    *,
-    iface,
-    signer,
-    call_module: str,
-    call_function: str,
-    call_params: dict,
-    tip: int = 0,
-) -> tuple[bytes, str]:
-    """Construct a hybrid-signed extrinsic byte-by-byte.
-
-    Returns (wire_bytes, extrinsic_hash_hex). Bypasses substrate-interface's
-    `create_signed_extrinsic` because that path assumes the chain uses
-    `MultiSignature` — the hybrid chain uses `HybridTxSignature`, which is
-    a composite struct of (public, signature) rather than a tagged enum.
-
-    Layout follows Substrate's signed v4 extrinsic format:
-
-        compact_len(body) || body
-
-        body = (version_byte | 0x80) ||
-               MultiAddress::Id || AccountId32(32 bytes) ||
-               HybridTxSignature(3828 bytes: public[1344] || signature[2484]) ||
-               extra(signed-extension extras in metadata order) ||
-               call(SCALE-encoded call bytes)
-
-    The signing payload is `call || extra || additional`, blake2_256-hashed
-    when > 256 bytes. The signer applies the hybrid domain prefix on top of
-    that — see `HybridSigner.sign` / `prepare_message`.
-    """
-    # 1. Compose the call bytes via substrate-interface (call shape doesn't
-    #    depend on the signer; we just want the SCALE-encoded body).
-    call = iface.compose_call(
-        call_module=call_module,
-        call_function=call_function,
-        call_params=call_params,
-    )
-    raw_call = call.data.data if hasattr(call.data, "data") else call.data
-    if hasattr(raw_call, "tobytes"):
-        call_bytes = bytes(raw_call)
-    elif isinstance(raw_call, str):
-        call_bytes = bytes.fromhex(_strip_0x(raw_call))
+    if not isinstance(dispatch_error, dict):
+        return None
+    module = dispatch_error.get("Module")
+    if not isinstance(module, dict):
+        return None
+    pallet_index = _as_int_or_none(module.get("index"))
+    raw_error = module.get("error")
+    error_index: Optional[int] = None
+    if isinstance(raw_error, str) and raw_error.startswith("0x"):
+        try:
+            error_index = int.from_bytes(bytes.fromhex(raw_error[2:]), "little")
+        except ValueError:
+            return None
+    elif isinstance(raw_error, (list, tuple)) and raw_error:
+        error_index = _as_int_or_none(raw_error[0])
     else:
-        call_bytes = bytes(raw_call)
-
-    # 2. Fetch chain state needed for the signed extensions.
-    account = signer.account_id_bytes()
-    nonce = iface.get_account_nonce(account_address="0x" + account.hex())
-    genesis_hex = iface.get_block_hash(block_id=0)
-    rv = iface.rpc_request("state_getRuntimeVersion", [])["result"]
-    spec_version = int(rv["specVersion"])
-    tx_version = int(rv["transactionVersion"])
-    genesis_bytes = bytes.fromhex(_strip_0x(genesis_hex))
-
-    # 3. Signed-extension extras, in metadata order. Empty composites
-    #    (AuthorizeCall / CheckNonZeroSender / CheckSpecVersion / CheckTxVersion /
-    #    CheckGenesis / CheckWeight / WeightReclaim) encode to 0 bytes.
-    extra = (
-        b""                                  # AuthorizeCall
-        + b""                                # CheckNonZeroSender
-        + b""                                # CheckSpecVersion
-        + b""                                # CheckTxVersion
-        + b""                                # CheckGenesis
-        + b"\x00"                            # CheckMortality: Era::immortal
-        + _encode_compact_u32(int(nonce))    # CheckNonce
-        + b""                                # CheckWeight
-        + _encode_compact_u128(tip)          # ChargeTransactionPayment tip
-        + b"\x00"                            # CheckMetadataHash: Mode::Disabled
-        + b""                                # WeightReclaim
-    )
-
-    # 4. Signed-extension additional_signed, in metadata order. CheckMortality
-    #    with an immortal era uses the genesis hash here.
-    additional = (
-        b""                                  # AuthorizeCall
-        + b""                                # CheckNonZeroSender
-        + spec_version.to_bytes(4, "little") # CheckSpecVersion
-        + tx_version.to_bytes(4, "little")   # CheckTxVersion
-        + genesis_bytes                      # CheckGenesis
-        + genesis_bytes                      # CheckMortality (immortal -> genesis)
-        + b""                                # CheckNonce
-        + b""                                # CheckWeight
-        + b""                                # ChargeTransactionPayment
-        + b"\x00"                            # CheckMetadataHash: Option::None
-        + b""                                # WeightReclaim
-    )
-
-    # 5. Sign payload = call || extra || additional. Blake2_256 if > 256 bytes
-    #    per Substrate's SignaturePayload::using_encoded convention.
-    payload = call_bytes + extra + additional
-    payload_to_sign = (
-        hashlib.blake2b(payload, digest_size=32).digest()
-        if len(payload) > 256
-        else payload
-    )
-    signature_bytes = signer.sign(payload_to_sign)
-
-    # 6. SCALE-encode HybridTxSignature = public(1344) || signature(2484).
-    hybrid_sig_scale = signer.public_bytes() + signature_bytes
-
-    # 7. Assemble the wire body and length-prefix the whole extrinsic.
-    body = (
-        bytes([0x84])                        # v4 | 0x80 signed flag
-        + b"\x00"                            # MultiAddress::Id discriminator
-        + account                            # AccountId32 (32 bytes)
-        + hybrid_sig_scale
-        + extra
-        + call_bytes
-    )
-    full_extrinsic = _encode_compact_u32(len(body)) + body
-    ext_hash = "0x" + hashlib.blake2b(full_extrinsic, digest_size=32).digest().hex()
-    return full_extrinsic, ext_hash
+        error_index = _as_int_or_none(raw_error)
+    if pallet_index is None or error_index is None:
+        return None
+    try:
+        err = iface.metadata.get_module_error(pallet_index, error_index)
+    except Exception:  # noqa: BLE001 — decode is best-effort by contract
+        return None
+    return getattr(err, "name", None)
 
 
 def _result_was_found(result) -> bool:
@@ -1663,257 +1957,30 @@ def _result_was_found(result) -> bool:
     return meta.get("result_found", True)
 
 
+def _storage_value(result, *, check_found: bool = False):
+    """Extract the decoded value from a storage query result, or return None.
+
+    Centralises the two recurring empty-result guards:
+    - ``result is None`` — the executor raised or the iface returned None.
+    - ``result.value is None`` — the entry was present but decoded to None.
+    - ``not _result_was_found(result)`` — OptionQuery default masking a
+      missing entry; only checked when ``check_found=True``.
+
+    Returns ``result.value`` when all guards pass, ``None`` otherwise.
+    Callers that need a different sentinel (e.g. ``0``) compare the return
+    value to ``None`` themselves.
+    """
+    if result is None:
+        return None
+    if check_found and not _result_was_found(result):
+        return None
+    if result.value is None:
+        return None
+    return result.value
+
+
 def _hex(b: bytes) -> str:
     return "0x" + b.hex()
-
-
-def _read_exact(data: ScaleBytes, n: int) -> bytes:
-    """Read `n` bytes from the SCALE buffer, raising on short reads.
-
-    ``ScaleBytes.get_next_bytes`` silently returns a partial slice when the
-    underlying buffer is exhausted (and bumps the offset past the end), so
-    every subsequent read sees an empty slice. The downstream effect is
-    that decode errors surface several fields *after* the actual
-    truncation. Surfacing the short read at the field where it happened
-    makes error messages diagnostic instead of misleading.
-    """
-    chunk = data.get_next_bytes(n)
-    if len(chunk) != n:
-        raise ValueError(
-            f"short read: wanted {n} bytes, got {len(chunk)}"
-        )
-    return bytes(chunk)
-
-
-def _decode_u32(data: ScaleBytes) -> int:
-    return int.from_bytes(_read_exact(data, 4), "little")
-
-
-def _decode_i32(data: ScaleBytes) -> int:
-    return int.from_bytes(_read_exact(data, 4), "little", signed=True)
-
-
-def _decode_i64(data: ScaleBytes) -> int:
-    return int.from_bytes(_read_exact(data, 8), "little", signed=True)
-
-
-def _decode_u128(data: ScaleBytes) -> int:
-    return int.from_bytes(_read_exact(data, 16), "little")
-
-
-def _decode_u256_le(data: ScaleBytes) -> bytes:
-    """Read a 32-byte little-endian ``U256`` and return the raw bytes.
-
-    The Rust pallet returns `nonce: U256` from BLAKE3, which `parity-scale-codec`
-    serialises little-endian. The Python side treats nonces as opaque 32-byte
-    blobs (see ``MiningResult.nonce`` and ``derive_nonce``) — the *byte order*
-    used by miners/validators is the BLAKE3 digest order (big-endian by the
-    `blake3` library convention), so we re-reverse on the wire to recover it.
-    """
-    raw_le = _read_exact(data, 32)
-    return bytes(reversed(raw_le))
-
-
-def _decode_difficulty_config(data: ScaleBytes) -> "SubstrateDifficulty":
-    min_solutions = _decode_field("min_solutions", data, _decode_u32)
-    max_energy_milli = _decode_field("max_energy_milli", data, _decode_i64)
-    min_diversity_milli = _decode_field("min_diversity_milli", data, _decode_u32)
-    return SubstrateDifficulty(
-        min_solutions=min_solutions,
-        max_energy_milli=max_energy_milli,
-        min_diversity_milli=min_diversity_milli,
-    )
-
-
-def _decode_allowed_value_spec(data: ScaleBytes):
-    """Decode a SCALE-encoded ``AllowedValueSpec<BoundedVec<i32>>``.
-
-    Variant tag byte (0 = Set, 1 = IntegerRange, 2 = ContinuousRange)
-    followed by the variant-specific payload. The pallet's bounded vec
-    encodes as a plain ``Vec<i32>`` on the wire (the bound is enforced
-    by the encoder, not represented in the bytes).
-    """
-    from shared.allowed_value_spec import (
-        AllowedValueContinuousRange,
-        AllowedValueIntegerRange,
-        AllowedValueSet,
-    )
-
-    tag = _read_exact(data, 1)[0]
-    if tag == 0:
-        length = _decode_compact_u32(data)
-        values = tuple(_decode_i32(data) for _ in range(length))
-        return AllowedValueSet(values)
-    if tag == 1:
-        return AllowedValueIntegerRange(min=_decode_i32(data), max=_decode_i32(data))
-    if tag == 2:
-        return AllowedValueContinuousRange(min=_decode_i32(data), max=_decode_i32(data))
-    raise ValueError(f"unknown AllowedValueSpec variant tag: {tag}")
-
-
-def _decode_compact_u32(data: ScaleBytes) -> int:
-    """Decode a SCALE compact-encoded u32 length prefix.
-
-    Mode is encoded in the low 2 bits of the first byte:
-      0b00 → single-byte (value in upper 6 bits)
-      0b01 → two-byte
-      0b10 → four-byte
-      0b11 → big-integer mode (rejected here: u32 length prefixes never need
-             more than 4 bytes, and a malformed/malicious payload claiming
-             mode 0b11 could otherwise drive an OOM allocation downstream).
-    """
-    first = _read_exact(data, 1)[0]
-    mode = first & 0b11
-    if mode == 0:
-        return first >> 2
-    if mode == 1:
-        return ((first >> 2) | (_read_exact(data, 1)[0] << 6))
-    if mode == 2:
-        rest = _read_exact(data, 3)
-        return (first >> 2) | (rest[0] << 6) | (rest[1] << 14) | (rest[2] << 22)
-    raise ValueError("compact big-integer mode not valid for u32 length prefix")
-
-
-def _decode_mining_snapshot(encoded_hex: str) -> Optional[dict]:
-    """Decode SCALE ``Option<MiningSnapshot<...>>`` from the runtime API.
-
-    Layout:
-      - 1 byte option tag (0x00 = None, 0x01 = Some)
-      - last_proof_block_hash: H256 (32 bytes) — `block_hash(LastProofBlock)`
-      - difficulty: DifficultyConfig {min_solutions: u32,
-            max_energy_milli: i64, min_diversity_milli: u32}
-      - topology_hash: H256 (32 bytes)
-      - nodes: Vec<u32>
-      - edges: Vec<(u32, u32)>
-      - allowed_h_values: AllowedValueSpec<BoundedVec<i32>>
-      - allowed_j_values: AllowedValueSpec<BoundedVec<i32>>
-      - allowed_spin_values: AllowedValueSpec<BoundedVec<i32>>
-
-    Decode failures are re-raised with the failing field name so a runtime
-    API shape change (or truncated transport) lands a usable error. Trailing
-    bytes raise — a future runtime upgrade that appends a field would
-    otherwise silently drop it.
-    """
-    data = ScaleBytes(encoded_hex)
-    try:
-        tag = _read_exact(data, 1)
-        if tag[0] == 0:
-            if data.get_remaining_length() != 0:
-                raise ValueError(
-                    f"trailing bytes after Option::None tag: "
-                    f"{data.get_remaining_length()} bytes"
-                )
-            return None
-        last_proof_block_hash = _decode_field(
-            "last_proof_block_hash", data, lambda d: _read_exact(d, 32)
-        )
-        difficulty = _decode_difficulty_config(data)
-        topology_hash = _decode_field("topology_hash", data, lambda d: _read_exact(d, 32))
-        nodes_len = _decode_field("nodes_len", data, _decode_compact_u32)
-        nodes = [_decode_field("nodes[%d]" % i, data, _decode_u32)
-                 for i in range(nodes_len)]
-        edges_len = _decode_field("edges_len", data, _decode_compact_u32)
-        edges = [
-            (
-                _decode_field("edges[%d].0" % i, data, _decode_u32),
-                _decode_field("edges[%d].1" % i, data, _decode_u32),
-            )
-            for i in range(edges_len)
-        ]
-        allowed_h = _decode_field("allowed_h_values", data, _decode_allowed_value_spec)
-        allowed_j = _decode_field("allowed_j_values", data, _decode_allowed_value_spec)
-        allowed_spin = _decode_field(
-            "allowed_spin_values", data, _decode_allowed_value_spec
-        )
-    except ValueError:
-        raise
-    except Exception as exc:  # noqa: BLE001 — rewrap with context
-        raise ValueError(f"failed to decode mining snapshot: {exc}") from exc
-
-    if data.get_remaining_length() != 0:
-        raise ValueError(
-            f"trailing bytes after mining snapshot decode: "
-            f"{data.get_remaining_length()} bytes; runtime API shape likely "
-            "changed"
-        )
-    return {
-        "last_proof_block_hash": last_proof_block_hash,
-        "difficulty": difficulty,
-        "topology_hash": topology_hash,
-        "nodes": nodes,
-        "edges": edges,
-        "allowed_h_values": allowed_h,
-        "allowed_j_values": allowed_j,
-        "allowed_spin_values": allowed_spin,
-    }
-
-
-def _decode_winning_solution_with_nonce(
-    encoded_hex: str,
-) -> Optional["WinningSolutionWithNonce"]:
-    """Decode SCALE ``Option<WinningSolutionWithNonce<AccountId, Balance, BlockNumber>>``.
-
-    Layout (matches `pallet_quantum_pow::types::WinningSolutionWithNonce`):
-      - 1 byte option tag (0x00 = None, 0x01 = Some)
-      - solution.miner: AccountId32 = [u8; 32]
-      - solution.salt: [u8; 32]
-      - solution.energy_milli: i64
-      - solution.reward: u128 (Balance)
-      - solution.submitted_at: BlockNumber (u32)
-      - solution.difficulty: DifficultyConfig
-      - solution.last_proof_block_hash: H256 (last proof block hash the proof used)
-      - nonce: U256 (little-endian on the wire; reversed to recover the
-        BLAKE3 digest order Python miners use)
-    """
-    data = ScaleBytes(encoded_hex)
-    tag = _read_exact(data, 1)
-    if tag[0] == 0:
-        if data.get_remaining_length() != 0:
-            raise ValueError(
-                "trailing bytes after winning_solution Option::None tag: "
-                f"{data.get_remaining_length()} bytes"
-            )
-        return None
-    try:
-        miner = _decode_field("miner", data, lambda d: _read_exact(d, 32))
-        salt = _decode_field("salt", data, lambda d: _read_exact(d, 32))
-        energy_milli = _decode_field("energy_milli", data, _decode_i64)
-        reward = _decode_field("reward", data, _decode_u128)
-        submitted_at = _decode_field("submitted_at", data, _decode_u32)
-        difficulty = _decode_difficulty_config(data)
-        last_proof_block_hash = _decode_field(
-            "last_proof_block_hash", data, lambda d: _read_exact(d, 32)
-        )
-        nonce = _decode_field("nonce", data, _decode_u256_le)
-    except ValueError:
-        raise
-    except Exception as exc:  # noqa: BLE001 — rewrap with context
-        raise ValueError(f"failed to decode winning solution: {exc}") from exc
-    if data.get_remaining_length() != 0:
-        raise ValueError(
-            "trailing bytes after winning_solution decode: "
-            f"{data.get_remaining_length()} bytes; runtime API shape likely changed"
-        )
-    return WinningSolutionWithNonce(
-        solution=WinningSolution(
-            miner=miner,
-            salt=salt,
-            energy_milli=energy_milli,
-            reward=reward,
-            submitted_at=submitted_at,
-            difficulty=difficulty,
-            last_proof_block_hash=last_proof_block_hash,
-        ),
-        nonce=nonce,
-    )
-
-
-def _decode_field(name: str, data: ScaleBytes, fn: Callable[[ScaleBytes], Any]) -> Any:
-    """Run a decoder, re-raising with the failing field name on error."""
-    try:
-        return fn(data)
-    except Exception as exc:  # noqa: BLE001 — rewrap with context
-        raise ValueError(f"failed to decode field {name!r}: {exc}") from exc
 
 
 def _coerce_block_number(raw: Any) -> int:

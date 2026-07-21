@@ -5,6 +5,7 @@ routes each call through a ValidatorPool. Its only job is to forward
 ``(method_name, kwargs)`` correctly; everything interesting happens in
 the pool.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -29,6 +30,12 @@ class _RecordingPool:
                 raise value
             return value
         return None
+
+    async def send_write(self, op: str, args: dict) -> Any:
+        # Writes (submit_signed_extrinsic) route through the dedicated
+        # write handle; record identically so submit assertions on
+        # ``calls`` keep working.
+        return await self.send(op, args)
 
 
 @pytest.mark.asyncio
@@ -100,6 +107,7 @@ async def test_query_methods_forward_single_kwarg():
     pool.scripted["query_balance"] = 1234
     pool.scripted["query_solver"] = "solver"
     pool.scripted["query_job_order"] = "order"
+    pool.scripted["query_latest_qblock_id"] = 9
     pool.scripted["get_events_at"] = [{"event": "x"}]
     client = PoolClient(pool)
 
@@ -108,6 +116,7 @@ async def test_query_methods_forward_single_kwarg():
     assert await client.query_balance(b"\x01" * 32) == 1234
     assert await client.query_solver(b"\x01" * 32) == "solver"
     assert await client.query_job_order(7) == "order"
+    assert await client.query_latest_qblock_id() == 9
     assert await client.get_events_at(b"\x02" * 32) == [{"event": "x"}]
 
     assert pool.calls == [
@@ -116,6 +125,7 @@ async def test_query_methods_forward_single_kwarg():
         ("query_balance", {"account": b"\x01" * 32}),
         ("query_solver", {"account": b"\x01" * 32}),
         ("query_job_order", {"order_id": 7}),
+        ("query_latest_qblock_id", {}),
         ("get_events_at", {"block_hash": b"\x02" * 32}),
     ]
 
@@ -126,7 +136,17 @@ async def test_query_difficulty_forwards_no_args():
     pool.scripted["query_difficulty"] = "diff"
     client = PoolClient(pool)
     assert await client.query_difficulty() == "diff"
-    assert pool.calls == [("query_difficulty", {})]
+    assert pool.calls == [("query_difficulty", {"topology_hash": None})]
+
+
+@pytest.mark.asyncio
+async def test_query_difficulty_forwards_topology_hash():
+    pool = _RecordingPool()
+    pool.scripted["query_difficulty"] = "diff-topo"
+    client = PoolClient(pool)
+    h = b"\xab" * 32
+    assert await client.query_difficulty(h) == "diff-topo"
+    assert pool.calls == [("query_difficulty", {"topology_hash": h})]
 
 
 @pytest.mark.asyncio
@@ -162,7 +182,8 @@ async def test_submit_signed_extrinsic_forwards_hex_and_wait_for():
     pool.scripted["submit_signed_extrinsic"] = "receipt-sentinel"
     client = PoolClient(pool)
     result = await client.submit_signed_extrinsic(
-        "0xdeadbeef", wait_for="finalized",
+        "0xdeadbeef",
+        wait_for="finalized",
     )
     assert result == "receipt-sentinel"
     assert pool.calls == [

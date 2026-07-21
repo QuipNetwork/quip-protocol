@@ -8,7 +8,12 @@ import weakref
 
 import pytest
 
-from shared.ising_feeder import FixedIsingFeeder, RandomIsingFeeder
+from shared.allowed_value_spec import AllowedValueSet
+from shared.ising_feeder import (
+    FixedIsingFeeder,
+    RandomIsingFeeder,
+    _default_max_workers,
+)
 from shared.ising_model import IsingModel
 from shared.quantum_proof_of_work import (
     generate_ising_model_from_nonce,
@@ -35,6 +40,61 @@ def _make_feeder(**kwargs):
 
 
 _NONCE_BYTES_42 = (42).to_bytes(32, "big")
+
+
+class TestFeederPrepHook:
+    """The prep_fn hook runs in the spawn worker and replaces the buffered item."""
+
+    def test_pow_feeder_with_prepare_reduced_yields_reduced_problem(self):
+        from shared.problem_prep import (
+            ReducedProblem,
+            live_topology,
+            prepare_reduced,
+        )
+
+        live_nodes, live_edges = live_topology(_NODES, _EDGES, [], set())
+        feeder = _make_feeder(
+            prep_fn=prepare_reduced,
+            prep_args=([], set(), live_nodes, live_edges),
+        )
+        try:
+            item = feeder.pop_blocking()
+        finally:
+            feeder.stop()
+
+        # The worker post-processed the IsingModel into a ReducedProblem.
+        assert isinstance(item, ReducedProblem)
+        assert item.h_vec.shape == (len(_NODES),)
+        assert item.j_vec.shape == (len(_EDGES),)
+        assert item.defect_info is None          # no defects in this topology
+        assert len(item.nonce) == 32 and len(item.salt) == 32
+
+    def test_no_prep_fn_yields_plain_ising_model(self):
+        feeder = _make_feeder()
+        try:
+            item = feeder.pop_blocking()
+        finally:
+            feeder.stop()
+        assert isinstance(item, IsingModel)
+
+
+class TestDefaultMaxWorkers:
+    """Auto-scaling of the generator pool to the node's core count."""
+
+    @pytest.mark.parametrize(
+        "cpu,expected",
+        [(1, 2), (2, 2), (3, 2), (4, 3), (8, 7)],
+    )
+    def test_scales_to_cpu_minus_one_with_floor_of_two(
+        self, cpu, expected, monkeypatch
+    ):
+        monkeypatch.setattr("os.cpu_count", lambda: cpu)
+        assert _default_max_workers() == expected
+
+    def test_unknown_cpu_count_falls_back_to_four(self, monkeypatch):
+        # os.cpu_count() can return None; the default must still be sane.
+        monkeypatch.setattr("os.cpu_count", lambda: None)
+        assert _default_max_workers() == 3
 
 
 class TestIsingModel:
@@ -257,6 +317,38 @@ class TestRandomIsingFeeder:
                 feeder.reseed(b"\x03" * 31, b"\x02" * 32)
             with pytest.raises(ValueError):
                 feeder.reseed(b"\x03" * 32, b"\x02" * 31)
+        finally:
+            feeder.stop()
+
+    def test_default_allowed_h_is_ternary(self):
+        """No allowed_h override → fields are the ternary chain default."""
+        feeder = _make_feeder(seed=71)
+        try:
+            models = [feeder.pop_blocking() for _ in range(5)]
+            seen = {v for m in models for v in m.h.values()}
+            assert seen.issubset({-1.0, 0.0, 1.0})
+            # Across several models at least one nonzero field appears (would be
+            # impossible if zero-field had leaked into the default path).
+            assert seen - {0.0}
+        finally:
+            feeder.stop()
+
+    def test_zero_field_allowed_h_zeroes_h_keeps_j(self):
+        """allowed_h=AllowedValueSet((0,)) → all h==0, J untouched (J-only class)."""
+        zero = AllowedValueSet((0,))
+        feeder = _make_feeder(seed=72, allowed_h=zero)
+        try:
+            model = feeder.pop_blocking()
+            assert all(v == 0.0 for v in model.h.values())
+            assert set(model.h.keys()) == set(_NODES)
+
+            # J must match a ternary-default recompute of the SAME nonce: the
+            # field spec changes h only, and h is sampled before J, so the J
+            # draw is identical. This pins that allowed_h doesn't perturb J.
+            _h_ternary, j_ternary = generate_ising_model_from_nonce(
+                model.nonce, _NODES, _EDGES,
+            )
+            assert model.J == j_ternary
         finally:
             feeder.stop()
 

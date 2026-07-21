@@ -10,6 +10,7 @@ stands in for the persistent stream-driver context.
 """
 from __future__ import annotations
 
+import logging
 import multiprocessing as mp
 
 import numpy as np
@@ -46,8 +47,8 @@ def _spy_ctl_q(miner, sent: list):
     """Wrap the miner's ctl_q.put to record command kinds (after _ensure)."""
     orig_ensure = miner._ensure_driver
 
-    def _ensure_spy(sample_ctx):
-        ready = orig_ensure(sample_ctx)
+    def _ensure_spy(sample_ctx, **kwargs):
+        ready = orig_ensure(sample_ctx, **kwargs)
         if ready and miner._ctl_q is not None and not getattr(
             miner._ctl_q, "_quip_spied", False,
         ):
@@ -382,60 +383,6 @@ def test_mine_work_item_stops_promptly_on_stop_event():
 
 
 # ----------------------------------------------------------------------
-# Participation marker: write-once per accepted dispatch
-# ----------------------------------------------------------------------
-
-
-class _AbortMiner(_DriverMiner):
-    """Driver miner whose budget gate aborts the dispatch (no mining)."""
-
-    def _pre_mine_setup(self, *a, **k) -> bool:
-        return False
-
-
-def test_participating_cb_fires_once_on_accepted_dispatch():
-    import threading
-    import time as _t
-
-    ctx = _streaming_context()
-    miner = _DriverMiner(factory=_FAKE_CTX)  # infinite stream
-    calls: list = []
-    stop = mp.Event()
-    try:
-        t = threading.Thread(
-            target=lambda: miner.mine_work_item(
-                ctx, stop, participating_cb=lambda n, e: calls.append((n, e)),
-            )
-        )
-        t.start()
-        _t.sleep(0.4)
-        stop.set()
-        t.join(timeout=15.0)
-        assert not t.is_alive()
-        assert len(calls) == 1, f"expected one participation emit, got {calls}"
-        solution_number, extra = calls[0]
-        assert isinstance(solution_number, int)
-        # _DriverMiner has no time_manager -> base _participation_extra -> {}.
-        assert extra == {}
-    finally:
-        miner._close_driver()
-
-
-def test_participating_cb_not_fired_when_setup_aborts():
-    ctx = _streaming_context()
-    miner = _AbortMiner(factory=_FAKE_CTX)
-    calls: list = []
-    stop = mp.Event()
-    # _pre_mine_setup returns False => _setup_dispatch returns None => the
-    # participation emit is never reached. Returns promptly (no driver loop).
-    result = miner.mine_work_item(
-        ctx, stop, participating_cb=lambda n, e: calls.append((n, e)),
-    )
-    assert result is None
-    assert calls == []
-
-
-# ----------------------------------------------------------------------
 # Headline regression: lookahead -> decay -> aggressive submit (end-to-end)
 # ----------------------------------------------------------------------
 
@@ -500,8 +447,8 @@ def test_aggressive_submit_on_decay_end_to_end():
 
     orig_ensure = miner._ensure_driver
 
-    def _ensure_spy(sample_ctx):
-        ready = orig_ensure(sample_ctx)
+    def _ensure_spy(sample_ctx, **kwargs):
+        ready = orig_ensure(sample_ctx, **kwargs)
         if ready and miner._ctl_q is not None and not getattr(
             miner._ctl_q, "_quip_spied", False,
         ):
@@ -793,6 +740,280 @@ def test_ensure_driver_forwards_topology_in_factory_kwargs():
 
 
 # ----------------------------------------------------------------------
+# Ring-reuse gate: _ring_can_host + _ensure_driver respawn policy
+# ----------------------------------------------------------------------
+
+
+class TestRingCanHost:
+    """_ring_can_host: reuse-when-compatible gate over the persistent ring."""
+
+    @staticmethod
+    def _miner(ring_dims):
+        miner = _RingConsumer()
+        miner._ring_dims = ring_dims
+        return miner
+
+    def test_no_ring_yet_cannot_host(self):
+        assert self._miner(None)._ring_can_host((8, 3)) is False
+
+    def test_equal_dims_reuse(self):
+        assert self._miner((8, 3))._ring_can_host((8, 3)) is True
+
+    def test_smaller_num_reads_reuse(self):
+        assert self._miner((8, 3))._ring_can_host((4, 3)) is True
+
+    def test_larger_num_reads_respawn(self):
+        assert self._miner((8, 3))._ring_can_host((16, 3)) is False
+
+    def test_node_count_change_respawn(self):
+        assert self._miner((8, 3))._ring_can_host((8, 4)) is False
+        assert self._miner((8, 3))._ring_can_host((4, 2)) is False
+
+
+def _driver_sample_ctx(num_reads=8, nodes=(0, 1, 2)):
+    """Minimal sample_ctx for driving _ensure_driver directly."""
+    return {
+        "num_reads": num_reads, "nodes": list(nodes), "edges": [],
+        "annealing_time": 80.0, "energy_threshold": -1.0,
+        "last_proof_block_hash": b"\xab" * 32, "miner_bytes": b"\x42" * 32,
+    }
+
+
+def test_ensure_driver_reuses_ring_for_smaller_num_reads():
+    """A smaller-num_reads dispatch reuses the driver: same pid, same ring.
+
+    The per-dispatch num_reads rides the ('switch', ...) command, so the ring
+    only needs CAPACITY for it — capacity stays at the spawn-time size.
+    """
+    miner = _DriverMiner()
+    try:
+        assert miner._ensure_driver(_driver_sample_ctx(num_reads=8)) is True
+        pid = miner._driver_proc.pid
+        assert miner._ensure_driver(_driver_sample_ctx(num_reads=4)) is True
+        assert miner._driver_proc.pid == pid
+        assert miner._ring_dims == (8, 3)
+        assert miner._ring.max_rows == 8
+    finally:
+        miner._close_driver()
+
+
+def test_ensure_driver_respawns_and_grows_on_larger_num_reads(caplog):
+    """num_reads > ring capacity respawns, sized to the LARGER num_reads —
+    monotonic growth, so alternating pow<->mempool dims settle into reuse."""
+    miner = _DriverMiner()
+    try:
+        assert miner._ensure_driver(_driver_sample_ctx(num_reads=8)) is True
+        pid = miner._driver_proc.pid
+        with caplog.at_level(logging.INFO, logger=miner.logger.name):
+            assert miner._ensure_driver(_driver_sample_ctx(num_reads=16)) is True
+        assert miner._driver_proc.pid != pid
+        assert miner._ring_dims == (16, 3)
+        assert miner._ring.max_rows == 16
+        assert "dims-grew" in caplog.text
+        # Monotonic growth: the original smaller round now reuses the big ring.
+        pid_grown = miner._driver_proc.pid
+        assert miner._ensure_driver(_driver_sample_ctx(num_reads=8)) is True
+        assert miner._driver_proc.pid == pid_grown
+    finally:
+        miner._close_driver()
+
+
+def test_ensure_driver_respawns_on_node_count_change(caplog):
+    """A different node count never reuses (sample columns are topology-bound)."""
+    miner = _DriverMiner()
+    try:
+        assert miner._ensure_driver(_driver_sample_ctx(nodes=(0, 1, 2))) is True
+        pid = miner._driver_proc.pid
+        with caplog.at_level(logging.INFO, logger=miner.logger.name):
+            assert miner._ensure_driver(
+                _driver_sample_ctx(nodes=(0, 1, 2, 3)),
+            ) is True
+        assert miner._driver_proc.pid != pid
+        assert miner._ring_dims == (8, 4)
+        assert "node-count-changed" in caplog.text
+    finally:
+        miner._close_driver()
+
+
+def test_ensure_driver_respawns_dead_driver_with_reason(caplog):
+    """A dead driver respawns even on identical dims, logged as dead-driver."""
+    miner = _DriverMiner()
+    try:
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        pid = miner._driver_proc.pid
+        terminate_join(miner._driver_proc, 5.0)
+        assert not miner._driver_proc.is_alive()
+        with caplog.at_level(logging.INFO, logger=miner.logger.name):
+            assert miner._ensure_driver(_driver_sample_ctx()) is True
+        assert miner._driver_proc.pid != pid
+        assert miner._driver_proc.is_alive()
+        assert "dead-driver" in caplog.text
+    finally:
+        miner._close_driver()
+
+
+class _BackoffMiner(_DriverMiner):
+    """Driver miner with a recording, configurable crash-backoff policy."""
+
+    def __init__(self):
+        super().__init__()
+        self.backoff_calls: list = []
+        self.backoff_delay = 0.0
+
+    def _crash_backoff_delay(self, streak: int) -> float:
+        self.backoff_calls.append(streak)
+        return self.backoff_delay
+
+
+def _kill_driver(miner):
+    terminate_join(miner._driver_proc, 5.0)
+    assert not miner._driver_proc.is_alive()
+
+
+def test_fast_dead_driver_respawn_consults_backoff_policy():
+    """A driver that dies within DRIVER_FAST_DEATH_S of spawning counts as a
+    crash: consecutive fast deaths grow the streak handed to the policy."""
+    miner = _BackoffMiner()
+    try:
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        _kill_driver(miner)
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        assert miner.backoff_calls == [1]
+        _kill_driver(miner)
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        assert miner.backoff_calls == [1, 2]
+    finally:
+        miner._close_driver()
+
+
+def test_long_lived_driver_death_resets_crash_streak():
+    """Dying AFTER a healthy run is not a crash loop: respawn immediately,
+    no policy consult, streak back to zero."""
+    import time as _t
+
+    miner = _BackoffMiner()
+    try:
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        _kill_driver(miner)
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        assert miner.backoff_calls == [1]
+        # Backdate the spawn so this driver "ran" past the fast-death window.
+        miner._driver_spawned_at = (
+            _t.monotonic() - miner.DRIVER_FAST_DEATH_S - 1.0
+        )
+        _kill_driver(miner)
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        assert miner.backoff_calls == [1]  # no new consult
+        # And the streak restarted: the next fast death is streak 1 again.
+        _kill_driver(miner)
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        assert miner.backoff_calls == [1, 1]
+    finally:
+        miner._close_driver()
+
+
+def test_healthy_respawn_reasons_do_not_count_as_crashes():
+    """dims-grew / node-count-changed respawns never consult the policy."""
+    miner = _BackoffMiner()
+    try:
+        assert miner._ensure_driver(_driver_sample_ctx(num_reads=8)) is True
+        assert miner._ensure_driver(_driver_sample_ctx(num_reads=16)) is True
+        assert miner._ensure_driver(
+            _driver_sample_ctx(nodes=(0, 1, 2, 3)),
+        ) is True
+        assert miner.backoff_calls == []
+    finally:
+        miner._close_driver()
+
+
+def test_default_crash_backoff_policy_backs_off_forever():
+    """Default policy: exponential backoff capped at 60s, never raises —
+    transient causes self-heal; a permanently broken backend retries slowly
+    forever instead of hot-looping (chosen over hard-fail-after-N)."""
+    miner = _DriverMiner()
+    assert miner._crash_backoff_delay(1) == 2.0
+    assert miner._crash_backoff_delay(2) == 4.0
+    assert miner._crash_backoff_delay(3) == 8.0
+    assert miner._crash_backoff_delay(6) == 60.0   # 2^6=64, capped
+    assert miner._crash_backoff_delay(1000) == 60.0  # no overflow, no raise
+
+
+def test_backoff_delay_is_waited_and_stop_aware():
+    """The policy's delay is actually waited before the respawn — unless the
+    dispatch stop_event is set, which cuts the wait short (shutdown must not
+    hang for the backoff duration)."""
+    import time as _t
+
+    miner = _BackoffMiner()
+    try:
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        miner.backoff_delay = 0.5
+        _kill_driver(miner)
+        t0 = _t.monotonic()
+        assert miner._ensure_driver(_driver_sample_ctx()) is True
+        assert _t.monotonic() - t0 >= 0.5
+
+        miner.backoff_delay = 30.0
+        stop = mp.Event()
+        stop.set()
+        _kill_driver(miner)
+        t0 = _t.monotonic()
+        assert miner._ensure_driver(
+            _driver_sample_ctx(), stop_event=stop,
+        ) is True
+        assert _t.monotonic() - t0 < 10.0
+    finally:
+        miner._close_driver()
+
+
+class _VariableReadsMiner(_DriverMiner):
+    """Driver miner whose adapted num_reads follows ``reads_next`` per dispatch."""
+
+    def __init__(self):
+        super().__init__(factory=_FAKE_CTX)
+        self.reads_next = 8
+
+    def _adapt_mining_params(self, requirements, nodes, edges) -> dict:
+        return {
+            "num_reads": self.reads_next,
+            "annealing_time": 80.0,
+            "energy_threshold": requirements.difficulty_energy,
+        }
+
+
+def test_mine_work_item_ring_reuse_across_num_reads_changes():
+    """End-to-end: a smaller-num_reads dispatch keeps the driver pid; a
+    larger one respawns (the pow<->mempool flip cost model)."""
+    import threading
+    import time as _t
+
+    ctx = _streaming_context()
+    miner = _VariableReadsMiner()
+    try:
+        pids = []
+        for gen, reads in enumerate((8, 4, 16), start=1):
+            miner.reads_next = reads
+            stop = mp.Event()
+            t = threading.Thread(target=lambda s=stop: miner.mine_work_item(ctx, s))
+            t.start()
+            # The generation bumps right after _ensure_driver succeeds, so
+            # polling it is race-free (no fixed sleep).
+            deadline = _t.monotonic() + 10.0
+            while miner._generation < gen and _t.monotonic() < deadline:
+                _t.sleep(0.02)
+            assert miner._generation == gen, f"dispatch {gen} never set up"
+            pids.append(miner._driver_proc.pid)
+            stop.set()
+            t.join(timeout=15.0)
+            assert not t.is_alive()
+        assert pids[0] == pids[1], "smaller num_reads must reuse the driver"
+        assert pids[1] != pids[2], "larger num_reads must respawn the driver"
+        assert miner._ring_dims == (16, 3)
+    finally:
+        miner._close_driver()
+
+
+# ----------------------------------------------------------------------
 # Regression: switch tuple with Metal-style adapted params (no threshold/anneal)
 # ----------------------------------------------------------------------
 
@@ -836,8 +1057,8 @@ def test_switch_tuple_with_metal_style_params_no_crash():
 
     orig_ensure = miner._ensure_driver
 
-    def _ensure_and_hijack(sample_ctx):
-        ready = orig_ensure(sample_ctx)
+    def _ensure_and_hijack(sample_ctx, **kwargs):
+        ready = orig_ensure(sample_ctx, **kwargs)
         if ready and miner._ctl_q is not None and not real_put_holder:
             # Grab the real put but replace it so the item lands in our list.
             real_put_holder["real"] = miner._ctl_q.put
@@ -987,3 +1208,50 @@ def test_stash_entry_and_loop_state_decay_fields(tmp_path):
     assert st2.decay_schedule is None
     assert st2.last_proof_block == 0
     assert st2.epoch_length == 0
+
+
+def test_progress_knob_qpu_shows_anneal_not_sweeps():
+    # QPU dispatch: anneal_time set -> show anneal, never the bogus sweeps=64.
+    assert BaseMiner._progress_knob(80.0, 64) == "anneal=80us"
+
+
+def test_progress_knob_sweep_backend_shows_sweeps():
+    # SA/Metal: no anneal time -> show the sweep count.
+    assert BaseMiner._progress_knob(None, 128) == "sweeps=128"
+
+
+class TestBestCandidateSummary:
+    """_best_candidate_summary surfaces the current best stash entry for progress."""
+
+    @staticmethod
+    def _entry(decay_num, valid_at_block, floor, energy):
+        from types import SimpleNamespace
+
+        from shared.base_miner import StashEntry
+        return StashEntry(
+            decay_num=decay_num,
+            valid_at_block=valid_at_block,
+            result=SimpleNamespace(effective_floor=floor, energy=energy),
+        )
+
+    def test_empty_stash_is_na(self):
+        assert BaseMiner._best_candidate_summary([], True) == "n/a"
+
+    def test_decay_ranked_picks_earliest_then_lowest_energy(self):
+        # decay #2 wins over decay #3 even though #3 has lower energy.
+        top_k = [
+            self._entry(3, 999, floor=-14600, energy=-14620),
+            self._entry(2, 487225, floor=-14475, energy=-14493),
+        ]
+        out = BaseMiner._best_candidate_summary(top_k, is_decay_ranked=True)
+        assert out == (
+            "floor=-14475 energy=-14493 submittable@block=487225 (decay #2)"
+        )
+
+    def test_legacy_ranked_picks_lowest_energy(self):
+        top_k = [
+            self._entry(0, 0, floor=-14400, energy=-14410),
+            self._entry(0, 0, floor=-14500, energy=-14520),
+        ]
+        out = BaseMiner._best_candidate_summary(top_k, is_decay_ranked=False)
+        assert out.startswith("floor=-14500 energy=-14520")

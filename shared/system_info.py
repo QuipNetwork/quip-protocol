@@ -9,11 +9,10 @@ summary derived from ``MinerCore.miner_handles``. The output schema
 matches the v0.1 ``telemetry/nodes.json`` entries so existing dashboards
 continue to parse it without change.
 
-The on-chain ``identify`` flow canonicalizes this descriptor to UTF-8
-JSON (sorted keys, compact separators) and posts it as a signed
-``System.remark_with_event`` so indexers can map AccountId → descriptor
-without trusting any unsigned channel. ``schema`` is a discriminator
-that lets remark-scanning indexers select the right parser.
+The on-chain ``identify`` flow stores a compact typed projection of this
+descriptor via ``MinerRegistry.set_descriptor`` so indexers can map AccountId
+→ descriptor without trusting any unsigned channel. ``schema`` is kept in the
+JSON form used by dry-run previews and the local REST/dashboard surface.
 
 The forbidden-substring scrubber is defense-in-depth: even if a future
 contributor leaks a secret-bearing key through the per-miner whitelist,
@@ -310,18 +309,6 @@ def _cpu_physical_cores() -> Optional[int]:
 
 
 def _windows_physical_cores() -> Optional[int]:
-    try:
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-    except (AttributeError, OSError):
-        return None
-    # GetLogicalProcessorInformation: call twice (size probe, then data).
-    needed = ctypes.c_ulong(0)
-    kernel32.GetLogicalProcessorInformation(None, ctypes.byref(needed))
-    if needed.value == 0:
-        return None
-    buf = (ctypes.c_byte * needed.value)()
-    if not kernel32.GetLogicalProcessorInformation(buf, ctypes.byref(needed)):
-        return None
     # SYSTEM_LOGICAL_PROCESSOR_INFORMATION is complex; we can't parse the
     # buffer without defining the full struct. Accept best-effort None here
     # and let logical_cores stand in on Windows.
@@ -460,11 +447,15 @@ def _apple_gpu_name() -> Optional[str]:
 
 
 def _apple_gpu_core_count() -> Optional[int]:
-    """Parse GPU core count from 'ioreg -l | grep gpu-core-count'."""
+    """Parse GPU core count from the AGXAccelerator ioreg node.
+
+    Targeted class query (~0.05s); a full ``ioreg -l`` dump takes ~1.1s
+    idle and times out under CPU contention.
+    """
     try:
         result = subprocess.run(
-            "ioreg -l | grep gpu-core-count",
-            shell=True, capture_output=True, text=True, timeout=2,
+            ["ioreg", "-rc", "AGXAccelerator", "-d1"],
+            capture_output=True, text=True, timeout=10,
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
@@ -533,18 +524,36 @@ def _spec_kind(spec: Dict[str, Any]) -> str:
     return str(spec.get("kind", "")).lower()
 
 
-def _filter_args(args: Dict[str, Any], whitelist) -> Dict[str, Any]:
-    """Keep only whitelisted, non-forbidden, JSON-friendly entries."""
+def filter_telemetry_fields(
+    mapping: Dict[str, Any],
+    whitelist=None,
+) -> Dict[str, Any]:
+    """Keep only safe, JSON-friendly entries from *mapping*.
+
+    Args:
+        mapping: Source dict to filter.
+        whitelist: Optional collection of allowed keys.  When ``None`` every
+            non-secret, JSON-safe key is kept; when provided only keys in
+            the whitelist are kept.
+
+    Returns:
+        Filtered dict with no secret keys and no non-JSON-safe values.
+    """
     out: Dict[str, Any] = {}
-    for k, v in (args or {}).items():
+    for k, v in (mapping or {}).items():
         if not isinstance(k, str) or is_secret_key(k):
             continue
-        if k not in whitelist:
+        if whitelist is not None and k not in whitelist:
             continue
         if not _is_jsonable(v):
             continue
         out[k] = v
     return out
+
+
+def _filter_args(args: Dict[str, Any], whitelist) -> Dict[str, Any]:
+    """Thin wrapper kept for internal call-sites; delegates to filter_telemetry_fields."""
+    return filter_telemetry_fields(args, whitelist=whitelist)
 
 
 def _is_jsonable(value: Any) -> bool:
@@ -577,10 +586,18 @@ def _gpu_spec_entry(spec: Dict[str, Any], miner_id: str, kind: str) -> Dict[str,
         "backend": backend,
         "miner_id": miner_id,
     }
+    whitelist = (
+        _MODAL_HANDLE_ARGS_WHITELIST if kind == "modal"
+        else _GPU_HANDLE_ARGS_WHITELIST
+    )
+    # Apply generic whitelist fields first, then overwrite with kind-specific
+    # coercions so the explicit values always win without a pop() dance.
+    entry.update(_filter_args(args, whitelist))
     if kind in ("cuda", "cuda-gibbs"):
         device = args.get("device")
         if device is not None:
             entry["device_index"] = _coerce_int(device, default=device)
+        entry.pop("device", None)
     elif kind == "metal":
         device = args.get("device")
         if device is not None:
@@ -589,17 +606,6 @@ def _gpu_spec_entry(spec: Dict[str, Any], miner_id: str, kind: str) -> Dict[str,
         gpu_type = args.get("gpu_type")
         if gpu_type is not None:
             entry["gpu_type"] = str(gpu_type)
-    whitelist = (
-        _MODAL_HANDLE_ARGS_WHITELIST if kind == "modal"
-        else _GPU_HANDLE_ARGS_WHITELIST
-    )
-    extras = _filter_args(args, whitelist)
-    # device_index / gpu_type already set explicitly above — don't
-    # re-emit through the generic whitelist path.
-    extras.pop("device", None)
-    extras.pop("device_index", None)
-    extras.pop("gpu_type", None)
-    entry.update(extras)
     return entry
 
 
@@ -883,8 +889,8 @@ def to_canonical_json(descriptor: NodeDescriptor) -> bytes:
     """Serialize the descriptor as deterministic UTF-8 JSON bytes.
 
     Sorted keys (recursively), compact separators, no trailing newline.
-    The output is what gets posted as the ``System.remark`` body — and
-    what the indexer hashes / compares against when deduplicating.
+    The output is the rich JSON preview used by dry-run and local REST
+    surfaces. Live chain submission uses a compact typed projection.
     """
     payload = descriptor.to_dict()
     return json.dumps(
@@ -913,6 +919,7 @@ __all__ = [
     "SystemInfo",
     "build_descriptor",
     "collect_system_info",
+    "filter_telemetry_fields",
     "is_secret_key",
     "summarize_miners_from_handles",
     "summarize_miners_from_specs",

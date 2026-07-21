@@ -1,11 +1,7 @@
 """GPU miner using Modal via ModalSampler(gpu_type)."""
 from __future__ import annotations
 
-import signal
-from typing import List, Tuple
-
 from shared.base_miner import BaseMiner
-from shared.miner_types import BlockRequirements
 from GPU.modal_sampler import ModalSampler
 
 
@@ -26,52 +22,32 @@ class ModalMiner(BaseMiner):
         self.gpu_type = gpu_type
 
         # Register SIGTERM handler for graceful cleanup
-        signal.signal(signal.SIGTERM, self._cleanup_handler)
+        self._register_sigterm_cleanup("Modal")
 
-    def _cleanup_handler(self, signum, frame):
-        """Handle SIGTERM signal for graceful cleanup of Modal cloud resources."""
-        if hasattr(self, 'logger'):
-            self.logger.info(f"Modal miner {self.miner_id} received SIGTERM, cleaning up cloud GPU resources ({self.gpu_type})...")
-
-        # Modal-specific cleanup
-        try:
-            # Terminate any running Modal functions
-            if hasattr(self, 'sampler') and hasattr(self.sampler, 'cleanup'):
-                self.sampler.cleanup()
-                if hasattr(self, 'logger'):
-                    self.logger.info("Modal functions terminated")
-
-            # Close Modal connections/sessions
-            if hasattr(self, 'sampler') and hasattr(self.sampler, 'close'):
-                self.sampler.close()
-                if hasattr(self, 'logger'):
-                    self.logger.info("Modal connections closed")
-
-            # Clear any cached data
-            if hasattr(self, 'top_attempts'):
-                self.top_attempts.clear()
-
-        except Exception as e:
-            if hasattr(self, 'logger'):
-                self.logger.error(f"Error during Modal miner cleanup: {e}")
-
-        # Exit gracefully — guard against raising SystemExit during
-        # interpreter finalization (would produce "Exception ignored" noise).
-        self._graceful_exit()
-
-    def _adapt_mining_params(
-        self,
-        current_requirements: BlockRequirements,
-        nodes: List[int],
-        edges: List[Tuple[int, int]],
-    ) -> dict:
-        return self.adapt_parameters(
-            current_requirements.difficulty_energy,
-            current_requirements.min_diversity,
-            current_requirements.min_solutions,
-            num_nodes=len(nodes),
-            num_edges=len(edges),
+    def _sigterm_log_message(self) -> str:
+        """First-line SIGTERM log naming the Modal cloud GPU resources."""
+        return (
+            f"Modal miner {self.miner_id} received SIGTERM, cleaning up "
+            f"cloud GPU resources ({self.gpu_type})..."
         )
+
+    def _backend_cleanup(self) -> None:
+        """Handle SIGTERM-time cleanup of Modal cloud resources."""
+        # Terminate any running Modal functions
+        if hasattr(self, 'sampler') and hasattr(self.sampler, 'cleanup'):
+            self.sampler.cleanup()
+            if hasattr(self, 'logger'):
+                self.logger.info("Modal functions terminated")
+
+        # Close Modal connections/sessions
+        if hasattr(self, 'sampler') and hasattr(self.sampler, 'close'):
+            self.sampler.close()
+            if hasattr(self, 'logger'):
+                self.logger.info("Modal connections closed")
+
+        # Clear any cached data
+        if hasattr(self, 'top_attempts'):
+            self.top_attempts.clear()
 
     def _stream_factory_kwargs(self, sample_ctx, nodes):
         """Kwargs forwarded to GPU.modal_stream:build_persistent_context."""
@@ -79,6 +55,7 @@ class ModalMiner(BaseMiner):
             "miner_id": self.miner_id,
             "nodes": nodes,
             "edges": sample_ctx["edges"],
+            "allowed_h": sample_ctx.get("allowed_h_values"),
             "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
             "num_reads": sample_ctx["num_reads"],
             "num_sweeps": sample_ctx["num_sweeps"],

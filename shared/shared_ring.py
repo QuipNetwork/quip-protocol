@@ -14,12 +14,64 @@ See docs/miner-architecture.md.
 """
 from __future__ import annotations
 
+import logging
 import multiprocessing as mp
+import os
 import queue as _queue
+import sys
 from multiprocessing import shared_memory
 from typing import Optional
 
 _SPAWN = mp.get_context("spawn")
+
+logger = logging.getLogger(__name__)
+
+
+def _dev_shm_free_bytes() -> Optional[int]:
+    """Free bytes on the POSIX shared-memory tmpfs, or ``None`` off-Linux.
+
+    macOS backs ``SharedMemory`` differently (no ``/dev/shm``), and on
+    non-Linux platforms there is no fixed mount to inspect, so the
+    preflight is Linux-only.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        st = os.statvfs("/dev/shm")
+    except OSError:
+        return None
+    return st.f_bavail * st.f_frsize
+
+
+def _warn_if_shm_underprovisioned(slots: int, slot_bytes: int) -> None:
+    """Warn when ``/dev/shm`` cannot back a ring of ``slots``×``slot_bytes``.
+
+    tmpfs files are sparse: ``shm_open``+``ftruncate``+``mmap`` all succeed
+    on a full ``/dev/shm``, and the process that first *writes* an unbackable
+    page dies with SIGBUS (exitcode -7) — far from this allocation site and
+    with no Python traceback. Docker containers default ``/dev/shm`` to
+    64 MiB, which one miner worker's sample ring can exceed on its own, so
+    log the exact requirement and the remedy up front. Warn-only: raising
+    here would kill the child (and with it the whole supervised container)
+    on what may be a transient low-water mark.
+    """
+    free = _dev_shm_free_bytes()
+    if free is None:
+        return
+    required = slots * slot_bytes
+    if required <= free:
+        return
+    logger.warning(
+        "shared-memory ring needs %.1f MiB (%d slots x %d bytes) but "
+        "/dev/shm has only %.1f MiB free; writers will crash with SIGBUS "
+        "(exitcode -7) once tmpfs runs out. In Docker, raise the shm size "
+        "(docker run --shm-size=2g / compose shm_size: \"2gb\") — the "
+        "default is 64 MiB. Budget ~80 MiB per CPU worker (num_cpus).",
+        required / 2**20,
+        slots,
+        slot_bytes,
+        free / 2**20,
+    )
 
 
 class SharedRing:
@@ -33,6 +85,7 @@ class SharedRing:
         # non-owner attribute types narrow cleanly.
         if names is None:
             self._owner = True
+            _warn_if_shm_underprovisioned(slots, slot_bytes)
             self._shm = [shared_memory.SharedMemory(create=True, size=slot_bytes)
                          for _ in range(slots)]
             self.names = [s.name for s in self._shm]

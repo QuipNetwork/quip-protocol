@@ -13,23 +13,26 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
-from typing import List, Tuple
 
 from shared.base_miner import BaseMiner
-from shared.miner_types import BlockRequirements
 from GPU.metal_sa import MetalSASampler
 from GPU.metal_scheduler import MetalScheduler
 
 
 def get_gpu_core_count() -> int:
-    """Detect Apple Silicon GPU core count via ioreg."""
+    """Detect Apple Silicon GPU core count via a targeted ioreg query.
+
+    Queries only the AGXAccelerator registry node (~0.05s) rather than
+    dumping the whole registry (``ioreg -l``, ~1.1s on an idle M4 Max) —
+    the full dump blew its timeout under CPU contention and crash-looped
+    the stream driver, whose context factory runs this at every spawn.
+    """
     try:
         result = subprocess.run(
-            "ioreg -l | grep gpu-core-count",
-            shell=True,
+            ["ioreg", "-rc", "AGXAccelerator", "-d1"],
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=10,
         )
         if result.stdout:
             for line in result.stdout.splitlines():
@@ -156,20 +159,6 @@ class MetalMiner(BaseMiner):
 
         return True
 
-    def _adapt_mining_params(
-        self,
-        current_requirements: BlockRequirements,
-        nodes: List[int],
-        edges: List[Tuple[int, int]],
-    ) -> dict:
-        return self.adapt_parameters(
-            current_requirements.difficulty_energy,
-            current_requirements.min_diversity,
-            current_requirements.min_solutions,
-            num_nodes=len(nodes),
-            num_edges=len(edges),
-        )
-
     def _stream_factory_kwargs(self, sample_ctx, nodes):
         """Return kwargs forwarded to GPU.metal_stream:build_persistent_context.
 
@@ -179,6 +168,7 @@ class MetalMiner(BaseMiner):
             "miner_id": self.miner_id,
             "nodes": nodes,
             "edges": sample_ctx["edges"],
+            "allowed_h": sample_ctx.get("allowed_h_values"),
             "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
             "num_reads": sample_ctx["num_reads"],
             "num_sweeps": sample_ctx["num_sweeps"],
@@ -187,6 +177,9 @@ class MetalMiner(BaseMiner):
             "yielding": self.yielding,
             "active_util": self.active_util,
             "idle_after_s": self.idle_after_s,
+            # Detected once at worker init; a driver respawn must never
+            # re-run the ioreg probe (see get_gpu_core_count).
+            "gpu_cores": self.gpu_core_count,
         }
 
     def _cleanup_handler(self, signum, frame):

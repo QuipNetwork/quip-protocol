@@ -11,12 +11,11 @@ time on problems where we know we won't hit the target energy.
 import argparse
 import json
 import logging
-import multiprocessing
 import random
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -40,47 +39,17 @@ sys.stderr.reconfigure(line_buffering=True)
 import numpy as np
 import dimod
 
-from shared.block import Block, BlockHeader, BlockRequirements, create_genesis_block
-from shared.miner_types import MiningResult
+from shared.block import BlockRequirements, create_genesis_block
 from shared.time_utils import utc_timestamp
 import hashlib
 
 from shared.quantum_proof_of_work import (
     derive_nonce,
-    evaluate_sampleset,
     generate_ising_model_from_nonce,
 )
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies import load_topology
-
-
-def parse_duration(duration_str: str) -> float:
-    """
-    Parse duration string to minutes.
-
-    Supports: 30s, 5m, 2h, 1d, 1w
-    Examples:
-        "30s" -> 0.5 (minutes)
-        "5m" -> 5.0
-        "2h" -> 120.0
-        "1d" -> 1440.0
-        "1w" -> 10080.0
-    """
-    duration_str = duration_str.strip().lower()
-
-    if duration_str.endswith('s'):
-        return int(duration_str[:-1]) / 60.0
-    elif duration_str.endswith('m'):
-        return float(duration_str[:-1])
-    elif duration_str.endswith('h'):
-        return int(duration_str[:-1]) * 60.0
-    elif duration_str.endswith('d'):
-        return int(duration_str[:-1]) * 1440.0
-    elif duration_str.endswith('w'):
-        return int(duration_str[:-1]) * 10080.0
-    else:
-        # Try parsing as raw minutes
-        return float(duration_str)
+from QPU.qpu_time_manager import parse_duration
 
 
 def determine_canary_params(num_sweeps: int = 4, num_reads: int = 10) -> Dict[str, int]:
@@ -104,7 +73,7 @@ def determine_canary_params(num_sweeps: int = 4, num_reads: int = 10) -> Dict[st
 def process_batch(
     batch_h_list, batch_J_list, batch_nonces, batch_salts, batch_canary_results,
     miner, full_params, difficulty_energy, is_gpu, qpu_time_used, qpu_calls,
-    full_passed, full_failed, full_energies, full_times, topology
+    full_passed, full_failed, full_energies, full_times
 ):
     """Process a batch of problems through the full miner.
 
@@ -505,7 +474,7 @@ def run_canary_test(
             batch_results, qpu_time_used, qpu_calls, full_passed, full_failed, full_energies, full_times = process_batch(
                 batch_h_list, batch_J_list, batch_nonces, batch_salts, batch_canary_results,
                 miner, full_params, difficulty_energy, is_gpu, qpu_time_used, qpu_calls,
-                full_passed, full_failed, full_energies, full_times, topology
+                full_passed, full_failed, full_energies, full_times
             )
 
             nonce_results.extend(batch_results)
@@ -617,7 +586,6 @@ def run_canary_test(
     # Calculate precision, recall, F1
     tp = stats['analysis']['true_positives']
     fp = stats['analysis']['false_positives']
-    tn = stats['analysis']['true_negatives']
     fn = stats['analysis']['false_negatives']
 
     if tp + fp > 0:
@@ -759,32 +727,50 @@ def run_canary_test(
                 'min': min_diff,
                 'max': max_diff,
                 'coefficient_of_variation': diff_cv,
-                'interpretation': (
-                    'roughly constant offset' if diff_cv < 0.1 else
-                    'moderately variable offset' if diff_cv < 0.3 else
-                    'highly variable (non-linear)'
-                )
+                'interpretation': _classify_offset(diff_cv),
             },
             'interpretation': {
-                'correlation_strength': (
-                    'very strong positive' if correlation > 0.9 else
-                    'strong positive' if correlation > 0.7 else
-                    'moderate positive' if correlation > 0.5 else
-                    'weak positive' if correlation > 0.3 else
-                    'weak or no correlation'
-                ),
-                'relationship_type': (
-                    'nearly perfect linear (constant offset)' if r_squared > 0.95 and diff_cv < 0.1 else
-                    'strong linear relationship' if r_squared > 0.8 else
-                    'moderate linear relationship' if r_squared > 0.5 else
-                    'weak linear relationship (non-linear)'
-                )
+                'correlation_strength': _classify_correlation(correlation),
+                'relationship_type': _classify_relationship(r_squared, diff_cv),
             }
         }
     else:
         stats['analysis']['correlation'] = None
 
     return stats
+
+
+def _classify_offset(diff_cv: float) -> str:
+    """Classify energy-difference coefficient of variation as an offset description."""
+    if diff_cv < 0.1:
+        return 'roughly constant offset'
+    if diff_cv < 0.3:
+        return 'moderately variable offset'
+    return 'highly variable (non-linear)'
+
+
+def _classify_correlation(correlation: float) -> str:
+    """Classify Pearson correlation strength."""
+    if correlation > 0.9:
+        return 'very strong positive'
+    if correlation > 0.7:
+        return 'strong positive'
+    if correlation > 0.5:
+        return 'moderate positive'
+    if correlation > 0.3:
+        return 'weak positive'
+    return 'weak or no correlation'
+
+
+def _classify_relationship(r_squared: float, diff_cv: float) -> str:
+    """Classify regression relationship type."""
+    if r_squared > 0.95 and diff_cv < 0.1:
+        return 'nearly perfect linear (constant offset)'
+    if r_squared > 0.8:
+        return 'strong linear relationship'
+    if r_squared > 0.5:
+        return 'moderate linear relationship'
+    return 'weak linear relationship (non-linear)'
 
 
 def main():
@@ -863,7 +849,10 @@ def main():
 
     # Parse duration
     try:
-        duration_minutes = parse_duration(args.duration)
+        # Bare numbers are legacy minutes; suffixed values use the canonical
+        # seconds-based parser.
+        _d = args.duration.strip()
+        duration_minutes = float(_d) if _d[-1:].isdigit() else parse_duration(_d) / 60.0
     except (ValueError, IndexError):
         print(f"❌ Invalid duration format: '{args.duration}'. Use formats like: 30s, 5m, 2h, 1d, 1w")
         return 1
@@ -1054,10 +1043,6 @@ def main():
     if stats['canary']['time_stats']['mean'] and stats['full']['time_stats']['mean']:
         avg_canary = stats['canary']['time_stats']['mean']
         avg_full = stats['full']['time_stats']['mean']
-
-        # Time saved by using canary to filter
-        fn = stats['analysis']['false_negatives']
-        tn = stats['analysis']['true_negatives']
 
         # Without canary: run full on everything
         time_without_canary = stats['total_nonces'] * avg_full

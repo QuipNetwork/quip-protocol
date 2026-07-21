@@ -14,12 +14,10 @@ import os
 import statistics
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple, cast
-from typing import Any as AnyType
-from typing import Tuple as TupleType
 
 import numpy as np
 
@@ -180,10 +178,6 @@ def normalize_test_id(test_id: str) -> str:
                 suffix += base[idx:]
                 base = base[:idx]
                 break  # suffixes are contiguous after the base
-        # Re-extract suffix from remaining if multiple
-        if suffix:
-            # All suffixes are in the suffix string already
-            pass
 
         num_reads, annealing_time = parse_test_id(base)
         normalized_base = f"quip_{num_reads}sweep_{int(round(annealing_time))}time"
@@ -238,6 +232,14 @@ def get_solver_properties(sampler: DWaveSamplerWrapper) -> Dict[str, Any]:
     }
 
 
+def _timing_params(solver_props: Dict[str, Any]) -> Tuple[float, float, float]:
+    """Return (programming_time, readout_per_sample, readout_therm) from solver_props."""
+    programming_time = solver_props.get('default_programming_thermalization', 1000.0)
+    readout_per_sample = solver_props.get('readout_time_per_sample', 123.0)
+    readout_therm = solver_props.get('default_readout_thermalization', 0.0)
+    return programming_time, readout_per_sample, readout_therm
+
+
 def estimate_qpu_time(
     annealing_time: float,
     num_reads: int,
@@ -249,9 +251,7 @@ def estimate_qpu_time(
 
     Returns estimated time in microseconds.
     """
-    programming_time = solver_props.get('default_programming_thermalization', 1000.0)
-    readout_per_sample = solver_props.get('readout_time_per_sample', 123.0)
-    readout_therm = solver_props.get('default_readout_thermalization', 0.0)
+    programming_time, readout_per_sample, readout_therm = _timing_params(solver_props)
 
     # Per-read time includes annealing + readout + thermalization overhead
     per_read_time = annealing_time + readout_per_sample + readout_therm
@@ -307,9 +307,7 @@ def max_annealing_time_for_reads(
     hw_max_duration = solver_props['problem_run_duration_range'][1]
     max_duration = min(qpu_budget, hw_max_duration)
 
-    programming_time = solver_props.get('default_programming_thermalization', 1000.0)
-    readout_per_sample = solver_props.get('readout_time_per_sample', 123.0)
-    readout_therm = solver_props.get('default_readout_thermalization', 0.0)
+    programming_time, readout_per_sample, readout_therm = _timing_params(solver_props)
 
     overhead_per_read = readout_per_sample + readout_therm
 
@@ -337,9 +335,7 @@ def max_num_reads_for_annealing_time(
     hw_max_duration = solver_props['problem_run_duration_range'][1]
     max_duration = min(qpu_budget, hw_max_duration)
 
-    programming_time = solver_props.get('default_programming_thermalization', 1000.0)
-    readout_per_sample = solver_props.get('readout_time_per_sample', 123.0)
-    readout_therm = solver_props.get('default_readout_thermalization', 0.0)
+    programming_time, readout_per_sample, readout_therm = _timing_params(solver_props)
 
     per_read_time = annealing_time + readout_per_sample + readout_therm
 
@@ -373,8 +369,8 @@ def submit_async_job(
     # Generate Ising model from seed
     h, J = generate_ising_model_from_nonce(ising_seed, nodes, edges)
 
-    h_cast = cast(Mapping[AnyType, float], h)
-    J_cast = cast(Mapping[TupleType[AnyType, AnyType], float], J)
+    h_cast = cast(Mapping[Any, float], h)
+    J_cast = cast(Mapping[Tuple[Any, Any], float], J)
 
     # Build sample kwargs
     sample_kwargs: Dict[str, Any] = {
@@ -472,6 +468,55 @@ def process_completed_job(job: PendingJob) -> Dict[str, Any]:
     }
 
 
+def _raise_quota_exhausted(pending_jobs: Dict[Any, PendingJob], error: Exception) -> None:
+    """Print the quota warning, cancel all pending jobs, and raise.
+
+    Used by the queue refill / result-processing paths where in-flight jobs
+    must be cancelled before propagating ``QuotaExhaustedError``.
+    """
+    print(f"\n    ⚠️  QUOTA EXHAUSTED: {error}")
+    for future in pending_jobs.keys():
+        try:
+            future.cancel()
+        except Exception:
+            pass
+    raise QuotaExhaustedError(str(error))
+
+
+def _fill_queue(
+    pending_jobs: Dict[Any, PendingJob],
+    seeds_to_run: List[int],
+    seed_index: int,
+    submit_kwargs: Dict[str, Any],
+    *,
+    queue_depth: int,
+    total_to_run: int,
+    cancel_on_quota: bool,
+) -> int:
+    """Submit jobs until the queue is full or seeds are exhausted.
+
+    ``submit_kwargs`` holds the static ``submit_async_job`` arguments shared by
+    every seed. Returns the advanced ``seed_index``. On quota exhaustion this
+    raises ``QuotaExhaustedError`` (cancelling pending jobs first when
+    ``cancel_on_quota`` is set, matching the original refill behaviour).
+    """
+    while len(pending_jobs) < queue_depth and seed_index < total_to_run:
+        seed = seeds_to_run[seed_index]
+        try:
+            job = submit_async_job(ising_seed=seed, **submit_kwargs)
+            pending_jobs[job.future] = job
+            seed_index += 1
+        except Exception as e:
+            if is_quota_exhausted_error(e):
+                if cancel_on_quota:
+                    _raise_quota_exhausted(pending_jobs, e)
+                print(f"\n    ⚠️  QUOTA EXHAUSTED: {e}")
+                raise QuotaExhaustedError(str(e))
+            print(f"    Error submitting seed {seed}: {e}")
+            seed_index += 1
+    return seed_index
+
+
 def run_configuration(
     sampler: DWaveSamplerWrapper,
     nodes: List[int],
@@ -530,25 +575,26 @@ def run_configuration(
     completed_count = 0
     total_to_run = len(seeds_to_run)
 
+    # Static arguments shared by every submit_async_job call for this config.
+    submit_kwargs: Dict[str, Any] = {
+        'sampler': sampler,
+        'nodes': nodes,
+        'edges': edges,
+        'num_reads': num_reads,
+        'annealing_time': annealing_time,
+        'test_id': test_id,
+        'solver_name': solver_name,
+        'chain_strength_multiplier': chain_strength_multiplier,
+        'reduce_intersample_correlation': reduce_intersample_correlation,
+        'reinitialize_state': reinitialize_state,
+    }
+
     # Initial queue fill
-    while len(pending_jobs) < queue_depth and seed_index < total_to_run:
-        seed = seeds_to_run[seed_index]
-        try:
-            job = submit_async_job(
-                sampler, nodes, edges, seed, num_reads, annealing_time, test_id,
-                solver_name=solver_name,
-                chain_strength_multiplier=chain_strength_multiplier,
-                reduce_intersample_correlation=reduce_intersample_correlation,
-                reinitialize_state=reinitialize_state,
-            )
-            pending_jobs[job.future] = job
-            seed_index += 1
-        except Exception as e:
-            if is_quota_exhausted_error(e):
-                print(f"\n    ⚠️  QUOTA EXHAUSTED: {e}")
-                raise QuotaExhaustedError(str(e))
-            print(f"    Error submitting seed {seed}: {e}")
-            seed_index += 1
+    seed_index = _fill_queue(
+        pending_jobs, seeds_to_run, seed_index, submit_kwargs,
+        queue_depth=queue_depth, total_to_run=total_to_run,
+        cancel_on_quota=False,
+    )
 
     # Streaming result loop
     while pending_jobs:
@@ -587,41 +633,15 @@ def run_configuration(
 
         except Exception as e:
             if is_quota_exhausted_error(e):
-                print(f"\n    ⚠️  QUOTA EXHAUSTED: {e}")
-                # Cancel remaining pending jobs
-                for future in pending_jobs.keys():
-                    try:
-                        future.cancel()
-                    except Exception:
-                        pass
-                raise QuotaExhaustedError(str(e))
+                _raise_quota_exhausted(pending_jobs, e)
             print(f"    Error processing seed {job.ising_seed}: {e}")
 
         # Refill queue
-        while len(pending_jobs) < queue_depth and seed_index < total_to_run:
-            seed = seeds_to_run[seed_index]
-            try:
-                new_job = submit_async_job(
-                    sampler, nodes, edges, seed, num_reads, annealing_time, test_id,
-                    solver_name=solver_name,
-                    chain_strength_multiplier=chain_strength_multiplier,
-                    reduce_intersample_correlation=reduce_intersample_correlation,
-                    reinitialize_state=reinitialize_state,
-                )
-                pending_jobs[new_job.future] = new_job
-                seed_index += 1
-            except Exception as e:
-                if is_quota_exhausted_error(e):
-                    print(f"\n    ⚠️  QUOTA EXHAUSTED: {e}")
-                    # Cancel remaining pending jobs
-                    for future in pending_jobs.keys():
-                        try:
-                            future.cancel()
-                        except Exception:
-                            pass
-                    raise QuotaExhaustedError(str(e))
-                print(f"    Error submitting seed {seed}: {e}")
-                seed_index += 1
+        seed_index = _fill_queue(
+            pending_jobs, seeds_to_run, seed_index, submit_kwargs,
+            queue_depth=queue_depth, total_to_run=total_to_run,
+            cancel_on_quota=True,
+        )
 
     if min_energies:
         avg = statistics.mean(min_energies)
@@ -1010,6 +1030,62 @@ def phase6_chain_strength_sweep(
     return best_mult, best_energies
 
 
+def _sweep_boolean_param(
+    phase_num: int,
+    param_name: str,
+    sampler: DWaveSamplerWrapper,
+    nodes: List[int],
+    edges: List[Tuple[int, int]],
+    solver_props: Dict[str, Any],
+    csv_path: str,
+    completed: set,
+    best_annealing_time: float,
+    best_num_reads: int,
+    num_ising_models: int = 1024,
+    queue_depth: int = 30,
+    solver_name: str = "",
+) -> Tuple[Optional[bool], List[float]]:
+    """Sweep a boolean solver parameter (False vs True).
+
+    Returns: (best_setting, energies at best point)
+    """
+    print("\n" + "="*60)
+    print(f"PHASE {phase_num}: {param_name}")
+    print(f"  Fixed annealing_time: {best_annealing_time} us")
+    print(f"  Fixed num_reads: {best_num_reads}")
+    print("="*60)
+
+    # Check solver support
+    raw_params = sampler.properties.get('parameters', {})
+    if param_name not in raw_params:
+        print(f"  SKIPPED: Solver does not support {param_name}")
+        return None, []
+
+    best_setting: Optional[bool] = None
+    best_energies: List[float] = []
+
+    for setting in [False, True]:
+        print(f"\n  --- {param_name} = {setting} ---")
+        energies = run_configuration(
+            sampler, nodes, edges,
+            best_num_reads, best_annealing_time,
+            csv_path, completed, solver_props, num_ising_models, queue_depth,
+            solver_name=solver_name,
+            **{param_name: setting},
+        )
+
+        if energies:
+            if not best_energies or statistics.mean(energies) < statistics.mean(best_energies):
+                best_setting = setting
+                best_energies = energies
+
+    print(f"\n  Best {param_name}: {best_setting}")
+    if best_energies:
+        print(f"  Best avg min_energy: {statistics.mean(best_energies):.1f}")
+
+    return best_setting, best_energies
+
+
 def phase7_intersample_correlation(
     sampler: DWaveSamplerWrapper,
     nodes: List[int],
@@ -1027,45 +1103,12 @@ def phase7_intersample_correlation(
 
     Returns: (best_setting, energies at best point)
     """
-    print("\n" + "="*60)
-    print("PHASE 7: reduce_intersample_correlation")
-    print(f"  Fixed annealing_time: {best_annealing_time} us")
-    print(f"  Fixed num_reads: {best_num_reads}")
-    print("="*60)
-
-    # Check solver support
-    supported_params = solver_props.get('parameters', {})
-    if not isinstance(supported_params, dict):
-        supported_params = {}
-    # Also check raw properties for parameter support
-    raw_params = sampler.properties.get('parameters', {})
-    if 'reduce_intersample_correlation' not in raw_params:
-        print("  SKIPPED: Solver does not support reduce_intersample_correlation")
-        return None, []
-
-    best_setting: Optional[bool] = None
-    best_energies: List[float] = []
-
-    for setting in [False, True]:
-        print(f"\n  --- reduce_intersample_correlation = {setting} ---")
-        energies = run_configuration(
-            sampler, nodes, edges,
-            best_num_reads, best_annealing_time,
-            csv_path, completed, solver_props, num_ising_models, queue_depth,
-            solver_name=solver_name,
-            reduce_intersample_correlation=setting,
-        )
-
-        if energies:
-            if not best_energies or statistics.mean(energies) < statistics.mean(best_energies):
-                best_setting = setting
-                best_energies = energies
-
-    print(f"\n  Best reduce_intersample_correlation: {best_setting}")
-    if best_energies:
-        print(f"  Best avg min_energy: {statistics.mean(best_energies):.1f}")
-
-    return best_setting, best_energies
+    return _sweep_boolean_param(
+        7, 'reduce_intersample_correlation',
+        sampler, nodes, edges, solver_props, csv_path, completed,
+        best_annealing_time, best_num_reads, num_ising_models, queue_depth,
+        solver_name=solver_name,
+    )
 
 
 def phase8_reinitialize_state(
@@ -1085,41 +1128,12 @@ def phase8_reinitialize_state(
 
     Returns: (best_setting, energies at best point)
     """
-    print("\n" + "="*60)
-    print("PHASE 8: reinitialize_state")
-    print(f"  Fixed annealing_time: {best_annealing_time} us")
-    print(f"  Fixed num_reads: {best_num_reads}")
-    print("="*60)
-
-    # Check solver support
-    raw_params = sampler.properties.get('parameters', {})
-    if 'reinitialize_state' not in raw_params:
-        print("  SKIPPED: Solver does not support reinitialize_state")
-        return None, []
-
-    best_setting: Optional[bool] = None
-    best_energies: List[float] = []
-
-    for setting in [False, True]:
-        print(f"\n  --- reinitialize_state = {setting} ---")
-        energies = run_configuration(
-            sampler, nodes, edges,
-            best_num_reads, best_annealing_time,
-            csv_path, completed, solver_props, num_ising_models, queue_depth,
-            solver_name=solver_name,
-            reinitialize_state=setting,
-        )
-
-        if energies:
-            if not best_energies or statistics.mean(energies) < statistics.mean(best_energies):
-                best_setting = setting
-                best_energies = energies
-
-    print(f"\n  Best reinitialize_state: {best_setting}")
-    if best_energies:
-        print(f"  Best avg min_energy: {statistics.mean(best_energies):.1f}")
-
-    return best_setting, best_energies
+    return _sweep_boolean_param(
+        8, 'reinitialize_state',
+        sampler, nodes, edges, solver_props, csv_path, completed,
+        best_annealing_time, best_num_reads, num_ising_models, queue_depth,
+        solver_name=solver_name,
+    )
 
 
 def estimate_total_configs(skip_phases: List[int]) -> int:

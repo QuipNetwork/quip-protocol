@@ -19,8 +19,10 @@ from shared.miner_types import MiningResult
 from shared.packed_solution import unpack_solution
 from substrate.submitter import (
     MILLI_SCALE,
+    RuntimeIncompatibleError,
     _normalize_spins,
     encode_quantum_proof,
+    runtime_incompat_reason,
 )
 from substrate.types import (
     SubstrateDifficulty,
@@ -90,8 +92,12 @@ def test_encode_quantum_proof_field_shape():
     assert proof["nonce"] == int.from_bytes(result.nonce, "big")
     assert bytes(proof["salt"]) == result.salt
 
-    # The post-MR-!20 proof carries ONLY topology_hash, nonce, salt, solutions.
-    assert set(proof.keys()) == {"topology_hash", "nonce", "salt", "solutions"}
+    # The spec-111 proof carries topology_hash, nonce, salt, solutions,
+    # device_access_time_us. scalecodec composes from chain metadata, so the
+    # extra key is ignored by a pre-111 chain and consumed by 111.
+    assert set(proof.keys()) == {
+        "topology_hash", "nonce", "salt", "solutions", "device_access_time_us",
+    }
 
     # One submitted solution, bit-packed against the binary spin spec
     # (1 bit per spin, 4 spins → 1 byte).
@@ -134,6 +140,26 @@ def test_encode_rejects_solution_length_mismatch():
         encode_quantum_proof(result, ctx)
 
 
+def test_encode_quantum_proof_device_access_time_threading():
+    ctx = _make_context()
+    result = _make_result()
+    result.device_access_time_us = 987_654
+    assert encode_quantum_proof(result, ctx)["device_access_time_us"] == 987_654
+
+
+def test_encode_quantum_proof_device_access_time_defaults_zero():
+    ctx = _make_context()
+    result = _make_result()  # device_access_time_us left as None
+    assert encode_quantum_proof(result, ctx)["device_access_time_us"] == 0
+
+
+def test_encode_quantum_proof_device_access_time_clamps_negative():
+    ctx = _make_context()
+    result = _make_result()
+    result.device_access_time_us = -5
+    assert encode_quantum_proof(result, ctx)["device_access_time_us"] == 0
+
+
 def test_normalize_spins_boolean_convention():
     assert _normalize_spins([0, 1, 0, 1]) == [-1, 1, -1, 1]
 
@@ -145,3 +171,55 @@ def test_normalize_spins_spin_convention():
 def test_normalize_spins_rejects_invalid_value():
     with pytest.raises(ValueError, match="cannot normalize"):
         _normalize_spins([0, 1, 2])
+
+
+# --- runtime-incompatibility classifier (gh-20) --------------------------
+
+
+def test_runtime_incompat_reason_missing_struct_field():
+    """The exact encode failure a too-old client hits when the runtime adds a
+    required proof field (gh-20: device_access_time_us)."""
+    exc = ValueError(
+        'Element "device_access_time_us" of struct is missing in given value'
+    )
+    reason = runtime_incompat_reason(exc)
+    assert reason is not None
+    assert "device_access_time_us" in reason
+
+
+def test_runtime_incompat_reason_storage_function_not_found():
+    class StorageFunctionNotFound(Exception):
+        pass
+
+    reason = runtime_incompat_reason(
+        StorageFunctionNotFound('Storage function "QuantumPow.Difficulty" not found')
+    )
+    assert reason is not None
+    assert "QuantumPow.Difficulty" in reason
+
+
+def test_runtime_incompat_reason_call_not_in_metadata():
+    reason = runtime_incompat_reason(
+        RuntimeError("Call function 'submit_proof' not found in metadata")
+    )
+    assert reason is not None
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        BrokenPipeError("broken pipe"),
+        TimeoutError("timed out"),
+        ConnectionError("connection reset"),
+        RuntimeError("Priority is too low (1014)"),
+        ValueError("cannot normalize spin 2"),
+    ],
+)
+def test_runtime_incompat_reason_ignores_transient_and_other_errors(exc):
+    """Transient RPC failures and unrelated bugs must NOT be misclassified as a
+    runtime mismatch — those still retry / fail as before."""
+    assert runtime_incompat_reason(exc) is None
+
+
+def test_runtime_incompatible_error_is_runtime_error():
+    assert issubclass(RuntimeIncompatibleError, RuntimeError)

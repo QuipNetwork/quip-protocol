@@ -1,4 +1,4 @@
-"""Unit tests for `shared.mempool_types` — pure dataclass round-trips.
+"""Unit tests for `substrate.mempool_types` — pure dataclass round-trips.
 
 Live-chain tests for solver registration / job proposal live in
 `tests/test_mempool_client.py`; this file only exercises the encoders +
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from shared.mempool_types import (
+from substrate.mempool_types import (
     IsingParams,
     JobMode,
     MinerType,
@@ -32,6 +32,13 @@ def test_miner_type_from_kind_cpu_gpu_qpu():
     # works without callers learning the vendor variants.
     assert MinerType.from_kind("qpu") == MinerType.QPU_DWAVE
     assert MinerType.from_kind("dwave") == MinerType.QPU_DWAVE
+
+
+def test_miner_type_from_kind_gpu_backends_collapse_to_gpu():
+    # The participation marker reports the running sampler backend, but the
+    # on-chain taxonomy is cpu/gpu/qpu — every GPU backend maps to GPU.
+    for backend in ("metal", "cuda", "cuda-gibbs", "modal", "METAL"):
+        assert MinerType.from_kind(backend) == MinerType.GPU
 
 
 def test_miner_type_from_kind_unknown_raises():
@@ -213,7 +220,7 @@ def test_ising_params_decode_with_missing_optionals():
 
 def test_mempool_job_context_from_job_order():
     """from_job_order must copy all IsingParams fields into the context."""
-    from shared.mempool_types import (
+    from substrate.mempool_types import (
         IsingParams, JobMode, JobOrder, MempoolJobContext,
         OrderStatus, OrderTiming, ResultDelivery, RewardResolution,
     )
@@ -253,7 +260,7 @@ def test_mempool_job_context_from_job_order():
 
 def test_mempool_job_context_rejects_mismatched_h_values():
     """MempoolJobContext.__post_init__ must raise if h_values length != nodes."""
-    from shared.mempool_types import MempoolJobContext
+    from substrate.mempool_types import MempoolJobContext
     with pytest.raises(ValueError, match="h_values length"):
         MempoolJobContext(
             order_id=1,
@@ -266,7 +273,7 @@ def test_mempool_job_context_rejects_mismatched_h_values():
 
 def test_mempool_job_context_rejects_mismatched_j_values():
     """MempoolJobContext.__post_init__ must raise if j_values length != edges."""
-    from shared.mempool_types import MempoolJobContext
+    from substrate.mempool_types import MempoolJobContext
     with pytest.raises(ValueError, match="j_values length"):
         MempoolJobContext(
             order_id=1,

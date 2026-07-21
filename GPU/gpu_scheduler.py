@@ -1,35 +1,27 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025 QUIP Protocol Contributors
 
-"""Event-based GPU buffer slot lifecycle + SM budget management.
+"""GPU SM budget management.
 
-Tracks buffer state via CUDA events for non-blocking kernel
-completion detection. Optionally monitors external GPU load
-via NVML to reduce SM budget when sharing the GPU.
+Optionally monitors external GPU load via NVML to throttle
+when sharing the GPU.
 
 Yielding modes:
     yielding=False (default): We own this GPU. Static SM
         budget from gpu_utilization config. No monitoring.
     yielding=True: Yield to other GPU users. NVML daemon
-        thread polls utilization and reduces SM budget when
+        thread polls utilization and throttles when
         external load is detected.
-
-State machine per slot:
-    FREE → UPLOADING → READY → ACTIVE → DONE → FREE
 """
-# ``cp.cuda.*`` appears in type annotations below; ``cupy`` is absent on
-# CPU/CI hosts (``cp`` is None). Defer annotation evaluation so importing this
-# module never evaluates ``cp.cuda`` — without this, Python < 3.14 (CI runs
-# 3.12) eagerly evaluates the annotations at class-definition time and raises
-# ``AttributeError: 'NoneType' object has no attribute 'cuda'`` on import.
 from __future__ import annotations
 
-import enum
 import logging
 import multiprocessing as mp
 import os
 import time
-from typing import Any, List, Optional
+from typing import Any
+
+from GPU.driver_budget import record_throttle
 
 _THROTTLE_SLEEP_S = 0.5
 
@@ -47,6 +39,9 @@ def throttle_if_busy(
     """
     if scheduler is not None and scheduler.should_throttle():
         sleep_fn(sleep_s)
+        # QUI-867: this sleep runs while the driver generator is suspended, so
+        # it is GPU idle time. Attribute it (no-op unless QUIP_DRIVER_BUDGET=1).
+        record_throttle(sleep_s)
 
 
 def throttled_stream(gen: Any, scheduler: Any) -> Any:
@@ -63,12 +58,6 @@ def throttled_stream(gen: Any, scheduler: Any) -> Any:
             yield next(gen)
         except StopIteration:
             return
-
-
-try:
-    import cupy as cp
-except ImportError:
-    cp = None  # type: ignore[assignment]
 
 
 logger = logging.getLogger(__name__)
@@ -214,130 +203,30 @@ def configure_mps_thread_limit(
     return mps_active
 
 
-class SlotState(enum.Enum):
-    """Buffer slot lifecycle states."""
-
-    FREE = "free"
-    UPLOADING = "uploading"
-    READY = "ready"
-    ACTIVE = "active"
-    DONE = "done"
-
-
-class GpuBufferSlot:
-    """A single GPU buffer slot with lifecycle tracking.
-
-    Each slot has its own CUDA stream and event for
-    non-blocking transfer/completion detection.
-
-    Args:
-        slot_id: Unique identifier for this slot.
-        stream: CUDA stream for this slot's operations.
-        event: CUDA event for completion detection.
-    """
-
-    def __init__(
-        self,
-        slot_id: int,
-        stream: cp.cuda.Stream,
-        event: cp.cuda.Event,
-    ):
-        self.slot_id = slot_id
-        self.stream = stream
-        self.event = event
-        self.state = SlotState.FREE
-        self.metadata: Optional[dict] = None
-
-    def begin_upload(self) -> None:
-        """Transition FREE → UPLOADING."""
-        assert self.state == SlotState.FREE, (
-            f"Slot {self.slot_id}: begin_upload requires FREE, got {self.state}"
-        )
-        self.state = SlotState.UPLOADING
-
-    def finish_upload(self) -> None:
-        """Transition UPLOADING → READY.
-
-        Records event on slot's stream so we can wait for
-        transfer completion before kernel launch.
-        """
-        assert self.state == SlotState.UPLOADING, (
-            f"Slot {self.slot_id}: finish_upload requires UPLOADING, got {self.state}"
-        )
-        self.event.record(self.stream)
-        self.state = SlotState.READY
-
-    def launch(self, compute_stream: cp.cuda.Stream) -> None:
-        """Transition READY → ACTIVE.
-
-        Waits for transfer event, then the caller launches
-        the kernel on compute_stream. After kernel launch,
-        the event is recorded on compute_stream for
-        completion detection.
-        """
-        assert self.state == SlotState.READY, (
-            f"Slot {self.slot_id}: launch requires READY, got {self.state}"
-        )
-        compute_stream.wait_event(self.event)
-        self.state = SlotState.ACTIVE
-
-    def record_launch(
-        self,
-        compute_stream: cp.cuda.Stream,
-    ) -> None:
-        """Record completion event after kernel launch."""
-        assert self.state == SlotState.ACTIVE, (
-            f"Slot {self.slot_id}: record_launch requires ACTIVE, got {self.state}"
-        )
-        self.event.record(compute_stream)
-
-    def harvest(self) -> None:
-        """Transition DONE → FREE after results are read."""
-        assert self.state == SlotState.DONE, (
-            f"Slot {self.slot_id}: harvest requires DONE, got {self.state}"
-        )
-        self.state = SlotState.FREE
-        self.metadata = None
-
-
 class KernelScheduler:
-    """Manages GPU buffer slots and SM budget.
+    """Manages GPU SM budget.
 
-    Combines event-based kernel completion detection with
-    optional NVML-based SM budget management.
+    Static SM budget from config with optional NVML-based
+    throttling when yielding the GPU to other users.
 
     Args:
-        num_slots: Number of buffer slots (typically 2).
         device_id: CUDA device index for NVML queries.
         device_sms: Total SM count on the device.
         gpu_utilization_pct: Config ceiling (1-100).
         yielding: True = yield to other GPU users
-            (NVML-adaptive budget). False = static budget.
+            (NVML throttling). False = static budget.
         poll_interval: Seconds between NVML polls
             (only used when yielding=True).
     """
 
     def __init__(
         self,
-        num_slots: int = 2,
         device_id: int = 0,
         device_sms: int = 0,
         gpu_utilization_pct: int = 100,
         yielding: bool = False,
         poll_interval: float = 5.0,
     ):
-        self.slots = [
-            GpuBufferSlot(
-                slot_id=i,
-                stream=cp.cuda.Stream(non_blocking=True),
-                event=cp.cuda.Event(),
-            )
-            for i in range(num_slots)
-        ]
-        self._compute_stream = cp.cuda.Stream(
-            non_blocking=True,
-        )
-
         self._device_id = device_id
         self._device_sms = device_sms
         self._gpu_utilization_pct = gpu_utilization_pct
@@ -356,10 +245,6 @@ class KernelScheduler:
         self._util_stop = None
         self._poll_interval = poll_interval
 
-        # Hysteresis: require 2 stable readings before scaling
-        self._prev_target = 0
-        self._stable_ticks = 0
-
         if yielding:
             self._start_nvml_monitor()
 
@@ -373,9 +258,9 @@ class KernelScheduler:
             return
 
         try:
-            # Initialize NVML in the parent to get a handle for process
-            # enumeration (count_external_gpu_processes). The monitor child
-            # does its own nvmlInit() via poll_nvml_gpu_util().
+            # Initialize NVML in the parent to get a handle that gates
+            # should_throttle (it returns False when the handle is None).
+            # The monitor child does its own nvmlInit() via poll_nvml_gpu_util().
             pynvml.nvmlInit()
             self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(
                 self._device_id,
@@ -430,138 +315,13 @@ class KernelScheduler:
             return False
         return self._util_value.value > 90
 
-    def count_external_gpu_processes(self) -> int:
-        """Count non-self processes using this GPU.
-
-        Uses pynvml to enumerate compute processes, filtering
-        out our own PID. Returns 0 if NVML is unavailable.
-        """
-        if not NVML_AVAILABLE or self._nvml_handle is None:
-            return 0
-        try:
-            procs = pynvml.nvmlDeviceGetComputeRunningProcesses(
-                self._nvml_handle,
-            )
-            my_pid = os.getpid()
-            return sum(1 for p in procs if p.pid != my_pid)
-        except Exception:
-            return 0
-
-    def is_mps_active(self) -> bool:
-        """Check if NVIDIA MPS daemon is running."""
-        return _is_mps_active()
-
     @property
     def yielding(self) -> bool:
         """Yielding mode (True=yield to others, False=static)."""
         return self._yielding
 
-    @property
-    def compute_stream(self) -> cp.cuda.Stream:
-        """Stream used for kernel launches."""
-        return self._compute_stream
-
-    def free_slots(self) -> List[GpuBufferSlot]:
-        """Return slots in FREE state."""
-        return [s for s in self.slots if s.state == SlotState.FREE]
-
-    def poll_completed(self) -> List[GpuBufferSlot]:
-        """Non-blocking: check events on ACTIVE slots.
-
-        Transitions completed slots to DONE and returns them.
-        """
-        completed = []
-        for slot in self.slots:
-            if slot.state == SlotState.ACTIVE and slot.event.done:
-                slot.state = SlotState.DONE
-                completed.append(slot)
-        return completed
-
-    def any_active(self) -> bool:
-        """Return True if any slot is in ACTIVE state."""
-        return any(s.state == SlotState.ACTIVE for s in self.slots)
-
-    def compute_target_nonces(
-        self,
-        max_nonces: int,
-        active_nonces: int,
-    ) -> int:
-        """Target nonces from NVML util + process count.
-
-        Formula:
-            external_util = total_util - our_estimate
-            floor = configured / num_competing
-            target = max(floor, configured - external/2)
-
-        When our estimate saturates total utilization (i.e.
-        our_est >= total_util), we can't measure external
-        load — fall back to process-count fair share.
-
-        Returns:
-            Target nonce count (>= 1).
-        """
-        external_count = self.count_external_gpu_processes()
-        if external_count <= 0:
-            return max_nonces
-
-        total_util = self._util_value.value
-        our_est = (
-            self._gpu_utilization_pct
-            * active_nonces
-            / max_nonces
-        )
-
-        num_competing = external_count + 1
-        floor_pct = self._gpu_utilization_pct / num_competing
-
-        if our_est >= total_util:
-            # Can't distinguish our load from external —
-            # fall back to process-count fair share
-            target_pct = floor_pct
-        else:
-            ext_util = total_util - our_est
-            target_pct = max(
-                floor_pct,
-                self._gpu_utilization_pct - ext_util / 2,
-            )
-
-        target = round(
-            target_pct
-            / self._gpu_utilization_pct
-            * max_nonces,
-        )
-        # Cap below max while externals exist so our_est
-        # never re-saturates the NVML reading
-        ceiling = max_nonces - 1 if external_count > 0 else max_nonces
-        return max(1, min(target, ceiling))
-
-    def check_stable_target(
-        self,
-        max_nonces: int,
-        active_nonces: int,
-    ) -> Optional[int]:
-        """Return target nonces only if stable for 2 checks.
-
-        Calls compute_target_nonces internally. Returns None
-        if the target is still changing between polls.
-        """
-        current = self.compute_target_nonces(
-            max_nonces, active_nonces,
-        )
-        if current == self._prev_target:
-            self._stable_ticks += 1
-        else:
-            self._prev_target = current
-            self._stable_ticks = 1
-        if self._stable_ticks >= 2:
-            return current
-        return None
-
     def stop(self) -> None:
-        """Synchronize streams and stop NVML monitor process."""
-        self._compute_stream.synchronize()
-        for slot in self.slots:
-            slot.stream.synchronize()
+        """Stop the NVML monitor process."""
         if self._util_proc is not None:
             self._util_stop.set()
             from shared.proc_util import terminate_join

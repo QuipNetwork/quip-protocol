@@ -43,13 +43,14 @@ import argparse
 import json
 import logging
 import math
+import multiprocessing
 import os
 import random
 import statistics
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Make repo modules importable when run as a script.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -63,21 +64,16 @@ except ImportError:
     # dotenv is optional — if absent, env vars must already be set.
     pass
 
+from shared.proc_util import terminate_join
 from shared.quantum_proof_of_work import (
     compute_solution_meta,
     evaluate_sampleset,
-    generate_ising_model_from_nonce,
     pack_spins_hex,
 )
 from shared.miner_types import BlockRequirements
 from shared.ising_feeder import RandomIsingFeeder
 from QPU.dwave_miner import DWaveMiner
-
-# Validator type: (sampleset, h, J, nonce, salt) -> bool.
-# Returns True when the submission would clear the chain's three gates
-# (energy < difficulty, num_solutions >= min_solutions, diversity >=
-# min_diversity). See ``_make_chain_validator``.
-from typing import Callable
+from QPU.stream_driver import qpu_access_time_us
 
 
 # ---------------------------------------------------------------------
@@ -132,19 +128,6 @@ def _make_energy_only_validator(threshold: float) -> Callable:
     return validate
 
 
-def _extract_timing(sampleset_info: Dict[str, Any]) -> int:
-    """Pull D-Wave's qpu_programming_time + qpu_sampling_time (µs).
-
-    Returns 0 when the timing dict is missing or partial — happens on
-    non-QPU fallbacks and on some embedded-future code paths. Callers
-    handle a zero like any other low value (it just won't contribute
-    to the access-fraction numerator).
-    """
-    timing = sampleset_info.get("timing", {}) if sampleset_info else {}
-    prog = timing.get("qpu_programming_time") or 0
-    sample = timing.get("qpu_sampling_time") or 0
-    return int(prog) + int(sample)
-
 
 def _run_batch(
     miner: DWaveMiner,
@@ -192,7 +175,6 @@ def _run_batch(
     )
     # stop_event is passed into the pump so it can cancel in-flight D-Wave
     # futures when we reach n_submissions or on KeyboardInterrupt.
-    import multiprocessing
     stop_event = multiprocessing.Event()
     miner._stop_event = stop_event  # kept for legacy callers that check this attr
 
@@ -234,7 +216,7 @@ def _run_batch(
             # errored and move on — the next iteration's future was
             # already submitted by sample_ising_streaming.
             try:
-                qpu_us = _extract_timing(sampleset.info)
+                qpu_us = qpu_access_time_us(sampleset)
                 best_energy = float(min(sampleset.record.energy))
             except (AttributeError, ValueError):
                 qpu_us = 0
@@ -957,9 +939,9 @@ def main() -> int:
 
     # Route every Python logger through stderr — this is what makes
     # production miner output visible (DWaveMiner's "[QPU] stream
-    # depth: ..." line every 100 completions from Phase 1,
-    # RandomIsingFeeder state messages, DWave SDK info logs). Without
-    # this the canary tool runs the production pipeline silently.
+    # depth: ..." line every 100 completions from Phase 1, DWave SDK
+    # info logs). Without this the canary tool runs the production
+    # pipeline silently.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s: %(message)s",
@@ -1107,8 +1089,6 @@ def _force_shutdown(miner) -> None:
     re-block; all output is already flushed to disk by this point, so a
     hard exit is safe and deterministic.
     """
-    import multiprocessing
-
     try:
         miner.sampler.close()
     except Exception:  # noqa: BLE001
@@ -1117,14 +1097,7 @@ def _force_shutdown(miner) -> None:
     children = multiprocessing.active_children()
     for child in children:
         try:
-            child.terminate()
-        except Exception:  # noqa: BLE001
-            pass
-    for child in children:
-        try:
-            child.join(timeout=2)
-            if child.is_alive():
-                child.kill()
+            terminate_join(child, 2)
         except Exception:  # noqa: BLE001
             pass
 

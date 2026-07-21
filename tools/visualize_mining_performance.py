@@ -25,17 +25,38 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+sys.path.append(str(Path(__file__).parent.parent))
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy import stats as scipy_stats
 
-# Standard color scheme for miner types
-MINER_COLORS = {
-    'CPU': '#e74c3c',
-    'GPU': '#3498db',
-    'QPU': '#2ecc71',
+from tools.mining_viz_common import (
+    MINER_COLORS,
+    get_device_counts,
+    load_mining_csv as _load_mining_csv_base,
+    normalize_miner_type,
+)
+
+# Required columns for this tool's CSV validation
+_REQUIRED_COLUMNS = {
+    'miner_type', 'energy', 'valid', 'miner_machine', 'process',
+    'threshold', 'start_time', 'end_time', 'time_to_solution',
 }
+
+
+def load_mining_csv(filepath: str) -> pd.DataFrame:
+    """Load mining data CSV into DataFrame.
+
+    Required columns: miner_type, energy, valid, miner_machine, process,
+                      threshold, start_time, end_time, time_to_solution
+    """
+    return _load_mining_csv_base(
+        filepath,
+        required_columns=_REQUIRED_COLUMNS,
+        parse_dates=True,
+    )
 
 
 def _add_difficulty_annotations(
@@ -65,47 +86,6 @@ def _add_difficulty_annotations(
             print("Note: Difficulty annotations disabled (shared.energy_utils not available)",
                   file=sys.stderr)
             _add_difficulty_annotations._import_warned = True
-
-
-def load_mining_csv(filepath: str) -> pd.DataFrame:
-    """Load mining data CSV into DataFrame.
-
-    Required columns: miner_type, energy, valid, miner_machine, process,
-                      threshold, start_time, end_time, time_to_solution
-    """
-    df = pd.read_csv(filepath)
-
-    # Validate required columns
-    required_columns = {
-        'miner_type', 'energy', 'valid', 'miner_machine', 'process',
-        'threshold', 'start_time', 'end_time', 'time_to_solution'
-    }
-    missing = required_columns - set(df.columns)
-    if missing:
-        raise ValueError(f"CSV missing required columns: {', '.join(sorted(missing))}")
-
-    # Parse date columns if present
-    for col in ['start_time', 'end_time']:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors='coerce')
-
-    return df
-
-
-def normalize_miner_type(miner_type: str) -> str:
-    """Normalize miner type to CPU/GPU/QPU for display."""
-    miner_type = miner_type.lower()
-    if miner_type == 'cuda':
-        return 'GPU'
-    return miner_type.upper()
-
-
-def get_miner_groups(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """Pre-group DataFrame by miner_type for efficiency.
-
-    Returns a dict mapping raw miner_type strings to their DataFrames.
-    """
-    return {miner_type: group for miner_type, group in df.groupby('miner_type')}
 
 
 def calculate_threshold_probabilities(
@@ -148,9 +128,8 @@ def plot_threshold_probabilities(
     """Plot probability of nonce meeting threshold for each miner type."""
     plt.figure(figsize=(12, 7))
 
-    for miner_type in df['miner_type'].unique():
+    for miner_type, miner_df in df.groupby('miner_type', sort=False):
         display_type = normalize_miner_type(miner_type)
-        miner_df = df[df['miner_type'] == miner_type]
         energies = miner_df['energy'].values
 
         probabilities = calculate_threshold_probabilities(energies, thresholds)
@@ -196,9 +175,8 @@ def plot_nonces_by_threshold(
     # Get device counts for normalization
     device_counts = get_device_counts(df)
 
-    for miner_type in df['miner_type'].unique():
+    for miner_type, miner_df in df.groupby('miner_type', sort=False):
         display_type = normalize_miner_type(miner_type)
-        miner_df = df[df['miner_type'] == miner_type]
         energies = miner_df['energy'].values
 
         # Calculate normalization factor
@@ -260,9 +238,8 @@ def plot_proportion_by_threshold(
     """Plot percentage of nonces that would mine at each threshold."""
     plt.figure(figsize=(12, 7))
 
-    for miner_type in df['miner_type'].unique():
+    for miner_type, miner_df in df.groupby('miner_type', sort=False):
         display_type = normalize_miner_type(miner_type)
-        miner_df = df[df['miner_type'] == miner_type]
         energies = miner_df['energy'].values
         total_attempts = len(energies)
 
@@ -296,39 +273,7 @@ def plot_proportion_by_threshold(
     print(f"Saved proportion by threshold chart to {output_file}")
 
 
-def get_device_counts(df: pd.DataFrame, miner_groups: Optional[Dict[str, pd.DataFrame]] = None) -> Dict[str, int]:
-    """
-    Count actual devices per miner type from the data.
-
-    For GPU/CUDA: count unique (miner_machine, process) pairs = number of GPUs
-    For CPU: count unique (miner_machine, process) pairs = number of CPU workers
-    For QPU: count unique miner_machine = number of QPUs
-
-    Args:
-        df: DataFrame with mining data
-        miner_groups: Optional pre-grouped dict from get_miner_groups() for efficiency
-    """
-    counts = {}
-
-    if miner_groups is None:
-        miner_groups = get_miner_groups(df)
-
-    for miner_type, miner_df in miner_groups.items():
-        display_type = normalize_miner_type(miner_type)
-
-        if display_type == 'QPU':
-            # QPU: count unique machines
-            count = miner_df['miner_machine'].nunique()
-        else:
-            # CPU/GPU: count unique (machine, process) pairs
-            count = miner_df.groupby(['miner_machine', 'process']).ngroups
-
-        counts[display_type] = count
-
-    return counts
-
-
-def get_miner_tts_stats(df: pd.DataFrame, miner_groups: Optional[Dict[str, pd.DataFrame]] = None) -> Dict[str, Dict[str, Any]]:
+def get_miner_tts_stats(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
     """
     Calculate TTS (time-to-solution) statistics for each miner type.
 
@@ -346,15 +291,11 @@ def get_miner_tts_stats(df: pd.DataFrame, miner_groups: Optional[Dict[str, pd.Da
 
     Args:
         df: DataFrame with mining data
-        miner_groups: Optional pre-grouped dict from get_miner_groups() for efficiency
     """
-    if miner_groups is None:
-        miner_groups = get_miner_groups(df)
-
-    device_counts = get_device_counts(df, miner_groups)
+    device_counts = get_device_counts(df)
     stats = {}
 
-    for miner_type, miner_df in miner_groups.items():
+    for miner_type, miner_df in df.groupby('miner_type'):
         display_type = normalize_miner_type(miner_type)
         energies = miner_df['energy'].values
 
@@ -397,7 +338,6 @@ def get_miner_tts_stats(df: pd.DataFrame, miner_groups: Optional[Dict[str, pd.Da
 
         stats[display_type] = {
             'energies': energies,
-            'num_attempts': len(energies),
             'observed_tts': observed_tts,
             'observed_tts_std': observed_tts_std,
             'tts_samples': tts_samples,
@@ -684,36 +624,23 @@ def plot_win_rate_by_threshold_projection(
     # Get actual device counts for base comparison
     device_counts = get_device_counts(df)
 
-    # Generate configurations with projections
-    configurations = []
+    # Generate configurations with projections.
+    # Per-config CPU/GPU projection (label, count); extreme adds 2 extra orders.
+    projections = {
+        'extreme': {'CPU': ('CPU (2^40)', 1099511627776), 'GPU': ('GPU (2^20)', 1048576)},
+        'standard': {'CPU': ('CPU (2^20)', 1048576), 'GPU': ('GPU (2^10)', 1024)},
+    }
+    projection = projections.get(projection_config, projections['standard'])
 
-    if projection_config == 'extreme':
-        # Extreme projection: CPU 2^40 + GPU 2^20
-        if 'QPU' in device_counts:
-            configurations.append((f'QPU ({device_counts["QPU"]})', 'QPU', device_counts['QPU']))
-        if 'CPU' in device_counts:
+    configurations = []
+    if 'QPU' in device_counts:
+        configurations.append((f'QPU ({device_counts["QPU"]})', 'QPU', device_counts['QPU']))
+    for device in ('CPU', 'GPU'):
+        if device in device_counts:
+            proj_label, proj_count = projection[device]
             configurations.extend([
-                (f'CPU ({device_counts["CPU"]} CPUs)', 'CPU', device_counts['CPU']),
-                ('CPU (2^40)', 'CPU', 1099511627776)
-            ])
-        if 'GPU' in device_counts:
-            configurations.extend([
-                (f'GPU ({device_counts["GPU"]} GPUs)', 'GPU', device_counts['GPU']),
-                ('GPU (2^20)', 'GPU', 1048576)
-            ])
-    else:
-        # Standard projection: CPU 2^20 + GPU 2^15
-        if 'QPU' in device_counts:
-            configurations.append((f'QPU ({device_counts["QPU"]})', 'QPU', device_counts['QPU']))
-        if 'CPU' in device_counts:
-            configurations.extend([
-                (f'CPU ({device_counts["CPU"]} CPUs)', 'CPU', device_counts['CPU']),
-                ('CPU (2^20)', 'CPU', 1048576)
-            ])
-        if 'GPU' in device_counts:
-            configurations.extend([
-                (f'GPU ({device_counts["GPU"]} GPUs)', 'GPU', device_counts['GPU']),
-                ('GPU (2^10)', 'GPU', 1024)
+                (f'{device} ({device_counts[device]} {device}s)', device, device_counts[device]),
+                (proj_label, device, proj_count),
             ])
 
     # Calculate win rates
@@ -722,7 +649,6 @@ def plot_win_rate_by_threshold_projection(
     # Plot styles for projections
     style_map = {
         1024: {'linestyle': '--', 'marker': 's', 'linewidth': 2.5, 'alpha': 0.7},        # 2^10
-        65536: {'linestyle': ':', 'marker': '^', 'linewidth': 2.5, 'alpha': 0.7},        # 2^16
         1048576: {'linestyle': '--', 'marker': 'D', 'linewidth': 2.5, 'alpha': 0.7},     # 2^20
         1099511627776: {'linestyle': ':', 'marker': 'X', 'linewidth': 2.5, 'alpha': 0.7} # 2^40
     }
@@ -838,9 +764,8 @@ def plot_nonces_per_block(
     nonces_data = {}
     block_counts = {}
 
-    for miner_type in df['miner_type'].unique():
+    for miner_type, miner_df in df.groupby('miner_type', sort=False):
         display_type = normalize_miner_type(miner_type)
-        miner_df = df[df['miner_type'] == miner_type]
 
         # Group by machine, process to count attempts between successful blocks
         nonces_list = []

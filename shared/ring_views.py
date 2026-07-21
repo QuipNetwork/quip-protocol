@@ -22,16 +22,13 @@ import numpy as np
 from shared.shared_ring import SharedRing
 
 
-class SampleView:
-    """int8 ``max_rows``×``max_cols`` samples + f64 ``max_rows`` energies."""
+class _RingView:
+    """Mixin that delegates common slot-management to ``self._ring``.
 
-    def __init__(self, slots: int, max_rows: int, max_cols: int,
-                 *, names: Optional[list] = None, free_q=None):
-        self.max_rows = max_rows
-        self.max_cols = max_cols
-        self._sample_bytes = max_rows * max_cols
-        slot_bytes = self._sample_bytes + max_rows * 8
-        self._ring = SharedRing(slots, slot_bytes, names=names, free_q=free_q)
+    Subclasses set ``self._ring`` in their ``__init__`` and inherit the
+    ``slots`` / ``names`` / ``free_q`` properties together with
+    ``claim_free`` / ``release`` / ``close`` / ``close_unlink``.
+    """
 
     # ── ring delegation ──────────────────────────────────────────────────
     @property
@@ -49,12 +46,6 @@ class SampleView:
         """Cross-process free-list queue."""
         return self._ring.free_q
 
-    def attach_args(self) -> dict:
-        """Picklable kwargs to reconstruct this view in another process."""
-        return {"slots": self._ring.slots, "max_rows": self.max_rows,
-                "max_cols": self.max_cols, "names": self._ring.names,
-                "free_q": self._ring.free_q}
-
     def claim_free(self, timeout: float) -> Optional[int]:
         """Return a free slot index, or None if none free within timeout."""
         return self._ring.claim_free(timeout)
@@ -70,6 +61,24 @@ class SampleView:
     def close_unlink(self) -> None:
         """Close all slots; unlink them if this instance owns them."""
         self._ring.close_unlink()
+
+
+class SampleView(_RingView):
+    """int8 ``max_rows``×``max_cols`` samples + f64 ``max_rows`` energies."""
+
+    def __init__(self, slots: int, max_rows: int, max_cols: int,
+                 *, names: Optional[list] = None, free_q=None):
+        self.max_rows = max_rows
+        self.max_cols = max_cols
+        self._sample_bytes = max_rows * max_cols
+        slot_bytes = self._sample_bytes + max_rows * 8
+        self._ring = SharedRing(slots, slot_bytes, names=names, free_q=free_q)
+
+    def attach_args(self) -> dict:
+        """Picklable kwargs to reconstruct this view in another process."""
+        return {"slots": self._ring.slots, "max_rows": self.max_rows,
+                "max_cols": self.max_cols, "names": self._ring.names,
+                "free_q": self._ring.free_q}
 
     # ── sample layout ────────────────────────────────────────────────────
     def write(self, slot: int, sample: np.ndarray, energy: np.ndarray) -> None:
@@ -117,7 +126,7 @@ class SampleView:
         return s, e
 
 
-class ProblemView:
+class ProblemView(_RingView):
     """f64 ``h`` vector (``n_nodes``) + f64 ``J`` vector (``n_edges``).
 
     Both arrays are dense, in the caller's canonical node / edge order. The
@@ -145,22 +154,6 @@ class ProblemView:
             free_q = _mp.get_context("spawn").Queue()
         self._ring = SharedRing(slots, slot_bytes, names=names, free_q=free_q)
 
-    # ── ring delegation ──────────────────────────────────────────────────
-    @property
-    def slots(self) -> int:
-        """Total number of slots in the ring."""
-        return self._ring.slots
-
-    @property
-    def names(self) -> list:
-        """Shared-memory segment names (one per slot)."""
-        return self._ring.names
-
-    @property
-    def free_q(self):
-        """Cross-process free-list queue."""
-        return self._ring.free_q
-
     def attach_args(self) -> dict:
         """Read-only descriptor to reconstruct this view in another process.
 
@@ -174,21 +167,19 @@ class ProblemView:
         return {"slots": self._ring.slots, "n_nodes": self.n_nodes,
                 "n_edges": self.n_edges, "names": self._ring.names}
 
-    def claim_free(self, timeout: float) -> Optional[int]:
-        """Return a free slot index, or None if none free within timeout."""
-        return self._ring.claim_free(timeout)
+    def recycling_attach_args(self) -> dict:
+        """Attach kwargs INCLUDING the shared free-list, for a recycling ring.
 
-    def release(self, slot: int) -> None:
-        """Return a slot to the free-list for reuse."""
-        self._ring.release(slot)
-
-    def close(self) -> None:
-        """Close all slot handles without unlinking (best-effort)."""
-        self._ring.close()
-
-    def close_unlink(self) -> None:
-        """Close all slots; unlink them if this instance owns them."""
-        self._ring.close_unlink()
+        The QPU submitter split uses ProblemView as a recycling transport: the
+        feeder driver (A) claims slots, the submitter (B) releases them back.
+        Both must share the owner's free-list, so unlike :meth:`attach_args`
+        (write-once, free-q omitted) this carries ``free_q``. Only valid to send
+        via ``Process(args=...)`` spawn inheritance — an ``mp.Queue`` can't ride
+        a live ``Queue.put``.
+        """
+        return {"slots": self._ring.slots, "n_nodes": self.n_nodes,
+                "n_edges": self.n_edges, "names": self._ring.names,
+                "free_q": self._ring.free_q}
 
     # ── problem layout ───────────────────────────────────────────────────
     def write(self, slot: int, h: np.ndarray, j: np.ndarray) -> None:

@@ -61,6 +61,39 @@ class DWaveTopologyFromJSON:
         return self._graph
 
 
+def topology_from_nodes_edges(
+    nodes: List[int],
+    edges: List[Tuple[int, int]],
+    solver_name: str,
+) -> DWaveTopologyFromJSON:
+    """Build a topology object from an explicit node/edge set.
+
+    Used by the live miner to construct its topology directly from the chain's
+    registered DefaultTopology snapshot (nodes/edges) rather than a bundled
+    file, so the miner's graph can never skew from the chain's. ``solver_name``
+    is the D-Wave hardware solver to connect to (a hardware detail the chain
+    does not store); for non-QPU backends it is informational only.
+
+    The returned object exposes the same ``nodes`` / ``edges`` / ``solver_name``
+    / ``num_nodes`` / ``num_edges`` surface consumers read, identical to a
+    file-loaded :class:`DWaveTopologyFromJSON`.
+    """
+    node_list = [int(n) for n in nodes]
+    edge_list = [[int(u), int(v)] for u, v in edges]
+    return DWaveTopologyFromJSON({
+        "metadata": {
+            "solver_name": solver_name,
+            "topology_type": "chain",
+            "topology_shape": "",
+            "num_nodes": len(node_list),
+            "num_edges": len(edge_list),
+        },
+        "properties": {},
+        "nodes": node_list,
+        "edges": edge_list,
+    })
+
+
 def load_json_topology(filename: str, topologies_dir: str = None, from_embeddings: bool = False) -> DWaveTopologyFromJSON:
     """
     Load a topology from a JSON file (plain or gzipped).

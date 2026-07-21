@@ -16,10 +16,23 @@ from substrate.client import _fetch_extrinsic_dispatch_error
 # ----------------------------------------------------------------------
 
 
+class _FakeMetadata:
+    """metadata.get_module_error stand-in: pallet 9 error 1 is the
+    SolverNotRegistered case observed live."""
+
+    def get_module_error(self, module_index, error_index):
+        from types import SimpleNamespace
+
+        if module_index == 9 and error_index == 1:
+            return SimpleNamespace(name="SolverNotRegistered")
+        raise ValueError(f"unknown error {module_index}/{error_index}")
+
+
 class _FakeIface:
     def __init__(self, block, events):
         self._block = block
         self._events = events
+        self.metadata = _FakeMetadata()
 
     def get_block(self, **kwargs):  # noqa: ARG002
         return self._block
@@ -111,6 +124,119 @@ def test_dispatch_error_apply_extrinsic_dict_phase():
     )
     assert err is not None
     assert "ExtrinsicFailed" in err
+
+
+def test_dispatch_error_bare_string_phase_with_sibling_extrinsic_idx():
+    """`phase: 'ApplyExtrinsic'` + top-level `extrinsic_idx` — the shape
+    the current substrate-interface event decoder actually produces.
+
+    Found live by T9: every event's phase parsed to None, so a real
+    in-block ExtrinsicFailed (SolverNotRegistered) was never attributed
+    to the extrinsic and the receipt reported success — a false OK on
+    EVERY failed hybrid extrinsic. The pow path was shielded by its
+    chain-state verify; the mempool submit/claim classification was not.
+    """
+    ext_hash = "0x" + "aa" * 32
+    block = {"extrinsics": [
+        {"extrinsic_hash": "0x" + "bb" * 32},  # timestamp inherent
+        {"extrinsic_hash": ext_hash},
+    ]}
+    events = [
+        {
+            "phase": "ApplyExtrinsic",
+            "extrinsic_idx": 0,
+            "event": {
+                "module_id": "System",
+                "event_id": "ExtrinsicSuccess",
+                "attributes": {},
+            },
+        },
+        {
+            "phase": "ApplyExtrinsic",
+            "extrinsic_idx": 1,
+            "event": {
+                "module_id": "System",
+                "event_id": "ExtrinsicFailed",
+                "attributes": {
+                    "dispatch_error": {"Module": {"index": 9, "error": "0x01000000"}}
+                },
+            },
+        },
+    ]
+    iface = _FakeIface(block, events)
+    err = _fetch_extrinsic_dispatch_error(
+        iface, block_hash="0x" + "cc" * 32, ext_hash=ext_hash
+    )
+    assert err is not None
+    # The module error must be decoded to its NAME: the submit/claim
+    # classifiers match error-name substrings (SolverNotRegistered is
+    # mempool-fatal; OrderNotOpen is merely stale) — raw indexes would
+    # misclassify every stale receipt as mempool-fatal.
+    assert "SolverNotRegistered" in err
+
+
+def test_dispatch_error_sibling_idx_success_short_circuits_none():
+    """Same decoder shape, success case: ExtrinsicSuccess at OUR index
+    (not the inherent's) returns None."""
+    ext_hash = "0x" + "aa" * 32
+    block = {"extrinsics": [
+        {"extrinsic_hash": "0x" + "bb" * 32},
+        {"extrinsic_hash": ext_hash},
+    ]}
+    events = [
+        {
+            "phase": "ApplyExtrinsic",
+            "extrinsic_idx": 1,
+            "event": {
+                "module_id": "System",
+                "event_id": "ExtrinsicSuccess",
+                "attributes": {},
+            },
+        },
+    ]
+    iface = _FakeIface(block, events)
+    assert (
+        _fetch_extrinsic_dispatch_error(
+            iface, block_hash="0x" + "cc" * 32, ext_hash=ext_hash
+        )
+        is None
+    )
+
+
+def test_dispatch_error_sibling_idx_other_extrinsic_failure_not_attributed():
+    """A sibling extrinsic's failure must not be pinned on ours."""
+    ext_hash = "0x" + "aa" * 32
+    block = {"extrinsics": [
+        {"extrinsic_hash": "0x" + "bb" * 32},
+        {"extrinsic_hash": ext_hash},
+    ]}
+    events = [
+        {
+            "phase": "ApplyExtrinsic",
+            "extrinsic_idx": 0,
+            "event": {
+                "module_id": "System",
+                "event_id": "ExtrinsicFailed",
+                "attributes": {"dispatch_error": "BadOrigin"},
+            },
+        },
+        {
+            "phase": "ApplyExtrinsic",
+            "extrinsic_idx": 1,
+            "event": {
+                "module_id": "System",
+                "event_id": "ExtrinsicSuccess",
+                "attributes": {},
+            },
+        },
+    ]
+    iface = _FakeIface(block, events)
+    assert (
+        _fetch_extrinsic_dispatch_error(
+            iface, block_hash="0x" + "cc" * 32, ext_hash=ext_hash
+        )
+        is None
+    )
 
 
 def test_dispatch_error_pallet_name_keys():

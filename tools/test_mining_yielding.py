@@ -59,8 +59,8 @@ OVERRIDE_PARAMS = {
 }
 
 
-def run_trial(label, miner_cls, device, yielding):
-    """Run a single mining trial, return elapsed seconds."""
+def run_trial(label, miner_cls, device, yielding) -> tuple[float, object]:
+    """Run a single mining trial, return (elapsed_seconds, result)."""
     print(f"\n{'='*60}")
     print(f"  {label}  (yielding={yielding})")
     print(f"{'='*60}")
@@ -114,7 +114,7 @@ def run_trial(label, miner_cls, device, yielding):
     return elapsed, result
 
 
-def main():
+def main() -> None:
     device = "0"  # CUDA_VISIBLE_DEVICES remaps
 
     from GPU.cuda_miner import CudaMiner
@@ -127,7 +127,7 @@ def main():
     # SA trials
     for yielding in [False, True]:
         tag = f"SA-yield={yielding}"
-        elapsed, res = run_trial(
+        elapsed, _ = run_trial(
             tag, CudaMiner, device, yielding,
         )
         results[tag] = elapsed
@@ -135,7 +135,7 @@ def main():
     # Gibbs trials
     for yielding in [False, True]:
         tag = f"Gibbs-yield={yielding}"
-        elapsed, res = run_trial(
+        elapsed, _ = run_trial(
             tag, GibbsMiner, device, yielding,
         )
         results[tag] = elapsed

@@ -40,11 +40,13 @@ def build_persistent_context(
     feeder_buffer_size: int,
     num_reads: int,
     num_sweeps: int,
+    allowed_h: Any = None,
     topology: Any = None,
     utilization: int = 100,
     yielding: bool = True,
     active_util: int = 85,
     idle_after_s: float = 60.0,
+    gpu_cores: Optional[int] = None,
     stop_event: Optional[multiprocessing.synchronize.Event] = None,
     **_ignored: Any,
 ) -> StreamContext:
@@ -66,7 +68,9 @@ def build_persistent_context(
     from GPU.metal_scheduler import MetalScheduler
 
     sampler = MetalSASampler(topology=topology)
-    cores = get_gpu_core_count()
+    # The worker passes its init-time detection; only standalone callers
+    # (tools) without one probe here.
+    cores = gpu_cores if gpu_cores is not None else get_gpu_core_count()
     active_threads = active_threads_for_util(active_util, sampler, cores)
     scheduler = MetalScheduler(
         gpu_core_count=cores,
@@ -79,6 +83,7 @@ def build_persistent_context(
         sampler=sampler,
         nodes=nodes,
         edges=edges,
+        allowed_h=allowed_h,
         feeder_buffer_size=feeder_buffer_size,
         num_reads=num_reads,
         num_sweeps=num_sweeps,

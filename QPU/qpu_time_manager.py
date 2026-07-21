@@ -59,6 +59,46 @@ def parse_duration(duration_str: str) -> float:
         return float(duration_str)
 
 
+def resolve_initial_budget(
+    raw: str,
+    daily_budget_seconds: float,
+    min_block_budget_seconds: float,
+    budget_cap_seconds: Optional[float] = None,
+) -> float:
+    """Resolve an operator-facing initial-budget setting to seconds.
+
+    Maps the three mental-model keywords plus explicit durations onto a seed
+    value for the reservoir pool. The result is *not* clamped here; the manager
+    clamps it to the pool cap at construction.
+
+    Args:
+        raw: ``"min"`` (one buffer), ``"daily"`` (a full day's budget),
+            ``"cap"`` (fill the pool cap), or a duration string like ``"600s"``
+            / ``"10m"`` (or raw seconds).
+        daily_budget_seconds: Configured daily budget, for ``"daily"``.
+        min_block_budget_seconds: Reservoir buffer, for ``"min"``.
+        budget_cap_seconds: Configured cap, for ``"cap"``. ``None`` mirrors the
+            manager's derived cap of ``max(daily, min_block)``.
+
+    Returns:
+        Seed value in QPU access seconds.
+
+    Raises:
+        ValueError: If ``raw`` is neither a known keyword nor a parseable
+            duration.
+    """
+    key = raw.strip().lower()
+    if key == "min":
+        return min_block_budget_seconds
+    if key == "daily":
+        return daily_budget_seconds
+    if key == "cap":
+        if budget_cap_seconds is not None:
+            return budget_cap_seconds
+        return max(daily_budget_seconds, min_block_budget_seconds)
+    return parse_duration(key)
+
+
 @dataclass
 class QPUTimeConfig:
     """Configuration for QPU time budget management.
@@ -88,6 +128,15 @@ class QPUTimeConfig:
     min_block_budget_seconds)`` so the buffer is always reachable and a
     post-downtime catch-up burst is bounded to one cap's worth of QPU."""
 
+    initial_budget_seconds: Optional[float] = None
+    """Pool balance to seed at process start (QPU access seconds). ``None``
+    starts dry (the historical behavior) and waits to accrue the buffer before
+    the first burst. Seeding to ``min_block_budget_seconds`` lets a fresh
+    process mine one burst immediately instead of waiting hours-to-days for the
+    pool to fill at ``daily_budget / 86400``. Clamped to the pool cap. This is
+    a per-process grant, not persisted accounting: frequent restarts re-grant
+    it, so keep the seed small (a buffer's worth) unless overspend is acceptable."""
+
 
 @dataclass
 class QPUTimeEstimate:
@@ -98,12 +147,6 @@ class QPUTimeEstimate:
 
     cumulative_used_us: float
     """Total QPU microseconds spent since process start (lifetime)."""
-
-    daily_budget_us: float
-    """Daily budget in microseconds (the reservoir accrual rate basis)."""
-
-    budget_remaining_us: float
-    """Current reservoir pool balance in microseconds (== ``pool_us``)."""
 
     pool_us: float
     """Current reservoir pool balance in microseconds."""
@@ -153,6 +196,22 @@ class QPUTimeManager:
             config.daily_budget_seconds * 1_000_000 / 86400.0
         )
 
+        # Seed the reservoir so a fresh process can mine without waiting to
+        # accrue the buffer. Clamped to [0, cap]; ``None`` starts dry.
+        if config.initial_budget_seconds is not None:
+            self._pool_us = min(
+                self._pool_cap_us,
+                max(0.0, config.initial_budget_seconds * 1_000_000),
+            )
+
+        if config.min_block_budget_seconds > cap_s > 0:
+            logger.warning(
+                "min_block_budget (%.0fs) exceeds budget_cap (%.0fs): the pool "
+                "caps below the burst threshold, so a burst can NEVER start. "
+                "Set budget_cap >= min_block_budget (or lower min_block_budget).",
+                config.min_block_budget_seconds,
+                cap_s,
+            )
         if config.min_block_budget_seconds > config.daily_budget_seconds > 0:
             eta_days = config.min_block_budget_seconds / config.daily_budget_seconds
             logger.warning(
@@ -266,7 +325,6 @@ class QPUTimeManager:
         now = now if now is not None else time.time()
         self._accrue(now)
         estimated_time = self.estimate_next_block_time()
-        daily_budget_us = self.config.daily_budget_seconds * 1_000_000
         buffer_us = self.config.min_block_budget_seconds * 1_000_000
         pool_us = self._pool_us
 
@@ -293,8 +351,6 @@ class QPUTimeManager:
         return QPUTimeEstimate(
             estimated_block_time_us=estimated_time,
             cumulative_used_us=self.cumulative_used_us,
-            daily_budget_us=daily_budget_us,
-            budget_remaining_us=pool_us,
             pool_us=pool_us,
             pool_cap_us=self._pool_cap_us,
             burst_active=self._burst_active,

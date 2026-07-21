@@ -81,18 +81,15 @@ COPY docker/quip-miner.cuda.toml /app/quip-miner.docker.toml
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Mode resolution is config-driven (see entrypoint.sh).
-# QUIP_IMAGE_SUPPORTS = modes this image's libraries can run.
-#   cuda image has cupy + dwave-ocean-sdk → cpu, gpu, qpu all work.
-# QUIP_DEFAULT_MODE  = fallback when config.toml has no backend sections.
-ENV QUIP_IMAGE_SUPPORTS=cpu,gpu,qpu
-ENV QUIP_DEFAULT_MODE=gpu
-ENV QUIP_MINE_MODE=pow
+# Mode resolution is config-driven: the template's active backend
+# section picks what runs, and `quip-miner --config` probes the
+# installed libraries itself (cuda image: cupy + dwave-ocean-sdk →
+# cpu, gpu, qpu all work).
 
 # Persistent /data: holds config.toml + keystore.json across restarts.
 VOLUME ["/data"]
 
-# Telemetry REST API (off by default; expose via -p when enabled).
+# Telemetry REST API (expose via -p; port set by config.toml rest_port).
 EXPOSE 8086/tcp
 
 ENTRYPOINT ["tini", "--", "/entrypoint.sh"]

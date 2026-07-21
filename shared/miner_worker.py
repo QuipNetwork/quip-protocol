@@ -2,8 +2,6 @@
 
 This worker runs a loop handling commands from the parent process:
 - mine_work_item {context}
-- stop_mining
-- get_stats
 - shutdown
 
 It constructs the correct concrete miner from a simple picklable spec dict:
@@ -14,42 +12,14 @@ It constructs the correct concrete miner from a simple picklable spec dict:
 from __future__ import annotations
 
 import logging
-import logging.handlers
 import multiprocessing as mp
 import multiprocessing.synchronize as mpsync
 import traceback
 from typing import Any, Dict, Optional
 
-import CPU  # noqa: E402
-import GPU  # noqa: E402
-import QPU  # noqa: E402
+from shared.logging_config import setup_child_process_logging
 
-from shared.logging_config import QuipFormatter
-
-# Global logger for this module
-log = None
 logger = logging.getLogger(__name__)
-
-
-def _setup_child_process_logging(log_queue=None):
-    """Set up logging for child processes to use QuipFormatter and optionally queue logging."""
-    global log
-
-    root_logger = logging.getLogger()
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-
-    if log_queue is not None:
-        queue_handler = logging.handlers.QueueHandler(log_queue)
-        root_logger.addHandler(queue_handler)
-        root_logger.setLevel(logging.DEBUG)
-    else:
-        handler = logging.StreamHandler()
-        handler.setFormatter(QuipFormatter())
-        root_logger.addHandler(handler)
-        root_logger.setLevel(logging.INFO)
-
-    log = logging.getLogger(__name__)
 
 # NOTE: the legacy `_signal_aware_mining_worker` (a dedicated per-attempt
 # child process used by `MinerHandle.mine_with_timeout`) was removed in
@@ -77,26 +47,36 @@ def build_miner_from_spec(spec: Dict[str, Any]):
         # `topology=` override in spec.args propagates to the sampler. Phase 4
         # controller relies on this to bind the miner to the chain's
         # registered topology.
+        import CPU
+
         return CPU.SimulatedAnnealingMiner(miner_id, **cfg, **args)
     elif kind == "metal":
+        import GPU
+
         if not GPU.METAL_AVAILABLE:
             raise RuntimeError(
                 "Metal miner requested but Metal is not available (requires macOS with Metal support)"
             )
         return GPU.MetalMiner(miner_id, **cfg, **args)
     elif kind == "cuda":
+        import GPU
+
         if not GPU.CUDA_AVAILABLE:
             raise RuntimeError(
                 "CUDA miner requested but CUDA is not available (requires CuPy and CUDA toolkit)"
             )
         return GPU.CudaMiner(miner_id, **cfg, **args)
     elif kind == "modal":
+        import GPU
+
         if not GPU.MODAL_AVAILABLE:
             raise RuntimeError(
                 "Modal miner requested but Modal is not available (requires modal SDK: pip install modal)"
             )
         return GPU.ModalMiner(miner_id, **cfg, **args)
     elif kind == "cuda-gibbs":
+        import GPU
+
         if not GPU.CUDA_AVAILABLE:
             raise RuntimeError(
                 "CUDA Gibbs miner requested but not available "
@@ -109,23 +89,39 @@ def build_miner_from_spec(spec: Dict[str, Any]):
             **args,
         )
     elif kind == "qpu":
+        import QPU
+
         # Build QPU time config if daily budget is specified
         time_config = None
         if cfg.get("daily_budget"):
-            from QPU.qpu_time_manager import QPUTimeConfig, parse_duration
+            from QPU.qpu_time_manager import (
+                QPUTimeConfig,
+                parse_duration,
+                resolve_initial_budget,
+            )
+
+            daily_budget_s = parse_duration(cfg["daily_budget"])
+            min_block_budget_s = parse_duration(cfg.get("min_block_budget", "90s"))
+            budget_cap_s = (
+                parse_duration(cfg["budget_cap"]) if cfg.get("budget_cap") else None
+            )
+            # Seed the reservoir on boot so a fresh process mines without
+            # waiting to accrue the buffer. Default "min" = one burst's worth;
+            # operators can set "daily", "cap", or an explicit duration.
+            initial_budget_s = resolve_initial_budget(
+                str(cfg.get("qpu_initial_budget", "min")),
+                daily_budget_s,
+                min_block_budget_s,
+                budget_cap_s,
+            )
 
             time_config = QPUTimeConfig(
-                daily_budget_seconds=parse_duration(cfg["daily_budget"]),
+                daily_budget_seconds=daily_budget_s,
                 min_blocks_for_estimation=cfg.get("qpu_min_blocks_for_estimation", 5),
                 ema_alpha=cfg.get("qpu_ema_alpha", 0.3),
-                min_block_budget_seconds=parse_duration(
-                    cfg.get("min_block_budget", "90s")
-                ),
-                budget_cap_seconds=(
-                    parse_duration(cfg["budget_cap"])
-                    if cfg.get("budget_cap")
-                    else None
-                ),
+                min_block_budget_seconds=min_block_budget_s,
+                budget_cap_seconds=budget_cap_s,
+                initial_budget_seconds=initial_budget_s,
             )
             # Remove time config keys from cfg to avoid passing them to miner
             cfg = {
@@ -138,6 +134,7 @@ def build_miner_from_spec(spec: Dict[str, Any]):
                     "qpu_ema_alpha",
                     "min_block_budget",
                     "budget_cap",
+                    "qpu_initial_budget",
                     "qpu_type",
                 )
             }
@@ -176,9 +173,8 @@ def miner_worker_main(
     it from ``cancel()``; the miner polls it during its inner mining loop
     and returns None as soon as it fires. Sharing the event across the
     process boundary is what makes cancellation observable while
-    ``mine_block`` is running — the command queue can't deliver a
-    ``stop_mining`` op until ``mine_block`` returns, which defeats the
-    whole point.
+    ``mine_block`` is running — the command queue cannot interrupt the
+    inner loop, so ``stop_event`` is the sole cancellation path.
 
     ``live_max_energy_milli`` is an ``mp.Value('q')`` the parent updates
     on each new head that crosses a decay-step boundary. The substrate
@@ -189,7 +185,7 @@ def miner_worker_main(
     ``substrate/miner_controller.py`` for the write site.
     """
     # Set up logging for child process
-    _setup_child_process_logging(log_queue)
+    setup_child_process_logging(log_queue)
     logger.info(f"Building miner: kind={spec.get('kind')}, id={spec.get('id')}")
     try:
         miner = build_miner_from_spec(spec)
@@ -200,6 +196,9 @@ def miner_worker_main(
     # Expose the shared threshold to the miner instance so mine_work_item
     # can read it each iteration without a queue round-trip.
     miner._live_max_energy_milli = live_max_energy_milli
+    # Forward the same log queue to the persistent stream-driver process so its
+    # producer-side diagnostics (stream depth, feeder pop-wait) aren't dropped.
+    miner._log_queue = log_queue
 
     while True:
         msg = req_q.get()
@@ -228,9 +227,6 @@ def miner_worker_main(
             except Exception:  # noqa: BLE001 — best-effort
                 pass
             return
-        elif op == "get_stats":
-            data = miner.get_stats()
-            resp_q.put({"op": "stats", "data": data, "id": spec.get("id")})
         elif op == "mine_work_item":
             # Substrate-mode entry point. The controller pushes a
             # SubstrateMiningContext (or MempoolJobContext) through the
@@ -294,14 +290,22 @@ def miner_worker_main(
             # Live QPU budget channel. The miner calls this at the progress-log
             # cadence with its ``QPUTimeManager.get_stats`` snapshot; we forward
             # it to the controller as a worker-initiated ``{"op": "budget"}``
-            # push (never blocks the serial op-loop, unlike a get_stats RPC).
+            # push, which never blocks the serial op-loop. Worker-initiated
+            # push is the pattern for every live counter here; the old
+            # controller-pulls-an-RPC path is gone.
             def _emit_budget(stats: Dict[str, Any]) -> None:
                 _emit("budget", stats)
+
+            # Ring-drop channel, same worker-initiated push shape as budget.
+            # A dropped sample never reaches this worker, so this counter is
+            # the only live signal that mined attempts are being discarded.
+            def _emit_drops(stats: Dict[str, Any]) -> None:
+                _emit("drops", stats)
 
             # Write-once participation channel. The miner calls this exactly
             # once per accepted dispatch (after its budget gate passes) with the
             # solution number + backend-specific extras (QPU: budget_seconds).
-            # The controller dedups and submits the participation remark.
+            # The controller dedups and submits the participation marker.
             # Best-effort: a put failure must not break mining.
             def _emit_participating(
                 solution_number: int, extra: Dict[str, Any],
@@ -324,6 +328,7 @@ def miner_worker_main(
                     context, stop_event, preview_cb=_emit_preview,
                     budget_cb=_emit_budget,
                     participating_cb=_emit_participating,
+                    drops_cb=_emit_drops,
                 )
             except Exception as exc:
                 logger.error(
@@ -466,12 +471,10 @@ class MinerHandle:
 
         Signals the running mining loop directly via the shared
         ``stop_event`` so the worker observes the cancel within one
-        iteration of its inner loop. We deliberately do NOT also enqueue
-        a ``stop_mining`` op on the request queue: that op can sit in
-        the queue while the worker is busy mining, and then get consumed
-        by a *later* dispatch's clear → mine_work_item → req.get
-        sequence — cancelling the new work with a stale cancel. The
-        ``stop_event`` is the single source of truth for cancellation.
+        iteration of its inner loop. The ``stop_event`` is the single
+        source of truth for cancellation; no op is enqueued on the
+        command queue, which cannot interrupt an in-progress
+        ``mine_block`` call.
 
         Idempotent — safe to call when the worker is idle (the set is a
         no-op cleared by the next ``mine_work_item()``).
@@ -491,14 +494,4 @@ class MinerHandle:
         """
         with self.live_max_energy_milli.get_lock():
             self.live_max_energy_milli.value = int(max_energy_milli)
-
-    def get_stats(self) -> dict:
-        self.req.put({"op": "get_stats"})
-        msg = self.resp.get(timeout=2.0)
-        if isinstance(msg, dict) and msg.get("op") == "stats":
-            return msg.get("data", {})
-        else:
-            raise ValueError(
-                f"Miner {self.miner_id} did not respond to get_stats: {msg}"
-            )
 

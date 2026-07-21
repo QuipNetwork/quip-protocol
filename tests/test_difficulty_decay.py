@@ -17,11 +17,13 @@ import math
 
 import pytest
 
+from shared.allowed_value_spec import AllowedValueSet
 from substrate.difficulty_decay import (
     DECAY_RATE_MILLI,
-    MIN_DECAY_DELTA_MILLI,
+    MIN_ENERGY_DELTA_MILLI,
     Direction,
     EnergyCurve,
+    _expected_gse_for_specs,
     adjust_energy_along_curve,
     apply_decay,
     current_difficulty,
@@ -119,6 +121,61 @@ def test_energy_curve_zero_nodes_or_edges() -> None:
 
 
 # ----------------------------------------------------------------------
+# Spec-aware curve — mirrors expected_gse_for_specs (quip-protocol-rs MR !35)
+# ----------------------------------------------------------------------
+
+# Legacy registered specs: ternary h {-1,0,+1} (⟨|h|⟩ = 2/3) and binary J.
+_LEGACY_H_SET = AllowedValueSet((-1000, 0, 1000))
+_LEGACY_J_SET = AllowedValueSet((-1000, 1000))
+
+
+def test_expected_gse_for_specs_matches_legacy_for_default_specs() -> None:
+    """Feeding the legacy ternary/binary specs must reproduce the old
+    hardcoded formula bit-for-bit — the Python mirror of the Rust test
+    ``expected_gse_for_specs_matches_legacy_for_default_specs``."""
+    for n, m in ((TEST_NODES, TEST_EDGES), (1368, 7692), (4800, 48000)):
+        for c in (0.700, 0.725, 0.750, 0.800):
+            assert _expected_gse_for_specs(
+                n, m, c, _LEGACY_H_SET, _LEGACY_J_SET
+            ) == _expected_gse_milli(n, m, c)
+
+
+def test_expected_gse_for_specs_zero_field_drops_h_term() -> None:
+    """h = {0} → pure ±J spin glass. n=1024,m=2048,c=0.75: avg degree 4,
+    √4=2 → -0.75·1.0·2·1024 = -1536.0 → -1_536_000 milli. Mirrors the
+    Rust ``expected_gse_for_specs_zero_field_drops_h_term``."""
+    zero_h = AllowedValueSet((0,))
+    assert _expected_gse_for_specs(1024, 2048, 0.75, zero_h, _LEGACY_J_SET) == -1_536_000
+
+
+def test_from_topology_default_specs_match_explicit_legacy() -> None:
+    """``from_topology`` with no specs must equal passing the legacy specs
+    explicitly — old call sites stay valid against the legacy default
+    topology with zero behavior change."""
+    implicit = EnergyCurve.from_topology(1368, 7692, 700, 750, 800)
+    explicit = EnergyCurve.from_topology(
+        1368, 7692, 700, 750, 800,
+        allowed_h=_LEGACY_H_SET, allowed_j=_LEGACY_J_SET,
+    )
+    assert implicit == explicit
+
+
+def test_from_topology_zero_field_curve_less_negative() -> None:
+    """A zero-field (h={0}) topology yields a strictly less-negative curve
+    than the ternary-field curve of the same graph — the chain credits no
+    energy the puzzle cannot produce."""
+    zero_h = AllowedValueSet((0,))
+    legacy = EnergyCurve.from_topology(1368, 7692, 700, 750, 800)
+    zero_field = EnergyCurve.from_topology(
+        1368, 7692, 700, 750, 800,
+        allowed_h=zero_h, allowed_j=_LEGACY_J_SET,
+    )
+    assert zero_field.min_milli > legacy.min_milli
+    assert zero_field.knee_milli > legacy.knee_milli
+    assert zero_field.max_milli > legacy.max_milli
+
+
+# ----------------------------------------------------------------------
 # current_difficulty — short-circuits + decay step accounting
 # ----------------------------------------------------------------------
 
@@ -203,61 +260,123 @@ def test_apply_decay_is_monotonic_easing(test_curve, base_difficulty) -> None:
 # ----------------------------------------------------------------------
 
 
+# Production-scale curve (milli) for the geometric walk-up tests. The tiny
+# test_curve range (~318 milli) sits below the 1000-milli floor, which would
+# flatten every step to the floor and hide the geometric behaviour. Mirrors
+# tests.rs::walkup_curve().
+def _walkup_curve() -> EnergyCurve:
+    return EnergyCurve(min_milli=-16_000_000, knee_milli=-15_600_000, max_milli=-14_000_000)
+
+
 def test_adjust_energy_along_curve_degenerate_curve_is_no_op() -> None:
-    """``total_range <= 0`` → leave current alone (matches Rust guard)."""
+    """``max_milli <= min_milli`` → leave current alone (matches Rust guard)."""
     flat = EnergyCurve(min_milli=-1000, knee_milli=-1000, max_milli=-1000)
     assert adjust_energy_along_curve(
-        -1000, DECAY_RATE_MILLI, Direction.EASIER, flat, MIN_DECAY_DELTA_MILLI,
+        -1000, DECAY_RATE_MILLI, Direction.EASIER, flat, MIN_ENERGY_DELTA_MILLI,
     ) == -1000
 
 
-def test_adjust_energy_along_curve_out_of_range_is_linear(test_curve) -> None:
-    """current outside [min, max] → linear fallback (matches Rust)."""
-    below = test_curve.min_milli - 100
-    result = adjust_energy_along_curve(
-        below, DECAY_RATE_MILLI, Direction.EASIER, test_curve, MIN_DECAY_DELTA_MILLI,
-    )
-    total_range = test_curve.max_milli - test_curve.min_milli
-    expected_delta = max(
-        MIN_DECAY_DELTA_MILLI,
-        _libm_round(total_range * DECAY_RATE_MILLI / 1000.0),
-    )
-    assert result == below + expected_delta
-
-
 def test_adjust_energy_along_curve_min_delta_floor_applies(test_curve) -> None:
-    """A tiny rate that would round to 0 still moves by min_delta_milli.
+    """A tiny geometric step that rounds to 0 still moves by min_delta_milli.
 
-    Mirrors tests.rs::adjust_energy_along_curve_applies_min_delta_floor
-    behaviour: ``raw_delta_f`` in (0, 0.5) rounds to 0, the floor kicks
-    in and the adjustment proceeds.
+    Mirrors tests.rs::difficulty_adjust_applies_min_delta_for_small_positive_floats:
+    harden from max_milli (greatest room to the hard cap) with rate 1‰ rounds to
+    0, the floor lifts it to min_delta, and the result stays inside the cap.
     """
-    start = (test_curve.min_milli + test_curve.knee_milli) // 2
-    # Rate of 1‰ → raw_delta would be sub-1, well under the round
-    # boundary on the test_curve's narrow range.
+    current = test_curve.max_milli
     result = adjust_energy_along_curve(
-        start, 1, Direction.EASIER, test_curve, MIN_DECAY_DELTA_MILLI,
+        current, 1, Direction.HARDER, test_curve, 100,
     )
-    # Must have moved by exactly the floor.
-    assert result == start + MIN_DECAY_DELTA_MILLI
+    assert result == current - 100
+    assert result > test_curve.min_milli
 
 
-def test_adjust_energy_along_curve_harder_decreases(test_curve) -> None:
-    """Direction.HARDER moves toward min_milli (more negative)."""
-    start = (test_curve.min_milli + test_curve.max_milli) // 2
-    harder = adjust_energy_along_curve(
-        start, DECAY_RATE_MILLI, Direction.HARDER, test_curve, MIN_DECAY_DELTA_MILLI,
+def test_adjust_harder_geometric_fraction_in_interior() -> None:
+    """Harden steps exactly round(room*rate) of the gap to the hard cap and
+    stays strictly inside it. Mirrors tests.rs::harden_steps_geometric_fraction
+    _in_the_interior."""
+    curve = _walkup_curve()
+    starts = [curve.max_milli, curve.knee_milli, -15_000_000, curve.min_milli + 100_000]
+    for current in starts:
+        for rate_milli in (50, 350, 650):
+            result = adjust_energy_along_curve(
+                current, rate_milli, Direction.HARDER, curve, 5000,
+            )
+            room = current - curve.min_milli
+            expected_delta = _libm_round(room * rate_milli / 1000.0)
+            assert result == current - expected_delta
+            assert result > curve.min_milli
+
+
+def test_adjust_harder_tail_walks_past_cap_by_min_delta() -> None:
+    """Near/at/below the hard cap the geometric term is below the floor, so a
+    harden steps one floor — uncapped, crossing past min_milli. Mirrors
+    tests.rs::harden_tail_walks_past_cap_by_min_delta."""
+    curve = _walkup_curve()
+    floor = MIN_ENERGY_DELTA_MILLI
+    for room in (5 * floor, floor, 1, 0, -floor):
+        current = curve.min_milli + room
+        result = adjust_energy_along_curve(current, 1, Direction.HARDER, curve, floor)
+        assert result == current - floor
+    at_cap = adjust_energy_along_curve(curve.min_milli, 1, Direction.HARDER, curve, floor)
+    assert at_cap < curve.min_milli
+
+
+def test_adjust_easier_capped_at_max() -> None:
+    """Easier never eases past the easy cap, and is a no-op at/past it."""
+    curve = _walkup_curve()
+    # A large rate from just below max clamps to the remaining gap (lands on max).
+    near_max = curve.max_milli - 100
+    assert adjust_energy_along_curve(
+        near_max, 650, Direction.EASIER, curve, MIN_ENERGY_DELTA_MILLI,
+    ) == curve.max_milli
+    # At the cap: no-op.
+    assert adjust_energy_along_curve(
+        curve.max_milli, DECAY_RATE_MILLI, Direction.EASIER, curve, MIN_ENERGY_DELTA_MILLI,
+    ) == curve.max_milli
+
+
+def test_fast_wins_walk_up_the_curve_over_many_steps() -> None:
+    """A 35% geometric harden takes many wins to reach the cap, never one.
+    Mirrors tests.rs::fast_wins_walk_up_the_curve_over_many_steps."""
+    curve = _walkup_curve()
+    current = curve.knee_milli
+    wins = 0
+    while current - curve.min_milli > 1000 and wins < 1000:
+        current = adjust_energy_along_curve(current, 350, Direction.HARDER, curve, 5000)
+        wins += 1
+    assert wins >= 10
+    assert current <= curve.min_milli + 1000
+
+
+def test_decay_recovers_fastest_from_the_hard_cap() -> None:
+    """Easing is geometric in the gap to the easy cap, so the largest step is at
+    the hard ceiling. Mirrors tests.rs::decay_recovers_fastest_from_the_hard_cap."""
+    curve = _walkup_curve()
+
+    def decay_step(start: int) -> int:
+        return adjust_energy_along_curve(
+            start, DECAY_RATE_MILLI, Direction.EASIER, curve, 3000,
+        ) - start
+
+    from_cap = decay_step(curve.min_milli)
+    from_mid = decay_step(curve.knee_milli)
+    from_near_max = decay_step(curve.max_milli - 50_000)
+    assert from_cap > from_mid > from_near_max
+
+
+def test_observed_win_series_never_pins_the_hard_cap() -> None:
+    """Replay the documented inter-win gap series and assert the base threshold
+    stays strictly interior. Decay-only mirror (the miner has no on-proof
+    hardening); the easing keeps the threshold off both caps."""
+    curve = _walkup_curve()
+    base = SubstrateDifficulty(
+        min_solutions=1, max_energy_milli=curve.knee_milli, min_diversity_milli=0,
     )
-    assert harder < start
-
-
-def test_adjust_energy_along_curve_easier_increases(test_curve) -> None:
-    """Direction.EASIER moves toward max_milli (less negative)."""
-    start = (test_curve.min_milli + test_curve.max_milli) // 2
-    easier = adjust_energy_along_curve(
-        start, DECAY_RATE_MILLI, Direction.EASIER, test_curve, MIN_DECAY_DELTA_MILLI,
-    )
-    assert easier > start
+    for gap in (29, 280, 27, 200, 100, 300, 1401):
+        steps = gap // 100
+        base = apply_decay(base, steps, curve)
+        assert curve.min_milli < base.max_energy_milli <= curve.max_milli
 
 
 # ----------------------------------------------------------------------

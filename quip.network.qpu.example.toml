@@ -13,7 +13,9 @@ validators = [
     "ws://quip-validator:9944",
 ]
 signer_key = "~/.quip-miner/signing.json"
-# faucet_url = "http://localhost:8087"
+# On the public testnet the miner defaults to the canonical faucet when
+# faucet_url is unset; set it only to override (e.g. a local dev faucet).
+# faucet_url = "https://faucet.testnet.quip.network"
 
 # Optional telemetry REST API. Off by default (rest_port=-1).
 # rest_port = 8086
@@ -43,23 +45,36 @@ retry_backoff_ms = 250
 # The miner banks unused budget into the reservoir and pauses until it has
 # `min_block_budget` of QPU runway accrued, then bursts until the pool
 # drains to 0 (accumulate-then-burst, to amortize D-Wave queue warmup).
-# The sampler's active solver and region come from environment variables —
-# DWAVE_API_SOLVER and DWAVE_REGION_URL — at runtime; `solver` and
-# `dwave_region_url` here are operator-asserted pass-through values
-# surfaced to dashboards. EMA + min-blocks tune the pacing estimator
-# inside QPUTimeManager.
+# `solver` (the active solver, e.g. Advantage2_system1) and `region` (the
+# D-Wave region NAME, e.g. na-west-1 — NOT a SAPI URL) are passed to the
+# D-Wave SDK to select the sampler; `solver` is also surfaced to dashboards.
+# EMA + min-blocks tune the pacing estimator inside QPUTimeManager.
+# Unrecognized [dwave] keys (e.g. a typo) are logged at WARNING, not silently
+# ignored.
 [dwave]
 daily_budget                   = "30m"
 # min_block_budget: QPU runway (access seconds) that must accrue before a
-# burst starts. Mining then continues until the pool drains to 0. Must be
-# < daily_budget or the reservoir fills only across multiple days (a
-# startup warning fires). Default "90s".
+# burst starts. Mining then continues until the pool drains to 0. Two
+# constraints, each fires a startup warning if violated:
+#   - must be <= budget_cap, else the pool caps below the threshold and a
+#     burst can NEVER start (the pool plateaus forever);
+#   - should be < daily_budget, else the reservoir fills only across multiple
+#     days before the first burst.
+# Default "90s".
 min_block_budget               = "90s"
 # budget_cap: max banked pool size. Bounds a post-downtime catch-up burst.
-# Defaults to max(daily_budget, min_block_budget) when unset.
+# MUST be >= min_block_budget (see above). Defaults to
+# max(daily_budget, min_block_budget) when unset, which always satisfies that.
 # budget_cap                     = "30m"
+# qpu_initial_budget: reservoir balance seeded on process start, so a fresh
+# miner mines without waiting hours-to-days to accrue the buffer. Keywords:
+# "min" (one buffer — the default, bursts once on boot then re-accrues),
+# "daily" (a full day's budget), "cap" (fill the pool cap), or an explicit
+# duration like "10m". This is a per-process grant, not persisted accounting:
+# frequent restarts re-grant it, so prefer "min" unless overspend is fine.
+# qpu_initial_budget             = "min"
 # solver                         = "Advantage2_system1"
-# dwave_region_url               = "https://na-west-1.cloud.dwavesys.com/sapi/v2/"
+# region                         = "na-west-1"   # D-Wave region NAME, not a URL
 # qpu_min_blocks_for_estimation  = 5
 # qpu_ema_alpha                  = 0.3
 

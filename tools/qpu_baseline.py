@@ -5,6 +5,7 @@ import sys
 import time
 import json
 from pathlib import Path
+from typing import cast, Mapping, Tuple, Any
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -13,9 +14,17 @@ sys.path.append(str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evaluate_sampleset
-from shared.block_requirements import BlockRequirements
 import random
+
+from shared.quantum_proof_of_work import (
+    generate_ising_model_from_nonce,
+    energies_for_solutions,
+)
+from tools.baseline_utils import (
+    classify_energy,
+    evaluate_baseline_sampleset,
+    print_results_summary,
+)
 
 try:
     from QPU.dwave_sampler import DWaveSamplerWrapper
@@ -91,7 +100,6 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, min_runtime_minute
             start_time = time.time()
 
             # Cast h and J to match protocol expectations (int is a valid Variable type)
-            from typing import cast, Mapping, Tuple, Any
             h_cast = cast(Mapping[Any, float], h)
             J_cast = cast(Mapping[Tuple[Any, Any], float], J)
 
@@ -104,6 +112,7 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, min_runtime_minute
             runtime = time.time() - start_time
 
             energies = list(sampleset.record.energy)
+            solutions = list(sampleset.record.sample)
             min_energy = float(min(energies))
             avg_energy = float(sum(energies) / len(energies))
             std_energy = float((sum((e - avg_energy)**2 for e in energies) / len(energies)) ** 0.5)
@@ -113,68 +122,19 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, min_runtime_minute
             print(f"    📊 avg_energy = {avg_energy:.1f} (±{std_energy:.1f})")
 
             # Verify energy calculation consistency
-            from shared.quantum_proof_of_work import energies_for_solutions
-            solutions = list(sampleset.record.sample)
             recalc_energies = energies_for_solutions(solutions, h, J, nodes)
             recalc_min = min(recalc_energies)
             print(f"    ✓ Energy verification: sampler={min_energy:.1f}, recalc={recalc_min:.1f}, diff={abs(min_energy - recalc_min):.1f}")
 
-            # Use evaluate_sampleset to get diversity and num_solutions
-            # Create test requirements (using dummy values to ensure they pass)
-            requirements = BlockRequirements(
-                difficulty_energy=0.0,       # Very lenient difficulty (allow positive energies)
-                min_diversity=0.1,           # Low diversity requirement
-                min_solutions=1,             # Low solution count requirement
-                timeout_to_difficulty_adjustment_decay=600  # 10 minutes
-            )
-
-            # Use the same nonce and generate test salt for evaluation
-            salt = b"test_salt_qpu_baseline"
-            prev_timestamp = int(time.time()) - 600  # 10 minutes ago
-
             # Evaluate the sampleset
-            mining_result = evaluate_sampleset(
-                sampleset, requirements, nodes, edges, nonce, salt,
-                prev_timestamp, start_time, f"qpu-baseline-{num_reads}", "QPU"
+            eval_fields = evaluate_baseline_sampleset(
+                sampleset, nodes, edges, nonce,
+                start_time, f"qpu-baseline-{num_reads}", "QPU",
+                b"test_salt_qpu_baseline",
             )
-
-            diversity = 0.0
-            num_solutions = 0
-            meets_requirements = False
-
-            # Calculate diversity of top 10 solutions by energy
-            from shared.quantum_proof_of_work import calculate_diversity
-            solutions = list(sampleset.record.sample)
-            energies = list(sampleset.record.energy)
-
-            # Sort solutions by energy and take top 10
-            solution_energy_pairs = list(zip(solutions, energies))
-            solution_energy_pairs.sort(key=lambda x: x[1])  # Sort by energy (ascending = better)
-            top_10_solutions = [sol for sol, _ in solution_energy_pairs[:10]]
-
-            top_10_diversity = calculate_diversity(top_10_solutions)
-            print(f"    🌈 diversity (top 10) = {top_10_diversity:.3f}")
-
-            if mining_result:
-                diversity = mining_result.diversity
-                num_solutions = mining_result.num_valid
-                meets_requirements = True
-                print(f"    🔢 num_solutions = {num_solutions}")
-                print(f"    ✅ Meets mining requirements!")
-            else:
-                print(f"    ❌ Does not meet mining requirements")
 
             # Energy target analysis
-            target_reached = "none"
-            if min_energy <= -15650:
-                target_reached = "excellent"
-            elif min_energy <= -15500:
-                target_reached = "very_good"
-            elif min_energy <= -15400:
-                target_reached = "good"
-            elif min_energy <= -15300:
-                target_reached = "fair"
-
+            target_reached = classify_energy(min_energy)
             if target_reached != "none":
                 print(f"    🎖️  Quality: {target_reached}")
 
@@ -195,11 +155,8 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, min_runtime_minute
                 'avg_energy': avg_energy,
                 'std_energy': std_energy,
                 'target_reached': target_reached,
-                'diversity': float(diversity),
-                'diversity_top_10': float(top_10_diversity),
-                'num_solutions': int(num_solutions),
-                'meets_requirements': bool(meets_requirements),
-                'qpu_timing': qpu_timing
+                'qpu_timing': qpu_timing,
+                **eval_fields,
             }
             results['tests'].append(test_result)
 
@@ -225,21 +182,10 @@ def qpu_baseline_test(timeout_minutes=20.0, output_file=None, min_runtime_minute
     
     # Summary and analysis
     total_runtime = time.time() - total_start_time
-    print(f"\n📊 QPU Baseline Summary (total time: {total_runtime/60:.1f} min):")
-    print("=" * 50)
-    
+    results['_total_runtime_seconds'] = total_runtime
+    print_results_summary(results, "QPU Baseline Summary")
+
     if results['tests']:
-        # Best energy achieved
-        best_result = min(results['tests'], key=lambda r: r['min_energy'])
-        print(f"🏆 Best energy: {best_result['min_energy']:.1f}")
-        print(f"   Required: {best_result['num_reads']} reads, {best_result['annealing_time_us']}µs, {best_result['runtime_minutes']:.1f} min")
-
-        # Time vs energy analysis
-        print(f"\n⏱️ Time vs Energy Performance:")
-        for result in results['tests']:
-            quality = f"({result['target_reached']})" if result['target_reached'] != 'none' else ""
-            print(f"  {result['runtime_minutes']:5.1f} min: {result['min_energy']:7.1f} energy {quality}")
-
         # Runtime analysis
         min_runtime_met = any(r['runtime_seconds'] >= min_runtime_seconds for r in results['tests'])
         print(f"\n⏰ Minimum runtime requirement ({min_runtime_minutes} min): {'✅ Met' if min_runtime_met else '❌ Not met'}")

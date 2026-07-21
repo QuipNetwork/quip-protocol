@@ -42,12 +42,13 @@ class BlockRequirements:
     solutions_range: Optional[Tuple[int, int]] = None
 
     def __post_init__(self):
-        if self.allowed_h_values is None:
-            from shared.quantum_proof_of_work import DEFAULT_ALLOWED_H
-            self.allowed_h_values = DEFAULT_ALLOWED_H
-        if self.allowed_j_values is None:
-            from shared.quantum_proof_of_work import DEFAULT_ALLOWED_J
-            self.allowed_j_values = DEFAULT_ALLOWED_J
+        # allowed_h_values / allowed_j_values are intentionally NOT defaulted
+        # here: the per-topology allowed-value spec must be threaded explicitly
+        # from the chain snapshot. Silently filling the ternary default is what
+        # let an h=0 chain be scored as ternary; _ising_from_requirements now
+        # crashes on a missing spec rather than mining a different problem than
+        # the chain validates. PoW callers pass it from the snapshot; mempool
+        # carries its Ising model directly and never reaches that path.
         if self.diversity_range is None:
             from shared.energy_utils import DEFAULT_DIVERSITY_RANGE
             self.diversity_range = DEFAULT_DIVERSITY_RANGE
@@ -96,6 +97,14 @@ class MiningResult:
     # ``None`` means the worst-case wasn't recomputed; fall back to
     # ``energy`` (legacy behavior) at the cost of possible chain rejection.
     submit_floor_energy: Optional[float] = None
+    # Miner-reported compute time for this proof, in microseconds — carried
+    # on-chain in the spec-111 ``QuantumProof.device_access_time_us`` and
+    # persisted on the winning ``QBlock``. QPU wins report the summed
+    # per-attempt D-Wave QPU access time for the solution; CPU/GPU wins
+    # report wall-clock mining time. The CONTROLLER fills this at submit
+    # time (both the result and the anticipatory fire paths); workers leave
+    # it None. None encodes as 0 = unreported.
+    device_access_time_us: Optional[int] = None
 
     @property
     def effective_floor(self) -> float:

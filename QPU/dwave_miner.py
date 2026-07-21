@@ -6,17 +6,20 @@ import multiprocessing
 import multiprocessing.synchronize
 import signal
 import time
-from typing import Dict, List, Optional, Tuple, Any
-
-init_logger = logging.getLogger(__name__)
+from typing import List, Optional, Tuple, Any
 
 from QPU.dwave_sampler import DWaveSamplerWrapper
 from QPU.qpu_time_manager import QPUTimeManager, QPUTimeConfig
-from shared.base_miner import BaseMiner, MidstreamBudget, _energy_to_milli
+from shared.base_miner import (
+    BaseMiner, MidstreamBudget, _SharedSampleSet, _energy_to_milli,
+)
 from shared.miner_types import BlockRequirements
+from shared.problem_prep import prepare_reduced
 from shared.stream_context import StreamContext
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies.dwave_topology import DWaveTopology
+
+init_logger = logging.getLogger(__name__)
 
 
 def build_persistent_context(
@@ -29,6 +32,7 @@ def build_persistent_context(
     num_reads: int,
     annealing_time: float,
     energy_threshold_milli: int,
+    allowed_h: Any = None,
     solver_name: Optional[str] = None,
     region: Optional[str] = None,
     token: Optional[str] = None,
@@ -67,10 +71,23 @@ def build_persistent_context(
         token=token,
         topology=topology,
     )
+    sampler = miner.sampler
+    # The feeder workers run prepare_reduced (defect-clamp + array reduction) off
+    # the submit path. They need the QPU's defect set and the live-topology
+    # ordering — taken from the connected sampler so producer and consumer share
+    # exactly one ordering (sampler.live_nodes/live_edges derive from the same
+    # live_topology call). With no defects this reduces to the full topology.
+    feeder_prep_args = (
+        sampler._defective_qubits,
+        sampler._defective_edges,
+        sampler.live_nodes,
+        sampler.live_edges,
+    )
     return StreamContext(
-        sampler=miner.sampler,
+        sampler=sampler,
         nodes=nodes,
         edges=edges,
+        allowed_h=allowed_h,
         feeder_buffer_size=feeder_buffer_size,
         num_reads=num_reads,
         num_sweeps=0,
@@ -79,8 +96,52 @@ def build_persistent_context(
             "annealing_time": annealing_time,
             "energy_threshold_milli": energy_threshold_milli,
         },
+        feeder_prep_fn=prepare_reduced,
+        feeder_prep_args=feeder_prep_args,
         stop_event=stop_event,
     )
+
+
+def build_sampler(
+    *,
+    miner_id: str,
+    queue_depth: int,
+    solver_name: Optional[str] = None,
+    region: Optional[str] = None,
+    token: Optional[str] = None,
+    topology: Optional[DWaveTopology] = None,
+) -> Any:
+    """Build ONLY the connected D-Wave sampler (for the isolated submitter).
+
+    The :mod:`QPU.dwave_submitter` process owns the keys/connection but not the
+    feeder, so it needs the bare :class:`~QPU.dwave_sampler.DWaveSamplerWrapper`
+    (with ``sample_ising_streaming`` + ``live_nodes``/``live_edges``), not a full
+    :class:`~shared.stream_context.StreamContext`. Mirrors the connect in
+    :func:`build_persistent_context`. Runs ONLY in the submitter process.
+
+    Args:
+        topology: The chain topology for the QPU (required).
+
+    Returns:
+        A connected :class:`~QPU.dwave_sampler.DWaveSamplerWrapper`.
+
+    Raises:
+        ValueError: If topology is None.
+    """
+    if topology is None:
+        raise ValueError(
+            "the QPU submitter requires a topology; the chain topology was not "
+            "wired to build_sampler"
+        )
+    miner = DWaveMiner(
+        miner_id=miner_id,
+        queue_depth=queue_depth,
+        solver_name=solver_name,
+        region=region,
+        token=token,
+        topology=topology,
+    )
+    return miner.sampler
 
 
 # Default interval between repeated pacing log lines (seconds).
@@ -144,9 +205,14 @@ class DWaveMiner(BaseMiner):
     # Keep that headroom so the streaming sampler can saturate the
     # D-Wave cloud queue without blocking on Python-side derivation.
     FEEDER_BUFFER_SIZE = 60
-    # The sampler + feeder live in the persistent stream-driver process (see
-    # QPU/stream_driver.py + build_persistent_context); _ensure_driver
-    # spawns/reuses that process and the worker keeps no feeder.
+    # Run the two-process submitter split: the SDK's GIL-held encode inside
+    # sample_bqm was the streaming bottleneck (submit_mean ~11s under
+    # contention), so the connection + submit live in their own process
+    # (shared.feeder_driver feeds reduced problems over a ProblemView ring to
+    # QPU.dwave_submitter). CPU/GPU keep the single stream driver.
+    USES_SUBMITTER_SPLIT = True
+    # The sampler + feeder live in separate stream-driver processes; the worker
+    # keeps no feeder. _ensure_driver spawns/reuses them.
 
     def __init__(
         self,
@@ -363,6 +429,20 @@ class DWaveMiner(BaseMiner):
             )
         return True
 
+    def _participation_extra(self) -> dict:
+        """Record the QPU runway committed to this solution in the marker.
+
+        Called once per accepted dispatch (the budget gate has already passed,
+        so the pool holds at least the configured buffer). Returns the current
+        pool in whole seconds as ``budget_seconds`` so the controller's
+        participation extrinsic carries the QPU time backing this solution.
+        Returns ``{}`` when no budget is configured (the base no-op).
+        """
+        if self.time_manager is None:
+            return {}
+        pool_seconds = self.time_manager.get_stats().get("pool_seconds", 0.0)
+        return {"budget_seconds": int(pool_seconds)}
+
     def _midstream_budget_ok(
         self, solution_number: int,
     ) -> Optional[MidstreamBudget]:
@@ -409,17 +489,6 @@ class DWaveMiner(BaseMiner):
             self._inloop_pacing_rl.reset()
         return MidstreamBudget(should_mine=should_mine, stats=stats)
 
-    def _participation_extra(self) -> Dict[str, Any]:
-        """QPU adds the reservoir pool at dispatch to the participation marker.
-
-        The snapshot is the QPU runway on hand when mining began for this
-        solution # (>= ``min_block_budget``). Returns ``{}`` when no budget is
-        configured.
-        """
-        if self.time_manager is None:
-            return {}
-        return {"budget_seconds": self.time_manager.get_stats()["pool_seconds"]}
-
     def _adapt_mining_params(
         self,
         current_requirements: BlockRequirements,
@@ -464,6 +533,7 @@ class DWaveMiner(BaseMiner):
             "queue_depth": self.queue_depth,
             "nodes": nodes,
             "edges": sample_ctx["edges"],
+            "allowed_h": sample_ctx.get("allowed_h_values"),
             "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
             "num_reads": sample_ctx["num_reads"],
             "annealing_time": sample_ctx["annealing_time"],
@@ -476,26 +546,37 @@ class DWaveMiner(BaseMiner):
             "topology": getattr(self, "topology", None),
         }
 
-    def _finalize_sample(self, sampleset: Any, defect_info: Any) -> Any:
-        """Reconstruct a reduced D-Wave sampleset to full topology (survivor-only).
+    def _finalize_sample(
+        self, sampleset: Any, defect_info: Any, nodes: List[int],
+    ) -> Any:
+        """Reconstruct a reduced D-Wave sample to full topology (survivor-only).
 
         Called by ``BaseMiner._run_substrate_ratchet`` when a promising sample
         has fewer variables than the topology — i.e. the QPU driver stripped
         offline qubits before writing to the ring.  ``defect_info`` carries the
         fixed-spin assignments and energy offset needed for reconstruction.
 
+        The driver discards dimod's variable labels (it writes a raw ``int8``
+        matrix to shared memory), so the input here is a positional
+        ``_SharedSampleSet`` view — NOT a labeled ``dimod.SampleSet``.
+        Reconstruct positionally against ``nodes`` and return a
+        ``_SharedSampleSet`` so the downstream ``evaluate_sampleset`` (which
+        reads ``record.sample`` positionally) sees a full-width matrix.
+
         Args:
-            sampleset: The reduced sampleset from the QPU driver.
+            sampleset: The reduced ``_SharedSampleSet`` from the QPU driver.
             defect_info: :class:`~QPU.dwave_sampler.DefectInfo` with
                 ``fixed_spins``, ``energy_offset``, and ``removed_edges``.
+            nodes: Full topology node order; the column order of the output.
 
         Returns:
-            Full-topology sampleset with all variables present and energies
-            corrected.
+            Full-topology ``_SharedSampleSet`` with clamped spins reinserted
+            and energies corrected.
         """
-        # Reconstruction is a pure transform of (sampleset, defect_info) and
-        # runs in the connection-less worker, where self.sampler is None. Call
-        # the staticmethod on the class so it does not require a live sampler.
-        return DWaveSamplerWrapper.reconstruct_full_sampleset(
-            sampleset, defect_info,
+        # Reconstruction is a pure transform of (sample matrix, defect_info,
+        # nodes) and runs in the connection-less worker, where self.sampler is
+        # None. Call the staticmethod on the class so it needs no live sampler.
+        full_sample, full_energy = DWaveSamplerWrapper.reconstruct_full_matrix(
+            sampleset.record.sample, sampleset.record.energy, defect_info, nodes,
         )
+        return _SharedSampleSet(full_sample, full_energy)

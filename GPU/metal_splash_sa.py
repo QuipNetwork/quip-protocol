@@ -19,7 +19,6 @@ by jointly sampling groups of tightly coupled variables.
 
 import logging
 import os
-import time
 from typing import Dict, List, Optional, Tuple
 
 import dimod
@@ -30,7 +29,6 @@ try:
 except ImportError:  # Apple Metal framework is macOS-only; absent on Linux/CI.
     Metal = None  # type: ignore[assignment]
 
-from GPU.metal_scheduler import DutyCycleController
 from GPU.metal_utils import _create_buffer, build_csr_from_ising, compute_beta_schedule, unpack_metal_results
 
 
@@ -72,7 +70,6 @@ class MetalSplashSampler:
         topology_graph = topology_obj.graph
         self.nodes = list(topology_graph.nodes())
         self.edges = list(topology_graph.edges())
-        self.nodelist = self.nodes
         self.properties = topology_obj.properties
 
         # Extract Zephyr parameters from topology (for logging)
@@ -117,7 +114,6 @@ class MetalSplashSampler:
         beta_schedule_type: str = "geometric",
         beta_schedule: Optional[np.ndarray] = None,
         seed: Optional[int] = None,
-        **kwargs
     ) -> List[dimod.SampleSet]:
         """
         Sample from Ising model using Splash sampling.
@@ -210,11 +206,6 @@ class MetalSplashSampler:
         )
 
         # Execute kernel
-        _duty_cycle: Optional[DutyCycleController] = kwargs.get(
-            'duty_cycle',
-        )
-        _t0 = time.perf_counter()
-
         cmd_buf = self._command_queue.commandBuffer()
         encoder = cmd_buf.computeCommandEncoder()
         encoder.setComputePipelineState_(self._pipeline)
@@ -260,11 +251,6 @@ class MetalSplashSampler:
         encoder.endEncoding()
         cmd_buf.commit()
         cmd_buf.waitUntilCompleted()
-
-        # Duty-cycle yielding after GPU dispatch
-        if _duty_cycle and _duty_cycle.enabled:
-            _compute_s = time.perf_counter() - _t0
-            time.sleep(_duty_cycle.compute_sleep(_compute_s))
 
         # Check for errors
         if cmd_buf.status() != Metal.MTLCommandBufferStatusCompleted:

@@ -1,11 +1,11 @@
 {
-  "generated_at": "2026-05-20T14:23:07+00:00",
+  "generated_at": "2026-06-09T23:34:06+00:00",
   "tool": "python tools/dump_solver_ranges.py",
   "solvers": [
     {
-      "chip_id": "Advantage_system4.1",
+      "chip_id": "Advantage_system4",
       "solver_names": [
-        "Advantage_system4.1"
+        "Advantage_system4"
       ],
       "topology_type": "pegasus",
       "topology_shape": [
@@ -35,9 +35,9 @@
       "online": true
     },
     {
-      "chip_id": "Advantage_system6.4",
+      "chip_id": "Advantage_system6",
       "solver_names": [
-        "Advantage_system6.4"
+        "Advantage_system6"
       ],
       "topology_type": "pegasus",
       "topology_shape": [
@@ -77,7 +77,7 @@
         4
       ],
       "num_qubits": 4800,
-      "num_active_qubits": 4578,
+      "num_active_qubits": 4577,
       "h_range": [
         -6.0,
         6.0
@@ -97,9 +97,9 @@
       "online": true
     },
     {
-      "chip_id": "Advantage2_system4.3",
+      "chip_id": "Advantage2_system4",
       "solver_names": [
-        "Advantage2_system4.3"
+        "Advantage2_system4"
       ],
       "topology_type": "zephyr",
       "topology_shape": [

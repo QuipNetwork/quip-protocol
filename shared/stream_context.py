@@ -50,19 +50,28 @@ class StreamContext:
     def __init__(
         self,
         *,
-        sampler: Any,
+        sampler: Any = None,
         nodes: List[int],
         edges: List[Tuple[int, int]],
         feeder_buffer_size: int,
         num_reads: int,
         num_sweeps: int,
+        allowed_h: Optional[Any] = None,
         sampler_kwargs: Optional[Dict[str, Any]] = None,
         feeder_builder: Optional[Callable] = None,
+        feeder_prep_fn: Optional[Callable] = None,
+        feeder_prep_args: tuple = (),
         stop_event: Optional[multiprocessing.synchronize.Event] = None,
     ) -> None:
         self._sampler = sampler
         self._nodes = nodes
         self._edges = edges
+        # The problem's per-node field spec (chain ``allowed_h_values``). It is
+        # topology-bound like nodes/edges, so it is fixed for the driver's
+        # lifetime and forwarded to the PoW feeder. ``None`` would make the
+        # feeder silently build a ternary h model the chain scores as h=0, so
+        # ``build_feeder`` rejects a None on the PoW path.
+        self._allowed_h = allowed_h
         self._feeder_buffer_size = feeder_buffer_size
         self._num_reads = num_reads
         self._num_sweeps = num_sweeps
@@ -77,6 +86,10 @@ class StreamContext:
                 "(passed explicitly per round)"
             )
         self._feeder_builder = feeder_builder or build_feeder
+        # Optional per-model post-processing the feeder workers run (QPU PoW path:
+        # prepare_reduced — defect-clamp + array reduction off the submit path).
+        self._feeder_prep_fn = feeder_prep_fn
+        self._feeder_prep_args = feeder_prep_args
         self._stop_event = stop_event
         self._feeder: Optional[Any] = None
         self._feeder_kind: Optional[str] = None
@@ -120,6 +133,9 @@ class StreamContext:
                     pass
             self._feeder = self._feeder_builder(
                 spec, self._nodes, self._edges, self._feeder_buffer_size,
+                allowed_h=self._allowed_h,
+                prep_fn=self._feeder_prep_fn,
+                prep_args=self._feeder_prep_args,
             )
             self._feeder_kind = skind
 
@@ -137,7 +153,16 @@ class StreamContext:
     def iter_results(
         self,
     ) -> Iterator[Tuple[IsingModel, dimod.SampleSet, int]]:
-        """Yield ``(model, sampleset, generation)`` until stop or pause."""
+        """Yield ``(model, sampleset, generation)`` until stop or pause.
+
+        Requires a sampler (the in-process / single-driver path). The split
+        feeder-driver has no connection and uses :meth:`iter_problems` instead.
+        """
+        if self._sampler is None:
+            raise RuntimeError(
+                "iter_results requires a sampler; the connection-less feeder "
+                "driver must use iter_problems()"
+            )
         while not self._stop() and not self._paused:
             if self._feeder is None:
                 return
@@ -152,6 +177,23 @@ class StreamContext:
                 self._close_stream()
                 continue
             yield model, ss, self.generation
+
+    def iter_problems(self) -> Iterator[Tuple[Any, int]]:
+        """Yield ``(ReducedProblem, generation)`` from the feeder until stop/pause.
+
+        The connection-less feeder-driver (process A) side: no sampler, no pump
+        — just drain the feeder so the driver can relay reduced problems into the
+        ProblemView ring. ``pop_blocking`` returns promptly (the feeder keeps a
+        ready buffer); stop/pause are observed between pops.
+        """
+        while not self._stop() and not self._paused:
+            if self._feeder is None:
+                return
+            try:
+                rp = self._feeder.pop_blocking()
+            except StopIteration:
+                return
+            yield rp, self.generation
 
     def cleanup(self) -> None:
         """Release the stream, feeder, and sampler."""

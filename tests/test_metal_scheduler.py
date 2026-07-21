@@ -4,8 +4,8 @@
 """Tests for MetalScheduler budget calculation and the adaptive cap policy.
 
 No GPU required — tests exercise the static core budget, the occupancy
-thread-budget surface, the pure tier policy (classify / hysteresis / budget
-mapping), and the DutyCycleController math without spawning the sensor monitor.
+thread-budget surface, and the pure tier policy (classify / hysteresis /
+budget mapping) without spawning the sensor monitor.
 """
 
 from unittest.mock import patch
@@ -96,6 +96,53 @@ class TestThreadBudget:
         sched.get_thread_budget()  # establish heartbeat baseline
         sched._last_hb_time = time.monotonic() - 100  # heartbeat now stale
         assert sched.get_thread_budget() == 2048
+        sched.stop()
+
+
+class TestTargetDispatchMs:
+    """The per-dispatch wall-time budget that gates Metal sweep-chunking.
+
+    None ⇒ dispatch monolithically (no UI to protect); a float ⇒ split the
+    sweep schedule. The occupancy machinery is covered by TestThreadBudget, so
+    here get_thread_budget is stubbed to isolate the four policy branches.
+    """
+
+    def _sched(self, yielding: bool):
+        from GPU.metal_scheduler import MetalScheduler
+        return MetalScheduler(
+            gpu_core_count=40,
+            gpu_utilization_pct=100,
+            yielding=yielding,
+        )
+
+    def test_none_when_yielding_off(self):
+        # Yielding disabled → never chunk (peak throughput).
+        sched = self._sched(yielding=False)
+        assert sched.target_dispatch_ms() is None
+
+    def test_none_when_uncapped(self):
+        # IDLE/headless: occupancy uncapped → no user present → monolithic.
+        from GPU.metal_scheduler import UNCAPPED
+        sched = self._sched(yielding=True)
+        sched.get_thread_budget = lambda: UNCAPPED
+        assert sched.target_dispatch_ms() is None
+        sched.stop()
+
+    def test_none_when_paused(self):
+        # PAUSE (budget 0): streaming loop handles PAUSE before dispatch, so
+        # chunking must not engage here either.
+        sched = self._sched(yielding=True)
+        sched.get_thread_budget = lambda: 0
+        assert sched.target_dispatch_ms() is None
+        sched.stop()
+
+    def test_target_ms_when_capping(self):
+        # ACTIVE/LOW: a finite positive occupancy cap means a user is present →
+        # split the schedule to the wall-time target.
+        from GPU.metal_scheduler import ACTIVE_DISPATCH_TARGET_MS
+        sched = self._sched(yielding=True)
+        sched.get_thread_budget = lambda: 512
+        assert sched.target_dispatch_ms() == ACTIVE_DISPATCH_TARGET_MS
         sched.stop()
 
 
@@ -235,125 +282,3 @@ class TestMetalSchedulerCachedUtilization:
         sched._util_value.value = 42
         assert sched.get_measured_gpu() == 42
         sched.stop()
-
-
-class TestDutyCycleController:
-    """DutyCycleController duty-cycle math and PI feedback."""
-
-    def test_disabled_at_100_percent(self):
-        from GPU.metal_scheduler import DutyCycleController
-        dc = DutyCycleController(target_pct=100)
-        assert dc.enabled is False
-
-    def test_enabled_below_100(self):
-        from GPU.metal_scheduler import DutyCycleController
-        dc = DutyCycleController(target_pct=30)
-        assert dc.enabled is True
-
-    def test_compute_sleep_at_30_percent(self):
-        from GPU.metal_scheduler import DutyCycleController
-        dc = DutyCycleController(target_pct=30)
-        sleep = dc.compute_sleep(0.1)
-        # 0.1 * (1/0.3 - 1) ≈ 0.233
-        assert 0.20 < sleep < 0.27
-
-    def test_compute_sleep_at_50_percent(self):
-        from GPU.metal_scheduler import DutyCycleController
-        dc = DutyCycleController(target_pct=50)
-        sleep = dc.compute_sleep(0.1)
-        # 0.1 * (1/0.5 - 1) = 0.1
-        assert 0.08 < sleep < 0.12
-
-    def test_compute_sleep_returns_min_when_disabled(self):
-        from GPU.metal_scheduler import DutyCycleController
-        dc = DutyCycleController(target_pct=100)
-        sleep = dc.compute_sleep(0.1)
-        assert sleep == dc._MIN_SLEEP_S
-
-    def test_compute_sleep_clamps_max(self):
-        from GPU.metal_scheduler import DutyCycleController
-        dc = DutyCycleController(target_pct=1)
-        # 10s * (1/0.01 - 1) = 990s → clamped to 2s
-        sleep = dc.compute_sleep(10.0)
-        assert sleep <= dc._MAX_SLEEP_S
-
-    def test_compute_sleep_clamps_min(self):
-        from GPU.metal_scheduler import DutyCycleController
-        dc = DutyCycleController(target_pct=30)
-        sleep = dc.compute_sleep(0.0001)
-        assert sleep >= dc._MIN_SLEEP_S
-
-    def test_ema_smoothing_converges(self):
-        from GPU.metal_scheduler import DutyCycleController
-        dc = DutyCycleController(target_pct=50)
-        # Feed 10 samples of 0.1s
-        for _ in range(10):
-            dc.compute_sleep(0.1)
-        # EMA should be near 0.1
-        assert 0.08 < dc._ema_compute_s < 0.12
-
-    def test_ema_smoothing_filters_spike(self):
-        from GPU.metal_scheduler import DutyCycleController
-        dc = DutyCycleController(target_pct=50)
-        # Steady state at 0.1s
-        for _ in range(10):
-            dc.compute_sleep(0.1)
-        # Spike to 1.0s
-        dc.compute_sleep(1.0)
-        # EMA should be smoothed, not jump to 1.0
-        assert dc._ema_compute_s < 0.5
-
-    def test_feedback_increases_sleep_when_hot(self):
-        from GPU.metal_scheduler import DutyCycleController
-        dc = DutyCycleController(target_pct=30)
-        initial_mult = dc._duty_multiplier
-        # Report 60% utilization vs 30% target
-        for _ in range(5):
-            dc.feedback(60)
-        assert dc._duty_multiplier > initial_mult
-
-    def test_feedback_decreases_sleep_when_cool(self):
-        from GPU.metal_scheduler import DutyCycleController
-        dc = DutyCycleController(target_pct=30)
-        # Start with inflated multiplier
-        dc._duty_multiplier = 3.0
-        # Report 10% utilization vs 30% target
-        for _ in range(5):
-            dc.feedback(10)
-        assert dc._duty_multiplier < 3.0
-
-    def test_feedback_noop_when_disabled(self):
-        from GPU.metal_scheduler import DutyCycleController
-        dc = DutyCycleController(target_pct=100)
-        dc.feedback(90)
-        assert dc._duty_multiplier == 1.0
-
-    def test_feedback_clamps_multiplier(self):
-        from GPU.metal_scheduler import DutyCycleController
-        dc = DutyCycleController(target_pct=30)
-        # Extreme positive error for many iterations
-        for _ in range(1000):
-            dc.feedback(100)
-        assert dc._duty_multiplier <= 10.0
-        # Extreme negative error
-        for _ in range(1000):
-            dc.feedback(0)
-        assert dc._duty_multiplier >= 0.1
-
-    def test_reset_clears_state(self):
-        from GPU.metal_scheduler import DutyCycleController
-        dc = DutyCycleController(target_pct=30)
-        dc.compute_sleep(0.1)
-        dc.feedback(90)
-        dc.reset()
-        assert dc._ema_compute_s == 0.0
-        assert dc._ema_initialized is False
-        assert dc._duty_multiplier == 1.0
-        assert dc._integral == 0.0
-
-    def test_target_pct_clamped(self):
-        from GPU.metal_scheduler import DutyCycleController
-        dc = DutyCycleController(target_pct=0)
-        assert dc._target_pct == 1
-        dc2 = DutyCycleController(target_pct=200)
-        assert dc2._target_pct == 100

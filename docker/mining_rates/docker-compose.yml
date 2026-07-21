@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # CPU miner service
   cpu-miner:
@@ -8,6 +6,9 @@ services:
       dockerfile: docker/Dockerfile.cpu
     image: quip-protocol/cpu-miner:latest
     container_name: quip-cpu-miner
+    # Sample rings need ~80 MiB of /dev/shm per CPU worker; Docker's
+    # 64 MiB default SIGBUSes the miner (see docker/README.md).
+    shm_size: "2gb"
     environment:
       - MINING_DURATION=${MINING_DURATION:-30m}
       - DIFFICULTY_ENERGY=${DIFFICULTY_ENERGY:--14900}
@@ -29,6 +30,7 @@ services:
       dockerfile: docker/Dockerfile.cuda
     image: quip-protocol/cuda-miner:latest
     container_name: quip-cuda-miner
+    shm_size: "2gb"
     environment:
       - MINING_DURATION=${MINING_DURATION:-30m}
       - DIFFICULTY_ENERGY=${DIFFICULTY_ENERGY:--14900}

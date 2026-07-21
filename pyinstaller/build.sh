@@ -47,11 +47,25 @@ fi
 
 "$BINARY" --version
 
+# Runtime-hook guard: pkg_resources must stay out of the bundle. Its
+# pyi_rth_pkgres runtime hook reads a setuptools vendor data file at the start
+# of every spawn child; macOS purges stale files from the onefile extraction
+# dir after ~3 days, so long-running miners would lose the file and every
+# worker spawn would die with BrokenPipeError. A fresh build passes the spawn
+# selftest below even with the hook present, so check the analysis instead.
+if grep -q "pyi_rth_pkgres" "$PROJECT_ROOT/build/pyinstaller-${ARCH}/quip_miner/Analysis-00.toc"; then
+    echo "ERROR: pkg_resources got pulled into the bundle (pyi_rth_pkgres hook"
+    echo "present). Find the importer in build/pyinstaller-${ARCH}/quip_miner/"
+    echo "xref-quip_miner.html and extend excludes in pyinstaller/quip_miner.spec."
+    exit 1
+fi
+
 # Data-bundle guard: load the scalecodec SCALE type-registry presets the way
 # SubstrateInterface does at connect time. Catches a dropped-package-data
 # regression (missing collect_data_files) here at build time rather than as a
 # runtime "'NoneType' object has no attribute 'get'" on the first validator
-# connect in production.
+# connect in production. Also runs a multiprocessing spawn round-trip to
+# verify worker spawning survives the frozen bootloader's runtime hooks.
 "$BINARY" selftest
 
 ls -lh "$BINARY"

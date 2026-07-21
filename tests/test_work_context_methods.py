@@ -1,7 +1,57 @@
 """Verify context types implement their own resolve_ising and requirements()."""
 from __future__ import annotations
 
-from shared.mempool_types import MempoolJobContext
+from substrate.mempool_types import MempoolJobContext
+from substrate.types import SubstrateMiningContext
+
+
+def _pow_context(*, decay_schedule=None) -> SubstrateMiningContext:
+    """Minimal valid PoW context; decay_schedule defaults to absent (None)."""
+    return SubstrateMiningContext(
+        last_proof_block_hash=b"\x00" * 32,
+        topology_hash=b"\x00" * 32,
+        nodes=[0, 1],
+        edges=[(0, 1)],
+        difficulty=None,
+        miner_account_bytes=b"\x00" * 32,
+        allowed_h_values=None,
+        allowed_j_values=None,
+        allowed_spin_values=None,
+        block_hash=b"\x00" * 32,
+        block_number=0,
+        decay_schedule=decay_schedule,
+    )
+
+
+def _mempool_context() -> MempoolJobContext:
+    return MempoolJobContext(
+        order_id=1,
+        nodes=(0, 1),
+        edges=((0, 1),),
+        h_values=(0, 0),
+        j_values=(0,),
+        min_energy_milli=None,
+        min_diversity_milli=None,
+        min_solutions=None,
+    )
+
+
+def test_pow_context_uses_decay_ratchet():
+    """PoW work always takes the decay-ratchet loop."""
+    assert _pow_context(decay_schedule=[100, 200, 300]).uses_decay_ratchet() is True
+
+
+def test_pow_context_uses_ratchet_even_without_decay_schedule():
+    """A decay-less PoW context still takes the ratchet path, not the mempool
+    path — the discriminator is the work source, not whether decay is active.
+    (The ratchet loop falls back to strict energy ranking when the schedule is
+    None; routing it to the mempool path would be a regression.)"""
+    assert _pow_context(decay_schedule=None).uses_decay_ratchet() is True
+
+
+def test_mempool_context_does_not_use_decay_ratchet():
+    """Mempool jobs use strict-energy evaluation, not the ratchet."""
+    assert _mempool_context().uses_decay_ratchet() is False
 
 
 def test_mempool_context_has_resolve_ising_method():

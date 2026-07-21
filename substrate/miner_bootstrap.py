@@ -29,15 +29,17 @@ invoke `--seed-chain`: chainspec ships with topology + difficulty
 baked in, and ad-hoc runtime config goes through ops tooling that
 holds the real sudo key.
 """
+
 from __future__ import annotations
 
 import asyncio
 import json
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import dwave_networkx as dnx
 
@@ -50,7 +52,7 @@ from shared.hybrid_signer import HybridSigner
 from shared.keystore_hybrid import HybridKeystoreFile, load_or_generate
 from shared.logging_config import get_logger
 from substrate.client import SubstrateClient
-from substrate.types import SubstrateDifficulty
+from substrate.types import ExtrinsicReceipt, SubstrateDifficulty
 
 
 # Default puzzle parameters seeded by `--seed-chain` on dev nodes. Mirror
@@ -72,6 +74,13 @@ DEV_CHAIN_PREFIXES: Tuple[str, ...] = (
     "Local Testnet",
     "quip-local",
 )
+
+# Canonical public testnet faucet, used as the fallback when no faucet_url
+# is configured and the connected chain identifies as the public testnet.
+# The chain name must match `system_chain` exactly — anything else (dev
+# chains, future networks) keeps the fail-fast `Underfunded` behavior.
+TESTNET_CHAIN_NAME = "Quip Testnet"
+DEFAULT_TESTNET_FAUCET_URL = "https://faucet.testnet.quip.network"
 
 
 # Well-known dev master seeds for the hybrid signature scheme. Captured
@@ -122,8 +131,8 @@ DEFAULT_SEED_TOPOLOGY: Tuple[int, int] = (2, 2)
 # operators should tune via `quip-miner set-difficulty` once that lands.
 DEFAULT_SEED_DIFFICULTY = SubstrateDifficulty(
     min_solutions=5,
-    max_energy_milli=-2_500_000,   # -2500.0
-    min_diversity_milli=200,        # 0.2
+    max_energy_milli=-2_500_000,  # -2500.0
+    min_diversity_milli=200,  # 0.2
 )
 
 # Minimum balance before bootstrap considers the account funded. Miner
@@ -147,10 +156,13 @@ FAUCET_FUNDING_TIMEOUT_SECONDS = 300.0  # 5 minutes
 _FAUCET_BACKOFF_START_SECONDS = 2.0
 _FAUCET_BACKOFF_MAX_SECONDS = 30.0
 
-# HTTP statuses worth retrying: rate-limit + the 5xx family the faucet
-# returns when a mint fails transiently. Any other 4xx means our request is
-# malformed and will fail identically on every retry.
-_RETRYABLE_FAUCET_STATUS = frozenset({429, 500, 502, 503, 504})
+# Statuses that fast-fail the caller because retrying genuinely cannot help:
+# a malformed request (400 — bad dest/amount) or an explicit ban, if the
+# faucet ever adds one. Everything else (429, the 5xx family, or any
+# unexpected code) is retried within the funding budget, because the on-chain
+# balance read — not the HTTP status — is the source of truth on whether we
+# cleared min_balance. 403 "already funded" is benign and handled separately.
+_PERMANENT_FAUCET_STATUS = frozenset({400})
 
 
 class FaucetTransientError(RuntimeError):
@@ -159,6 +171,17 @@ class FaucetTransientError(RuntimeError):
 
 class FaucetPermanentError(RuntimeError):
     """Faucet failure that retrying cannot fix (malformed request → 4xx)."""
+
+
+class FaucetAlreadyFunded(RuntimeError):
+    """Faucet refused because the account already exceeds its ``max_funded``
+    cap (HTTP 403). Not a failure: the account *has* money. Carries the
+    faucet-reported free balance so the caller can reconcile it against its
+    own ``min_balance`` threshold instead of crashing."""
+
+    def __init__(self, free_balance: Optional[int], detail: str) -> None:
+        super().__init__(detail)
+        self.free_balance = free_balance
 
 
 class Underfunded(RuntimeError):
@@ -235,9 +258,7 @@ async def bootstrap(config: BootstrapConfig) -> BootstrapResult:
         topology_seeded = False
         difficulty_seeded = False
         if config.seed_chain:
-            topology_seeded, difficulty_seeded = await _maybe_seed_chain(
-                client, config
-            )
+            topology_seeded, difficulty_seeded = await _maybe_seed_chain(client, config)
 
         balance = await ensure_funded(client, keystore, config)
         # Idempotent: returns whether it *newly* registered; either way the
@@ -286,45 +307,21 @@ async def _maybe_seed_chain(
 
     Idempotent: returns `(topology_seeded, difficulty_seeded)` reflecting
     whether *this* call did the seeding. Both are False on re-runs.
+
+    Order matters: topology MUST be registered before set_difficulty because
+    the runtime's `set_difficulty` now `ensure!`s the topology hash is in
+    `RegisteredTopologies`. The topology hash is resolved from the snapshot
+    after registration (or from the existing snapshot if already present).
     """
     await _assert_dev_chain(client)
     sudo_signer = _resolve_dev_signer(config.sudo_key_uri)
 
-    difficulty_seeded = False
-    needs_seed = (
-        await client.query_difficulty() is None or config.force_reseed_difficulty
-    )
-    if needs_seed:
-        if config.force_reseed_difficulty:
-            # Defense in depth: `_assert_dev_chain` above already refused
-            # non-dev chains, but log a loud warning when we're about to
-            # overwrite an existing on-chain difficulty so the action is
-            # never invisible. Production CLI doesn't expose the flag.
-            logger.warning(
-                "force-reseeding QuantumPow.Difficulty via sudo: "
-                "min_solutions=%d max_energy_milli=%d min_diversity_milli=%d",
-                config.seed_difficulty.min_solutions,
-                config.seed_difficulty.max_energy_milli,
-                config.seed_difficulty.min_diversity_milli,
-            )
-        else:
-            logger.info("seeding QuantumPow.Difficulty via sudo (first time)")
-        await _sudo_call(
-            client,
-            sudo_signer,
-            "QuantumPow",
-            "set_difficulty",
-            {"difficulty": _difficulty_to_dict(config.seed_difficulty)},
-        )
-        difficulty_seeded = True
-    else:
-        logger.info("QuantumPow.Difficulty already set; skipping seed")
-
+    # --- Step 1: register topology (must precede set_difficulty) -----------
     topology_seeded = False
     # Probe whether DefaultTopology is set by asking for the snapshot. If the
-    # runtime API returns None despite Difficulty being set, that's the
-    # missing-topology case — see pallets/quantum-pow/src/lib.rs:457 where
-    # mining_snapshot bails on DefaultTopology::get()? returning None.
+    # runtime API returns None, that's the missing-topology case — see
+    # pallets/quantum-pow/src/lib.rs:457 where mining_snapshot bails on
+    # DefaultTopology::get()? returning None.
     snapshot = await client.get_mining_snapshot(
         miner_account_bytes=b"\x00" * 32,  # placeholder; we just want the call
     )
@@ -355,11 +352,57 @@ async def _maybe_seed_chain(
             },
         )
         topology_seeded = True
+        # Fetch the snapshot again so we have the topology hash for set_difficulty.
+        snapshot = await client.get_mining_snapshot(
+            miner_account_bytes=b"\x00" * 32,
+        )
+        if snapshot is None:
+            raise RuntimeError(
+                "register_topology succeeded but mining_snapshot is still None; "
+                "the topology may have failed inner-call validation."
+            )
     else:
         logger.info(
             "QuantumPow topology already registered (hash=0x%s); skipping seed",
             snapshot.topology_hash.hex(),
         )
+
+    seed_topology_hash = snapshot.topology_hash
+
+    # --- Step 2: seed difficulty (topology must already be registered) -----
+    difficulty_seeded = False
+    needs_seed = (
+        await client.query_difficulty(seed_topology_hash) is None
+        or config.force_reseed_difficulty
+    )
+    if needs_seed:
+        if config.force_reseed_difficulty:
+            # Defense in depth: `_assert_dev_chain` above already refused
+            # non-dev chains, but log a loud warning when we're about to
+            # overwrite an existing on-chain difficulty so the action is
+            # never invisible. Production CLI doesn't expose the flag.
+            logger.warning(
+                "force-reseeding QuantumPow.Difficulty via sudo: "
+                "min_solutions=%d max_energy_milli=%d min_diversity_milli=%d",
+                config.seed_difficulty.min_solutions,
+                config.seed_difficulty.max_energy_milli,
+                config.seed_difficulty.min_diversity_milli,
+            )
+        else:
+            logger.info("seeding QuantumPow.Difficulty via sudo (first time)")
+        await _sudo_call(
+            client,
+            sudo_signer,
+            "QuantumPow",
+            "set_difficulty",
+            {
+                "topology_hash": "0x" + seed_topology_hash.hex(),
+                "difficulty": _difficulty_to_dict(config.seed_difficulty),
+            },
+        )
+        difficulty_seeded = True
+    else:
+        logger.info("QuantumPow.Difficulty already set; skipping seed")
 
     return topology_seeded, difficulty_seeded
 
@@ -370,8 +413,13 @@ async def _sudo_call(
     inner_module: str,
     inner_function: str,
     inner_params: dict,
-) -> None:
-    """Compose and submit `Sudo.sudo(<inner_call>)`."""
+) -> ExtrinsicReceipt:
+    """Compose and submit `Sudo.sudo(<inner_call>)`, returning the receipt.
+
+    Raises on a failed receipt. The returned receipt lets callers read
+    events from the inclusion block (e.g. `JobSpecRegistered` after a
+    root-only `register_job_spec`).
+    """
     # substrate-interface lets us nest by composing the inner call first,
     # then passing it as the `call` param of Sudo.sudo.
     iface = client._iface  # noqa: SLF001 — bootstrap is internal client
@@ -393,6 +441,7 @@ async def _sudo_call(
         raise RuntimeError(
             f"sudo call {inner_module}.{inner_function} failed: {receipt.error}"
         )
+    return receipt
 
 
 def _difficulty_to_dict(d: SubstrateDifficulty) -> dict:
@@ -403,7 +452,9 @@ def _difficulty_to_dict(d: SubstrateDifficulty) -> dict:
     }
 
 
-def _build_seed_topology(mt: Tuple[int, int]) -> Tuple[List[int], List[Tuple[int, int]]]:
+def _build_seed_topology(
+    mt: Tuple[int, int],
+) -> Tuple[List[int], List[Tuple[int, int]]]:
     """Generate a Zephyr Z(m,t) graph using sampler-compatible node labels.
 
     The labels are whatever `dwave_networkx.zephyr_graph` assigns (linear ints,
@@ -423,11 +474,92 @@ def _build_seed_topology(mt: Tuple[int, int]) -> Tuple[List[int], List[Tuple[int
     m, t = mt
     g = dnx.zephyr_graph(m=m, t=t)
     nodes = sorted(int(n) for n in g.nodes())
-    edges = sorted(
-        (min(int(u), int(v)), max(int(u), int(v)))
-        for u, v in g.edges()
-    )
+    edges = sorted((min(int(u), int(v)), max(int(u), int(v))) for u, v in g.edges())
     return nodes, edges
+
+
+# ----------------------------------------------------------------------
+# Sync gate
+# ----------------------------------------------------------------------
+
+SYNC_POLL_INTERVAL_SECONDS = 5.0
+SYNC_STALL_TIMEOUT_SECONDS = 600.0  # 10 min with no block progress AND no peers
+
+
+class ChainSyncStalled(RuntimeError):
+    """The node stopped advancing and has no peers to sync from.
+
+    Distinct from a slow-but-live sync (which the miner waits out): a node
+    with zero peers that hasn't imported a block in
+    ``SYNC_STALL_TIMEOUT_SECONDS`` will never catch up on its own, so failing
+    fast beats hanging forever.
+    """
+
+    def __init__(self, current_block: int, highest_block: int, stalled_for: float):
+        self.current_block = current_block
+        self.highest_block = highest_block
+        self.stalled_for = stalled_for
+        super().__init__(
+            f"validator sync stalled at block {current_block}/{highest_block} "
+            f"with no peers for {stalled_for:.0f}s"
+        )
+
+
+async def wait_for_sync(
+    client: SubstrateClient,
+    *,
+    poll_interval: float = SYNC_POLL_INTERVAL_SECONDS,
+    stall_timeout: float = SYNC_STALL_TIMEOUT_SECONDS,
+    _clock: Callable[[], float] = time.monotonic,
+) -> None:
+    """Block until the node reports it is no longer in major sync.
+
+    A miner started against a still-syncing validator reads genesis/early
+    state — balance 0, no registration — at the node's current best head, and
+    would otherwise fail its startup guards for reasons that clear themselves
+    once the node catches up (the ``wallet-underfunded`` mis-exit in QUI-825).
+    This gate waits out a live sync, logging block progress, and only gives up
+    when the node stalls: no block advance AND zero peers for ``stall_timeout``
+    (a node with no peers will never sync), raising :class:`ChainSyncStalled`.
+
+    A node that doesn't expose ``system_syncState`` reports ``is_syncing=False``
+    (see :meth:`SubstrateClient.get_sync_state`) and returns immediately — fail
+    open to the prior behavior rather than block on data we don't have.
+
+    Args:
+        client: connected substrate client to probe.
+        poll_interval: seconds between ``get_sync_state`` probes.
+        stall_timeout: seconds of no-progress-and-no-peers before giving up.
+        _clock: monotonic clock source, injectable for tests.
+    """
+    last_block: Optional[int] = None
+    last_progress_at = _clock()
+    while True:
+        state = await client.get_sync_state()
+        if not state.get("is_syncing"):
+            if last_block is not None:
+                logger.info(
+                    "validator sync complete at block %d",
+                    int(state.get("current_block") or 0),
+                )
+            return
+        current = int(state.get("current_block") or 0)
+        highest = int(state.get("highest_block") or 0)
+        peers = int(state.get("peers") or 0)
+        now = _clock()
+        if last_block is None or current > last_block:
+            last_block = current
+            last_progress_at = now
+        elif peers == 0 and (now - last_progress_at) >= stall_timeout:
+            raise ChainSyncStalled(current, highest, now - last_progress_at)
+        logger.info(
+            "waiting for validator sync: block %d/%d (%d remaining), %d peer(s)",
+            current,
+            highest,
+            max(highest - current, 0),
+            peers,
+        )
+        await asyncio.sleep(poll_interval)
 
 
 # ----------------------------------------------------------------------
@@ -473,7 +605,9 @@ async def ensure_funded_via_faucet(
 
     Raises:
         Underfunded: balance is below ``min_balance`` and ``faucet_url`` is
-            ``None`` — nothing to top up from.
+            ``None`` on a chain other than the public testnet — nothing to
+            top up from. On ``TESTNET_CHAIN_NAME`` the canonical
+            ``DEFAULT_TESTNET_FAUCET_URL`` is used as the fallback instead.
         FaucetPermanentError: the faucet rejected the request as malformed
             (propagated without retry).
         RuntimeError: the faucet did not settle within ``timeout_seconds``.
@@ -481,13 +615,19 @@ async def ensure_funded_via_faucet(
     account = keystore.signer.account_id_bytes()
     balance = await client.query_balance(account)
     if balance >= min_balance:
-        logger.info(
-            "miner account already funded: balance=%d plancks", balance
-        )
+        logger.info("miner account already funded: balance=%d plancks", balance)
         return balance
 
     if faucet_url is None:
-        raise Underfunded(balance, min_balance)
+        faucet_url = await _default_faucet_for_chain(client)
+        if faucet_url is None:
+            raise Underfunded(balance, min_balance)
+        logger.info(
+            "no faucet_url configured; chain is %r — using the canonical "
+            "testnet faucet %s",
+            TESTNET_CHAIN_NAME,
+            faucet_url,
+        )
 
     logger.info(
         "requesting %d plancks from faucet for %s (retrying up to %.0fs)",
@@ -504,7 +644,7 @@ async def ensure_funded_via_faucet(
         attempt += 1
         # A FaucetPermanentError (malformed request) propagates straight out
         # — no amount of retrying fixes a bad dest/amount.
-        balance, last_note = await _try_fund_once(
+        balance, last_note, faucet_free = await _try_fund_once(
             client,
             account,
             faucet_url=faucet_url,
@@ -514,16 +654,27 @@ async def ensure_funded_via_faucet(
         if balance >= min_balance:
             logger.info(
                 "faucet funded after %d attempt(s): balance=%d plancks",
-                attempt, balance,
+                attempt,
+                balance,
             )
             return balance
+        # The faucet reports the account already holds >= min_balance, yet our
+        # own node reads below it — two reads of the same account/field that
+        # only disagree across different chain state. Raises if the node is
+        # synced (unrecoverable: different chains); else returns an accurate
+        # "node still syncing" note so the retry keeps waiting.
+        disagreement_note = await _reconcile_faucet_disagreement(
+            client, faucet_free=faucet_free, balance=balance, min_balance=min_balance
+        )
         if budget <= 0:
             break
         wait = min(backoff, budget)
         logger.warning(
-            "faucet not funded yet (%s); attempt %d, retrying in %.1fs "
-            "(%.0fs budget left)",
-            last_note, attempt, wait, budget,
+            "%s; attempt %d, retrying in %.1fs (%.0fs budget left)",
+            disagreement_note or f"faucet not funded yet ({last_note})",
+            attempt,
+            wait,
+            budget,
         )
         await asyncio.sleep(wait)
         budget -= wait
@@ -535,6 +686,24 @@ async def ensure_funded_via_faucet(
     )
 
 
+async def _default_faucet_for_chain(client: SubstrateClient) -> Optional[str]:
+    """Return the canonical testnet faucet URL when connected to the public
+    testnet, else ``None``.
+
+    A failed chain-name probe also returns ``None`` — an unidentifiable
+    chain keeps the fail-fast ``Underfunded`` behavior rather than guessing
+    at a faucet that funds a different network.
+    """
+    try:
+        chain_name = await client._run(lambda: client._iface.chain)  # noqa: SLF001
+    except Exception:  # noqa: BLE001 — fail open to the legacy Underfunded path
+        logger.warning("could not identify chain for faucet fallback", exc_info=True)
+        return None
+    if chain_name == TESTNET_CHAIN_NAME:
+        return DEFAULT_TESTNET_FAUCET_URL
+    return None
+
+
 async def _try_fund_once(
     client: SubstrateClient,
     account: bytes,
@@ -542,33 +711,95 @@ async def _try_fund_once(
     faucet_url: str,
     dest_hex: str,
     amount: int,
-) -> Tuple[int, str]:
+) -> Tuple[int, str, Optional[int]]:
     """One faucet POST + balance read for the ``ensure_funded`` retry loop.
 
-    Returns ``(balance, status_note)``. A transient faucet failure is
-    swallowed and surfaced in the note so the caller backs off and retries;
-    the balance read still runs (it's the source of truth, and an earlier
-    mint may have settled). ``FaucetPermanentError`` propagates so the caller
-    fails fast.
+    Returns ``(balance, status_note, faucet_free)``. ``faucet_free`` is the
+    faucet-reported free balance on a 403 "already funded" (else ``None``), so
+    the caller can reconcile it against its own ``min_balance``. A transient
+    faucet failure is swallowed and surfaced in the note so the caller backs
+    off and retries; the balance read still runs (it's the source of truth,
+    and an earlier mint may have settled). ``FaucetPermanentError`` propagates
+    so the caller fails fast.
     """
     note = "requested"
+    faucet_free: Optional[int] = None
     try:
         _post_faucet(faucet_url, dest_hex=dest_hex, amount=amount)
     except FaucetTransientError as exc:
         # Includes 429: a mint to this dest is already in flight/done, so
         # don't treat re-requests as fatal — the balance read picks it up.
         note = str(exc)
+    except FaucetAlreadyFunded as exc:
+        # 403: the account is above the faucet's cap. Benign — the on-chain
+        # balance read below is the source of truth on whether we cleared our
+        # own min_balance. Surface the faucet-reported free balance so the
+        # retry loop can reconcile against min_balance rather than crash.
+        faucet_free = exc.free_balance
+        note = f"already funded (faucet free={exc.free_balance}): {exc}"
     balance = await client.query_balance(account)
-    return balance, note
+    return balance, note, faucet_free
 
 
-def _post_faucet(url: str, *, dest_hex: str, amount: int) -> dict:
+async def _reconcile_faucet_disagreement(
+    client: SubstrateClient,
+    *,
+    faucet_free: Optional[int],
+    balance: int,
+    min_balance: int,
+) -> Optional[str]:
+    """Adjudicate a faucet-vs-node balance disagreement via the sync state.
+
+    Returns ``None`` when there is nothing to reconcile — either the faucet
+    did not report "already funded", or it reported a free balance below
+    ``min_balance`` (a genuine under-cap the normal retry handles).
+
+    When the faucet reports ``free >= min_balance`` but our node reads below
+    it, the two are reading the same account/field across different chain
+    state. Probes ``get_sync_state``:
+
+    * node still syncing → returns an accurate note so the caller keeps
+      waiting for it to catch up;
+    * node fully synced → raises ``RuntimeError`` (unrecoverable: the miner
+      and faucet are pointed at different chains);
+    * probe itself fails → fail open, returning a note so the caller retries
+      within its budget rather than crashing on an unprovable claim.
+    """
+    if faucet_free is None or faucet_free < min_balance:
+        return None
+    try:
+        state = await client.get_sync_state()
+    except Exception as exc:  # noqa: BLE001 — probe is best-effort; retry on any failure
+        return (
+            f"faucet reports account funded (free={faucet_free} >= min "
+            f"{min_balance}) but node reads {balance}; sync-state probe "
+            f"failed ({exc}), retrying"
+        )
+    if state.get("is_syncing"):
+        return (
+            f"faucet reports account funded (free={faucet_free} >= min "
+            f"{min_balance}) but node reads {balance}; node still syncing "
+            f"({state.get('current_block', 0)}/{state.get('highest_block', 0)} "
+            f"blocks), waiting for it to catch up"
+        )
+    raise RuntimeError(
+        f"faucet reports account free={faucet_free} (>= min_balance "
+        f"{min_balance}) but the fully-synced node reads {balance} for the "
+        f"same account — the miner and faucet are pointed at different chains"
+    )
+
+
+def _post_faucet(url: str, *, dest_hex: str, amount: int) -> None:
     """POST the faucet ``/request`` contract, classifying failures for retry.
 
-    Raises :class:`FaucetTransientError` for failures that may clear on retry
-    (429 / 5xx / connection / timeout) and :class:`FaucetPermanentError` for
-    a malformed request (other 4xx). The contract is served by the standalone
-    faucet at ``gitlab.com/quip.network/faucet``.
+    Retries are the default: anything that isn't a known-permanent rejection
+    is raised as :class:`FaucetTransientError` (429 / 5xx / connection /
+    timeout / any unexpected status) so the caller backs off and re-reads the
+    balance. :class:`FaucetAlreadyFunded` is raised for 403 (the account is
+    already above the faucet cap), and :class:`FaucetPermanentError` only for
+    the genuinely unrecoverable statuses in ``_PERMANENT_FAUCET_STATUS`` (a
+    malformed request or ban). The contract is served by the standalone faucet
+    at ``gitlab.com/quip.network/faucet``.
     """
     body = json.dumps({"dest": dest_hex, "amount": amount}).encode()
     req = urllib.request.Request(
@@ -578,14 +809,32 @@ def _post_faucet(url: str, *, dest_hex: str, amount: int) -> dict:
         method="POST",
     )
     try:
+        # The success body is discarded — the caller treats the on-chain
+        # balance read as the source of truth — so don't parse it. A 2xx with
+        # a non-JSON body (proxy splash page, half-written response) must not
+        # crash the retry loop with a JSONDecodeError it can't classify.
         with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
+            resp.read()
+        return
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")
         msg = f"faucet returned {exc.code}: {detail}"
-        if exc.code in _RETRYABLE_FAUCET_STATUS:
-            raise FaucetTransientError(msg) from exc
-        raise FaucetPermanentError(msg) from exc
+        if exc.code == 403:
+            # "destination already funded" — the account is above the faucet's
+            # max_funded cap, so it has money even though we asked. Surface the
+            # reported free balance so the retry loop can reconcile, not crash.
+            free = None
+            try:
+                free = json.loads(detail).get("free_balance_plancks")
+            except (ValueError, AttributeError):
+                pass
+            raise FaucetAlreadyFunded(free, msg) from exc
+        if exc.code in _PERMANENT_FAUCET_STATUS:
+            # Malformed request / ban — retrying re-sends the same bad request.
+            raise FaucetPermanentError(msg) from exc
+        # Default to transient: 429, 5xx, and any unexpected status are worth
+        # retrying within the budget rather than killing a long-running miner.
+        raise FaucetTransientError(msg) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         # HTTPError is caught above; this is connection-refused / DNS /
         # socket timeout — the faucet may just be slow to come up.
@@ -640,10 +889,13 @@ __all__ = [
     "DEFAULT_MIN_BALANCE_PLANCKS",
     "DEFAULT_FAUCET_TOP_UP_PLANCKS",
     "FAUCET_FUNDING_TIMEOUT_SECONDS",
+    "FaucetAlreadyFunded",
     "FaucetPermanentError",
     "FaucetTransientError",
+    "ChainSyncStalled",
     "Underfunded",
     "bootstrap",
     "ensure_funded",
     "ensure_funded_via_faucet",
+    "wait_for_sync",
 ]

@@ -225,8 +225,13 @@ def calibrate_gibbs_curve(
     experiment_start = time.time()
     completed = 0
 
+    timed_out = False
     for spb in spb_range:
+        if timed_out:
+            break
         for sweeps in sweeps_range:
+            if timed_out:
+                break
             for reads in reads_range:
                 elapsed = time.time() - experiment_start
                 if elapsed > timeout_seconds:
@@ -234,6 +239,7 @@ def calibrate_gibbs_curve(
                         f"\nTimeout reached "
                         f"({timeout_minutes} min)"
                     )
+                    timed_out = True
                     break
 
                 completed += 1
@@ -257,12 +263,6 @@ def calibrate_gibbs_curve(
                     f"avg={point['avg_energy_mean']:.0f} "
                     f"({point['runtime_seconds']:.1f}s)"
                 )
-            else:
-                continue
-            break
-        else:
-            continue
-        break
 
     # Analyze knee points per sweeps_per_beta
     results['calibration'] = find_all_knee_points(
@@ -439,7 +439,7 @@ def print_calibration_summary(results: Dict) -> None:
     best = cal.get('best_overall', {})
     if best:
         print()
-        print(f"Best config:")
+        print("Best config:")
         print(
             f"  sweeps_per_beta = {best.get('sweeps_per_beta')}"
         )

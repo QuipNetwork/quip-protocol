@@ -188,6 +188,20 @@ a = Analysis(
         "torch",
         "torchvision",
         "torchaudio",
+        # pytest drags in pkg_resources (via _pytest.monkeypatch), and
+        # pkg_resources in the bundle makes PyInstaller install the
+        # pyi_rth_pkgres runtime hook, which reads a setuptools vendor data
+        # file ("jaraco/text/Lorem ipsum.txt") at the start of EVERY process
+        # — including each multiprocessing spawn child. macOS purges
+        # not-recently-accessed files from the onefile extraction dir under
+        # /var/folders/.../T/ after ~3 days, so long-running miners lose that
+        # file and every spawn_worker() dies with BrokenPipeError. Nothing in
+        # the miner imports pytest or pkg_resources at runtime (pytest enters
+        # the graph only through collect_submodules("dimod") -> dimod.testing,
+        # which itself never imports pytest).
+        "pytest",
+        "_pytest",
+        "pkg_resources",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

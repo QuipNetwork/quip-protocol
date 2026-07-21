@@ -14,13 +14,12 @@ Auto-skips when the docker chain at `ws://localhost:9944` isn't reachable.
 from __future__ import annotations
 
 import os
-import socket
 from pathlib import Path
 
 import pytest
 
 from shared.keystore_hybrid import generate
-from shared.mempool_types import (
+from substrate.mempool_types import (
     IsingParams,
     JobMode,
     MinerType,
@@ -28,27 +27,21 @@ from shared.mempool_types import (
     ResultDelivery,
     RewardResolution,
 )
-from shared.miner_bootstrap import _resolve_dev_signer
+from substrate.miner_bootstrap import _resolve_dev_signer, _sudo_call
 from substrate.client import SubstrateClient
+from chain_probe import dev_chain_reachable
 
 
 DEFAULT_URL = os.environ.get("QUIP_SUBSTRATE_URL", "ws://localhost:9944")
 
 
-def _chain_reachable(url: str) -> bool:
-    bare = url.split("://", 1)[1]
-    host, _, port_str = bare.partition(":")
-    port = int(port_str) if port_str else 9944
-    try:
-        with socket.create_connection((host, port), timeout=0.5):
-            return True
-    except (OSError, socket.timeout):
-        return False
-
-
+# These tests seed chain state via //Alice sudo, which `miner_bootstrap`
+# refuses against a non-dev chain. Gate on the same condition that guard
+# enforces, so a developer running the public-testnet stack locally skips
+# rather than erroring.
 pytestmark = pytest.mark.skipif(
-    not _chain_reachable(DEFAULT_URL),
-    reason=f"substrate chain not reachable at {DEFAULT_URL}",
+    not dev_chain_reachable(DEFAULT_URL),
+    reason=f"no dev substrate chain at {DEFAULT_URL}",
 )
 
 
@@ -132,35 +125,37 @@ async def test_register_and_deregister_solver(tmp_path):
 
 @pytest.mark.timeout(90)
 async def test_propose_job_and_query_back(tmp_path):
-    """End-to-end propose: //Alice registers a job spec + proposes an
-    Ising job, then we query JobOrders[order_id] and assert the IsingParams
-    survives the SCALE round-trip byte-equally.
+    """End-to-end propose: register a job spec via sudo (root-only), have
+    //Alice propose an Ising job against it, then query JobOrders[order_id]
+    and assert the IsingParams survives the SCALE round-trip byte-equally.
     """
     client = SubstrateClient(url=DEFAULT_URL)
     await client.connect()
     try:
         alice = _resolve_dev_signer("//Alice")
 
-        # Register a fresh JobSpec under //Alice's name. The spec_id is
-        # `blake2_256((name, formulation, validation_program, transform_program))`.
+        # Register a fresh JobSpec. `register_job_spec` is ROOT-ONLY (blessed
+        # protocol/team templates) with an explicit `builder` first param —
+        # sudo dispatch arrives as Root, so the builder account is passed
+        # explicitly. A signed call fails BadOrigin (and the receipt's
+        # `.error` can be None even then, so it can't be relied on there).
         # Using a unique random name keeps reruns idempotent without us
         # needing to query the spec_id back.
         import os as _os
         name = b"phase8a-test-" + _os.urandom(8).hex().encode()
-        register_receipt = await client.submit_extrinsic(
+        register_receipt = await _sudo_call(
+            client,
+            alice,
             "QuantumComputeMempool",
             "register_job_spec",
             {
+                "builder": "0x" + alice.account_id_bytes().hex(),
                 "name": (list(name),),  # BoundedVec composite
                 "formulation": "Ising",
                 "validation_program": None,
                 "transform_program": None,
             },
-            alice,
-            wait_for="inblock",
         )
-        if register_receipt.error:
-            pytest.fail(f"register_job_spec: {register_receipt.error}")
 
         # Pull the spec_id out of the JobSpecRegistered event in the
         # inclusion block. Phase 8a's hybrid extrinsic path doesn't

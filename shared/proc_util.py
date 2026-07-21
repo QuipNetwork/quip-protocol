@@ -9,7 +9,7 @@ thread-to-process site behaves identically (see AGENTS.md concurrency rule).
 from __future__ import annotations
 
 import multiprocessing as mp
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, Iterable, Tuple
 
 _SPAWN = mp.get_context("spawn")
 
@@ -56,3 +56,32 @@ def terminate_join(proc: "mp.process.BaseProcess", timeout: float) -> bool:
         proc.kill()
         proc.join(timeout=1.0)
     return not proc.is_alive()
+
+
+def drain_and_force_terminate(
+    processes: "Iterable[mp.process.BaseProcess]",
+    drain_queue: Callable[[], Any],
+    *,
+    join_timeout: float = 2.0,
+) -> None:
+    """Drain a shared result queue once, then terminate/join/kill all procs.
+
+    Unlike :func:`terminate_join`, this terminates immediately with no initial
+    graceful join — callers use it only after already waiting for a graceful
+    stop. ``drain_queue`` is invoked once up front so any results still buffered
+    on the queue are captured before the producers are killed.
+
+    Args:
+        processes: The worker processes to stop.
+        drain_queue: Zero-arg callable that drains the shared result queue.
+        join_timeout: Seconds to wait for each process after terminate() before
+            escalating to kill().
+    """
+    drain_queue()
+    for p in processes:
+        if p.is_alive():
+            p.terminate()
+    for p in processes:
+        p.join(timeout=join_timeout)
+        if p.is_alive():
+            p.kill()

@@ -1,4 +1,4 @@
-"""Unit tests for DWaveMiner budget-gate and participation helpers.
+"""Unit tests for DWaveMiner budget-gate helpers.
 
 The legacy DWaveMiner.sample_ising_streaming (diagnostic path) was removed
 when QPU switched to the generic StreamContext + DWaveSamplerWrapper.
@@ -53,17 +53,6 @@ def test_midstream_budget_ok_returns_none_without_time_manager():
     assert miner._midstream_budget_ok(solution_number=1) is None
 
 
-def test_participation_extra_carries_pool_budget():
-    miner = _dwave_with_time_manager(_FakeTimeManager(should_mine=True))
-    extra = miner._participation_extra()
-    assert extra == {"budget_seconds": 5.0}  # pool_seconds from the stub
-
-
-def test_participation_extra_empty_without_time_manager():
-    miner = _dwave_with_time_manager(None)
-    assert miner._participation_extra() == {}
-
-
 def test_midstream_budget_ok_passes_when_budget_available():
     miner = _dwave_with_time_manager(_FakeTimeManager(should_mine=True))
     status = miner._midstream_budget_ok(solution_number=1)
@@ -74,6 +63,18 @@ def test_midstream_budget_ok_passes_when_budget_available():
     assert status.stats["pool_seconds"] == 5.0
     assert status.stats["blocks_skipped"] == 3
     assert status.stats["daily_budget_seconds"] == 1800.0
+
+
+def test_participation_extra_empty_without_time_manager():
+    miner = _dwave_with_time_manager(None)
+    assert miner._participation_extra() == {}
+
+
+def test_participation_extra_reports_pool_seconds_as_budget():
+    # Pool of 5.0s at dispatch must surface as the marker's budget_seconds so
+    # the participation extrinsic records the QPU runway backing this solution.
+    miner = _dwave_with_time_manager(_FakeTimeManager(should_mine=True))
+    assert miner._participation_extra() == {"budget_seconds": 5}
 
 
 def test_midstream_budget_ok_stalls_and_logs_when_exhausted(caplog):

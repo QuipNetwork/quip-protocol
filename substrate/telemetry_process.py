@@ -58,6 +58,14 @@ logger = logging.getLogger(__name__)
 # scheduler ticks.
 _SNAPSHOT_FRESHNESS_S = 5.0
 
+# Snapshot age (seconds) above which the aggregator drops a per-kind
+# file from the merged view entirely. A controller that stops (config
+# change, restart, crash) leaves its snapshot behind; without this gate
+# telemetry keeps reporting that dead child's miners/modes forever. Set
+# well above the writer's 1s interval so a briefly-stalled live child
+# is never flapped out of the inventory.
+_STALE_SNAPSHOT_MAX_AGE_S = 30.0
+
 
 def telemetry_main(
     listen_host: str,
@@ -317,7 +325,7 @@ def _read_snapshot_or_503(
     """
     snapshot_dir: Optional[Path] = request.app["snapshot_dir"]
     if snapshot_dir is not None:
-        snaps = read_all_snapshots(snapshot_dir)
+        snaps = read_all_snapshots(snapshot_dir, max_age_s=_STALE_SNAPSHOT_MAX_AGE_S)
         snap = merge_snapshots(snaps)
     else:
         path: Path = request.app["stats_snapshot_path"]
@@ -370,6 +378,20 @@ async def _get_client(request: web.Request) -> Optional[SubstrateClient]:
             return None
         request.app["client"] = new_client
         return new_client
+
+
+async def _require_client(
+    request: web.Request,
+) -> Tuple[Optional[SubstrateClient], Optional[web.Response]]:
+    """Return ``(client, None)`` when a chain client is available, or
+    ``(None, 503-error-response)`` when it is not.
+
+    Matches the ``(value, error)`` convention used throughout this module.
+    """
+    client = await _get_client(request)
+    if client is None:
+        return None, _error("chain client unavailable", "CHAIN_UNAVAILABLE", status=503)
+    return client, None
 
 
 # ----------------------------------------------------------------------
@@ -512,11 +534,30 @@ async def _handle_status(request: web.Request) -> web.Response:
             "account_id_hex": account_hex,
             "node_id": snapshot.get("node_id"),
             "is_mining": is_mining,
+            # Wall-clock (epoch seconds) of the last landed submit, or None
+            # if the node has never landed one. A node reporting is_mining
+            # True with a stale/None value here is mining but not winning
+            # (QUI-829 / gh-18) — the one field that makes that self-evident.
+            "last_successful_submission": snapshot.get("controller", {}).get(
+                "last_successful_submission"
+            ),
+            # Consecutive failed submits since the last landed proof, and a
+            # reason string when this build is too old for the chain runtime.
+            # A large counter or a non-null reason means "mining but landing
+            # nothing" even while is_mining reads true (gh-20).
+            "consecutive_submit_failures": snapshot.get("controller", {}).get(
+                "consecutive_submit_failures"
+            ),
+            "runtime_incompatible": snapshot.get("controller", {}).get(
+                "runtime_incompatible"
+            ),
             "uptime_seconds": uptime_seconds,
             "chain": chain_payload,
             "miner_registered": miner_registered,
             "miner_info": miner_info_dict,
             "miners": snapshot.get("miners", []),
+            # Node sync progress (pool sync-wait) — None when healthy.
+            "sync_state": snapshot.get("sync_state"),
             # Per-mode breakdown — populated in aggregator mode (one
             # entry per active backend group: cpu / gpu / qpu); empty
             # dict in legacy single-process mode where there's only
@@ -528,9 +569,9 @@ async def _handle_status(request: web.Request) -> web.Response:
 
 async def _handle_block_latest(request: web.Request) -> web.Response:
     """Return the chain head block (header + extrinsic count)."""
-    client = await _get_client(request)
-    if client is None:
-        return _error("chain client unavailable", "CHAIN_UNAVAILABLE", status=503)
+    client, err = await _require_client(request)
+    if err is not None:
+        return err
     try:
         head_hash = await client.get_head()
         return _success(await _block_payload(client, at=head_hash))
@@ -538,25 +579,36 @@ async def _handle_block_latest(request: web.Request) -> web.Response:
         return _error(f"chain query failed: {exc}", "CHAIN_ERROR", status=502)
 
 
+async def _fetch_block_payload(
+    request: web.Request, block_number: int,
+) -> Tuple[Optional[dict], Optional[web.Response]]:
+    """Resolve *block_number* to its payload, returning ``(payload, None)`` on
+    success or ``(None, error_response)`` on any failure."""
+    client, err = await _require_client(request)
+    if err is not None:
+        return None, err
+    try:
+        block_hash = await _block_hash_for_number(client, block_number)
+        if block_hash is None:
+            return None, _error(
+                f"block {block_number} not found",
+                "BLOCK_NOT_FOUND",
+                status=404,
+            )
+        return await _block_payload(client, at=block_hash), None
+    except Exception as exc:  # noqa: BLE001
+        return None, _error(f"chain query failed: {exc}", "CHAIN_ERROR", status=502)
+
+
 async def _handle_block(request: web.Request) -> web.Response:
     """Return the block at a given block number."""
     block_number, err = _parse_block_number(request)
     if err is not None:
         return err
-    client = await _get_client(request)
-    if client is None:
-        return _error("chain client unavailable", "CHAIN_UNAVAILABLE", status=503)
-    try:
-        block_hash = await _block_hash_for_number(client, block_number)
-        if block_hash is None:
-            return _error(
-                f"block {block_number} not found",
-                "BLOCK_NOT_FOUND",
-                status=404,
-            )
-        return _success(await _block_payload(client, at=block_hash))
-    except Exception as exc:  # noqa: BLE001
-        return _error(f"chain query failed: {exc}", "CHAIN_ERROR", status=502)
+    payload, err = await _fetch_block_payload(request, block_number)
+    if err is not None:
+        return err
+    return _success(payload)
 
 
 async def _handle_block_header(request: web.Request) -> web.Response:
@@ -564,23 +616,10 @@ async def _handle_block_header(request: web.Request) -> web.Response:
     block_number, err = _parse_block_number(request)
     if err is not None:
         return err
-    client = await _get_client(request)
-    if client is None:
-        return _error("chain client unavailable", "CHAIN_UNAVAILABLE", status=503)
-    try:
-        block_hash = await _block_hash_for_number(client, block_number)
-        if block_hash is None:
-            return _error(
-                f"block {block_number} not found",
-                "BLOCK_NOT_FOUND",
-                status=404,
-            )
-        payload = await _block_payload(client, at=block_hash)
-        return _success(
-            {"header": payload.get("header"), "hash": payload.get("hash")}
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _error(f"chain query failed: {exc}", "CHAIN_ERROR", status=502)
+    payload, err = await _fetch_block_payload(request, block_number)
+    if err is not None:
+        return err
+    return _success({"header": payload.get("header"), "hash": payload.get("hash")})
 
 
 async def _handle_solve(request: web.Request) -> web.Response:

@@ -19,22 +19,25 @@ Usage:
 import argparse
 import sys
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
+
+sys.path.append(str(Path(__file__).parent.parent))
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from tools.mining_viz_common import (
+    MINER_COLORS,
+    get_device_counts,
+    load_mining_csv as _load_mining_csv_base,
+    normalize_miner_type,
+)
 
 # Required columns for CSV validation
-REQUIRED_CSV_COLUMNS = {'miner_type', 'energy', 'valid', 'miner_machine', 'process',
-                        'start_time', 'end_time', 'time_to_solution'}
-
-# Standard colors for miner types
-MINER_COLORS = {
-    'CPU': '#e74c3c',
-    'GPU': '#3498db',
-    'QPU': '#2ecc71'
+_REQUIRED_CSV_COLUMNS = {
+    'miner_type', 'energy', 'valid', 'miner_machine', 'process',
+    'start_time', 'end_time', 'time_to_solution',
 }
 
 
@@ -45,47 +48,11 @@ def load_mining_csv(filepath: str) -> pd.DataFrame:
         ValueError: If required columns are missing from the CSV
     """
     # start_time/end_time are relative offsets (seconds from machine's test start)
-    df = pd.read_csv(filepath, encoding='utf-8')
-
-    # Validate required columns
-    missing = REQUIRED_CSV_COLUMNS - set(df.columns)
-    if missing:
-        raise ValueError(f"CSV missing required columns: {', '.join(sorted(missing))}")
-
-    return df
-
-
-def normalize_miner_type(miner_type: str) -> str:
-    """Normalize miner type to CPU/GPU/QPU for display."""
-    miner_type = miner_type.lower()
-    if miner_type == 'cuda':
-        return 'GPU'
-    return miner_type.upper()
-
-
-def get_device_counts(df: pd.DataFrame) -> Dict[str, int]:
-    """
-    Count actual devices per miner type from the data.
-
-    For GPU/CUDA: count unique (miner_machine, process) pairs = number of GPUs
-    For CPU: count unique (miner_machine, process) pairs = number of CPU workers
-    For QPU: count unique miner_machine = number of QPUs
-    """
-    counts = {}
-
-    for miner_type, miner_df in df.groupby('miner_type'):
-        display_type = normalize_miner_type(miner_type)
-
-        if display_type == 'QPU':
-            # QPU: count unique machines
-            count = miner_df['miner_machine'].nunique()
-        else:
-            # CPU/GPU: count unique (machine, process) pairs
-            count = miner_df.groupby(['miner_machine', 'process']).ngroups
-
-        counts[display_type] = count
-
-    return counts
+    return _load_mining_csv_base(
+        filepath,
+        required_columns=_REQUIRED_CSV_COLUMNS,
+        encoding='utf-8',
+    )
 
 
 def get_normalization_units(device_counts: Dict[str, int]) -> Dict[str, float]:
@@ -103,12 +70,14 @@ def get_normalization_units(device_counts: Dict[str, int]) -> Dict[str, float]:
     return units
 
 
-def get_normalization_single_unit(device_counts: Dict[str, int]) -> Dict[str, int]:
+def per_unit_norm(df: pd.DataFrame) -> Dict[str, float]:
+    """Return normalization units for each miner type inferred from *df*.
+
+    Combines get_device_counts() and get_normalization_units() into a single
+    call for the common case where both the raw counts and derived units are
+    not needed separately.
     """
-    Get normalization units for single device comparison.
-    All types normalized per device/worker for fair comparison.
-    """
-    return device_counts.copy()
+    return get_normalization_units(get_device_counts(df))
 
 
 def plot_blocks_vs_time(ax, df: pd.DataFrame):
@@ -120,7 +89,7 @@ def plot_blocks_vs_time(ax, df: pd.DataFrame):
 
     # Get device counts for normalization (per single worker/GPU/QPU)
     device_counts = get_device_counts(df)
-    norm_units = get_normalization_single_unit(device_counts)
+    norm_units = device_counts
 
     # Get successful blocks only - first valid block per attempt
     # (same machine, process, start_time = same mining attempt/SA run)
@@ -132,9 +101,6 @@ def plot_blocks_vs_time(ax, df: pd.DataFrame):
     for miner_type, miner_df in successful_df.groupby('miner_type'):
         display_type = normalize_miner_type(miner_type)
         miner_df = miner_df.sort_values('end_time')
-
-        if len(miner_df) == 0:
-            continue
 
         # Get normalization factor
         units = norm_units.get(display_type, 1)
@@ -149,20 +115,12 @@ def plot_blocks_vs_time(ax, df: pd.DataFrame):
         times_minutes = np.concatenate([[0], times_minutes])
         cumulative_blocks = np.concatenate([[0], cumulative_blocks])
 
-        # Create label
-        if display_type == 'CPU':
-            display_name = "CPU"
-        elif display_type == 'GPU':
-            display_name = "GPU"
-        else:
-            display_name = "QPU"
-
         ax.plot(
             times_minutes,
             cumulative_blocks,
             marker='o',
             markersize=2,
-            label=f"{display_name} ({cumulative_blocks[-1]:.2f} blocks)",
+            label=f"{display_type} ({cumulative_blocks[-1]:.2f} blocks)",
             color=MINER_COLORS.get(display_type, 'gray'),
             linewidth=2,
             alpha=0.8
@@ -178,8 +136,7 @@ def plot_mining_efficiency(ax, df: pd.DataFrame):
     ax.grid(True, alpha=0.3, axis='y')
 
     # Get device counts for normalization
-    device_counts = get_device_counts(df)
-    norm_units = get_normalization_units(device_counts)
+    norm_units = per_unit_norm(df)
 
     miner_names = []
     rates = []
@@ -189,9 +146,6 @@ def plot_mining_efficiency(ax, df: pd.DataFrame):
     for miner_type in sorted(groups.keys()):
         miner_df = groups[miner_type]
         display_type = normalize_miner_type(miner_type)
-
-        if len(miner_df) == 0:
-            continue
 
         # Get normalization factor
         units = norm_units.get(display_type, 1)
@@ -208,14 +162,7 @@ def plot_mining_efficiency(ax, df: pd.DataFrame):
         else:
             nonces_per_min = 0
 
-        # Create label with unit info
-        if display_type == 'CPU':
-            display_name = "CPU (32c)"
-        elif display_type == 'GPU':
-            display_name = "GPU"
-        else:
-            display_name = "QPU"
-
+        display_name = 'CPU (32c)' if display_type == 'CPU' else display_type
         miner_names.append(display_name)
         rates.append(nonces_per_min)
         rate_colors.append(MINER_COLORS.get(display_type, 'gray'))
@@ -250,8 +197,7 @@ def plot_energy_distributions(ax, df: pd.DataFrame):
     ax.grid(True, alpha=0.3, axis='y')
 
     # Get device counts for normalization
-    device_counts = get_device_counts(df)
-    norm_units = get_normalization_units(device_counts)
+    norm_units = per_unit_norm(df)
 
     all_energies = df['energy'].values
     if len(all_energies) == 0:
@@ -273,13 +219,7 @@ def plot_energy_distributions(ax, df: pd.DataFrame):
             units = 1
 
         if len(energies) > 0:
-            # Create label with unit info
-            if display_type == 'CPU':
-                display_name = "CPU (32c)"
-            elif display_type == 'GPU':
-                display_name = "GPU"
-            else:
-                display_name = "QPU"
+            display_name = 'CPU (32c)' if display_type == 'CPU' else display_type
 
             # Use weights to normalize the histogram
             weights = np.ones(len(energies)) / units
@@ -306,8 +246,7 @@ def plot_time_to_solution(ax, df: pd.DataFrame):
     ax.grid(True, alpha=0.3, axis='y')
 
     # Get device counts for normalization
-    device_counts = get_device_counts(df)
-    norm_units = get_normalization_units(device_counts)
+    norm_units = per_unit_norm(df)
 
     # Only successful attempts
     successful_df = df[(df['valid'] > 0) & (df['time_to_solution'] > 0)]
@@ -337,13 +276,7 @@ def plot_time_to_solution(ax, df: pd.DataFrame):
             # Clip TTS values at max for histogram (values > max go in last bin)
             tts_clipped = np.clip(tts, 0, max_tts)
 
-            # Create label with unit info
-            if display_type == 'CPU':
-                display_name = "CPU (32c)"
-            elif display_type == 'GPU':
-                display_name = "GPU"
-            else:
-                display_name = "QPU"
+            display_name = 'CPU (32c)' if display_type == 'CPU' else display_type
 
             # Use weights to normalize the histogram
             weights = np.ones(len(tts_clipped)) / units
@@ -440,8 +373,7 @@ def plot_speedup_vs_cpu(ax, df: pd.DataFrame):
     ax.grid(True, alpha=0.3, axis='y')
 
     # Get device counts for normalization
-    device_counts = get_device_counts(df)
-    norm_units = get_normalization_units(device_counts)
+    norm_units = per_unit_norm(df)
 
     # Calculate CPU baseline rate (nonces per minute per 32-core unit)
     # Find CPU miner types using normalization (handles 'cpu', 'CPU', 'Cpu', etc.)
@@ -488,13 +420,7 @@ def plot_speedup_vs_cpu(ax, df: pd.DataFrame):
         if miner_rate > 0:
             speedup = miner_rate / cpu_rate
 
-            # Create label with unit info
-            if display_type == 'GPU':
-                display_name = "GPU"
-            else:
-                display_name = "QPU"
-
-            miner_names.append(display_name)
+            miner_names.append(display_type)
             speedups.append(speedup)
             speedup_colors.append(MINER_COLORS.get(display_type, 'gray'))
 

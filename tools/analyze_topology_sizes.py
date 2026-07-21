@@ -26,40 +26,13 @@ from dwave.samplers import SimulatedAnnealingSampler
 
 from shared.quantum_proof_of_work import generate_ising_model_from_nonce
 from shared.energy_utils import expected_solution_energy
+from QPU.qpu_time_manager import parse_duration
 
 
 # Advantage2-System1.6 capacity (target QPU)
 ADVANTAGE2_NODES = 4593
 ADVANTAGE2_EDGES = 41796
 
-
-def parse_timeout(timeout_str: str) -> int:
-    """
-    Parse timeout string to seconds.
-
-    Supports: 30s, 5m, 2h, 1d, 1w
-    Examples:
-        "30s" -> 30
-        "5m" -> 300
-        "2h" -> 7200
-        "1d" -> 86400
-        "1w" -> 604800
-    """
-    timeout_str = timeout_str.strip().lower()
-
-    if timeout_str.endswith('s'):
-        return int(timeout_str[:-1])
-    elif timeout_str.endswith('m'):
-        return int(timeout_str[:-1]) * 60
-    elif timeout_str.endswith('h'):
-        return int(timeout_str[:-1]) * 3600
-    elif timeout_str.endswith('d'):
-        return int(timeout_str[:-1]) * 86400
-    elif timeout_str.endswith('w'):
-        return int(timeout_str[:-1]) * 604800
-    else:
-        # Try parsing as raw seconds
-        return int(timeout_str)
 
 
 def analyze_zephyr_config(m: int, t: int) -> Dict[str, Any]:
@@ -273,7 +246,6 @@ def _find_embedding_worker(args):
 
     worker_start = time.perf_counter()
     num_tries = 0
-    best_embedding = None
 
     while True:
         # Check if we've exceeded worker timeout
@@ -333,10 +305,6 @@ def _find_native_subgraph_seed(source_graph: nx.Graph, target_graph: nx.Graph, m
 
     print(f"  Searching for native Zephyr subgraph seed (up to Z({max_m},{max_t}))...")
 
-    # Try to find largest native subgraph
-    best_seed = None
-    best_size = 0
-
     for m in range(max_m, 1, -1):  # Start from largest
         for t in range(max_t, 0, -1):
             test_graph = dnx.zephyr_graph(m, t)
@@ -346,14 +314,11 @@ def _find_native_subgraph_seed(source_graph: nx.Graph, target_graph: nx.Graph, m
             edges_present = all(target_graph.has_edge(u, v) for u, v in test_graph.edges())
 
             if nodes_present and edges_present:
-                # Found a perfect native subgraph
+                # Found a perfect native subgraph; return immediately (loop is largest-first)
                 num_nodes = len(test_graph.nodes())
-                if num_nodes > best_size:
-                    # Create identity embedding for these nodes
-                    best_seed = {node: [node] for node in test_graph.nodes()}
-                    best_size = num_nodes
-                    print(f"    ✓ Found native Z({m},{t}) seed: {num_nodes:,} nodes")
-                    return best_seed
+                seed = {node: [node] for node in test_graph.nodes()}
+                print(f"    ✓ Found native Z({m},{t}) seed: {num_nodes:,} nodes")
+                return seed
 
     print(f"    ✗ No native subgraph found - starting from scratch")
     return None
@@ -378,7 +343,6 @@ def precompute_embedding(config: Dict[str, Any], target_solver_name: str = "Adva
     import os
     import json
     import gzip
-    import minorminer
     import multiprocessing as mp
     from dwave_topologies.topologies import ADVANTAGE2_SYSTEM1_TOPOLOGY
 
@@ -574,7 +538,6 @@ def generate_topology_file(m: int, t: int):
     edge_util = config['edge_utilization_pct']
 
     # Calculate expected GSE
-    from shared.energy_utils import expected_solution_energy
     expected_gse = expected_solution_energy(
         num_nodes=config['num_nodes'],
         num_edges=config['num_edges'],
@@ -825,8 +788,8 @@ def main():
         embedding_result = {'embedding_tested': False}
         if args.precompute_embedding:
             # Parse timeouts and precompute embedding
-            timeout_seconds = parse_timeout(args.embedding_timeout)
-            try_timeout_seconds = parse_timeout(args.try_timeout)
+            timeout_seconds = int(parse_duration(args.embedding_timeout))
+            try_timeout_seconds = int(parse_duration(args.try_timeout))
             precompute_embedding(
                 config_info,
                 target_solver_name="Advantage2_system1",

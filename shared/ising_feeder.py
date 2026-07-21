@@ -27,8 +27,9 @@ import signal as _signal
 import time
 import weakref
 from concurrent.futures import ProcessPoolExecutor
-from typing import Iterator, List, Optional, Sequence
+from typing import Any, Callable, Iterator, List, Optional, Sequence
 
+from shared.allowed_value_spec import AllowedValueSpec
 from shared.ising_model import IsingModel
 from shared.quantum_proof_of_work import (
     derive_nonce,
@@ -38,6 +39,24 @@ from shared.quantum_proof_of_work import (
 logger = logging.getLogger(__name__)
 
 _SPAWN_CTX = _mp.get_context("spawn")
+
+
+def _require_len(name: str, value: bytes, n: int = 32) -> None:
+    """Raise ValueError if *value* is not exactly *n* bytes long."""
+    if len(value) != n:
+        raise ValueError(f"{name} must be {n} bytes, got {len(value)}")
+
+
+def _default_max_workers() -> int:
+    """Generator-process count to use when the caller passes ``max_workers=None``.
+
+    Scales to the node: one worker per core minus one reserved for the
+    consuming process (the QPU submit-pool / GPU / CPU sampler all run there),
+    with a floor of 2. Workers only run when ``_fill`` needs to refill the
+    buffer, so over-provisioning on a many-core box is harmless — surplus
+    workers idle rather than burning CPU.
+    """
+    return max(2, (os.cpu_count() or 4) - 1)
 
 
 def _empty_feeder_counters() -> dict:
@@ -57,17 +76,34 @@ def _generate_one_model(
     nodes: list,
     edges: list,
     salt: bytes,
-) -> IsingModel:
-    """Generate one IsingModel in a worker process.
+    allowed_h: Optional[AllowedValueSpec] = None,
+    prep_fn: Optional[Callable] = None,
+    prep_args: tuple = (),
+) -> Any:
+    """Generate one model in a worker process, optionally post-processing it.
 
     ``last_proof_block_hash`` and ``miner_bytes`` are fixed 32-byte inputs to
     ``derive_nonce``. The hash is ``block_hash(LastProofBlock)`` — the
     round-scoped seed that only changes when a new proof wins. Callers
     must supply the canonical miner identity
     (``blake2_256(SCALE(account))`` for substrate accounts).
+
+    ``allowed_h`` overrides the per-node field distribution (``None`` keeps the
+    chain's ternary default). It is a frozen ``AllowedValueSet`` and therefore
+    picklable across the spawn-context ``ProcessPoolExecutor``.
+
+    ``prep_fn`` (with ``prep_args``), when given, OWNS derivation: it is called
+    as ``prep_fn(nonce, salt, nodes, edges, allowed_h, *prep_args)`` and its
+    return value is what the feeder buffers. The QPU PoW path uses this to derive
+    + reduce straight to arrays (vectorized, off the submit path) — skipping the
+    expensive scalar dict build below. Must be a module-level picklable callable.
+    ``None`` returns the raw :class:`IsingModel` (the CPU/GPU path, which needs
+    the h/J dicts).
     """
     nonce = derive_nonce(last_proof_block_hash, miner_bytes, salt)
-    h, J = generate_ising_model_from_nonce(nonce, nodes, edges)
+    if prep_fn is not None:
+        return prep_fn(nonce, salt, nodes, edges, allowed_h, *prep_args)
+    h, J = generate_ising_model_from_nonce(nonce, nodes, edges, allowed_h=allowed_h)
     return IsingModel(h=h, J=J, nonce=nonce, salt=salt)
 
 
@@ -144,8 +180,16 @@ class RandomIsingFeeder:
         nodes: Topology node list.
         edges: Topology edge list.
         buffer_size: Target number of ready + in-flight models.
-        max_workers: Worker processes for model generation.
+        max_workers: Worker processes for model generation. ``None``
+            (the default) auto-scales to the node via
+            :func:`_default_max_workers` (``max(2, cpu_count - 1)``) so a
+            fast submit/consume path can't out-drain a fixed 2-worker pool
+            on a multi-core box.
         seed: Optional seed for deterministic salt generation.
+        allowed_h: Optional per-node field distribution override forwarded to
+            ``generate_ising_model_from_nonce``. ``None`` keeps the chain's
+            ternary default (``h in {-1, 0, +1}``); pass
+            ``AllowedValueSet((0,))`` for the zero-field (J-only) problem class.
     """
 
     def __init__(
@@ -155,24 +199,26 @@ class RandomIsingFeeder:
         nodes: list,
         edges: list,
         buffer_size: int = 8,
-        max_workers: int = 2,
+        max_workers: Optional[int] = None,
         seed: Optional[int] = None,
+        allowed_h: Optional[AllowedValueSpec] = None,
+        prep_fn: Optional[Callable] = None,
+        prep_args: tuple = (),
     ):
-        if len(last_proof_block_hash) != 32:
-            raise ValueError(
-                "last_proof_block_hash must be 32 bytes, got "
-                f"{len(last_proof_block_hash)}"
-            )
-        if len(miner_bytes) != 32:
-            raise ValueError(f"miner_bytes must be 32 bytes, got {len(miner_bytes)}")
+        _require_len("last_proof_block_hash", last_proof_block_hash)
+        _require_len("miner_bytes", miner_bytes)
         self._last_proof_block_hash = last_proof_block_hash
         self._miner_id = miner_bytes
         self._nodes = nodes
         self._edges = edges
         self._buffer_size = buffer_size
+        self._allowed_h = allowed_h
+        self._prep_fn = prep_fn
+        self._prep_args = prep_args
         self._rng = random.Random(seed) if seed is not None else None
+        workers = max_workers if max_workers is not None else _default_max_workers()
         self._pool = ProcessPoolExecutor(
-            max_workers=max_workers,
+            max_workers=workers,
             mp_context=_SPAWN_CTX,
         )
         # Backstop: shut down the pool even if stop() is never called (the
@@ -186,7 +232,9 @@ class RandomIsingFeeder:
             self._pool,
         )
         self._futures: list = []
-        self._queue: queue.Queue[IsingModel] = queue.Queue()
+        # Holds IsingModel by default, or whatever ``prep_fn`` returns (e.g. a
+        # ReducedProblem on the QPU PoW path).
+        self._queue: queue.Queue[Any] = queue.Queue()
         self._stopped = False
         # Throughput diagnostics: continuously updated in _fill() and
         # pop_blocking(). Read by telemetry to confirm the buffer stays
@@ -217,13 +265,8 @@ class RandomIsingFeeder:
         Raises:
             ValueError: If either argument is not exactly 32 bytes.
         """
-        if len(last_proof_block_hash) != 32:
-            raise ValueError(
-                "last_proof_block_hash must be 32 bytes, got "
-                f"{len(last_proof_block_hash)}"
-            )
-        if len(miner_bytes) != 32:
-            raise ValueError(f"miner_bytes must be 32 bytes, got {len(miner_bytes)}")
+        _require_len("last_proof_block_hash", last_proof_block_hash)
+        _require_len("miner_bytes", miner_bytes)
         # Abandon old-seed in-flight work. cancel() is best-effort (a
         # running worker keeps going), but clearing _futures means _fill
         # never harvests the result, so no old-seed model can reach the new
@@ -252,13 +295,11 @@ class RandomIsingFeeder:
         if self._stopped:
             return
         still_pending = []
-        failures = 0
         for f in self._futures:
             if f.done():
                 try:
                     self._queue.put_nowait(f.result())
                 except Exception as exc:
-                    failures += 1
                     logger.warning(
                         "RandomIsingFeeder worker failed: %s (pending=%d, "
                         "queue=%d, buffer_size=%d)",
@@ -271,7 +312,6 @@ class RandomIsingFeeder:
                 still_pending.append(f)
         self._futures = still_pending
 
-        submitted = 0
         while len(self._futures) + self._queue.qsize() < self._buffer_size:
             salt = self._make_salt()
             f = self._pool.submit(
@@ -281,25 +321,16 @@ class RandomIsingFeeder:
                 self._nodes,
                 self._edges,
                 salt,
+                self._allowed_h,
+                self._prep_fn,
+                self._prep_args,
             )
             self._futures.append(f)
-            submitted += 1
 
-        # Buffer state visibility: log when the feeder is drained
-        # (callers fighting for queue slots) or when workers failed.
-        ready = self._queue.qsize()
-        pending = len(self._futures)
-        self._record_depth(ready)
-        if failures or ready == 0:
-            logger.info(
-                "RandomIsingFeeder state: ready=%d pending=%d "
-                "buffer_size=%d submitted=%d failures=%d",
-                ready,
-                pending,
-                self._buffer_size,
-                submitted,
-                failures,
-            )
+        # Depth tracking feeds the consolidated "[QPU] stream depth" line
+        # (feeder_ready / drained / wait_total) and the structured attempt
+        # log. Per-worker failures are logged individually above.
+        self._record_depth(self._queue.qsize())
 
     def _record_depth(self, ready: int) -> None:
         s = self._stats
@@ -356,8 +387,7 @@ class RandomIsingFeeder:
                 model = self._futures.pop(i).result()
                 self._fill()
                 return model
-        assert self._futures, "RandomIsingFeeder: no pending work and empty queue"
-        assert False, (
+        raise AssertionError(
             f"RandomIsingFeeder buffer underrun: "
             f"{len(self._futures)} futures pending, "
             f"none ready. Increase buffer_size."
@@ -543,7 +573,8 @@ class FixedIsingFeeder:
         """No-op for API parity with :class:`RandomIsingFeeder`."""
 
 
-def build_feeder(spec, nodes, edges, buffer_size):
+def build_feeder(spec, nodes, edges, buffer_size, allowed_h=None,
+                 prep_fn=None, prep_args=()):
     """Build an IsingFeeder from a switch ``feeder_spec`` tuple.
 
     ``("pow", last_proof_block_hash, miner_bytes)`` -> ``RandomIsingFeeder``.
@@ -555,16 +586,31 @@ def build_feeder(spec, nodes, edges, buffer_size):
         nodes: Topology node list passed through to the feeder.
         edges: Topology edge list passed through to the feeder.
         buffer_size: Target number of ready + in-flight models.
+        allowed_h: The chain topology's ``allowed_h_values`` spec. Required on
+            the PoW path: a ``None`` would make ``RandomIsingFeeder`` fall back
+            to the legacy ternary spec, so the sampler optimizes ``h in
+            {-1,0,+1}`` while the chain scores the registered spec (e.g. h=0),
+            yielding 0 valid solutions. Ignored for the mempool path (fixed
+            h/J come from the ProblemView).
 
     Returns:
         A configured feeder implementing the pop/stop interface.
 
     Raises:
+        ValueError: If ``spec[0] == "pow"`` and ``allowed_h`` is None.
         NotImplementedError: If ``spec[0]`` is neither ``"pow"`` nor
             ``"mempool"``.
     """
     kind = spec[0]
     if kind == "pow":
+        if allowed_h is None:
+            raise ValueError(
+                "build_feeder('pow', ...) requires allowed_h (the chain "
+                "topology's allowed_h_values). None silently builds a ternary "
+                "h model the chain scores as the registered spec, producing 0 "
+                "valid solutions. Thread requirements.allowed_h_values through "
+                "sample_ctx -> _stream_factory_kwargs -> build_persistent_context."
+            )
         _, last_proof_block_hash, miner_bytes = spec
         return RandomIsingFeeder(
             last_proof_block_hash=last_proof_block_hash,
@@ -572,6 +618,9 @@ def build_feeder(spec, nodes, edges, buffer_size):
             nodes=nodes,
             edges=edges,
             buffer_size=buffer_size,
+            allowed_h=allowed_h,
+            prep_fn=prep_fn,
+            prep_args=prep_args,
         )
     elif kind == "mempool":
         from shared.ring_views import ProblemView

@@ -18,10 +18,20 @@ from substrateinterface import Keypair, KeypairType
 SignatureKind = Literal["Sr25519", "Ed25519", "Ecdsa", "Hybrid"]
 
 
+def strip_0x(s: str) -> str:
+    """Return *s* with a leading ``0x`` / ``0X`` prefix removed.
+
+    Uses explicit slicing rather than ``lstrip("0x")`` to avoid the footgun
+    where ``lstrip`` strips any combination of ``'0'`` and ``'x'`` characters.
+    """
+    s = s.lower()
+    return s[2:] if s.startswith("0x") else s
+
+
 def _normalize_sr25519_sig(raw: object) -> bytes:
     """Coerce substrate-interface's sign() return (bytes or hex str) to raw bytes."""
     if isinstance(raw, str):
-        raw = bytes.fromhex(raw[2:] if raw.startswith("0x") else raw)
+        raw = bytes.fromhex(strip_0x(raw))
     return bytes(raw)
 
 

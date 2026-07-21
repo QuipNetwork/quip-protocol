@@ -4,14 +4,20 @@
 """Stream-driver process: owns the sampler/feeder/generator and produces
 samplesets into a SampleView for the consumer (miner worker).
 
-Replaces the in-worker QPU pump thread (AGENTS.md). The generator is driven
-by exactly one caller (this process's loop). Only a small descriptor crosses
-the descriptor queue; the sample matrix is written zero-copy into the ring.
+Used by the CPU/GPU backends (and the legacy single-process QPU path). The
+generator is driven by exactly one caller (this process's loop). Only a small
+descriptor crosses the descriptor queue; the sample matrix is written zero-copy
+into the ring.
+
+The QPU backend instead splits this across two processes — a connection-less
+feeder driver (``shared.feeder_driver``) and an isolated submitter
+(``QPU.dwave_submitter``) — so the SDK's GIL-held encode can't contend with
+feeder-harvest + decode. The generic helpers both paths share live in
+``shared.driver_util``; they are re-exported here for back-compat with existing
+importers (tools + tests).
 """
 from __future__ import annotations
 
-import importlib
-import inspect
 import logging
 import pickle
 import queue as _queue
@@ -19,121 +25,67 @@ from typing import Any, Dict
 
 import numpy as np
 
+from shared.driver_util import (  # noqa: F401  (re-exported for back-compat)
+    _coalesce_ctl_q,
+    _extract_qpu_us,
+    _maybe_with_stop,
+    _parent_death_watchdog,
+    _resolve,
+    _start_parent_death_watchdog,
+    _wait_for_first_switch,
+    qpu_access_time_us,
+)
+from shared.logging_config import setup_child_process_logging
 from shared.ring_views import SampleView
 
 log = logging.getLogger(__name__)
 
 
-def _resolve(dotted: str):
-    module_name, _, attr = dotted.partition(":")
-    return getattr(importlib.import_module(module_name), attr)
-
-
-def _maybe_with_stop(fn, kwargs: Dict[str, Any], stop_event) -> Dict[str, Any]:
-    """Add ``stop_event`` to ``kwargs`` only if ``fn`` accepts that kwarg.
-
-    The production factory consumes ``stop_event`` so its streaming loop can
-    observe cancellation; test fakes don't declare it. Inspecting the
-    signature keeps both callers working without a dual code path.
-    """
-    if "stop_event" in inspect.signature(fn).parameters:
-        return {**kwargs, "stop_event": stop_event}
-    return kwargs
-
-
-def _extract_qpu_us(sampleset) -> int:
-    info = getattr(sampleset, "info", None) or {}
-    t = info.get("timing", {}) if info else {}
-    return int(t.get("qpu_programming_time", 0) + t.get("qpu_sampling_time", 0))
-
-
-def _coalesce_ctl_q(ctx, ctl_q) -> str:
-    """Drain ctl_q, applying the newest switch + latest threshold + pause.
-
-    Returns ``"shutdown"`` if a ``None`` sentinel was seen, else ``"ok"``.
-    A burst of switches coalesces to the highest generation (dead
-    intermediate rounds are skipped); a trailing threshold still applies.
-    A ``("pause", gen)`` (budget-exhaustion stall) stops new submissions but
-    is superseded by a switch in the same drain (a fresh head outranks a
-    stall) and ignored if stale for an older generation.
-    """
-    latest_switch = None
-    latest_threshold = None
-    latest_pause = None
-    shutdown = False
-    while True:
-        try:
-            cmd = ctl_q.get_nowait()
-        except _queue.Empty:
-            break
-        if cmd is None:
-            shutdown = True
-            break
-        if cmd[0] == "switch":
-            if latest_switch is None or cmd[1] >= latest_switch[1]:
-                latest_switch = cmd
-        elif cmd[0] == "threshold":
-            latest_threshold = cmd
-        elif cmd[0] == "pause":
-            if latest_pause is None or cmd[1] >= latest_pause[1]:
-                latest_pause = cmd
-    # Apply switch BEFORE threshold: when both target the live generation in
-    # one drain, the threshold update must override the threshold embedded in
-    # the switch tuple (a decay that landed in the same tick as the head
-    # change). Reordering these would let the stale switch-threshold win.
-    if latest_switch is not None:
-        ctx.apply_command(latest_switch)
-    if latest_threshold is not None and (
-        latest_switch is None or latest_threshold[1] >= ctx.generation
-    ):
-        ctx.apply_command(latest_threshold)
-    # Pause only when no switch superseded it this drain (a switch resumes the
-    # driver for a new head) and it is not stale for an older generation.
-    if (
-        latest_pause is not None
-        and latest_switch is None
-        and latest_pause[1] >= ctx.generation
-    ):
-        ctx.apply_command(latest_pause)
-    return "shutdown" if shutdown else "ok"
-
-
-def _wait_for_first_switch(ctx, ctl_q, stop_event) -> bool:
-    """Block (polling stop_event) until the first switch arrives.
-
-    Returns True once a round is active, False if shutdown/stop came first.
-    """
-    while not stop_event.is_set():
-        try:
-            cmd = ctl_q.get(timeout=0.1)
-        except _queue.Empty:
-            continue
-        if cmd is None:
-            return False
-        if cmd[0] == "switch":
-            ctx.apply_command(cmd)
-            return True
-        # A 'threshold' before any 'switch' is meaningless; apply + keep waiting.
-        ctx.apply_command(cmd)
-    return False
-
-
 def stream_driver_main(ring_args: Dict[str, Any], desc_q, ctl_q, stop_event,
                        stream_factory_dotted: str,
-                       factory_kwargs: Dict[str, Any]) -> None:
+                       factory_kwargs: Dict[str, Any],
+                       log_queue: Any = None,
+                       drops: Any = None) -> None:
     """Long-lived stream driver: persist the context, switch rounds via ctl_q.
 
     ``stream_factory_dotted`` resolves to a context factory
     (``build_persistent_context``) returning an object exposing
     ``apply_command`` / ``iter_results`` / ``cleanup`` / ``generation``.
     Descriptor tuple:
-    ``(slot, n_rows, n_cols, nonce, salt, qpu_us, generation)``. A trailing
-    ``None`` on ``desc_q`` signals end-of-stream (driver exit).
+    ``(slot, n_rows, n_cols, nonce, salt, qpu_us, generation, defect_pickle)``.
+    A trailing ``None`` on ``desc_q`` signals end-of-stream (driver exit).
+
+    ``log_queue`` is the shared queue drained by ``log_writer_main``; this is a
+    spawned process with no inherited handlers, so without configuring it here
+    every producer-side INFO diagnostic (stream depth, feeder pop-wait) is
+    silently dropped.
+
+    ``drops`` is an optional shared counter (``multiprocessing.Value``) the
+    consumer reads to surface ring drops on ``/api/v1/status``. A dropped
+    sample never reaches the worker, so a win it carried is lost with no other
+    signal. It is a shared counter rather than a field on the descriptor
+    because a saturated ring drops *every* result and therefore emits no
+    descriptor at all — a piggybacked count would go silent exactly when drops
+    peak. Inherited via ``Process(args=...)``; never sent over a queue.
     """
+    setup_child_process_logging(log_queue)
+    # Orphan guard: if the parent dies ungracefully, stop instead of burning
+    # QPU forever as a reparented orphan.
+    _start_parent_death_watchdog(stop_event)
     ring = SampleView(**ring_args)
     ctx = None
     dropped = 0
     shutdown = False
+
+    def _drop() -> int:
+        """Count one dropped sample locally and on the shared counter."""
+        nonlocal dropped
+        dropped += 1
+        if drops is not None:
+            with drops.get_lock():
+                drops.value += 1
+        return dropped
+
     # Context construction can raise on D-Wave auth/topology errors; keep it
     # inside the try so the finally always sends the end-of-stream sentinel.
     try:
@@ -166,11 +118,18 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, ctl_q, stop_event,
                         "(slot capacity %dx%d)",
                         n_rows, n_cols, ring.max_rows, ring.max_cols,
                     )
-                    dropped += 1
+                    _drop()
                     continue
-                slot = ring.claim_free(timeout=0.0 if dropped else 0.005)
+                # Always give the claim a real wait budget. This was
+                # ``timeout=0.0 if dropped else 0.005``, but ``dropped`` is the
+                # cumulative counter, so a single drop disabled waiting for the
+                # life of the process and every later momentary ring-full was
+                # discarded instantly. A dropped sample never reaches the
+                # worker and is never evaluated, so a win it carried is lost
+                # silently (QUI-867).
+                slot = ring.claim_free(timeout=0.005)
                 if slot is None:
-                    dropped += 1
+                    _drop()
                     continue
                 ring.write(slot, sample, energy)
                 try:
@@ -186,7 +145,7 @@ def stream_driver_main(ring_args: Dict[str, Any], desc_q, ctl_q, stop_event,
                 except _queue.Full:
                     # Consumer backpressure: release the slot and drop.
                     ring.release(slot)
-                    dropped += 1
+                    _drop()
             # iter_results returned. If stop/shutdown, fall through to cleanup;
             # otherwise the driver paused-and-drained (or the round ended) —
             # idle until the next switch (resume) or None (shutdown).

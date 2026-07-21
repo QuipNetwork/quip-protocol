@@ -1,191 +1,421 @@
-"""Tests for the Phase 8d `--mode pow|mempool|both` worker-split logic.
+"""Scheduler-stack wiring tests for the T7 cutover.
 
-The split helper is a pure function (`_split_handles_for_mode` in
-quip_cli) so this exercises it without any chain plumbing. The
-integration test for "both" mode is deferred — it requires a registered
-PoW miner AND mempool solver running concurrently against the docker
-chain, which is more setup than the current Phase 6 / 8c live tests
-cover. Phase 9 verification will add that path.
+The `--mode pow|mempool|both` handle split is gone: `_prepare_core` builds
+one `MinerCore` and `_build_scheduler_stack` puts a single `WorkScheduler`
+over ALL of its handles — pow fills idle workers, mempool jobs preempt.
+These tests pin the wiring:
 
-CLI wiring tests (--mode option forwarded correctly to _run_concurrent_miner)
-are also included to catch mis-wired Click option defaults or parameter names.
+  - 1-handle nodes run BOTH work sources (the old `--mode both` exit-5
+    case is now the supported default);
+  - mempool=False builds a pow-only stack (no producer/submitter glue);
+  - the pow controller and the mempool stack share ONE ChainEventManager
+    (the producer's per-block poll rides the pow controller's manager);
+  - MEMPOOL_DISABLE parks the mempool stack while pow continues.
 """
 from __future__ import annotations
 
-import pytest
-from click.testing import CliRunner
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
-from quip_cli import _split_handles_for_mode, quip_miner
+import pytest
+
+import quip_cli
+from substrate.mempool_stack import MempoolStack
+from substrate.mempool_submitter import SubmitOutcome, SubmitReport
+from substrate.mempool_types import MempoolJobContext, MinerType, OrderStatus
+from substrate.work_scheduler import WorkScheduler
 
 
 class _StubHandle:
-    """Sentinel for split tests — we only need identity comparison."""
+    """Duck-typed MinerHandle: identity + the scheduler's dispatch surface."""
 
     def __init__(self, name: str) -> None:
         self.miner_id = name
+        self.miner_type = "CPU"
+        self._active_dispatch_id = 0
+        self.resp = MagicMock()
 
-    def __repr__(self) -> str:
-        return f"_StubHandle({self.miner_id!r})"
+    def mine_work_item(self, context, *, solution_number=None) -> int:
+        self._active_dispatch_id += 1
+        return self._active_dispatch_id
 
-
-def _handles(n: int) -> list:
-    return [_StubHandle(f"h{i}") for i in range(n)]
-
-
-def test_pow_mode_takes_all_handles():
-    handles = _handles(4)
-    pow_h, mempool_h = _split_handles_for_mode("pow", handles)
-    assert pow_h == handles
-    assert mempool_h == []
+    def cancel(self) -> None:
+        pass
 
 
-def test_mempool_mode_takes_all_handles():
-    handles = _handles(4)
-    pow_h, mempool_h = _split_handles_for_mode("mempool", handles)
-    assert pow_h == []
-    assert mempool_h == handles
+def _fake_keystore():
+    ks = MagicMock()
+    ks.signer.account_id_bytes.return_value = b"\x42" * 32
+    ks.signer.ss58_address.return_value = "5Test"
+    return ks
 
 
-def test_both_mode_splits_half_half_even():
-    handles = _handles(4)
-    pow_h, mempool_h = _split_handles_for_mode("both", handles)
-    assert pow_h == handles[:2]
-    assert mempool_h == handles[2:]
+def _fake_binding(*, matches: bool = True):
+    return SimpleNamespace(
+        matches=matches,
+        chain_hash=b"\xaa" * 32,
+        expected_hash=b"\xbb" * 32,
+        snapshot=SimpleNamespace(
+            allowed_h_values=MagicMock(),
+            allowed_j_values=MagicMock(),
+            allowed_spin_values=MagicMock(),
+        ),
+    )
 
 
-def test_both_mode_splits_floor_for_odd_count():
-    """5 handles → 2 PoW, 3 mempool (mempool gets the remainder).
+def _fake_pool():
+    pool = MagicMock()
+    pool.urls = ("ws://x:9944",)
+    return pool
 
-    This rule is documented in the helper's docstring; it favors mempool
-    by 1 when the count is odd. Why mempool? In a 1-worker odd case
-    (3, 5, 7) the user explicitly asked for "both" — defaulting the
-    remainder to mempool ensures mempool is always represented even at
-    minimal handle counts, while PoW (always running on chain heads)
-    still has at least 1 worker.
+
+async def _build_stack(*, mempool_enabled: bool, num_handles: int = 1):
+    client = MagicMock()
+    client.resolve_topology_binding = AsyncMock(return_value=_fake_binding())
+    core = MagicMock()
+    core.miner_handles = [_StubHandle(f"h{i}") for i in range(num_handles)]
+    return await quip_cli._build_scheduler_stack(
+        client=client,
+        pool=_fake_pool(),
+        core=core,
+        keystore=_fake_keystore(),
+        topology=MagicMock(),
+        miner_kind="cpu",
+        telemetry_port=8086,
+        submission_config=quip_cli.SubmissionConfig(),
+        mempool_enabled=mempool_enabled,
+        mempool_min_reward=7,
+    )
+
+
+# ---------------------------------------------------------------------------
+# _prepare_core — no split, no exit-5
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_core_builds_unsplit_core(monkeypatch):
+    """One core, node_id 'quip-miner', all handles kept together."""
+    built = {}
+
+    class _FakeCore:
+        def __init__(self, *, node_id, miners_config, topology):
+            built.update(node_id=node_id, miners_config=miners_config)
+            self.miner_handles = [_StubHandle("h0")]
+
+        def close(self):
+            built["closed"] = True
+
+    monkeypatch.setattr(quip_cli, "MinerCore", _FakeCore)
+    core = quip_cli._prepare_core("cpu", {"cpu": {"num_cpus": 1}}, MagicMock())
+    assert built["node_id"] == "quip-miner"
+    assert len(core.miner_handles) == 1
+    assert "closed" not in built
+
+
+def test_prepare_core_single_handle_no_longer_exits_5(monkeypatch):
+    """Regression: 1 handle used to exit code 5 under --mode both."""
+
+    class _FakeCore:
+        def __init__(self, **_kw):
+            self.miner_handles = [_StubHandle("only")]
+
+        def close(self):
+            raise AssertionError("must not close a healthy core")
+
+    monkeypatch.setattr(quip_cli, "MinerCore", _FakeCore)
+    core = quip_cli._prepare_core("cpu", {}, MagicMock())  # must not raise
+    assert [h.miner_id for h in core.miner_handles] == ["only"]
+
+
+def test_prepare_core_no_handles_exit_code_2(monkeypatch):
+    class _FakeCore:
+        def __init__(self, **_kw):
+            self.miner_handles = []
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    cores = []
+    monkeypatch.setattr(
+        quip_cli, "MinerCore",
+        lambda **kw: cores.append(_FakeCore(**kw)) or cores[-1],
+    )
+    with pytest.raises(quip_cli._MiningStartupError) as excinfo:
+        quip_cli._prepare_core("cpu", {}, MagicMock())
+    assert excinfo.value.code == 2
+    assert cores[0].closed
+
+
+def test_split_handles_for_mode_is_gone():
+    """The mode split machinery is deleted, not deprecated."""
+    assert not hasattr(quip_cli, "_split_handles_for_mode")
+    assert not hasattr(quip_cli, "_MODE_HELP")
+    assert "mode" not in quip_cli._MINING_DEFAULTS
+
+
+# ---------------------------------------------------------------------------
+# _build_scheduler_stack — one scheduler owns all handles
+# ---------------------------------------------------------------------------
+
+
+def test_stack_one_handle_serves_both_sources():
+    """The previously-impossible 1-handle pow+mempool node builds fine."""
+    controller, scheduler, stack = asyncio.run(
+        _build_stack(mempool_enabled=True, num_handles=1)
+    )
+    assert stack is not None
+    assert len(scheduler.miner_handles) == 1
+    # The scheduler owns ALL handles; controller + stack delegate to it.
+    assert controller.miner_handles is scheduler.miner_handles or (
+        [h.miner_id for h in controller.miner_handles]
+        == [h.miner_id for h in scheduler.miner_handles]
+    )
+    assert controller._scheduler is scheduler
+    assert stack._scheduler is scheduler
+
+
+def test_stack_mempool_disabled_is_pow_only():
+    controller, scheduler, stack = asyncio.run(
+        _build_stack(mempool_enabled=False, num_handles=2)
+    )
+    assert stack is None
+    assert controller._scheduler is scheduler
+    assert controller._head_subscribers == []
+    assert scheduler._on_job_result is None
+
+
+def test_stack_shares_one_event_manager_with_producer():
+    """The producer's per-block poll rides the pow controller's manager."""
+    controller, _scheduler, stack = asyncio.run(
+        _build_stack(mempool_enabled=True)
+    )
+    assert controller._head_subscribers == [stack.producer.on_new_block]
+    # min_reward from [miner] mempool_min_reward reaches the producer.
+    assert stack.producer.min_reward == 7
+
+
+def test_stack_topology_mismatch_exit_code_4():
+    async def _go():
+        client = MagicMock()
+        client.resolve_topology_binding = AsyncMock(
+            return_value=_fake_binding(matches=False)
+        )
+        core = MagicMock()
+        core.miner_handles = [_StubHandle("h0")]
+        await quip_cli._build_scheduler_stack(
+            client=client,
+            pool=_fake_pool(),
+            core=core,
+            keystore=_fake_keystore(),
+            topology=MagicMock(),
+            miner_kind="cpu",
+            telemetry_port=8086,
+            submission_config=quip_cli.SubmissionConfig(),
+            mempool_enabled=False,
+        )
+
+    with pytest.raises(quip_cli._MiningStartupError) as excinfo:
+        asyncio.run(_go())
+    assert excinfo.value.code == 4
+
+
+@pytest.mark.asyncio
+async def test_one_event_manager_fans_to_both_consumers(monkeypatch):
+    """ONE ChainEventManager: a snapshot fans to on_new_head AND the
+    producer's on_new_block — no second poller is constructed."""
+    import substrate.event_manager as em
+
+    managers = []
+
+    class _FakeManager:
+        def __init__(self, **_kw):
+            self.subscribers = []
+            managers.append(self)
+
+        def subscribe(self, event_type, callback):
+            self.subscribers.append((event_type, callback))
+
+        async def run(self):
+            await asyncio.Event().wait()
+
+        def request_shutdown(self):
+            pass
+
+    monkeypatch.setattr(em, "ChainEventManager", _FakeManager)
+    controller, _scheduler, stack = await _build_stack(mempool_enabled=True)
+    controller.pool = MagicMock()
+    controller.pool.active_url.return_value = "ws://x:9944"
+    await controller._start_event_manager(b"\x42" * 32)
+    # Let the supervised tasks reach their first await so the wrapped
+    # coroutines start (cancelling earlier leaves them never-awaited and
+    # leaks RuntimeWarnings into the next test).
+    await asyncio.sleep(0)
+    try:
+        assert len(managers) == 1
+        callbacks = [cb for _, cb in managers[0].subscribers]
+        assert controller.on_new_head in callbacks
+        assert stack.producer.on_new_block in callbacks
+    finally:
+        controller._shutdown_event.set()
+        for task in (controller._event_manager_task,
+                     controller._fire_timer_task):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(
+            *(t for t in (controller._event_manager_task,
+                          controller._fire_timer_task) if t),
+            return_exceptions=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# MempoolStack — feed / submit / park behavior
+# ---------------------------------------------------------------------------
+
+
+def _order(status=OrderStatus.OPENED):
+    return SimpleNamespace(
+        status=status,
+        ising_params=SimpleNamespace(
+            nodes=(0, 1),
+            edges=((0, 1),),
+            h_values=(0, 0),
+            j_values=(1000,),
+            min_energy_milli=None,
+            min_diversity_milli=None,
+            min_solutions=None,
+        ),
+    )
+
+
+def _stack_with_fakes():
+    stack = MempoolStack(
+        pool=_fake_pool(),
+        signer=_fake_keystore().signer,
+        sampler_topology_hash=b"\xbb" * 32,
+        allowed_h_values=MagicMock(),
+        allowed_j_values=MagicMock(),
+        allowed_spin_values=MagicMock(),
+        solver_type=MinerType.CPU,
+        min_reward=0,
+    )
+    stack.pool_client = MagicMock()
+    scheduler = MagicMock()
+    stack.attach_scheduler(scheduler)
+    return stack, scheduler
+
+
+@pytest.mark.asyncio
+async def test_feed_jobs_submits_context_with_revalidate():
+    stack, scheduler = _stack_with_fakes()
+    stack.pool_client.query_job_order = AsyncMock(return_value=_order())
+    stack.producer.accepted.put_nowait(11)
+
+    feed = asyncio.create_task(stack._feed_jobs())
+    await asyncio.sleep(0.05)
+    feed.cancel()
+    await asyncio.gather(feed, return_exceptions=True)
+
+    assert scheduler.submit_job.call_count == 1
+    context = scheduler.submit_job.call_args.args[0]
+    assert isinstance(context, MempoolJobContext)
+    assert context.order_id == 11
+    revalidate = scheduler.submit_job.call_args.kwargs["revalidate"]
+    # Dispatch-time re-check: OPENED passes, CLOSED drops.
+    assert await revalidate() is True
+    stack.pool_client.query_job_order = AsyncMock(
+        return_value=_order(status=OrderStatus.CLOSED)
+    )
+    assert await revalidate() is False
+
+
+@pytest.mark.asyncio
+async def test_mempool_disable_parks_stack_and_scheduler():
+    """A mempool-fatal receipt parks mempool; nothing raises (pow lives)."""
+    stack, scheduler = _stack_with_fakes()
+    stack.submitter = MagicMock()
+    stack.submitter.submit_solution = AsyncMock(
+        return_value=SubmitReport(
+            SubmitOutcome.MEMPOOL_DISABLE, "SolverNotRegistered"
+        )
+    )
+    work = SimpleNamespace(
+        context=SimpleNamespace(order_id=5),
+        result=SimpleNamespace(miner_id="h0", mining_time=1.0),
+    )
+    await stack.on_job_result(work)  # queue-put contract: sync enqueue
+
+    consume = asyncio.create_task(stack._consume_results())
+    await asyncio.sleep(0.05)
+    consume.cancel()
+    await asyncio.gather(consume, return_exceptions=True)
+
+    assert stack.parked is True
+    scheduler.disable_mempool.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_park_parks_producer_and_wakes_feed_loop():
+    """park() must silence the whole discovery side, not just the feed.
+
+    The producer stays subscribed to the shared ChainEventManager for
+    the process lifetime, so park() has to make on_new_block a no-op
+    (no more per-block RPCs, no unbounded `accepted` growth) — and the
+    feed loop must exit promptly instead of fetching one more order
+    into the disabled queue.
     """
-    handles = _handles(5)
-    pow_h, mempool_h = _split_handles_for_mode("both", handles)
-    assert len(pow_h) == 2
-    assert len(mempool_h) == 3
+    stack, scheduler = _stack_with_fakes()
+    stack.pool_client.query_job_order = AsyncMock(return_value=_order())
+
+    feed = asyncio.create_task(stack._feed_jobs())
+    await asyncio.sleep(0.05)  # feed loop is blocked on accepted.get()
+    stack.park("test")
+    # An order accepted just before/while parking must NOT be fed.
+    stack.producer.accepted.put_nowait(11)
+    await asyncio.wait_for(feed, timeout=2)
+
+    assert scheduler.submit_job.call_count == 0
+    assert stack.pool_client.query_job_order.await_count == 0
+    # The producer itself is parked: new heads poll nothing.
+    stack.producer.pool_client = MagicMock()
+    await stack.producer.on_new_block(
+        SimpleNamespace(block_hash=b"\x10" * 32, block_number=10)
+    )
+    stack.producer.pool_client.get_events_at.assert_not_called()
 
 
-def test_both_mode_with_single_handle_assigns_to_mempool():
-    """1 handle in `both` mode produces (0, 1) — empty PoW side. The
-    CLI catches this and fails fast with "needs ≥2 handles". The split
-    helper itself just returns the floor-half so callers can inspect."""
-    handles = _handles(1)
-    pow_h, mempool_h = _split_handles_for_mode("both", handles)
-    assert len(pow_h) == 0
-    assert len(mempool_h) == 1
+@pytest.mark.asyncio
+async def test_stack_run_survives_loop_crash_until_shutdown():
+    """Failure containment: an internal crash parks mempool but run()
+    returns only on shutdown — an early return would tear down pow via
+    FIRST_COMPLETED."""
+    stack, scheduler = _stack_with_fakes()
+    stack.build_client = MagicMock()
+    stack.build_client.connect = AsyncMock(
+        side_effect=RuntimeError("connect boom")
+    )
+    stack.build_client.close = AsyncMock()
 
-
-def test_both_mode_with_two_handles_splits_one_one():
-    handles = _handles(2)
-    pow_h, mempool_h = _split_handles_for_mode("both", handles)
-    assert pow_h == handles[:1]
-    assert mempool_h == handles[1:]
-
-
-def test_split_returns_fresh_lists():
-    """The helper must return lists (not slices of the input) so callers
-    can mutate without affecting the source."""
-    handles = _handles(4)
-    pow_h, mempool_h = _split_handles_for_mode("pow", handles)
-    pow_h.append(_StubHandle("extra"))
-    assert len(handles) == 4
-
-
-def test_split_empty_handles_both():
-    pow_h, mempool_h = _split_handles_for_mode("both", [])
-    assert pow_h == []
-    assert mempool_h == []
-
-
-def test_split_unknown_mode_raises():
-    """Unknown modes must raise ValueError, not silently fall through to
-    'both' logic. The CLI validates mode before calling the helper, but
-    the helper is also callable directly."""
-    with pytest.raises(ValueError, match="unknown mode"):
-        _split_handles_for_mode("solo", _handles(2))
-
-
-def test_split_both_preserves_handle_order():
-    """Handles routed to each bucket must preserve their original order."""
-    handles = _handles(5)
-    pow_h, mempool_h = _split_handles_for_mode("both", handles)
-    assert pow_h[0] is handles[0]
-    assert pow_h[1] is handles[1]
-    assert mempool_h[0] is handles[2]
-    assert mempool_h[1] is handles[3]
-    assert mempool_h[2] is handles[4]
+    run = asyncio.create_task(stack.run())
+    await asyncio.sleep(0.05)
+    assert not run.done()          # crash did NOT end run()
+    assert stack.parked is True    # ...it parked mempool instead
+    scheduler.disable_mempool.assert_called_once()
+    stack.shutdown()
+    await asyncio.wait_for(run, timeout=2)
 
 
 # ---------------------------------------------------------------------------
-# CLI wiring tests — verify --mode is forwarded correctly to the runner
+# Scheduler still enforces first-wins fan-out with the CLI-built stack
 # ---------------------------------------------------------------------------
 
 
-def test_cpu_default_mode_is_pow(monkeypatch):
-    """quip-miner cpu must default --mode to pow."""
-    captured = {}
-
-    async def fake_run(**kwargs):
-        captured.update(kwargs)
-        return 0
-
-    import quip_cli
-
-    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
-
-    runner = CliRunner()
-    result = runner.invoke(
-        quip_miner,
-        ["cpu", "--validator", "ws://localhost:9944"],
-        catch_exceptions=False,
+def test_scheduler_stack_uses_workscheduler_type():
+    controller, scheduler, _stack = asyncio.run(
+        _build_stack(mempool_enabled=True, num_handles=3)
     )
-    assert result.exit_code == 0
-    assert captured.get("mode") == "pow"
-
-
-def test_cpu_mode_mempool_forwarded(monkeypatch):
-    """--mode mempool must reach _run_concurrent_miner unchanged."""
-    captured = {}
-
-    async def fake_run(**kwargs):
-        captured.update(kwargs)
-        return 0
-
-    import quip_cli
-
-    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
-
-    runner = CliRunner()
-    result = runner.invoke(
-        quip_miner,
-        ["cpu", "--validator", "ws://localhost:9944", "--mode", "mempool"],
-        catch_exceptions=False,
-    )
-    assert result.exit_code == 0
-    assert captured.get("mode") == "mempool"
-
-
-def test_cpu_mode_both_forwarded(monkeypatch):
-    """--mode both must reach _run_concurrent_miner unchanged."""
-    captured = {}
-
-    async def fake_run(**kwargs):
-        captured.update(kwargs)
-        return 0
-
-    import quip_cli
-
-    monkeypatch.setattr(quip_cli, "_run_concurrent_miner", fake_run)
-
-    runner = CliRunner()
-    result = runner.invoke(
-        quip_miner,
-        ["cpu", "--validator", "ws://localhost:9944", "--mode", "both"],
-        catch_exceptions=False,
-    )
-    assert result.exit_code == 0
-    assert captured.get("mode") == "both"
+    assert isinstance(scheduler, WorkScheduler)
+    assert len(scheduler.miner_handles) == 3
+    assert controller._scheduler is scheduler

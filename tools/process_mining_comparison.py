@@ -15,7 +15,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 
 # Regex patterns for log parsing
@@ -99,19 +99,18 @@ def parse_log_file(filepath: Path, miner_machine: str, miner_type: str) -> List[
     # Read entire file for model detection (first ~5000 chars should be enough)
     with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
         header_content = f.read(5000)
+        model = detect_model(header_content, miner_type)
+        f.seek(0)
 
-    model = detect_model(header_content, miner_type)
+        # Track active mining starts per process: process_id -> (start_time, block_num)
+        active_mining: Dict[str, Tuple[datetime, int]] = {}
 
-    # Track active mining starts per process: process_id -> (start_time, block_num)
-    active_mining: Dict[str, Tuple[datetime, int]] = {}
-
-    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
             # Check for mining start - only set if we don't have a start time yet
             # (i.e., first attempt after a block was found or start of log)
             start_match = PATTERNS['mining_start'].search(line)
             if start_match:
-                timestamp_str, log_miner_type, process_id, block_num = start_match.groups()
+                timestamp_str, _, process_id, block_num = start_match.groups()
                 # Only set start time if we don't already have one for this process
                 if process_id not in active_mining:
                     start_time = parse_timestamp(timestamp_str)
@@ -121,7 +120,7 @@ def parse_log_file(filepath: Path, miner_machine: str, miner_type: str) -> List[
             # Check for block found (reset timer for this process)
             found_match = PATTERNS['block_found'].search(line)
             if found_match:
-                log_miner_type, process_id, block_num = found_match.groups()
+                _, process_id, block_num = found_match.groups()
                 # Clear start time - next "Mining block X" will set new start
                 if process_id in active_mining:
                     del active_mining[process_id]
@@ -130,7 +129,7 @@ def parse_log_file(filepath: Path, miner_machine: str, miner_type: str) -> List[
             # Check for mining attempt
             attempt_match = PATTERNS['mining_attempt'].search(line)
             if attempt_match:
-                (timestamp_str, log_miner_type, process_id,
+                (timestamp_str, _, process_id,
                  energy, valid, diversity, threshold) = attempt_match.groups()
 
                 end_time = parse_timestamp(timestamp_str)

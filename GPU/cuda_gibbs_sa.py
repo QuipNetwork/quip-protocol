@@ -12,23 +12,11 @@ chunk) from atomic queue, process all sweeps/colors using shared
 memory, then grab the next unit. Work-stealing balances load
 across models.
 """
-import time
-from itertools import chain
-from typing import (
-    Any, Dict, Iterable, Iterator, List, Optional, Tuple,
-)
-
 import cupy as cp
-import dimod
 import numpy as np
 
 from GPU.base_cuda_sampler import BaseCudaSampler
-from GPU.gpu_scheduler import throttled_stream
-from GPU.sampler_utils import (
-    compute_beta_schedule,
-    compute_color_blocks,
-)
-from shared.ising_model import IsingModel
+from GPU.sampler_utils import compute_color_blocks
 
 
 class CudaGibbsSampler(BaseCudaSampler):
@@ -118,20 +106,16 @@ class CudaGibbsSampler(BaseCudaSampler):
         num_reads: int = 256,
         num_sweeps: int = 1000,
         num_sweeps_per_beta: int = 1,
-        max_nonces: int = 1,
     ) -> None:
         """Pre-allocate GPU buffers for a fixed topology.
 
-        Extends base prepare() with color block computation
-        and double-buffered GPU arrays for the non-self-feeding
-        pipeline path.
+        Extends base prepare() with color block computation.
 
         Args:
             num_reads: Max reads per job.
             num_sweeps: Max sweeps (determines beta schedule
                 size).
             num_sweeps_per_beta: Sweeps per beta value.
-            max_nonces: Max nonces for multi-nonce dispatch.
         """
         super().prepare(
             num_reads=num_reads,
@@ -141,7 +125,6 @@ class CudaGibbsSampler(BaseCudaSampler):
 
         N = self._prep_N
         nnz = self._prep_nnz
-        max_packed_size = self._prep_max_packed_size
         node_to_idx = self._prep_node_to_idx
 
         # Build color blocks (topology-constant, computed once)
@@ -172,162 +155,10 @@ class CudaGibbsSampler(BaseCudaSampler):
         self._d_problem_j = cp.asarray(problem_j)
         self._d_problem_h = cp.asarray(problem_h)
 
-        # Double-buffered mutable GPU arrays (A/B sets)
-        max_betas = self._prep_max_num_betas
-        total_samples = num_reads
-        self._d_J_vals = [
-            cp.zeros(nnz, dtype=cp.int8),
-            cp.zeros(nnz, dtype=cp.int8),
-        ]
-        self._d_h_vals = [
-            cp.zeros(N, dtype=cp.int8),
-            cp.zeros(N, dtype=cp.int8),
-        ]
-        self._d_beta_sched = [
-            cp.zeros(max_betas, dtype=cp.float32),
-            cp.zeros(max_betas, dtype=cp.float32),
-        ]
-        self._d_final_samples = [
-            cp.zeros(
-                total_samples * max_packed_size,
-                dtype=cp.int8,
-            ),
-            cp.zeros(
-                total_samples * max_packed_size,
-                dtype=cp.int8,
-            ),
-        ]
-        self._d_final_energies = [
-            cp.zeros(total_samples, dtype=cp.int32),
-            cp.zeros(total_samples, dtype=cp.int32),
-        ]
-        self._d_queue_counter = [
-            cp.zeros(1, dtype=cp.int32),
-            cp.zeros(1, dtype=cp.int32),
-        ]
-
-        # Multi-nonce double-buffered GPU arrays (A/B)
-        self._max_nonces = max_nonces
-        if max_nonces > 1:
-            mn_total_reads = max_nonces * num_reads
-            self._d_mn_J = [
-                cp.zeros(
-                    max_nonces * nnz, dtype=cp.int8,
-                ),
-                cp.zeros(
-                    max_nonces * nnz, dtype=cp.int8,
-                ),
-            ]
-            self._d_mn_h = [
-                cp.zeros(
-                    max_nonces * N, dtype=cp.int8,
-                ),
-                cp.zeros(
-                    max_nonces * N, dtype=cp.int8,
-                ),
-            ]
-            self._d_mn_samples = [
-                cp.zeros(
-                    mn_total_reads * max_packed_size,
-                    dtype=cp.int8,
-                ),
-                cp.zeros(
-                    mn_total_reads * max_packed_size,
-                    dtype=cp.int8,
-                ),
-            ]
-            self._d_mn_energies = [
-                cp.zeros(
-                    mn_total_reads, dtype=cp.int32,
-                ),
-                cp.zeros(
-                    mn_total_reads, dtype=cp.int32,
-                ),
-            ]
-            self._d_mn_queue = [
-                cp.zeros(1, dtype=cp.int32),
-                cp.zeros(1, dtype=cp.int32),
-            ]
-            self._d_mn_beta = [
-                cp.zeros(
-                    self._prep_max_num_betas,
-                    dtype=cp.float32,
-                ),
-                cp.zeros(
-                    self._prep_max_num_betas,
-                    dtype=cp.float32,
-                ),
-            ]
-            # Per-nonce metadata
-            self._d_mn_problem_N = cp.full(
-                max_nonces, N, dtype=cp.int32,
-            )
-            self._d_mn_problem_rp = cp.zeros(
-                max_nonces, dtype=cp.int32,
-            )
-            self._d_mn_problem_ci = cp.zeros(
-                max_nonces, dtype=cp.int32,
-            )
-            self._d_mn_problem_j = cp.asarray(
-                np.arange(
-                    max_nonces, dtype=np.int32,
-                ) * nnz,
-            )
-            self._d_mn_problem_h = cp.asarray(
-                np.arange(
-                    max_nonces, dtype=np.int32,
-                ) * N,
-            )
-            self._d_mn_block_starts = cp.asarray(
-                np.tile(starts, max_nonces),
-            )
-            self._d_mn_block_counts = cp.asarray(
-                np.tile(counts, max_nonces),
-            )
-
-            # Double host staging buffers (A/B)
-            self._h_mn_J = [
-                np.zeros(
-                    max_nonces * nnz, dtype=np.int8,
-                ),
-                np.zeros(
-                    max_nonces * nnz, dtype=np.int8,
-                ),
-            ]
-            self._h_mn_h = [
-                np.zeros(
-                    max_nonces * N, dtype=np.int8,
-                ),
-                np.zeros(
-                    max_nonces * N, dtype=np.int8,
-                ),
-            ]
-
-        # CUDA streams for pipeline overlap
-        self._stream_compute = cp.cuda.Stream(
-            non_blocking=True,
-        )
-        self._stream_transfer = cp.cuda.Stream(
-            non_blocking=True,
-        )
-        self._event_transfer_done = cp.cuda.Event()
-
-        # Pipeline state — single-nonce double buffer
-        self._buf_idx = 0
-        self._preloaded = False
-        self._preload_meta = None
-
-        # Pipeline state — multi-nonce double buffer
-        self._mn_buf_idx = 0
-        self._mn_preloaded = False
-        self._mn_preload_meta = None
-        self._mn_pending = None
-
         self.logger.info(
             "Prepared Gibbs buffers: N=%d, nnz=%d, "
-            "num_reads=%d, max_betas=%d, max_nonces=%d",
-            N, nnz, num_reads,
-            self._prep_max_num_betas, max_nonces,
+            "num_reads=%d, max_betas=%d",
+            N, nnz, num_reads, self._prep_max_num_betas,
         )
 
     def _allocate_kernel_buffers(
@@ -401,290 +232,6 @@ class CudaGibbsSampler(BaseCudaSampler):
             np.int32(self.update_mode),
         )
 
-    # -- Gibbs-specific close (also handles double-buffer
-    #    streams) --
-
-    def close(self) -> None:
-        """Synchronize and release all CUDA streams."""
-        super().close()
-        if hasattr(self, '_stream_compute'):
-            self._stream_compute.synchronize()
-            self._stream_transfer.synchronize()
-        self._mn_preloaded = False
-        self._preloaded = False
-
-    # -- Gibbs-specific methods --
-
-    def _get_cached_beta_schedule(
-        self,
-        h: Dict[int, float],
-        J: Dict[Tuple[int, int], float],
-        num_sweeps: int,
-        num_sweeps_per_beta: int,
-        beta_range: Optional[Tuple[float, float]],
-        beta_schedule_type: str,
-        beta_schedule: Optional[np.ndarray],
-    ) -> Tuple[np.ndarray, Tuple[float, float]]:
-        """Return cached beta schedule if params match."""
-        key = (
-            num_sweeps, num_sweeps_per_beta,
-            beta_schedule_type, beta_range,
-        )
-        if (self._cached_beta_key == key
-                and beta_schedule is None):
-            return (
-                self._cached_beta_sched,
-                self._cached_beta_range,
-            )
-
-        sched, br = compute_beta_schedule(
-            h, J, num_sweeps, num_sweeps_per_beta,
-            beta_range, beta_schedule_type, beta_schedule,
-        )
-        if beta_schedule is None:
-            self._cached_beta_key = key
-            self._cached_beta_sched = sched
-            self._cached_beta_range = br
-        return sched, br
-
-    def preload(
-        self,
-        h: Dict[int, float],
-        J: Dict[Tuple[int, int], float],
-        num_reads: int,
-        num_sweeps: int,
-        num_sweeps_per_beta: int = 1,
-        beta_range: Optional[Tuple[float, float]] = None,
-        beta_schedule_type: str = "geometric",
-        beta_schedule: Optional[np.ndarray] = None,
-        seed: Optional[int] = None,
-    ) -> None:
-        """Preload next job's data asynchronously."""
-        assert self._prepared, "Must call prepare() first"
-        next_idx = 1 - self._buf_idx
-        num_reads = min(num_reads, self._prep_num_reads)
-
-        # Vectorized staging fill
-        j_vals = np.fromiter(
-            J.values(), dtype=np.int8, count=len(J),
-        )
-        self._h_J_vals[:] = 0
-        self._h_J_vals[self._pos_ij] = j_vals
-        self._h_J_vals[self._pos_ji] = j_vals
-
-        h_vals = np.fromiter(
-            h.values(), dtype=np.int8, count=len(h),
-        )
-        self._h_h_vals[:] = 0
-        self._h_h_vals[self._h_idx] = h_vals
-
-        sched, beta_range = self._get_cached_beta_schedule(
-            h, J, num_sweeps, num_sweeps_per_beta,
-            beta_range, beta_schedule_type, beta_schedule,
-        )
-        num_betas = len(sched)
-
-        if seed is None:
-            seed = np.random.randint(0, 2**31)
-
-        # Async H2D on transfer stream
-        with self._stream_transfer:
-            self._d_J_vals[next_idx].set(self._h_J_vals)
-            self._d_h_vals[next_idx].set(self._h_h_vals)
-            self._d_beta_sched[next_idx][
-                :num_betas
-            ].set(sched)
-        self._event_transfer_done.record(
-            self._stream_transfer,
-        )
-
-        self._preloaded = True
-        self._preload_meta = (
-            num_reads, num_betas, num_sweeps_per_beta,
-            seed, beta_range, beta_schedule_type,
-        )
-
-    # -- Gibbs-specific streaming API --
-
-    def sample_ising_streaming(
-        self,
-        models: Iterable[IsingModel],
-        *,
-        num_reads: int = 200,
-        num_sweeps: int = 1000,
-        num_sweeps_per_beta: int = 1,
-        beta_range: Optional[Tuple[float, float]] = None,
-        beta_schedule_type: str = "geometric",
-        seed: Optional[int] = None,
-        num_kernels: Optional[int] = None,
-        poll_timeout: Optional[float] = None,
-        scheduler: Any = None,
-    ) -> Iterator[Tuple[IsingModel, dimod.SampleSet]]:
-        """Stream Ising model solutions via Gibbs kernel.
-
-        Gibbs-specific prepare logic (max_nonces,
-        sms_per_nonce) + base rotation loop.
-
-        Args:
-            models: Iterable of IsingModel.
-            num_reads: Samples per model.
-            num_sweeps: Total sweeps per model.
-            num_sweeps_per_beta: Sweeps per beta value.
-            beta_range: (hot, cold) or None for auto.
-            beta_schedule_type: Schedule type.
-            seed: RNG seed.
-            num_kernels: Concurrent nonces (default: auto).
-            poll_timeout: Seconds before TimeoutError.
-
-        Yields:
-            (model, SampleSet) in completion order.
-        """
-        num_k = num_kernels or max(
-            1,
-            self.max_sms // self._sms_per_nonce,
-        )
-
-        if not self._prepared:
-            self.prepare(
-                num_reads=num_reads,
-                num_sweeps=num_sweeps,
-                num_sweeps_per_beta=num_sweeps_per_beta,
-                max_nonces=num_k,
-            )
-
-        if not self._sf_prepared:
-            self.prepare_self_feeding(
-                num_nonces=num_k,
-                reads_per_nonce=num_reads,
-                num_sweeps=num_sweeps,
-                num_sweeps_per_beta=num_sweeps_per_beta,
-                sms_per_nonce=self._sf_sms_per_nonce_val,
-            )
-
-        # Peek first model for beta schedule
-        model_iter = iter(models)
-        try:
-            first = next(model_iter)
-        except StopIteration:
-            return
-
-        num_betas, _ = self.upload_beta_schedule(
-            first.h, first.J, num_sweeps,
-            num_sweeps_per_beta, beta_range,
-            beta_schedule_type,
-        )
-
-        # Throttle before pulling each result (yielding mode): the unified
-        # driver path bypasses the old _sample_batch back-off, so honor it here.
-        yield from throttled_stream(
-            self._run_streaming_loop(
-                chain([first], model_iter),
-                num_k=num_k,
-                num_betas=num_betas,
-                seed=seed,
-                poll_timeout=poll_timeout,
-            ),
-            scheduler,
-        )
-
-    # -- sample_ising --
-
-    def sample_ising(
-        self,
-        h: List[Dict[int, float]],
-        J: List[Dict[Tuple[int, int], float]],
-        num_reads: int = 200,
-        num_sweeps: int = 1000,
-        num_sweeps_per_beta: int = 1,
-        beta_range: Optional[Tuple[float, float]] = None,
-        beta_schedule_type: str = "geometric",
-        beta_schedule: Optional[np.ndarray] = None,
-        seed: Optional[int] = None,
-        **kwargs,
-    ) -> List[dimod.SampleSet]:
-        """Sample from Ising model using self-feeding kernel.
-
-        Args:
-            h: List of linear biases per problem.
-            J: List of quadratic biases per problem.
-            num_reads: Number of independent samples per
-                problem.
-            num_sweeps: Total number of sweeps.
-            num_sweeps_per_beta: Sweeps per beta value.
-            beta_range: (hot_beta, cold_beta) or None for
-                auto.
-            beta_schedule_type: Schedule type.
-            beta_schedule: Custom schedule.
-            seed: RNG seed.
-
-        Returns:
-            List of dimod.SampleSet, one per problem.
-        """
-        num_problems = len(h)
-        assert len(J) == num_problems, (
-            f"h and J must have same length: "
-            f"{num_problems} vs {len(J)}"
-        )
-
-        # Prepare topology structures if needed
-        if not self._prepared:
-            self.prepare(
-                num_reads=num_reads,
-                num_sweeps=num_sweeps,
-                num_sweeps_per_beta=num_sweeps_per_beta,
-                max_nonces=num_problems,
-            )
-
-        # Prepare self-feeding buffers if needed
-        if not self._sf_prepared:
-            sms_per_nonce = max(1, 4)
-            self.prepare_self_feeding(
-                num_nonces=num_problems,
-                reads_per_nonce=num_reads,
-                num_sweeps=num_sweeps,
-                num_sweeps_per_beta=num_sweeps_per_beta,
-                sms_per_nonce=sms_per_nonce,
-            )
-
-        # Reset ctrl array (clears stale EXIT_NOW from
-        # previous sample_ising call)
-        self._d_sf_ctrl[:] = 0
-
-        # Upload beta schedule
-        num_betas, beta_range = self.upload_beta_schedule(
-            h[0], J[0], num_sweeps,
-            num_sweeps_per_beta, beta_range,
-            beta_schedule_type,
-        )
-
-        # Upload one model per nonce to slot 0
-        for i in range(num_problems):
-            self.upload_slot(i, 0, h[i], J[i])
-
-        # Launch kernel
-        self._sf_kernel_running = False  # allow re-launch
-        self.launch_self_feeding(
-            num_betas=num_betas,
-            seed=seed,
-            active_nonce_count=num_problems,
-        )
-
-        # Poll until all nonces complete
-        completed = set()
-        while len(completed) < num_problems:
-            for nonce_id, slot_id in self.poll_completions():
-                if nonce_id not in completed:
-                    completed.add(nonce_id)
-            if len(completed) < num_problems:
-                time.sleep(0.001)
-
-        # Download results
-        results = []
-        for i in range(num_problems):
-            ss = self.download_slot(i, 0)
-            results.append(ss)
-
-        # Signal exit and wait
-        self.signal_exit()
-
-        return results
+    def _self_feeding_kwargs(self) -> dict:
+        """Pass sms_per_nonce into prepare_self_feeding()."""
+        return {"sms_per_nonce": self._sf_sms_per_nonce_val}

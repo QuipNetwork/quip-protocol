@@ -26,19 +26,30 @@ helper, still used by the legacy tests).
 """
 from __future__ import annotations
 
-import bisect
 import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
+from shared.allowed_value_spec import (
+    MILLI_SCALE,
+    AllowedValueContinuousRange,
+    AllowedValueIntegerRange,
+    AllowedValueSet,
+    AllowedValueSpec,
+    EmptyAllowedValues,
+)
+from shared.decay_math import step_for_energy
 from substrate.types import SubstrateDifficulty
 
 
 # Mirrors `pallets/quantum-pow/src/difficulty.rs`.
 DECAY_RATE_MILLI: int = 25
-MIN_DECAY_DELTA_MILLI: int = 3
-MIN_HARDENING_DELTA_MILLI: int = 5
+# Unified floor (runtime 110 `MIN_ENERGY_DELTA_MILLI`): one energy unit in milli.
+# The geometric step `room * rate` rounds toward zero near a bound; the floor
+# guarantees forward progress (and, for hardening past the hard cap, carries the
+# threshold one step further down).
+MIN_ENERGY_DELTA_MILLI: int = 1000
 
 # i64 saturation bounds. Used so ``saturating_add``/``saturating_sub``
 # match the Rust exactly; in practice ``max_energy_milli`` lives in the
@@ -79,18 +90,31 @@ class EnergyCurve:
         c_easy_milli: int,
         c_knee_milli: int,
         c_hard_milli: int,
+        *,
+        allowed_h: Optional[AllowedValueSpec] = None,
+        allowed_j: Optional[AllowedValueSpec] = None,
     ) -> "EnergyCurve":
         """Build a curve matching ``EnergyCurve::new`` in the Rust.
 
         c values are stored on chain as scaled u32 (e.g. 700 = 0.70)
         because pallet constants must implement ``Get<_>`` and ``f64``
         does not implement ``Encode``. They divide by 1000 here before
-        feeding into ``expected_gse_with_c``.
+        feeding into ``expected_gse_for_specs``.
+
+        ``allowed_h`` / ``allowed_j`` are the default topology's field and
+        coupling value specs. The chain derives the curve's mean magnitudes
+        from them (``expected_gse_for_specs``), so a zero-field topology
+        (``allowed_h = Set([0])``) gets a curve with no h contribution. When
+        omitted they default to the legacy ternary-h / binary-J specs, which
+        reproduce the pre-spec-aware ``expected_gse_with_c`` bit-for-bit — so
+        callers against the legacy default topology need no change.
         """
+        h = allowed_h if allowed_h is not None else _LEGACY_H_SPEC
+        j = allowed_j if allowed_j is not None else _LEGACY_J_SPEC
         return cls(
-            min_milli=_expected_gse_with_c(num_nodes, num_edges, c_hard_milli / 1000.0),
-            knee_milli=_expected_gse_with_c(num_nodes, num_edges, c_knee_milli / 1000.0),
-            max_milli=_expected_gse_with_c(num_nodes, num_edges, c_easy_milli / 1000.0),
+            min_milli=_expected_gse_for_specs(num_nodes, num_edges, c_hard_milli / 1000.0, h, j),
+            knee_milli=_expected_gse_for_specs(num_nodes, num_edges, c_knee_milli / 1000.0, h, j),
+            max_milli=_expected_gse_for_specs(num_nodes, num_edges, c_easy_milli / 1000.0, h, j),
         )
 
 
@@ -101,56 +125,46 @@ def adjust_energy_along_curve(
     curve: EnergyCurve,
     min_delta_milli: int,
 ) -> int:
-    """Move ``current_milli`` along the curve by ``rate_milli`` per-mille.
+    """Move ``current_milli`` toward the bound implied by ``direction`` by a
+    geometric fraction of the distance *remaining* to that bound.
 
-    Mirrors ``adjust_energy_along_curve`` in
-    ``pallets/quantum-pow/src/difficulty.rs`` (Phase 1 port for the
-    Python miner). Behaviour at boundaries / degenerate inputs / the
-    ``min_delta_milli`` floor matches the Rust to the milli.
+    Mirrors the runtime-110 ``adjust_energy_along_curve`` in
+    ``pallets/quantum-pow/src/difficulty.rs`` to the milli. The step is
+    ``round(room * rate)`` floored at ``min_delta_milli``, where ``room`` is the
+    gap to the target bound. Because ``rate < 1`` the threshold *walks* toward
+    the bound a fraction of the remaining gap at a time — a single fast win can
+    no longer slam across the whole range and pin the cap.
 
-    A degenerate curve (``total_range <= 0``) leaves ``current`` alone.
-    A current value outside ``[min, max]`` falls back to linear motion
-    (``total_range * rate``). Otherwise the curve compresses motion
-    near the boundaries and peaks at the knee, per the same sqrt
-    schedule.
+    The two directions are deliberately asymmetric (the curve bounds are GSE
+    *estimates*, not hard limits):
+
+    - ``HARDER`` references ``min_milli`` but is **uncapped**: once at/past it
+      (``room <= 0``) the geometric term vanishes and the floor carries the
+      threshold one further step down, so it keeps tracking a
+      stronger-than-calibrated field.
+    - ``EASIER`` references ``max_milli`` and is **capped** there: the step is
+      clamped to the remaining gap and is a no-op once at/past the easy cap.
+
+    A degenerate curve (``max_milli <= min_milli``) leaves ``current`` alone.
     """
-    min_f = float(curve.min_milli)
-    max_f = float(curve.max_milli)
-    knee_f = float(curve.knee_milli)
-    cur_f = float(current_milli)
-    total_range = max_f - min_f
+    if curve.max_milli <= curve.min_milli:
+        return current_milli
     rate = float(rate_milli) / 1000.0
 
-    if total_range <= 0.0:
-        return current_milli
-
-    if cur_f < min_f or cur_f > max_f:
-        raw_delta_f = total_range * rate
-    else:
-        normalized = (cur_f - min_f) / total_range
-        knee_pos = (knee_f - min_f) / total_range
-        if knee_pos <= 0.0 or knee_pos >= 1.0:
-            curve_factor = 1.0
-        elif normalized <= knee_pos:
-            curve_factor = 0.1 + 0.9 * math.sqrt(normalized / knee_pos)
-        else:
-            curve_factor = 1.0 - 0.9 * math.sqrt(
-                (normalized - knee_pos) / (1.0 - knee_pos)
-            )
-        raw_delta_f = total_range * rate * curve_factor
-
-    delta = _libm_round(raw_delta_f)
-    # Floor on the raw float, not the rounded int — see Rust comment:
-    # a raw_delta_f in (0, 0.5) rounds to 0, which would skip the floor
-    # and stall difficulty progress.
-    if raw_delta_f > 0.0 and delta < min_delta_milli:
-        delta = min_delta_milli
-    if delta == 0:
-        return current_milli
+    def geometric_floored(room: int) -> int:
+        # round(room * rate) saturated to i64, then floored at min_delta_milli.
+        return max(_to_i64(_libm_round(room * rate)), min_delta_milli)
 
     if direction is Direction.HARDER:
-        return _saturating_sub(current_milli, delta)
-    return _saturating_add(current_milli, delta)
+        # Uncapped: room may be <= 0 below the hard estimate, where the floor
+        # alone advances the threshold one step further down.
+        room = _saturating_sub(current_milli, curve.min_milli)
+        return _saturating_sub(current_milli, geometric_floored(room))
+    # EASIER: capped at the easy cap — never ease past max_milli.
+    room = _saturating_sub(curve.max_milli, current_milli)
+    if room <= 0:
+        return current_milli
+    return _saturating_add(current_milli, min(geometric_floored(room), room))
 
 
 def apply_decay(
@@ -172,7 +186,7 @@ def apply_decay(
             DECAY_RATE_MILLI,
             Direction.EASIER,
             curve,
-            MIN_DECAY_DELTA_MILLI,
+            MIN_ENERGY_DELTA_MILLI,
         )
     return SubstrateDifficulty(
         min_solutions=current.min_solutions,
@@ -204,9 +218,7 @@ def current_difficulty(
         return base_difficulty
     elapsed = max(0, block_number - last_proof_block)
     steps = elapsed // epoch_length
-    if steps == 0:
-        return base_difficulty
-    if curve is None:
+    if curve is None or steps == 0:
         return base_difficulty
     return apply_decay(base_difficulty, steps, curve)
 
@@ -229,24 +241,15 @@ def build_decay_schedule(
     cur = base_max_energy_milli
     for _ in range(horizon):
         cur = adjust_energy_along_curve(
-            cur, DECAY_RATE_MILLI, Direction.EASIER, curve, MIN_DECAY_DELTA_MILLI,
+            cur, DECAY_RATE_MILLI, Direction.EASIER, curve, MIN_ENERGY_DELTA_MILLI,
         )
         sched.append(cur)
     return sched
 
 
-def step_for_energy(
-    decay_schedule: list[int], floor_energy_milli: int
-) -> Optional[int]:
-    """First decay step ``s`` where ``schedule[s] > floor_energy_milli``.
-
-    Mirrors the chain's strict ``best_energy_milli < max_energy_milli`` gate:
-    the candidate clears at the first step whose threshold is *strictly* above
-    its floor. ``None`` when it never clears within the schedule's horizon.
-    The schedule is monotonic non-decreasing, so this is a binary search.
-    """
-    i = bisect.bisect_right(decay_schedule, floor_energy_milli)
-    return i if i < len(decay_schedule) else None
+# ``step_for_energy`` is re-exported from ``shared.decay_math`` (imported above):
+# it is pure decay-step math with no substrate dependency, so it lives in the
+# foundation layer and chain-side callers keep importing it from here.
 
 
 # ----------------------------------------------------------------------
@@ -280,32 +283,114 @@ def _saturating_sub(a: int, b: int) -> int:
     return _saturating_add(a, -b)
 
 
-def _expected_gse_with_c(num_nodes: int, num_edges: int, c: float) -> int:
-    """Port of ``quantum_validation::expected_gse_with_c``.
+def _to_i64(x: int) -> int:
+    """Saturating cast to i64, matching Rust's ``f64 as i64`` clamp.
+
+    The geometric step rounds a float then casts; for realistic curves the
+    value is tiny, but the genesis ``i64::MAX`` sentinel and extreme curves
+    must clamp rather than overflow.
+    """
+    if x > _I64_MAX:
+        return _I64_MAX
+    if x < _I64_MIN:
+        return _I64_MIN
+    return x
+
+
+# Empirical SA alignment-efficiency factor for the field term, calibrated
+# against the v0.1 Python reference. Applies only to the h contribution.
+# Mirrors ``quantum_validation::energy::DEFAULT_H_ALPHA``.
+_DEFAULT_H_ALPHA: float = 0.88
+
+# Legacy registered specs: ternary field {-1, 0, +1} (⟨|h|⟩ = 2/3) and binary
+# coupling {-1, +1} (⟨|J|⟩ = 1.0), expressed in milli units. Used as the
+# default so ``expected_gse_for_specs`` over them reproduces the old hardcoded
+# ``expected_gse_with_c`` exactly.
+_LEGACY_H_SPEC: AllowedValueSpec = AllowedValueSet((-MILLI_SCALE, 0, MILLI_SCALE))
+_LEGACY_J_SPEC: AllowedValueSpec = AllowedValueSet((-MILLI_SCALE, MILLI_SCALE))
+
+
+def _discrete_mean_abs(min_v: int, max_v: int) -> float:
+    """Mean of |i| over the uniform integer distribution on ``[min, max]``.
+
+    Mirrors ``quantum_validation::energy::discrete_mean_abs``. Python ints are
+    arbitrary precision, so the straddle-zero triangular sum is always exact.
+    """
+    if max_v < min_v:
+        raise EmptyAllowedValues("allowed value spec is empty or inverted")
+    if min_v >= 0:
+        return (min_v + max_v) / 2.0
+    if max_v <= 0:
+        return -(min_v + max_v) / 2.0
+    # Straddles zero: Σ|i| = T(-min) + T(max) with T(k) = k(k+1)/2.
+    triangle = lambda k: k * (k + 1) // 2  # noqa: E731
+    sum_abs = triangle(-min_v) + triangle(max_v)
+    span = max_v - min_v + 1
+    return sum_abs / span
+
+
+def _mean_abs_unit(spec: AllowedValueSpec) -> float:
+    """Mean |value| of a spec on the unit scale (1.0 == ``MILLI_SCALE`` milli),
+    under the spec's own uniform sampling distribution.
+
+    Mirrors ``quantum_validation::energy::mean_abs_unit``.
+    """
+    if isinstance(spec, AllowedValueSet):
+        if not spec.values:
+            raise EmptyAllowedValues("allowed value spec is empty")
+        sum_abs_milli = sum(abs(int(v)) for v in spec.values)
+        return sum_abs_milli / (len(spec.values) * MILLI_SCALE)
+    if isinstance(spec, AllowedValueIntegerRange):
+        # IntegerRange samples whole integers scaled by MILLI_SCALE, so the
+        # integers themselves are already unit scale.
+        return _discrete_mean_abs(spec.min, spec.max)
+    if isinstance(spec, AllowedValueContinuousRange):
+        # ContinuousRange samples integer milli steps, so the discrete mean
+        # over milli values divided by MILLI_SCALE is exact.
+        return _discrete_mean_abs(spec.min, spec.max) / MILLI_SCALE
+    raise TypeError(f"unknown AllowedValueSpec variant: {type(spec).__name__}")
+
+
+def _expected_gse_for_specs(
+    num_nodes: int,
+    num_edges: int,
+    c: float,
+    allowed_h: AllowedValueSpec,
+    allowed_j: AllowedValueSpec,
+) -> int:
+    """Port of ``quantum_validation::expected_gse_for_specs``.
 
     Constants and formula must match ``crates/quantum-validation/src/
-    energy.rs`` exactly — the chain registers topologies with curve
-    bounds it computes via this function, so any Python drift would
+    energy.rs`` exactly — the chain calibrates the difficulty curve via this
+    function on the default topology's value specs, so any Python drift would
     yield a different ``EnergyCurve`` and a different decay trajectory.
     """
     if num_nodes == 0 or num_edges == 0:
         return 0
-    DEFAULT_H_NONZERO_FRACTION = 2.0 / 3.0
-    DEFAULT_H_ALPHA = 0.88
-    MILLI_SCALE = 1_000
+    h_mean_abs = _mean_abs_unit(allowed_h)
+    j_mean_abs = _mean_abs_unit(allowed_j)
     n = float(num_nodes)
     m = float(num_edges)
     avg_degree = (2.0 * m) / n
     sqrt_avg_degree = math.sqrt(avg_degree)
-    j_contribution = -c * sqrt_avg_degree * n
-    h_contribution = -c * DEFAULT_H_ALPHA * DEFAULT_H_NONZERO_FRACTION * n / sqrt_avg_degree
+    j_contribution = -c * j_mean_abs * sqrt_avg_degree * n
+    h_contribution = -c * _DEFAULT_H_ALPHA * h_mean_abs * n / sqrt_avg_degree
     return _libm_round((j_contribution + h_contribution) * MILLI_SCALE)
+
+
+def _expected_gse_with_c(num_nodes: int, num_edges: int, c: float) -> int:
+    """Port of ``quantum_validation::expected_gse_with_c``.
+
+    The legacy curve hardcodes ternary-h / binary-J magnitudes; this delegates
+    to :func:`_expected_gse_for_specs` over the legacy specs so the two paths
+    stay bit-identical (the Rust ships the same equivalence test).
+    """
+    return _expected_gse_for_specs(num_nodes, num_edges, c, _LEGACY_H_SPEC, _LEGACY_J_SPEC)
 
 
 __all__ = [
     "DECAY_RATE_MILLI",
-    "MIN_DECAY_DELTA_MILLI",
-    "MIN_HARDENING_DELTA_MILLI",
+    "MIN_ENERGY_DELTA_MILLI",
     "Direction",
     "EnergyCurve",
     "adjust_energy_along_curve",

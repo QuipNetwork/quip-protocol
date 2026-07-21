@@ -22,24 +22,32 @@ IMPORTANT: Embedded mode shows significant energy degradation (~16%) due to chai
 in classical SA. This is a TESTING ARTIFACT - QPU quantum annealing maintains chain integrity
 much better. Use embedded mode to verify embedding structure, NOT to predict QPU performance.
 """
-import argparse
+import json
+import os
+import random
 import sys
 import time
-import json
 from pathlib import Path
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
+import dimod
+from dwave.embedding import embed_ising, unembed_sampleset
+
 from CPU.sa_sampler import SimulatedAnnealingStructuredSampler
-from shared.quantum_proof_of_work import generate_ising_model_from_nonce, evaluate_sampleset
-from shared.block_requirements import BlockRequirements
+from shared.quantum_proof_of_work import generate_ising_model_from_nonce
 from dwave_topologies import DEFAULT_TOPOLOGY
 from dwave_topologies.topologies.json_loader import load_topology
-from dwave_topologies.embedded_topology import create_embedded_topology
 from dwave_topologies.embedding_loader import load_embedding
-import random
-import dimod
+from tools.baseline_utils import (
+    build_baseline_argparser,
+    classify_energy,
+    evaluate_baseline_sampleset,
+    filter_configs_by_label,
+    print_problem_summary,
+    print_results_summary,
+)
 
 
 def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, only_label=None, topology=None):
@@ -66,7 +74,6 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
     print(f"🎲 h_values: {h_values}")
 
     # Load topology and embedding if specified
-    import os
     embedding_data = None
     embedding_dict = None
     source_topology = None
@@ -168,7 +175,6 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
     if topology and use_embedding:
         print(f"🔗 Embedding logical problem onto hardware...")
         # Embed h and J from logical to hardware
-        from dwave.embedding import embed_ising
         # Convert edge list to adjacency dict for embed_ising
         target_adj = {u: set() for u in nodes}
         for u, v in edges:
@@ -181,12 +187,8 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
         J = logical_J
 
     # Show h distribution
-    h_vals_set = sorted(set(h.values()))
-    h_counts = {v: list(h.values()).count(v) for v in h_vals_set}
-    h_dist_str = ", ".join([f"{v}: {h_counts[v]} ({100*h_counts[v]/len(h):.1f}%)" for v in h_vals_set])
-    print(f"📊 Problem: {len(h)} variables, {len(J)} couplings")
-    print(f"   h distribution: {h_dist_str}")
-    
+    print_problem_summary(h, J)
+
     # Test configurations - from light to heavy
     test_configs = [
         (256, 64, "Light CPU"),
@@ -198,14 +200,10 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
     ]
 
     # Optional filter: run only the requested label
-    if only_label:
-        available_labels = [desc for _, _, desc in test_configs]
-        filtered = [cfg for cfg in test_configs if cfg[2].lower() == only_label.lower()]
-        if not filtered:
-            print(f"⚠️ No test config matched --only {only_label!r}; available: {available_labels}")
-            return None
-        test_configs = filtered
-    
+    test_configs = filter_configs_by_label(test_configs, only_label)
+    if test_configs is None:
+        return None
+
     print(f"\n🧪 Testing CPU configurations:")
 
     results = {
@@ -245,7 +243,6 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
 
             # Embed if needed
             if topology and use_embedding:
-                from dwave.embedding import embed_ising, unembed_sampleset
                 h_test, J_test = embed_ising(logical_h_test, logical_J_test, embedding_dict, target_adj)
             else:
                 h_test, J_test = logical_h_test, logical_J_test
@@ -259,7 +256,6 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
 
             # Unembed if needed
             if topology and use_embedding:
-                from dwave.embedding import unembed_sampleset
                 sampleset = unembed_sampleset(sampleset, embedding_dict, source_bqm=dimod.BinaryQuadraticModel.from_ising(logical_h_test, logical_J_test))
 
             runtime = time.time() - start_time
@@ -273,64 +269,17 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
             print(f"  🎯 min_energy = {min_energy:.1f}")
             print(f"  📊 avg_energy = {avg_energy:.1f} (±{std_energy:.1f})")
 
-            # Use evaluate_sampleset to get diversity and num_solutions
-            # Create test requirements (using dummy values to ensure they pass)
-            requirements = BlockRequirements(
-                difficulty_energy=0.0,       # Very lenient difficulty (allow positive energies)
-                min_diversity=0.1,           # Low diversity requirement
-                min_solutions=1,             # Low solution count requirement
-                timeout_to_difficulty_adjustment_decay=600  # 10 minutes
-            )
-
-            # Use the same nonce and generate test salt for evaluation
-            salt = b"test_salt_cpu_baseline"
-            prev_timestamp = int(time.time()) - 600  # 10 minutes ago
-
-            # Evaluate the sampleset (always use logical topology for validation)
+            # Evaluate sampleset (always use logical topology for validation)
             eval_nodes = logical_nodes if topology else nodes
             eval_edges = logical_edges if topology else edges
-            mining_result = evaluate_sampleset(
-                sampleset, requirements, eval_nodes, eval_edges, nonce, salt,
-                prev_timestamp, start_time, f"cpu-baseline-{sweeps}-{reads}", "CPU"
+            eval_fields = evaluate_baseline_sampleset(
+                sampleset, eval_nodes, eval_edges, nonce,
+                start_time, f"cpu-baseline-{sweeps}-{reads}", "CPU",
+                b"test_salt_cpu_baseline",
             )
 
-            diversity = 0.0
-            num_solutions = 0
-            meets_requirements = False
-
-            # Calculate diversity of top 10 solutions by energy
-            from shared.quantum_proof_of_work import calculate_diversity
-            solutions = list(sampleset.record.sample)
-            energies = list(sampleset.record.energy)
-
-            # Sort solutions by energy and take top 10
-            solution_energy_pairs = list(zip(solutions, energies))
-            solution_energy_pairs.sort(key=lambda x: x[1])  # Sort by energy (ascending = better)
-            top_10_solutions = [sol for sol, _ in solution_energy_pairs[:10]]
-
-            top_10_diversity = calculate_diversity(top_10_solutions)
-            print(f"  🌈 diversity (top 10) = {top_10_diversity:.3f}")
-
-            if mining_result:
-                diversity = mining_result.diversity
-                num_solutions = mining_result.num_valid
-                meets_requirements = True
-                print(f"  🔢 num_solutions = {num_solutions}")
-                print(f"  ✅ Meets mining requirements!")
-            else:
-                print(f"  ❌ Does not meet mining requirements")
-
             # Energy target analysis
-            target_reached = "none"
-            if min_energy <= -15650:
-                target_reached = "excellent"
-            elif min_energy <= -15500:
-                target_reached = "very_good"
-            elif min_energy <= -15400:
-                target_reached = "good"
-            elif min_energy <= -15300:
-                target_reached = "fair"
-
+            target_reached = classify_energy(min_energy)
             if target_reached != "none":
                 print(f"  🎖️  Quality: {target_reached}")
 
@@ -344,10 +293,7 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
                 'avg_energy': avg_energy,
                 'std_energy': std_energy,
                 'target_reached': target_reached,
-                'diversity': float(diversity),
-                'diversity_top_10': float(top_10_diversity),
-                'num_solutions': int(num_solutions),
-                'meets_requirements': bool(meets_requirements)
+                **eval_fields,
             }
             results['tests'].append(test_result)
             
@@ -362,21 +308,9 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
     
     # Summary
     total_runtime = time.time() - total_start_time
-    print(f"\n📊 CPU Baseline Summary (total time: {total_runtime/60:.1f} min):")
-    print("=" * 50)
-    
-    if results['tests']:
-        # Best energy achieved
-        best_result = min(results['tests'], key=lambda r: r['min_energy'])
-        print(f"🏆 Best energy: {best_result['min_energy']:.1f}")
-        print(f"   Required: {best_result['num_sweeps']} sweeps, {best_result['runtime_minutes']:.1f} min")
-        
-        # Time vs energy analysis
-        print(f"\n⏱️ Time vs Energy Performance:")
-        for result in results['tests']:
-            quality = f"({result['target_reached']})" if result['target_reached'] != 'none' else ""
-            print(f"  {result['runtime_minutes']:5.1f} min: {result['min_energy']:7.1f} energy {quality}")
-    
+    results['_total_runtime_seconds'] = total_runtime
+    print_results_summary(results, "CPU Baseline Summary")
+
     # Save results if requested
     if output_file:
         with open(output_file, 'w') as f:
@@ -388,45 +322,7 @@ def cpu_baseline_test(timeout_minutes=10.0, output_file=None, h_values=None, onl
 
 def main():
     """Main function with command line argument parsing."""
-    parser = argparse.ArgumentParser(description='CPU baseline parameter testing tool')
-    parser.add_argument(
-        '--timeout', '-t', 
-        type=float, 
-        default=10.0,
-        help='Timeout in minutes (default: 10.0)'
-    )
-    parser.add_argument(
-        '--output', '-o',
-        type=str,
-        help='Output JSON file for results'
-    )
-    parser.add_argument(
-        '--quick',
-        action='store_true',
-        help='Quick test mode (only Light test)'
-    )
-    parser.add_argument(
-        '--extended',
-        action='store_true',
-        help='Extended test mode (30 minute timeout)'
-    )
-    parser.add_argument(
-        '--only',
-        type=str,
-        help='Run only the config with this description (e.g., "Light CPU")'
-    )
-    parser.add_argument(
-        '--h-values',
-        type=str,
-        default='-1,0,1',
-        help='Comma-separated h field values (default: -1,0,1). Use "0" for h=0 baseline.'
-    )
-    parser.add_argument(
-        '--topology',
-        type=str,
-        help='Topology: Z(9,2), Advantage2_system1, file path, or *.embed.json.gz for embedded. '
-             'Default: Advantage2_system1'
-    )
+    parser = build_baseline_argparser('CPU baseline parameter testing tool')
 
     args = parser.parse_args()
 

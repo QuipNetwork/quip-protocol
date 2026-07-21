@@ -4,7 +4,7 @@ Contains core mining logic and defines abstract methods for miner-specific imple
 """
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import ABC
 from collections import OrderedDict
 import logging
 import math
@@ -12,6 +12,7 @@ import multiprocessing
 import multiprocessing.synchronize
 import pickle
 import queue
+import signal
 import sys
 import time
 import traceback
@@ -21,21 +22,21 @@ from typing import Dict, List, Optional, Tuple, Any
 import dimod
 import numpy as np
 
+from shared.allowed_value_spec import MILLI_SCALE
 from shared.energy_utils import (
     energy_to_difficulty as _energy_to_difficulty,
+    DEFAULT_H_VALUES,
     DEFAULT_NUM_NODES,
     DEFAULT_NUM_EDGES,
 )
-from shared.mempool_types import MempoolJobContext
-from shared.miner_types import BlockRequirements, IsingSample, MiningResult, Sampler
+from shared.miner_types import BlockRequirements, MiningResult, Sampler
 from shared.mining_attempt_log import AttemptLogger, SolutionStore
 from shared.quantum_proof_of_work import (
     compute_solution_meta,
     evaluate_sampleset,
     pack_spins_hex,
 )
-from substrate.difficulty_decay import step_for_energy
-from substrate.types import SubstrateMiningContext
+from shared.decay_math import step_for_energy
 from shared.work_context import (
     WorkContext,
     requirements_from_context,
@@ -154,6 +155,9 @@ class _DispatchSetup:
     # Round generation this dispatch accepts; descriptors tagged with any
     # other generation are stale and dropped by the consumer.
     generation: int = 0
+    # Anneal duration (µs) for QPU dispatches; ``None`` for sweep-based
+    # backends (SA/Metal). Drives the backend-aware progress log knob.
+    anneal_time: Optional[float] = None
 
 
 @dataclass
@@ -216,6 +220,12 @@ class _MiningLoopState:
     decay_schedule: Optional[List[int]] = None
     last_proof_block: int = 0
     epoch_length: int = 0
+    # Mempool only: the order's fixed (h, J) Ising model, resolved once at
+    # dispatch setup. Passed to ``evaluate_sampleset`` so the mempool path
+    # validates against the order's actual problem instead of regenerating a
+    # nonce-derived one (PoW leaves these None and regenerates per attempt).
+    ising_h: Optional[Dict[int, float]] = None
+    ising_j: Optional[Dict[Tuple[int, int], float]] = None
 
     @property
     def is_decay_ranked(self) -> bool:
@@ -306,17 +316,6 @@ class BaseMiner(ABC):
             'blocks_attempted': 0
         }
 
-        # Track timing history for graphing (block_number, timing_value)
-        self.timing_history = {
-            'block_numbers': [],
-            'preprocessing_times': [],
-            'sampling_times': [],
-            'postprocessing_times': [],
-            'total_times': [],
-            'win_rates': [],
-            'adaptive_params_history': []  # Track adaptive params over time
-        }
-
         # Track participation in current round
         self.current_round_attempted = False
 
@@ -338,17 +337,13 @@ class BaseMiner(ABC):
         }
 
         # Track top 3 mining results
-        self.top_attempts: List[IsingSample] = []
+        self.top_attempts: List = []
 
         # Worker-side feeder slot, always None: every backend mines through
         # the stream-driver process, which owns the feeder. Kept so subclass
         # SIGTERM handlers that guard on ``self._feeder`` have the attribute
         # before their own ``__init__`` runs.
         self._feeder: Optional[Any] = None
-
-        # Count of QPU results dropped under result-queue backpressure.
-        # Reset per dispatch by mine_work_item; logged at dispatch end.
-        self._dropped_results: int = 0
 
         # Persistent driver handles. ``_ensure_driver`` spawns ONE stream-driver
         # process and keeps it alive across dispatches; ``_close_driver`` (miner
@@ -359,15 +354,32 @@ class BaseMiner(ABC):
         self._ctl_q: Optional[Any] = None
         self._driver_stop: Optional[Any] = None
         self._driver_proc: Optional[Any] = None
+        # Submitter-split handles (QPU only, when ``USES_SUBMITTER_SPLIT``).
+        # The feeder driver (process A) reuses ``_driver_proc``; the isolated
+        # D-Wave submitter (process B) and the ProblemView ring carrying reduced
+        # problems A→B are tracked here. All ``None`` on the single-driver path.
+        self._submitter_proc: Optional[Any] = None
+        self._prob_ring: Optional[Any] = None
+        # Shared log queue forwarded to the spawned stream-driver process so its
+        # producer-side INFO diagnostics route to the central writer instead of
+        # being dropped. Set by miner_worker_main; None for standalone tooling.
+        self._log_queue: Optional[Any] = None
         # ProblemView written by _mempool_feeder_spec for the current mempool
         # order. The worker owns the shared memory; the driver reads it on the
         # switch. Replaced (and previous freed) on each mempool dispatch;
         # close-unlinked in _close_driver on shutdown.
         self._mempool_problem_view: Optional[Any] = None
-        # (max_rows, max_cols) the persistent ring was sized for; a dispatch
-        # whose dims differ forces a driver respawn (rare — num_reads and the
-        # topology are stable within a miner's life).
+        # (max_rows, max_cols) the persistent ring was sized for. This is
+        # CAPACITY, not the last dispatch's dims: a dispatch reuses the ring
+        # when its node count matches and its num_reads fits (_ring_can_host);
+        # only num_reads growth or a topology change forces a respawn.
         self._ring_dims: Optional[Tuple[int, int]] = None
+        # Crash-loop guard state: when the driver spawned (monotonic) and how
+        # many consecutive times it died within DRIVER_FAST_DEATH_S of its
+        # spawn. A persistent startup failure (e.g. the context factory
+        # raising every time) otherwise respawns in a tight loop forever.
+        self._driver_spawned_at: Optional[float] = None
+        self._driver_crash_streak: int = 0
         # Monotonic per-miner round generation. Bumped once per dispatch in
         # _setup_dispatch; tags every switch_round and every descriptor so a
         # superseded round's results are dropped. Process-local; never persisted.
@@ -391,81 +403,6 @@ class BaseMiner(ABC):
         # each work-tag still surfaces; repeats are suppressed until the
         # tag is evicted from the bounded cache.
         self._setup_abort_throttle = _SetupAbortThrottle()
-
-    def update_top_samples(self, sampleset: dimod.SampleSet, nonce: int, salt: bytes, requirements: BlockRequirements):
-        """Update the top 3 results list with a new mining result."""
-
-        # Add current result
-        attempt = IsingSample(nonce, salt, sampleset)
-        self.top_attempts.append(attempt)
-        self.top_attempts.sort(key=lambda r: compare_mining_samples(r, attempt, requirements))
-
-        # Keep only top 3
-        self.top_attempts = self.top_attempts[:3]
-
-    def capture_partial_timing(self):
-        """Capture timing for current mining attempt, including partial progress."""
-        current_time = time.time()
-
-        # Initialize with zeros
-        preprocessing_time = 0
-        sampling_time = 0
-        postprocessing_time = 0
-
-        # If we have completed preprocessing
-        if len(self.timing_stats['preprocessing']) > len(self.timing_stats['sampling']):
-            # Preprocessing was completed
-            preprocessing_time = self.timing_stats['preprocessing'][-1]
-
-            # Check if sampling was started
-            if self.current_stage == 'sampling' and self.current_stage_start:
-                # Sampling was in progress
-                sampling_time = (current_time - self.current_stage_start) * 1e6
-                postprocessing_time = 0  # Not started
-            elif self.current_stage == 'postprocessing' and self.current_stage_start:
-                # Sampling was completed, postprocessing in progress
-                if self.timing_stats['sampling']:
-                    sampling_time = self.timing_stats['sampling'][-1]
-                postprocessing_time = (current_time - self.current_stage_start) * 1e6
-        elif self.current_stage == 'preprocessing' and self.current_stage_start:
-            # Still in preprocessing
-            preprocessing_time = (current_time - self.current_stage_start) * 1e6
-            sampling_time = 0
-            postprocessing_time = 0
-
-        return preprocessing_time, sampling_time, postprocessing_time
-
-    def get_timing_summary(self) -> str:
-        """Generate a summary of timing statistics for this miner."""
-        summary_lines = [f"\nTiming Statistics for {self.miner_id}:"]
-
-        if self.timing_stats['blocks_attempted'] > 0:
-            summary_lines.append(f"  Blocks Attempted: {self.timing_stats['blocks_attempted']}")
-            summary_lines.append(f"  Total Samples: {self.timing_stats['total_samples']}")
-            summary_lines.append(f"  Blocks Won: {self.blocks_won}")
-            summary_lines.append(f"  Win Rate: {self.blocks_won / self.timing_stats['blocks_attempted'] * 100:.1f}%")
-
-        # Calculate averages for each timing component
-        for component in ['preprocessing', 'sampling', 'postprocessing']:
-            if self.timing_stats[component]:
-                avg_time = np.mean(self.timing_stats[component])
-                std_time = np.std(self.timing_stats[component])
-                summary_lines.append(f"  {component.capitalize()} Time: {avg_time:.2f} ± {std_time:.2f} μs")
-
-        # QPU-specific timing
-        if self.timing_stats['quantum_annealing_time']:
-            avg_anneal = np.mean(self.timing_stats['quantum_annealing_time'])
-            summary_lines.append(f"  Quantum Annealing Time: {avg_anneal:.2f} μs")
-
-        # Show adaptive parameters
-        if self.miner_type == "QPU":
-            summary_lines.append(f"  Current Annealing Time: {self.adaptive_params['quantum_annealing_time']:.2f} μs")
-        else:
-            summary_lines.append(f"  Current Num Sweeps: {self.adaptive_params['num_sweeps']}")
-            summary_lines.append(f"  Beta Range: {self.adaptive_params['beta_range']}")
-            summary_lines.append(f"  Beta Schedule: {self.adaptive_params['beta_schedule']}")
-
-        return "\n".join(summary_lines)
 
     # --- Feeder buffer size (override in subclasses) ---
     # ``BaseMiner.mine_work_item`` builds a feeder via
@@ -502,6 +439,23 @@ class BaseMiner(ABC):
     # pump drops the newest result (rare safety valve) and counts it.
     RESULT_QUEUE_MAXSIZE: int = 32
 
+    # A driver death within this many seconds of its spawn counts as a crash
+    # for the respawn-backoff guard (see _crash_backoff_delay); a driver that
+    # outlived the window died "healthy" and respawns immediately.
+    DRIVER_FAST_DEATH_S: float = 30.0
+
+    # --- Submitter split (QPU only) ---
+    # When True, ``_ensure_driver`` spawns TWO processes instead of one: a
+    # connection-less feeder driver (``shared.feeder_driver``) that reduces
+    # problems into a ProblemView ring, and an isolated submitter
+    # (``SAMPLER_FACTORY_DOTTED``) that owns the D-Wave connection and does
+    # ``sample_bqm`` off the contended GIL. CPU/GPU keep the single driver
+    # (their sampling is local — no slow SDK encode to isolate).
+    USES_SUBMITTER_SPLIT: bool = False
+    # Dotted factory the submitter process resolves to build ONLY the connected
+    # sampler (no feeder). Unused unless ``USES_SUBMITTER_SPLIT``.
+    SAMPLER_FACTORY_DOTTED: str = "QPU.dwave_miner:build_sampler"
+
     # --- Adaptive parameter bounds (override in subclasses) ---
     # SA/GPU miners use sweeps + reads; QPU miners use annealing_time + reads.
     ADAPT_MIN_SWEEPS: int = 64
@@ -528,22 +482,54 @@ class BaseMiner(ABC):
     # None = use DEFAULT_C_RANGE from energy_utils (SA baseline).
     ADAPT_C_RANGE: Optional[Tuple[float, float]] = None
 
+    @staticmethod
+    def _h_values_from_allowed(allowed_h) -> Tuple[float, ...]:
+        """Physical-unit h field values for the GSE difficulty band.
+
+        The achievable-energy band shifts with the field distribution (zeroing
+        the ternary ``h`` moves the ground state ~+3% shallower), so the
+        difficulty curve must key off the *problem's* ``allowed_h`` rather than
+        a hardcoded ternary default.
+
+        ``allowed_h`` may be:
+
+        - ``None`` — the chain's ternary default (``-1, 0, +1``),
+        - an :class:`~shared.allowed_value_spec.AllowedValueSet` carrying
+          milli-precision ints (as ``BlockRequirements.allowed_h_values`` does),
+        - or an explicit sequence of float field values.
+
+        Returns the float tuple :func:`expected_solution_energy` expects (it
+        keys off which values are zero, so the magnitudes only matter via their
+        nonzero fraction).
+        """
+        if allowed_h is None:
+            return DEFAULT_H_VALUES
+        milli_values = getattr(allowed_h, "values", None)
+        if milli_values is not None:
+            return tuple(v / MILLI_SCALE for v in milli_values)
+        return tuple(float(v) for v in allowed_h)
+
     @classmethod
     def energy_to_difficulty(
         cls,
         target_energy: float,
         num_nodes: int = DEFAULT_NUM_NODES,
         num_edges: int = DEFAULT_NUM_EDGES,
+        h_values: Optional[Tuple[float, ...]] = None,
     ) -> float:
         """Convert energy target to [0, 1] difficulty for this miner.
 
-        Uses the miner's ADAPT_C_RANGE if set, otherwise falls
-        back to the SA baseline. Override in subclasses for
-        fundamentally different difficulty mappings.
+        Uses the miner's ADAPT_C_RANGE if set, otherwise falls back to the SA
+        baseline. ``h_values`` selects the GSE energy band for the problem's
+        field distribution; ``None`` keeps the ternary default (so existing
+        callers are unchanged). Override in subclasses for fundamentally
+        different difficulty mappings.
         """
         kwargs = {}
         if cls.ADAPT_C_RANGE is not None:
             kwargs['c_range'] = cls.ADAPT_C_RANGE
+        if h_values is not None:
+            kwargs['h_values'] = h_values
         return _energy_to_difficulty(
             target_energy,
             num_nodes=num_nodes,
@@ -559,6 +545,7 @@ class BaseMiner(ABC):
         min_solutions: int,
         num_nodes: int = DEFAULT_NUM_NODES,
         num_edges: int = DEFAULT_NUM_EDGES,
+        allowed_h=None,
     ) -> dict:
         """Calculate adaptive mining parameters based on difficulty.
 
@@ -574,6 +561,11 @@ class BaseMiner(ABC):
             min_solutions: Minimum number of valid solutions required.
             num_nodes: Number of nodes in topology.
             num_edges: Number of edges in topology.
+            allowed_h: The problem's ``h`` field distribution (e.g.
+                ``requirements.allowed_h_values``). Selects the GSE difficulty
+                band so a given relative difficulty allocates the same effort
+                across field distributions; ``None`` keeps the ternary default,
+                leaving ternary callers unchanged.
 
         Returns:
             Dictionary with miner-specific parameter keys.
@@ -582,6 +574,7 @@ class BaseMiner(ABC):
             difficulty_energy,
             num_nodes=num_nodes,
             num_edges=num_edges,
+            h_values=cls._h_values_from_allowed(allowed_h),
         )
 
         # QPU path: annealing_time + bonus reads
@@ -646,6 +639,7 @@ class BaseMiner(ABC):
         preview_cb: Optional[Any] = None,
         budget_cb: Optional[Any] = None,
         participating_cb: Optional[Any] = None,
+        drops_cb: Optional[Any] = None,
         **kwargs,
     ) -> Optional[MiningResult]:
         """Protocol-neutral mining loop.
@@ -691,12 +685,18 @@ class BaseMiner(ABC):
                 ``QPUTimeManager.get_stats`` shape) so the controller can
                 surface live usage on telemetry. Default ``None`` = no-op. A
                 failing callback never breaks mining.
+            drops_cb: Optional callable invoked at the progress-log cadence
+                with ``{"ring_drops": int}`` so the controller can surface ring
+                drops on telemetry. Skipped entirely when the count is
+                unavailable (no driver, or the split QPU path), so a missing
+                signal is never reported as zero drops. Default ``None`` =
+                no-op. A failing callback never breaks mining.
             participating_cb: Optional callable invoked exactly once per
                 accepted dispatch (after ``_pre_mine_setup`` passes its gate,
                 so a budget-starved QPU dispatch that aborts never fires it).
                 Receives ``(solution_number, extra_dict)`` where ``extra_dict``
                 is ``self._participation_extra()`` (QPU adds ``budget_seconds``).
-                Drives the controller's write-once participation remark.
+                Drives the controller's write-once participation marker.
                 Default ``None`` = no-op; a failing callback never breaks mining.
             **kwargs: Forwarded to ``_pre_mine_setup``.
 
@@ -850,24 +850,46 @@ class BaseMiner(ABC):
 
                 progress += 1
                 if progress % PROGRESS_LOG_INTERVAL == 0:
-                    # `self.top_attempts` is intentionally not maintained in
-                    # substrate mode — no best-energy field to surface here.
+                    # Ring drops ride the general progress cadence, not the
+                    # QPU-only budget branch below: drops matter most on the
+                    # CPU/GPU path, which never reaches that branch.
+                    n_drops = self.ring_drops
+                    if drops_cb is not None and n_drops is not None:
+                        try:
+                            drops_cb({"ring_drops": n_drops})
+                        except Exception as exc:  # noqa: BLE001
+                            self.logger.debug(
+                                "drops_cb failed (ignored): %s", exc,
+                            )
                     budget = self._midstream_budget_ok(
                         loop_state.solution_number_for_log,
+                    )
+                    # Backend-aware knob: QPU dispatches anneal (no sweeps);
+                    # SA/Metal sweep. Showing sweeps=64 for QPU was a stale
+                    # default leaking from the SA-centric format.
+                    knob = self._progress_knob(
+                        setup.anneal_time, setup.num_sweeps,
+                    )
+                    # Current best stashed candidate + when it's submittable
+                    # (same selection as the "Best Solution" line). ``n/a`` until
+                    # the first stash (or on the mempool path).
+                    best_disp = self._best_candidate_summary(
+                        loop_state.top_k, loop_state.is_decay_ranked,
                     )
                     if budget is None:
                         self.logger.info(
                             "mine_work_item progress: %d attempts | "
-                            "sweeps=%d reads=%d",
-                            progress, setup.num_sweeps, setup.num_reads,
+                            "%s reads=%d | best: %s",
+                            progress, knob, setup.num_reads, best_disp,
                         )
                     else:
                         s = budget.stats
                         self.logger.info(
                             "mine_work_item progress: %d attempts | "
-                            "sweeps=%d reads=%d | qpu_pool=%.2fs/%.2fs cap "
+                            "%s reads=%d | best: %s | "
+                            "qpu_pool=%.2fs/%.2fs cap "
                             "(buffer %.0fs) burst=%s used=%.2fs skipped=%d",
-                            progress, setup.num_sweeps, setup.num_reads,
+                            progress, knob, setup.num_reads, best_disp,
                             s.get("pool_seconds", 0.0),
                             s.get("pool_cap_seconds", 0.0),
                             s.get("min_block_budget_seconds", 0.0),
@@ -893,6 +915,19 @@ class BaseMiner(ABC):
             return None
         finally:
             self._teardown_dispatch()
+
+    @staticmethod
+    def _progress_knob(anneal_time: Optional[float], num_sweeps: int) -> str:
+        """Format the backend-specific tuning knob for the progress log.
+
+        QPU dispatches carry an anneal duration and never sweep, so reporting
+        ``sweeps=N`` for them is misleading (it's a stale SA-centric default).
+        Returns ``anneal=<µs>us`` when an anneal time is set, else
+        ``sweeps=<n>`` for sweep-based backends (SA/Metal).
+        """
+        if anneal_time is not None:
+            return f"anneal={anneal_time:.0f}us"
+        return f"sweeps={num_sweeps}"
 
     @staticmethod
     def _init_attempt_log_kwargs(
@@ -1009,7 +1044,7 @@ class BaseMiner(ABC):
         # decay-aware "store best, submit when chain catches up" loop;
         # mempool jobs have hard quality floors that don't decay so
         # they keep the strict-energy behaviour.
-        is_substrate = isinstance(context, SubstrateMiningContext)
+        is_substrate = context.uses_decay_ratchet()
         live_threshold_var = getattr(self, '_live_max_energy_milli', None)
         # Seed the worker's live-threshold view with the snapshot value
         # in case the controller hasn't written one yet (e.g. tests, or
@@ -1056,6 +1091,16 @@ class BaseMiner(ABC):
         solution_number_for_log = int(solution_number) if solution_number is not None else 0
         dispatch_id_for_log = int(getattr(self, '_current_dispatch_id', 0))
 
+        # Mempool jobs carry a fixed (h, J) in the order; resolve it once here
+        # so the eval path validates against the order's actual problem instead
+        # of regenerating a nonce-derived Ising (the fixed-model context ignores
+        # the salt). PoW leaves these None and regenerates per attempt from the
+        # chain's allowed-value spec.
+        mempool_h: Optional[Dict[int, float]] = None
+        mempool_j: Optional[Dict[Tuple[int, int], float]] = None
+        if not is_substrate:
+            mempool_h, mempool_j, _ = context.resolve_ising(b"\x00" * 32, nodes, edges)
+
         loop_state = _MiningLoopState(
             requirements=requirements,
             nodes=nodes,
@@ -1073,6 +1118,8 @@ class BaseMiner(ABC):
             decay_schedule=getattr(context, "decay_schedule", None),
             last_proof_block=int(getattr(context, "last_proof_block", 0) or 0),
             epoch_length=int(getattr(context, "epoch_length", 0) or 0),
+            ising_h=mempool_h,
+            ising_j=mempool_j,
         )
 
         # The stream-driver process builds its own feeder (RandomIsingFeeder
@@ -1091,6 +1138,11 @@ class BaseMiner(ABC):
             "cur_index": bridge_prev_block.header.index,
             "nodes": nodes,
             "edges": edges,
+            # The chain topology's per-node field spec. Topology-bound like
+            # nodes/edges; the stream driver forwards it to the PoW feeder so
+            # the sampler optimizes the SAME h distribution the chain scores
+            # (None here would let the feeder silently fall back to ternary).
+            "allowed_h_values": getattr(requirements, "allowed_h_values", None),
             "num_reads": num_reads,
             "num_sweeps": current_num_sweeps,
             "extra": extra_params,
@@ -1103,9 +1155,8 @@ class BaseMiner(ABC):
             "feeder_buffer_size": self.FEEDER_BUFFER_SIZE,
         }
 
-        self._dropped_results = 0
         generation = 0
-        if self._ensure_driver(sample_ctx):
+        if self._ensure_driver(sample_ctx, stop_event=stop_event):
             # New round: bump the generation and tell the persistent driver to
             # switch (reseed feeder, cancel in-flight, set threshold). The
             # driver keeps its D-Wave connection — no reconnect, no respawn.
@@ -1153,6 +1204,7 @@ class BaseMiner(ABC):
             desc_q=self._desc_q,
             driver_proc=self._driver_proc,
             generation=generation,
+            anneal_time=sample_ctx["annealing_time"],
         )
 
     def _stream_factory_kwargs(
@@ -1167,15 +1219,51 @@ class BaseMiner(ABC):
             f"{type(self).__name__} does not override _stream_factory_kwargs"
         )
 
-    def _ensure_driver(self, sample_ctx: Dict[str, Any]) -> bool:
+    def _ring_can_host(self, dims: Tuple[int, int]) -> bool:
+        """True when the persistent ring can host a dispatch of ``dims``.
+
+        Reuse-when-compatible gate: the node count must equal the ring's
+        column capacity (the sample layout is topology-bound), while
+        ``num_reads`` only needs to FIT — descriptors carry the written row
+        count and the per-dispatch ``num_reads`` rides the ``('switch', ...)``
+        command, so a smaller round reuses a larger ring (pow<->mempool flips
+        stop paying a full respawn each direction).
+
+        Caveat: on ``USES_SUBMITTER_SPLIT`` backends the submitter's
+        ``num_reads`` is frozen at spawn time (only a respawn propagates a
+        new value); safe today because QPU ``num_reads`` is constant per
+        process.
+
+        Args:
+            dims: ``(num_reads, node_count)`` of the incoming dispatch.
+        """
+        if self._ring_dims is None:
+            return False
+        max_rows, max_cols = self._ring_dims
+        return dims[1] == max_cols and dims[0] <= max_rows
+
+    def _ensure_driver(
+        self,
+        sample_ctx: Dict[str, Any],
+        stop_event: Optional[multiprocessing.synchronize.Event] = None,
+    ) -> bool:
         """Ensure ONE persistent stream-driver process is running.
 
         Idempotent. Spawns the driver (and its persistent ring / ctl_q /
-        desc_q / stop event) on first use, and respawns it if it died or if a
-        new dispatch needs a differently-sized ring (rare — ``num_reads`` and
-        the topology are stable within a miner's life). The driver builds its
-        own connected context via ``STREAM_FACTORY_DOTTED`` and keeps it alive
-        across dispatches; only ``_close_driver`` (miner shutdown) reaps it.
+        desc_q / stop event) on first use, and respawns it if it died or if
+        the ring cannot host the new dispatch (``_ring_can_host``: node count
+        changed, or ``num_reads`` outgrew the ring — the respawn sizes the new
+        ring to the larger ``num_reads``, so capacity grows monotonically and
+        later smaller rounds reuse it). The driver builds its own connected
+        context via ``STREAM_FACTORY_DOTTED`` and keeps it alive across
+        dispatches; only ``_close_driver`` (miner shutdown) reaps it.
+
+        Crash-loop guard: a driver that died within ``DRIVER_FAST_DEATH_S``
+        of its spawn grows a consecutive-crash streak, and the respawn waits
+        ``_crash_backoff_delay(streak)`` seconds first — otherwise a
+        persistent startup failure respawns in a tight loop forever.
+        ``stop_event`` (the dispatch cancellation event) cuts that wait
+        short so shutdown never blocks on the backoff.
 
         Returns:
             ``True`` once a live driver is ready (always — every backend mines
@@ -1184,12 +1272,30 @@ class BaseMiner(ABC):
         nodes = sample_ctx["nodes"]
         dims = (int(sample_ctx["num_reads"]), len(nodes))
         alive = self._driver_proc is not None and self._driver_proc.is_alive()
-        if alive and self._ring_dims == dims:
-            return True  # reuse the running driver
-        # Dead, first-time, or dims changed: tear down any stale driver, spawn.
+        if self.USES_SUBMITTER_SPLIT:
+            alive = alive and (
+                self._submitter_proc is not None
+                and self._submitter_proc.is_alive()
+            )
+        if alive and self._ring_can_host(dims):
+            return True  # reuse the running driver(s)
+        # Dead, first-time, or incompatible ring: tear down any stale driver,
+        # spawn. Every forced respawn is logged with its reason so the
+        # residual pow<->mempool flip cost stays measurable.
+        if self._ring_dims is not None:
+            if not alive:
+                reason = "dead-driver"
+            elif dims[1] != self._ring_dims[1]:
+                reason = "node-count-changed"
+            else:
+                reason = "dims-grew"
+            self.logger.info(
+                "stream driver respawn (%s): ring capacity %s, dispatch dims %s",
+                reason, self._ring_dims, dims,
+            )
+            self._apply_crash_backoff(reason, stop_event)
         self._close_driver()
         import multiprocessing as _mp
-        from QPU.stream_driver import stream_driver_main
         ctx = _mp.get_context("spawn")
         ring = SampleView(
             slots=self.RESULT_QUEUE_MAXSIZE, max_rows=dims[0], max_cols=dims[1],
@@ -1197,25 +1303,158 @@ class BaseMiner(ABC):
         desc_q = ctx.Queue(maxsize=self.RESULT_QUEUE_MAXSIZE)
         ctl_q = ctx.Queue()
         driver_stop = ctx.Event()
+        # Ring drops, counted by the driver and read here for telemetry. A
+        # dropped sample never reaches this process, so without a shared
+        # counter the loss is invisible until the driver's exit warning.
+        # Lives across driver respawns is NOT wanted: a respawned driver
+        # starts a fresh count, matching the "per driver process" semantics
+        # the operator sees.
+        drops = ctx.Value("L", 0)
         factory_kwargs = self._stream_factory_kwargs(sample_ctx, nodes)
-        driver_proc = spawn_worker(
-            stream_driver_main,
-            (ring.attach_args(), desc_q, ctl_q, driver_stop,
-             self.STREAM_FACTORY_DOTTED, factory_kwargs),
-            name=f"qpu-stream-driver-{self.miner_id}",
-            # Non-daemon: the driver's RandomIsingFeeder forks pool children,
-            # which a daemon process is forbidden from doing. _close_driver
-            # reaps it explicitly so it never blocks interpreter shutdown.
-            daemon=False,
-        )
+        if self.USES_SUBMITTER_SPLIT:
+            self._spawn_split_driver(
+                ctx, ring, desc_q, ctl_q, driver_stop, factory_kwargs,
+                sample_ctx, nodes,
+            )
+            # The split QPU path drops in its own feeder/submitter processes,
+            # which don't take this counter. Report "unknown" rather than a
+            # zero that would read as a clean bill of health.
+            drops = None
+        else:
+            from QPU.stream_driver import stream_driver_main
+            self._driver_proc = spawn_worker(
+                stream_driver_main,
+                (ring.attach_args(), desc_q, ctl_q, driver_stop,
+                 self.STREAM_FACTORY_DOTTED, factory_kwargs, self._log_queue,
+                 drops),
+                name=f"qpu-stream-driver-{self.miner_id}",
+                # Non-daemon: the driver's RandomIsingFeeder forks pool children,
+                # which a daemon process is forbidden from doing. _close_driver
+                # reaps it explicitly so it never blocks interpreter shutdown.
+                daemon=False,
+            )
         self._ring = ring
         self._desc_q = desc_q
         self._ctl_q = ctl_q
         self._driver_stop = driver_stop
-        self._driver_proc = driver_proc
+        self._drops = drops
         self._ring_dims = dims
+        self._driver_spawned_at = time.monotonic()
         self._last_forwarded_threshold_milli = None
         return True
+
+    def _apply_crash_backoff(
+        self,
+        reason: str,
+        stop_event: Optional[multiprocessing.synchronize.Event],
+    ) -> None:
+        """Grow/reset the fast-death streak and wait out the policy's delay.
+
+        Only a ``dead-driver`` respawn whose driver died within
+        ``DRIVER_FAST_DEATH_S`` of spawning counts as a crash; healthy
+        respawns (dims-grew, node-count-changed, or a death after a long
+        run) reset the streak and never wait.
+        """
+        lifetime = (
+            time.monotonic() - self._driver_spawned_at
+            if self._driver_spawned_at is not None else None
+        )
+        if (
+            reason != "dead-driver"
+            or lifetime is None
+            or lifetime >= self.DRIVER_FAST_DEATH_S
+        ):
+            self._driver_crash_streak = 0
+            return
+        self._driver_crash_streak += 1
+        delay = self._crash_backoff_delay(self._driver_crash_streak)
+        if delay <= 0:
+            return
+        self.logger.warning(
+            "stream driver died %.1fs after spawn (crash streak %d); "
+            "backing off %.1fs before respawn",
+            lifetime, self._driver_crash_streak, delay,
+        )
+        if stop_event is not None:
+            stop_event.wait(delay)
+        else:
+            time.sleep(delay)
+
+    def _crash_backoff_delay(self, streak: int) -> float:
+        """Backoff policy for a crash-looping stream driver.
+
+        Called only when the previous driver died within
+        ``DRIVER_FAST_DEATH_S`` of its spawn; ``streak`` counts consecutive
+        such fast deaths (1 = first). Returns seconds to wait before the
+        respawn.
+
+        Exponential backoff, capped, retrying forever: transient causes
+        (e.g. the ioreg probe timing out under CPU contention) self-heal,
+        and a permanently broken backend degrades to one respawn per minute
+        instead of a hot loop. Chosen over hard-fail-after-N so a
+        recoverable stall never kills the worker; the per-respawn WARNING
+        in _apply_crash_backoff keeps the loop operator-visible.
+        """
+        return min(2.0 ** streak, 60.0)
+
+    def _spawn_split_driver(
+        self, ctx: Any, ring: Any, desc_q: Any, ctl_q: Any, driver_stop: Any,
+        factory_kwargs: Dict[str, Any], sample_ctx: Dict[str, Any], nodes: list,
+    ) -> None:
+        """Spawn the QPU submitter split: feeder driver (A) + submitter (B).
+
+        A (``shared.feeder_driver``) holds no connection — it owns the feeder and
+        relays reduced problems into a ProblemView ring. B
+        (``SAMPLER_FACTORY_DOTTED``) owns the D-Wave connection and submits. The
+        ProblemView is FULL-topology-sized and created here (before B knows the
+        live count) so its shared free-list rides spawn inheritance to both
+        children — an mp.Queue can't ride a live queue.put. B ships the live
+        topology to A over ``handshake_q`` (plain data). Sets ``_driver_proc``
+        (A), ``_submitter_proc`` (B), and ``_prob_ring``.
+        """
+        from QPU.dwave_submitter import dwave_submitter_main
+        from shared.feeder_driver import feeder_driver_main
+        from shared.ring_views import ProblemView
+
+        edges = sample_ctx["edges"]
+        slots = max(int(self.queue_depth) + 8, 16)
+        prob_ring = ProblemView(
+            slots=slots, n_nodes=len(nodes), n_edges=len(edges),
+        )
+        prob_desc_q = ctx.Queue(maxsize=slots)
+        handshake_q = ctx.Queue()
+
+        submitter_factory_kwargs = {
+            "miner_id": factory_kwargs["miner_id"],
+            "queue_depth": factory_kwargs["queue_depth"],
+            "solver_name": factory_kwargs.get("solver_name"),
+            "region": factory_kwargs.get("region"),
+            "token": factory_kwargs.get("token"),
+            "topology": factory_kwargs.get("topology"),
+        }
+        # B: isolated submitter (owns the connection + does sample_bqm).
+        # recycling_attach_args carries the shared free-list (A claims, B
+        # releases) — valid because it rides spawn inheritance, not a live queue.
+        self._submitter_proc = spawn_worker(
+            dwave_submitter_main,
+            (self.SAMPLER_FACTORY_DOTTED, submitter_factory_kwargs,
+             prob_ring.recycling_attach_args(), prob_desc_q,
+             ring.attach_args(), desc_q, handshake_q, driver_stop,
+             factory_kwargs["num_reads"], factory_kwargs["queue_depth"],
+             factory_kwargs["annealing_time"], self._log_queue),
+            name=f"qpu-submitter-{self.miner_id}",
+            daemon=False,
+        )
+        # A: connection-less feeder driver (owns the feeder, writes ProblemView).
+        self._driver_proc = spawn_worker(
+            feeder_driver_main,
+            (prob_ring.recycling_attach_args(), prob_desc_q, ctl_q, driver_stop,
+             handshake_q, nodes, edges, factory_kwargs.get("allowed_h"),
+             factory_kwargs["feeder_buffer_size"], self._log_queue),
+            name=f"qpu-feeder-driver-{self.miner_id}",
+            daemon=False,
+        )
+        self._prob_ring = prob_ring
 
     def _close_driver(self) -> None:
         """Reap the persistent driver and close+unlink the ring (shutdown only).
@@ -1235,6 +1474,20 @@ class BaseMiner(ABC):
         if self._driver_proc is not None:
             terminate_join(self._driver_proc, 5.0)
             self._driver_proc = None
+        # Submitter split: reap process B (the feeder driver A is _driver_proc,
+        # already joined above) and release the ProblemView ring. getattr-guarded
+        # so minimal test miners that bypass __init__ still tear down cleanly.
+        submitter_proc = getattr(self, "_submitter_proc", None)
+        if submitter_proc is not None:
+            terminate_join(submitter_proc, 5.0)
+            self._submitter_proc = None
+        prob_ring = getattr(self, "_prob_ring", None)
+        if prob_ring is not None:
+            try:
+                prob_ring.close_unlink()
+            except Exception:  # noqa: BLE001 — best-effort; small problem ring
+                pass
+            self._prob_ring = None
         if self._ring is not None:
             import gc
             gc.collect()
@@ -1467,11 +1720,6 @@ class BaseMiner(ABC):
         delegates to subclass ``_post_mine_cleanup``.
         """
         self.mining = False
-        if self._dropped_results:
-            self.logger.info(
-                "mine_work_item: %d QPU results dropped under "
-                "result-queue backpressure", self._dropped_results,
-            )
         attempt_logger = getattr(self, "_attempt_logger", None)
         if attempt_logger is not None:
             attempt_logger.flush()
@@ -1588,6 +1836,61 @@ class BaseMiner(ABC):
         except Exception as exc:  # noqa: BLE001 — best-effort
             self.logger.debug("threshold forward failed (ignored): %s", exc)
 
+    @staticmethod
+    def _worst_stashed_energy(state: _MiningLoopState) -> float:
+        """Return the worst (highest) energy in the stash, or +inf when not full.
+
+        ``+inf`` means any sample qualifies — used as the legacy-path ratchet
+        threshold when the stash hasn't reached its cap yet.
+        """
+        if len(state.top_k) >= state.top_k_cap:
+            return state.top_k[-1].result.energy
+        return float("inf")
+
+    @staticmethod
+    def _best_candidate_summary(
+        top_k: List["StashEntry"], is_decay_ranked: bool,
+    ) -> str:
+        """One-line summary of the current best stashed candidate for progress.
+
+        Selects the same entry as the "Best Solution" line — earliest win-time
+        then lowest energy on the decay path, lowest energy on the legacy path —
+        and reports its floor, energy, and when it becomes submittable. Returns
+        ``"n/a"`` when nothing is stashed yet (before the first stash, or the
+        mempool path, which doesn't use this stash).
+        """
+        if not top_k:
+            return "n/a"
+        if is_decay_ranked:
+            best = min(top_k, key=lambda e: (e.decay_num, e.result.energy))
+        else:
+            best = min(top_k, key=lambda e: e.result.energy)
+        return (
+            "floor=%.0f energy=%.0f submittable@block=%d (decay #%d)" % (
+                best.result.effective_floor, best.result.energy,
+                best.valid_at_block, best.decay_num,
+            )
+        )
+
+    def _reconstruct_or_skip(
+        self, sampleset: Any, defect_info: Any, state: _MiningLoopState,
+    ) -> Optional[Any]:
+        """Reconstruct a reduced sampleset to full topology, or signal a skip.
+
+        ``evaluate_sampleset`` indexes topology positions, so a sample narrower
+        than the topology must be reconstructed first. A full-width sample is
+        returned unchanged. A reduced sample carrying ``defect_info`` is
+        reconstructed via ``_finalize_sample`` and returned. A reduced sample
+        without ``defect_info`` is unexpectedly narrow — return ``None`` so the
+        caller can translate the skip into its own control outcome and emit its
+        own log line.
+        """
+        if sampleset.record.sample.shape[1] == len(state.nodes):
+            return sampleset
+        if defect_info is not None:
+            return self._finalize_sample(sampleset, defect_info, state.nodes)
+        return None
+
     def _stash_pre_check(
         self,
         state: _MiningLoopState,
@@ -1612,11 +1915,7 @@ class BaseMiner(ABC):
         """
         decay_schedule = state.decay_schedule
         if decay_schedule is None:
-            ratchet_threshold = (
-                state.top_k[-1].result.energy
-                if len(state.top_k) >= state.top_k_cap
-                else float("inf")
-            )
+            ratchet_threshold = self._worst_stashed_energy(state)
             admit = (iter_best_milli / 1000.0) < ratchet_threshold
         elif len(state.top_k) < state.top_k_cap:
             admit = True
@@ -1631,6 +1930,7 @@ class BaseMiner(ABC):
         self,
         state: _MiningLoopState,
         result: MiningResult,
+        live_threshold_milli: int,
     ) -> Optional[StashEntry]:
         """Wrap a valid ``result`` into a ``StashEntry`` for the active ranking.
 
@@ -1638,14 +1938,24 @@ class BaseMiner(ABC):
         result's effective floor and the absolute block it lands on; returns
         ``None`` when the floor never clears within the schedule horizon (so
         the caller stashes nothing). Legacy path: ``StashEntry(0, 0, result)``.
+
+        Admission must never be stricter than the submit gate: the schedule
+        is frozen at dispatch, but an out-of-band difficulty ease (a sudo
+        reseed) can move the LIVE threshold below the schedule's horizon
+        while the item is still mining. A floor that already clears
+        ``live_threshold_milli`` is therefore admitted as immediately
+        submittable even when ``step_for_energy`` finds no step — otherwise
+        the candidate is silently dropped and, on a chain where the work key
+        never rolls, nothing ever submits again for this item.
         """
         decay_schedule = state.decay_schedule
         if decay_schedule is None:
             return StashEntry(0, 0, result)
-        s_floor = step_for_energy(
-            decay_schedule, int(result.effective_floor * 1000),
-        )
+        floor_milli = int(result.effective_floor * 1000)
+        s_floor = step_for_energy(decay_schedule, floor_milli)
         if s_floor is None:
+            if floor_milli < live_threshold_milli:
+                return StashEntry(0, state.last_proof_block, result)
             # Never clears within the schedule horizon — not stashed.
             return None
         valid_at = state.last_proof_block + s_floor * state.epoch_length
@@ -1686,11 +1996,7 @@ class BaseMiner(ABC):
         iter_best_milli = int(iter_best_energy * 1000)
         # ratchet_threshold (legacy energy gate the attempt log records):
         # +inf until the stash is full, then the worst stashed energy.
-        ratchet_threshold = (
-            state.top_k[-1].result.energy
-            if len(state.top_k) >= state.top_k_cap
-            else float("inf")
-        )
+        ratchet_threshold = self._worst_stashed_energy(state)
         improves_stash = self._stash_pre_check(
             state, sampleset, iter_best_energy, iter_best_milli,
         )
@@ -1698,10 +2004,11 @@ class BaseMiner(ABC):
         # must be reconstructed before evaluate_sampleset indexes topology
         # positions. With defect_info, reconstruct here; without it, the
         # sample is unexpectedly narrow — skip evaluation and log a warning.
-        if improves_stash and sampleset.record.sample.shape[1] != len(state.nodes):
-            if defect_info is not None:
-                sampleset = self._finalize_sample(sampleset, defect_info)
-            else:
+        if improves_stash:
+            reconstructed = self._reconstruct_or_skip(
+                sampleset, defect_info, state,
+            )
+            if reconstructed is None:
                 self.logger.info(
                     "[%s] Mining attempt - Energy: %.0f (under-reconstructed: "
                     "sample width %d != topology %d; skipping evaluation)",
@@ -1709,6 +2016,8 @@ class BaseMiner(ABC):
                     sampleset.record.sample.shape[1], len(state.nodes),
                 )
                 improves_stash = False
+            else:
+                sampleset = reconstructed
 
         result = None
         stored_replaced = False
@@ -1729,7 +2038,9 @@ class BaseMiner(ABC):
             if result is not None:
                 post_num_valid = result.num_valid
                 post_diversity_milli = int(result.diversity * 1000)
-                entry = self._compute_stash_entry(state, result)
+                entry = self._compute_stash_entry(
+                    state, result, live_threshold_milli,
+                )
                 stored_replaced = entry is not None and self._stash_insert(
                     state.top_k, state.top_k_cap, entry, state.is_decay_ranked,
                 )
@@ -1849,21 +2160,21 @@ class BaseMiner(ABC):
         before evaluation.  Metal/CUDA mempool samples are full-width with
         ``defect_info=None`` and are unaffected.
         """
-        if sampleset.record.sample.shape[1] != len(state.nodes):
-            if defect_info is not None:
-                sampleset = self._finalize_sample(sampleset, defect_info)
-            else:
-                self.logger.info(
-                    "[%s] mempool attempt skipped (under-reconstructed: "
-                    "width %d != topology %d)",
-                    self.miner_id, sampleset.record.sample.shape[1],
-                    len(state.nodes),
-                )
-                return None
+        reconstructed = self._reconstruct_or_skip(sampleset, defect_info, state)
+        if reconstructed is None:
+            self.logger.info(
+                "[%s] mempool attempt skipped (under-reconstructed: "
+                "width %d != topology %d)",
+                self.miner_id, sampleset.record.sample.shape[1],
+                len(state.nodes),
+            )
+            return None
+        sampleset = reconstructed
 
         result = self.evaluate_sampleset(
             sampleset, state.requirements, state.nodes, state.edges,
             nonce, salt, state.prev_timestamp, state.start_time,
+            h=state.ising_h, J=state.ising_j,
         )
 
         self.timing_stats['postprocessing'].append(
@@ -1923,8 +2234,14 @@ class BaseMiner(ABC):
         # Compute solution_meta scalars + capture top-5 solutions. Meta is
         # always embedded in the attempt log; top-5 spins go to disk only
         # when this iter is stored or submitted (see write below).
+        # gauge_fix collapses spin-flip (Z2) twins before dedup so the
+        # uniqueness/diversity diagnostics aren't inflated up to 2x on
+        # zero-field (h=0) instances. At h!=0 twins are vanishingly rare, so
+        # it's a near-no-op (one vectorized sign-multiply); enabled
+        # unconditionally to keep the metric honest across all field
+        # distributions.
         sol_meta, top_5_sols, top_5_es = compute_solution_meta(
-            sampleset, state.requirements.difficulty_energy,
+            sampleset, state.requirements.difficulty_energy, gauge_fix=True,
         )
         attempt_log_kwargs["solution_meta"] = sol_meta
         state.attempt_log.record(**attempt_log_kwargs)
@@ -2017,18 +2334,21 @@ class BaseMiner(ABC):
     # Hook methods (override in subclasses as needed)
     # ------------------------------------------------------------------
 
-    def _finalize_sample(self, sampleset: Any, defect_info: Any) -> Any:
+    def _finalize_sample(
+        self, sampleset: Any, defect_info: Any, nodes: List[int],
+    ) -> Any:
         """Reconstruct a reduced sampleset to full topology (survivor-only).
 
         Called in ``_run_substrate_ratchet`` only when a sample passes the
         energy pre-check but its width is narrower than the topology (i.e. the
         QPU stream driver clamped offline qubits out before writing to the
         ring). ``defect_info`` carries the fixed-spin assignments and energy
-        offset needed for reconstruction.
+        offset needed for reconstruction; ``nodes`` is the full topology order
+        the reduced columns must be scattered back into.
 
         The base implementation is the identity (CPU/GPU/Metal samples are
         always full width; the ratchet's width guard never triggers for them).
-        ``DWaveMiner`` overrides this to call ``reconstruct_full_sampleset``.
+        ``DWaveMiner`` overrides this to reconstruct the full-topology matrix.
         """
         return sampleset
 
@@ -2047,7 +2367,6 @@ class BaseMiner(ABC):
         """
         return True
 
-    @abstractmethod
     def _adapt_mining_params(
         self,
         current_requirements: BlockRequirements,
@@ -2059,7 +2378,18 @@ class BaseMiner(ABC):
         The returned dict must include at least 'num_sweeps' and
         'num_reads'.  Extra keys are forwarded to the stream-driver context
         factory.
+
+        Default implementation forwards to ``adapt_parameters`` using the
+        subclass-declared calibration bounds. Override only for
+        backend-specific post-processing (e.g. CUDA Gibbs sweep doubling).
         """
+        return self.adapt_parameters(
+            current_requirements.difficulty_energy,
+            current_requirements.min_diversity,
+            current_requirements.min_solutions,
+            num_nodes=len(nodes),
+            num_edges=len(edges),
+        )
 
     def _post_sample(
         self, sampleset: dimod.SampleSet,
@@ -2082,7 +2412,7 @@ class BaseMiner(ABC):
           - Mempool: order_id / nodes / edges
         Both flavors print enough to grep logs for a specific work item.
         """
-        if isinstance(context, MempoolJobContext):
+        if not context.uses_decay_ratchet():
             msg = (
                 f"mine_work_item: order_id={context.order_id} "
                 f"nodes={len(context.nodes)} edges={len(context.edges)} "
@@ -2116,6 +2446,41 @@ class BaseMiner(ABC):
             return
         sys.exit(0)
 
+    def _register_sigterm_cleanup(self, backend_label: str) -> None:
+        """Install the shared SIGTERM handler for graceful worker cleanup.
+
+        ``backend_label`` is interpolated into the default log lines. Subclasses
+        customize the cleanup body via ``_backend_cleanup`` and (optionally) the
+        first log line via ``_sigterm_log_message``.
+        """
+        self._sigterm_backend_label = backend_label
+        signal.signal(signal.SIGTERM, self._cleanup_handler)
+
+    def _sigterm_log_message(self) -> str:
+        """Return the first-line SIGTERM log text.
+
+        Default uses the backend label; override for backend-specific detail.
+        """
+        label = getattr(self, "_sigterm_backend_label", "")
+        return f"{label} miner {self.miner_id} received SIGTERM, cleaning up..."
+
+    def _backend_cleanup(self) -> None:
+        """Release backend-specific resources on SIGTERM. Default no-op."""
+
+    def _cleanup_handler(self, signum, frame) -> None:
+        """Shared SIGTERM handler: log, run backend cleanup, exit gracefully."""
+        label = getattr(self, "_sigterm_backend_label", "")
+        if hasattr(self, "logger"):
+            self.logger.info(self._sigterm_log_message())
+        try:
+            self._backend_cleanup()
+        except Exception as e:
+            if hasattr(self, "logger"):
+                self.logger.error(f"Error during {label} miner cleanup: {e}")
+        # Exit gracefully — guard against raising SystemExit during
+        # interpreter finalization (would produce "Exception ignored" noise).
+        self._graceful_exit()
+
     def _on_sampling_error(
         self,
         error: Exception,
@@ -2134,16 +2499,25 @@ class BaseMiner(ABC):
         )
         return False
 
-    def get_stats(self) -> Dict[str, Any]:
-        """Return machine-readable stats for this miner."""
-        stats = dict(self.timing_stats)
-        stats.update({
-            "miner_id": self.miner_id,
-            "miner_type": self.miner_type,
-        })
-        return stats
+    @property
+    def ring_drops(self) -> Optional[int]:
+        """Samples the stream driver dropped, or None if not counted.
 
-    def evaluate_sampleset(self, sampleset: dimod.SampleSet, requirements: BlockRequirements, nodes: List[int], edges: List[Tuple[int, int]], nonce: int, salt: bytes, prev_timestamp: int, start_time: float, *, strict_energy: bool = True, live_threshold_energy: Optional[float] = None) -> Optional[MiningResult]:
+        A drop means the sampleset never reached this process and was never
+        evaluated, so a winning solution it carried is lost. Counted per driver
+        process: a respawn restarts the count.
+
+        Returns None (not 0) when no driver is running or on the split QPU
+        path, which drops in processes that don't share this counter. A zero
+        there would read as "no drops" rather than "not measured".
+        """
+        drops = getattr(self, "_drops", None)
+        if drops is None:
+            return None
+        with drops.get_lock():
+            return int(drops.value)
+
+    def evaluate_sampleset(self, sampleset: dimod.SampleSet, requirements: BlockRequirements, nodes: List[int], edges: List[Tuple[int, int]], nonce: int, salt: bytes, prev_timestamp: int, start_time: float, *, h: Optional[Dict[int, float]] = None, J: Optional[Dict[Tuple[int, int], float]] = None, strict_energy: bool = True, live_threshold_energy: Optional[float] = None) -> Optional[MiningResult]:
         """Convert a sample set into a mining result if it meets requirements, otherwise return None.
 
         ``strict_energy=False`` enables the substrate ratchet's lenient
@@ -2158,7 +2532,7 @@ class BaseMiner(ABC):
         chain-recomputed energy clears that live target (rather than
         the snapshot ``difficulty_energy``).
         """
-        return evaluate_sampleset(sampleset, requirements, nodes, edges, nonce, salt, prev_timestamp, start_time, self.miner_id, self.miner_type, strict_energy=strict_energy, live_threshold_energy=live_threshold_energy)
+        return evaluate_sampleset(sampleset, requirements, nodes, edges, nonce, salt, prev_timestamp, start_time, self.miner_id, self.miner_type, h=h, J=J, strict_energy=strict_energy, live_threshold_energy=live_threshold_energy)
 
 
 # ----------------------------------------------------------------------
@@ -2168,7 +2542,7 @@ class BaseMiner(ABC):
 
 def _work_tag(context: WorkContext) -> str:
     """Short identifier for a work context, used in per-iteration log lines."""
-    if isinstance(context, MempoolJobContext):
+    if not context.uses_decay_ratchet():
         return f"order={context.order_id}"
     return f"last_proof_block_hash=0x{context.last_proof_block_hash.hex()[:16]}"
 
@@ -2210,7 +2584,7 @@ class _BridgePrevBlock:
 
     @classmethod
     def from_work_context(cls, context: WorkContext) -> "_BridgePrevBlock":
-        if isinstance(context, MempoolJobContext):
+        if not context.uses_decay_ratchet():
             return cls(
                 header=_BridgePrevBlockHeader(index=context.order_id),
                 hash=b"\x00" * 32,
@@ -2243,7 +2617,7 @@ class _BridgeNodeInfo:
 
     @classmethod
     def from_work_context(cls, context: WorkContext) -> "_BridgeNodeInfo":
-        if isinstance(context, MempoolJobContext):
+        if not context.uses_decay_ratchet():
             return cls(
                 miner_id=f"mempool-order-{context.order_id}",
                 miner_account_bytes=b"\x00" * 32,
@@ -2252,45 +2626,4 @@ class _BridgeNodeInfo:
             miner_id="0x" + context.miner_account_bytes.hex(),
             miner_account_bytes=context.miner_account_bytes,
         )
-
-
-def compare_mining_samples(sample_a: IsingSample, sample_b: IsingSample, requirements: BlockRequirements) -> int:
-    """
-    Compare two mining results to determine which is better.
-
-    Returns:
-        -1 if A is better than B
-         0 if A and B are equal
-         1 if B is better than A
-
-    Comparison logic:
-    1. Compare average of top N energies
-       where N = requirements.min_solutions
-    2. If still equal, compare overall average solution energy
-    """
-
-    # 1. Compare average of top N solution energies
-    a_energies = list(sample_a.sampleset.record.energy)
-    b_energies = list(sample_b.sampleset.record.energy)
-    n_energies = min(requirements.min_solutions, len(a_energies), len(b_energies))
-    if n_energies > 0:
-        energies_a = a_energies[:n_energies]
-        energies_b = b_energies[:n_energies]
-        avg_energy_a = np.mean(energies_a)
-        avg_energy_b = np.mean(energies_b)
-
-        if avg_energy_a < avg_energy_b:  # Lower energy is better
-            return -1
-        elif avg_energy_b < avg_energy_a:
-            return 1
-
-    # 2. If still equal, compare overall best energy (lower is better)
-    best_energy_a = min(a_energies)
-    best_energy_b = min(b_energies)
-    if best_energy_a < best_energy_b:
-        return -1
-    elif best_energy_b < best_energy_a:
-        return 1
-
-    return 0  # Equal
 

@@ -8,11 +8,13 @@ Phase 1 only verifies the read paths (head queries, mining_snapshot,
 storage). Extrinsic submission is covered by Phase 2's bootstrap tests
 because it requires a funded signing account.
 """
+
 from __future__ import annotations
 
 import asyncio
 import os
 import socket
+import warnings
 
 import pytest
 
@@ -36,9 +38,49 @@ def _chain_reachable(url: str) -> bool:
         return False
 
 
+def _chain_has_per_topology_difficulty(url: str) -> bool:
+    """True if the chain's runtime exposes per-topology difficulty.
+
+    `quip-protocol-rs` MR !42 (rc4) replaced the global `QuantumPow.Difficulty`
+    value with a per-topology `QuantumPow.Difficulties` storage map. Tests that
+    read difficulty/snapshot through that map raise `StorageFunctionNotFound`
+    against an older runtime, so probe the metadata and skip cleanly until the
+    new runtime is deployed.
+    """
+    if not _chain_reachable(url):
+        return False
+    try:
+        from substrateinterface import SubstrateInterface
+        si = SubstrateInterface(url=url)
+        pallet = si.get_metadata().get_metadata_pallet("QuantumPow")
+        return (
+            pallet is not None
+            and pallet.get_storage_function("Difficulties") is not None
+        )
+    except Exception as exc:  # noqa: BLE001
+        # The chain was reachable a moment ago (checked above), so a failure
+        # here is a transport/metadata fault, NOT evidence of an older
+        # runtime. Surface it as a warning so a flaky node isn't silently
+        # mislabeled "pre-MR!42" and the dependent tests skipped under a
+        # misleading reason.
+        warnings.warn(
+            f"per-topology difficulty probe failed unexpectedly "
+            f"(treating as absent): {type(exc).__name__}: {exc}",
+            stacklevel=2,
+        )
+        return False
+
+
 pytestmark = pytest.mark.skipif(
     not _chain_reachable(DEFAULT_URL),
     reason=f"substrate chain not reachable at {DEFAULT_URL}",
+)
+
+# Evaluated once; tests that need the per-topology difficulty runtime gate on it.
+_CHAIN_HAS_PER_TOPOLOGY_DIFFICULTY = _chain_has_per_topology_difficulty(DEFAULT_URL)
+_skip_pre_mr42 = pytest.mark.skipif(
+    not _CHAIN_HAS_PER_TOPOLOGY_DIFFICULTY,
+    reason="chain runtime lacks per-topology QuantumPow.Difficulties (pre-MR!42)",
 )
 
 
@@ -77,6 +119,7 @@ async def test_get_finalized_head(client):
     assert nf <= nh, "finalized head should not exceed best head"
 
 
+@_skip_pre_mr42
 async def test_mining_snapshot_either_returns_or_none(client):
     head = await client.get_head()
     alice = Sr25519Signer.from_uri("//Alice")
@@ -88,7 +131,10 @@ async def test_mining_snapshot_either_returns_or_none(client):
     # a populated context. Both outcomes are correct in Phase 1.
     if snapshot is None:
         return
-    assert len(snapshot.parent_hash) == 32
+    # Renamed from `parent_hash` when the context started carrying the
+    # LastProofBlock hash rather than the head's parent. The test only runs
+    # against a live chain, so the stale name went unnoticed until now.
+    assert len(snapshot.last_proof_block_hash) == 32
     assert len(snapshot.topology_hash) == 32
     assert snapshot.block_number >= 0
     assert len(snapshot.nodes) > 0
@@ -115,21 +161,26 @@ async def test_query_miner_unregistered_account(client):
     assert miner_info is None
 
 
+@_skip_pre_mr42
 async def test_query_difficulty_either_returns_or_none(client):
-    """`StorageValue<_, DifficultyConfig>` quirks: substrate-interface returns
-    the `Default::default()` value (all zeros) when storage is empty rather
-    than `None`. `query_difficulty` must honor `meta_info[result_found]`
-    so the bootstrap idempotency check stays correct on a fresh chain."""
+    """`query_difficulty` reads ``QuantumPow.Difficulties[DefaultTopology]``.
+
+    On a fresh chain with no ``DefaultTopology`` set, it returns ``None``.
+    After bootstrap the map entry is populated and a real
+    ``SubstrateDifficulty`` is returned. Either outcome is correct, but we
+    must never see an all-zeros struct (the pre-map-query default-masking bug).
+    """
     difficulty = await client.query_difficulty()
-    # On a freshly-built chain `Difficulty` is unset and we expect None. After
-    # Phase 2 bootstrap (or any prior sudo set_difficulty) the storage is
-    # populated and we expect a real SubstrateDifficulty. Either is correct,
-    # but we must never see the all-zeros default-struct case.
+    # On a freshly-built chain DefaultTopology is unset → None. After Phase 2
+    # bootstrap or any prior sudo set_difficulty the map entry is populated.
+    # Both are correct; we just must never see the all-zeros default-struct.
     if difficulty is not None:
         # If we got a value, at least one field must be non-zero — otherwise
         # we're back to the "default returned for empty storage" bug.
-        assert any([
-            difficulty.min_solutions,
-            difficulty.max_energy_milli,
-            difficulty.min_diversity_milli,
-        ]), "query_difficulty returned all-zeros struct; storage is empty"
+        assert any(
+            [
+                difficulty.min_solutions,
+                difficulty.max_energy_milli,
+                difficulty.min_diversity_milli,
+            ]
+        ), "query_difficulty returned all-zeros struct; storage is empty"

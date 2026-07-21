@@ -275,12 +275,12 @@ async def _validate_one(
     client: SubstrateClient,
     block_number: int,
     topo_cache: Dict[bytes, SubstrateMiningContext],
-) -> Tuple[Dict[str, Any], Dict[str, Any], bytes]:
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Download + validate the win at ``block_number``.
 
-    Returns ``(archive_record, verdict_record, prev_proof_hash)``. The verdict
-    carries an ``error`` field instead of checks when the proof can't be
-    reconstructed (e.g. missing extrinsic on a pruned node).
+    Returns ``(archive_record, verdict_record)``. The verdict carries an
+    ``error`` field instead of checks when the proof can't be reconstructed
+    (e.g. missing extrinsic on a pruned node).
     """
     ws = await client.query_winning_solution(block_number)
     if ws is None:
@@ -300,19 +300,20 @@ async def _validate_one(
         "submitted_at": sol.submitted_at,
         "last_proof_block_hash": "0x" + sol.last_proof_block_hash.hex(),
         "difficulty": _difficulty_dict(sol.difficulty),
+        "device_access_time_us": sol.device_access_time_us,
         "topology_hash": "0x" + proof["topology_hash"].hex() if proof else None,
         "solutions_hex": ["0x" + s.hex() for s in proof["solutions"]] if proof else [],
     }
     if proof is None:
         verdict = {"block_number": block_number, "valid": False,
                    "error": "no submit_proof extrinsic matching the winning nonce"}
-        return archive, verdict, sol.last_proof_block_hash
+        return archive, verdict
 
     snapshot = await _topology_for(
         client, proof["topology_hash"], sol.miner, _hx(block_hash_hex), topo_cache
     )
     verdict = {"block_number": block_number, **_validate(ws, proof, snapshot)}
-    return archive, verdict, sol.last_proof_block_hash
+    return archive, verdict
 
 
 def _load_cache(cache_path: Path) -> Dict[int, Dict[str, Any]]:
@@ -383,7 +384,7 @@ async def _download_one(
 ) -> Optional[Dict[str, Any]]:
     """Download + validate one win, returning a cache record or ``None``."""
     try:
-        archive, verdict, _prev = await _validate_one(client, block_number, topo_cache)
+        archive, verdict = await _validate_one(client, block_number, topo_cache)
     except Exception as exc:  # noqa: BLE001 — record & stop the walk
         errors.append(f"{block_number}: {type(exc).__name__}: {exc}")
         return None

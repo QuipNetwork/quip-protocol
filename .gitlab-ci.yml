@@ -1,5 +1,5 @@
 # GitLab CI/CD for Quip Network Node
-# Tests on branches, builds + releases on main/tags
+# Tests on branches; image + binary pushes on git tags ONLY
 
 stages:
   - test
@@ -61,8 +61,12 @@ check-version:
     - |
       PKG_VERSION=$(python3 -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
       TAG_VERSION="${CI_COMMIT_TAG#v}"
-      if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
-        echo "ERROR: tag $CI_COMMIT_TAG has version v${PKG_VERSION} in pyproject.toml (expected v${TAG_VERSION})"
+      # Git tags use SemVer hyphenated pre-releases (0.2.1-rc17); pyproject uses
+      # PEP 440 (0.2.1rc17). Normalize the tag to PEP 440 before comparing so the
+      # numeric parts + rc number must still match. See docs/VERSIONING.md.
+      TAG_VERSION_NORM=$(echo "$TAG_VERSION" | sed -E 's/-(rc|alpha|beta)/\1/')
+      if [ "$PKG_VERSION" != "$TAG_VERSION_NORM" ]; then
+        echo "ERROR: tag $CI_COMMIT_TAG (PEP440 ${TAG_VERSION_NORM}) != pyproject.toml version ${PKG_VERSION}"
         exit 1
       fi
       echo "OK: tag $CI_COMMIT_TAG matches pyproject.toml version $PKG_VERSION"
@@ -71,39 +75,54 @@ check-version:
 # Docker image builds (Kaniko — no daemon required)
 # ---------------------------------------------------------------------------
 
-# Shared trigger rules + per-branch mutable tags. Referenced from every
-# image-build job so the Docker pipelines move in lockstep. MUTABLE_TAGS is
-# a space-separated list; each entry becomes an additional registry tag:
-#   main                  -> :latest                (stable)
-#   v0.2                  -> :v0.2                   (rolling branch pointer)
-#   git tag v0.2.0rc7     -> :v0.2 :v0.2.0rc7        (pre-release: rolls the
-#                                        :v0.2 pointer and pins the immutable
-#                                        :<tag>. Must NOT move :latest, which
-#                                        the production node manager tracks)
-#   git tag v0.2.0        -> :latest :v0.2 :v0.2.0   (stable release: also
-#                                        advances :latest and rolls :v0.2)
-# The immutable :CI_COMMIT_SHA tag is pushed unconditionally so downstream
-# can pin to a specific build regardless of branch.
+# Shared trigger rules for image jobs. Image pushes happen ONLY on git tags —
+# branch merges (main/v0.2) run tests but never push images.
+#
+# MUTABLE_TAGS is resolved at script time by the resolve-tags job (git ancestry
+# cannot be tested in rules:if). Space-separated; each entry is an extra
+# registry tag beyond the unconditional :$CI_COMMIT_SHA:
+#   pre-release (vX.Y.Z-rcN or vX.Y.ZrcN)  -> :$CI_COMMIT_TAG only
+#   stable vX.Y.Z reachable from origin/main -> :latest :vX.Y :$CI_COMMIT_TAG
+#   stable vX.Y.Z NOT on main              -> :$CI_COMMIT_TAG only
+#   any other tag                          -> :$CI_COMMIT_TAG only
 .shared_image_rules:
   rules:
-    - if: $CI_COMMIT_BRANCH == "main"
-      variables:
-        MUTABLE_TAGS: latest
-    - if: $CI_COMMIT_BRANCH == "v0.2"
-      variables:
-        MUTABLE_TAGS: v0.2
-    # Pre-release tag (rc/alpha/beta): roll :v0.2 + pin :<tag>, never :latest.
+    # Pre-release — SemVer hyphenated (vX.Y.Z-rcN). Preferred form; see
+    # docs/VERSIONING.md. Does not move :latest or :vX.Y.
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+-(rc|alpha|beta)[0-9]*$/
+    # Legacy pre-release — PEP 440 no-hyphen (vX.Y.ZrcN). Still builds.
     - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(rc|alpha|beta)[0-9]*$/
-      variables:
-        MUTABLE_TAGS: "v0.2 $CI_COMMIT_TAG"
-    # Stable release tag (vX.Y.Z): advance :latest, roll :v0.2, pin :<tag>.
+    # Stable release tag (vX.Y.Z). Mutable tags decided by resolve-tags.
     - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
-      variables:
-        MUTABLE_TAGS: "latest v0.2 $CI_COMMIT_TAG"
-    # Any other tag: legacy fallback to :latest.
+    # Any other tag: build and pin :$CI_COMMIT_TAG only (no :latest).
     - if: $CI_COMMIT_TAG
-      variables:
-        MUTABLE_TAGS: latest
+
+# Runtime ancestry gate: only stable tags reachable from origin/main publish
+# :latest and :vX.Y. Exports MUTABLE_TAGS via dotenv for manifest/cuda jobs.
+resolve-tags:
+  stage: build
+  needs: []
+  rules: !reference [.shared_image_rules, rules]
+  image:
+    name: alpine/git:latest
+    entrypoint: [""]
+  tags: [linux, amd64]
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    - git fetch origin main
+    - |
+      MUTABLE_TAGS="$CI_COMMIT_TAG"
+      if printf '%s' "$CI_COMMIT_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+         && git merge-base --is-ancestor "$CI_COMMIT_SHA" origin/main; then
+        MINOR=$(printf '%s' "$CI_COMMIT_TAG" | sed -E 's/^(v[0-9]+\.[0-9]+).*/\1/')
+        MUTABLE_TAGS="latest $MINOR $CI_COMMIT_TAG"
+      fi
+      echo "MUTABLE_TAGS=$MUTABLE_TAGS" > tags.env
+      echo "resolved MUTABLE_TAGS=$MUTABLE_TAGS"
+  artifacts:
+    reports:
+      dotenv: tags.env
 
 .docker_build:
   stage: build
@@ -111,6 +130,17 @@ check-version:
     name: gcr.io/kaniko-project/executor:v1.23.2-debug
     entrypoint: [""]
   before_script:
+    # The cuda runners' NVIDIA container runtime bind-mounts host GPU driver
+    # firmware into every job container at /lib/firmware/nvidia/. kaniko's
+    # rootfs extraction cannot replace /lib with the usr-merge symlink while
+    # those mounts are busy, so the executor runs with --ignore-path=/lib,
+    # which skips that replacement and preserves /lib as a plain directory.
+    # The ELF interpreter resolves through /lib/x86_64-linux-gnu (via the
+    # /lib64 → /usr/lib64 → /lib/x86_64-linux-gnu symlink chain), so RUN
+    # commands need this shim. It dangles until kaniko unpacks the rootfs,
+    # and never reaches the image: /lib is excluded from snapshots and the
+    # final image's /lib symlink comes from the base layers.
+    - mkdir -p /lib && ln -sfn /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu
     - mkdir -p /kaniko/.docker
     - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(echo -n ${CI_REGISTRY_USER}:${CI_REGISTRY_PASSWORD} | base64)\"}}}" > /kaniko/.docker/config.json
   rules: !reference [.shared_image_rules, rules]
@@ -127,11 +157,14 @@ build-cpu-amd64:
   extends: .docker_build
   tags: [linux, amd64]
   script:
+    # --ignore-path=/lib: paired with the /lib/x86_64-linux-gnu shim in the
+    # .docker_build before_script — see the comment there.
     - /kaniko/executor
         --context $CI_PROJECT_DIR
         --dockerfile docker/Dockerfile.cpu
         --build-arg QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA
         --destination $CI_REGISTRY_IMAGE/$CPU_IMAGE:$CI_COMMIT_SHA-amd64
+        --ignore-path=/lib
 
 build-cpu-arm64:
   stage: build
@@ -163,6 +196,7 @@ manifest-cpu:
     entrypoint: [""]
   tags: [linux, amd64]
   needs:
+    - resolve-tags
     - build-cpu-amd64
     - build-cpu-arm64
   rules: !reference [.shared_image_rules, rules]
@@ -182,6 +216,8 @@ manifest-cpu:
 build-cuda:
   extends: .docker_build
   tags: [linux, amd64]
+  needs:
+    - resolve-tags
   script:
     # Immutable SHA destination, then one --destination per MUTABLE_TAGS entry.
     - |
@@ -189,11 +225,14 @@ build-cuda:
       for tag in $MUTABLE_TAGS; do
         DESTINATIONS="$DESTINATIONS --destination $CI_REGISTRY_IMAGE/$CUDA_IMAGE:$tag"
       done
+      # --ignore-path=/lib: paired with the /lib/x86_64-linux-gnu shim in the
+      # .docker_build before_script — see the comment there.
       /kaniko/executor \
         --context $CI_PROJECT_DIR \
         --dockerfile docker/Dockerfile.cuda \
         --build-arg QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/$CUDA_IMAGE:$CI_COMMIT_SHA \
-        $DESTINATIONS
+        $DESTINATIONS \
+        --ignore-path=/lib
 
 # ---------------------------------------------------------------------------
 # PyInstaller native binaries

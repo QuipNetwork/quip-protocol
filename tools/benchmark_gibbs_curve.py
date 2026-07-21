@@ -27,7 +27,6 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -92,13 +91,6 @@ def gpu_worker(
         create_genesis_block,
     )
 
-    class CudaMinerGibbsCalibrated(CudaMiner):
-        """Gibbs with 2x sweep multiplier (inherited from CudaMiner).
-
-        No ADAPT overrides needed — CudaMiner._adapt_mining_params
-        applies GIBBS_SWEEP_MULTIPLIER=2 automatically.
-        """
-
     dummy_key = b'\x00' * 32
     node_info = MinerInfo(
         miner_id='benchmark',
@@ -121,23 +113,15 @@ def gpu_worker(
         config_name = job['config']
         energy_target = job['energy_target']
         update_mode = job['update_mode']
-        calibrated = job['calibrated']
 
         # Fresh miner per job — guarantees clean CUDA and
         # streaming state. No stale buffers, no leftover
         # kernel completions.
-        if calibrated:
-            miner = CudaMinerGibbsCalibrated(
-                f'bench-{config_name[:8]}-d{device}',
-                device=device,
-                update_mode=update_mode,
-            )
-        else:
-            miner = CudaMiner(
-                f'bench-{config_name[:8]}-d{device}',
-                device=device,
-                update_mode=update_mode,
-            )
+        miner = CudaMiner(
+            f'bench-{config_name[:8]}-d{device}',
+            device=device,
+            update_mode=update_mode,
+        )
 
         # Compute adaptive params for reporting
         params = miner.adapt_parameters(
@@ -359,6 +343,24 @@ _COLORS = ['#2196F3', '#FF9800', '#4CAF50']
 _MARKERS = ['o', 's', '^']
 
 
+def _rows_for(results, name):
+    """Return result rows matching a config name."""
+    return [r for r in results if r['config'] == name]
+
+
+def _split_mined(rows):
+    """Split rows into mined/timeout (energy, time) lists."""
+    energies = [r['energy_target'] for r in rows]
+    times = [r['elapsed_s'] for r in rows]
+    mined = [r['mined'] for r in rows]
+
+    mined_e = [e for e, m in zip(energies, mined) if m]
+    mined_t = [t for t, m in zip(times, mined) if m]
+    timeout_e = [e for e, m in zip(energies, mined) if not m]
+    timeout_t = [t for t, m in zip(times, mined) if not m]
+    return energies, times, mined, mined_e, mined_t, timeout_e, timeout_t
+
+
 def plot_mine_time(results, output_path):
     """Plot time-to-mine vs energy target."""
     plt = _get_plot_deps()
@@ -369,19 +371,9 @@ def plot_mine_time(results, output_path):
     config_names = [c[0] for c in CONFIG_DEFS]
 
     for i, name in enumerate(config_names):
-        rows = [r for r in results if r['config'] == name]
-        energies = [r['energy_target'] for r in rows]
-        times = [r['elapsed_s'] for r in rows]
-        mined = [r['mined'] for r in rows]
-
-        mined_e = [e for e, m in zip(energies, mined) if m]
-        mined_t = [t for t, m in zip(times, mined) if m]
-        timeout_e = [
-            e for e, m in zip(energies, mined) if not m
-        ]
-        timeout_t = [
-            t for t, m in zip(times, mined) if not m
-        ]
+        rows = _rows_for(results, name)
+        (_energies, _times, _mined, mined_e, mined_t,
+         timeout_e, timeout_t) = _split_mined(rows)
 
         if mined_t:
             ax.semilogy(
@@ -423,7 +415,7 @@ def plot_difficulty(results, output_path):
     config_names = [c[0] for c in CONFIG_DEFS]
 
     for i, name in enumerate(config_names):
-        rows = [r for r in results if r['config'] == name]
+        rows = _rows_for(results, name)
         energies = [r['energy_target'] for r in rows]
         diffs = [r['difficulty'] for r in rows]
         ax.plot(
@@ -473,19 +465,9 @@ def plot_sa_vs_gibbs_overlay(results, output_path):
 
     series = {}
     for i, name in enumerate(config_names):
-        rows = [r for r in results if r['config'] == name]
-        energies = [r['energy_target'] for r in rows]
-        times = [r['elapsed_s'] for r in rows]
-        mined = [r['mined'] for r in rows]
-
-        mined_e = [e for e, m in zip(energies, mined) if m]
-        mined_t = [t for t, m in zip(times, mined) if m]
-        timeout_e = [
-            e for e, m in zip(energies, mined) if not m
-        ]
-        timeout_t = [
-            t for t, m in zip(times, mined) if not m
-        ]
+        rows = _rows_for(results, name)
+        (energies, times, mined, mined_e, mined_t,
+         timeout_e, timeout_t) = _split_mined(rows)
 
         style = line_styles.get(name, {})
         series[name] = {
@@ -583,7 +565,7 @@ def plot_runtime_settings_overlay(results, output_path):
     config_names = [c[0] for c in CONFIG_DEFS]
 
     for i, name in enumerate(config_names):
-        rows = [r for r in results if r['config'] == name]
+        rows = _rows_for(results, name)
         energies = [r['energy_target'] for r in rows]
         sweeps = [r['num_sweeps'] for r in rows]
         reads = [r['num_reads'] for r in rows]
@@ -632,7 +614,6 @@ def plot_runtime_settings_overlay(results, output_path):
 
 def save_outputs(results, output_dir, meta):
     """Save results JSON and plots to output directory."""
-    from pathlib import Path
     outdir = Path(output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
 

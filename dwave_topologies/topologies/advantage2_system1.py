@@ -8,8 +8,8 @@ Topology Information:
 - Solver: Advantage2_system1
 - Type: zephyr
 - Shape: [12, 4]
-- Nodes: 4578
-- Edges: 41531
+- Nodes: 4577
+- Edges: 41515
 """
 
 from .json_loader import load_json_topology

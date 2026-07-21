@@ -19,7 +19,6 @@ Key algorithm (from BlockSampler):
 
 import logging
 import os
-import time
 from collections import defaultdict
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
@@ -34,11 +33,11 @@ except ImportError:  # Apple Metal framework is macOS-only; absent on Linux/CI.
     objc = None  # type: ignore[assignment]
 
 from GPU.metal_sa import (
-    apply_qos_utility,
-    _resolve_budget,
+    concat_read_split,
     reads_per_buffer_for_budget,
+    stream_read_split_batches,
 )
-from GPU.metal_scheduler import DutyCycleController, MetalScheduler
+from GPU.metal_scheduler import MetalScheduler
 from GPU.metal_utils import (
     build_csr_from_ising,
     compute_beta_schedule,
@@ -47,11 +46,6 @@ from GPU.metal_utils import (
     unpack_metal_results,
 )
 from shared.ising_model import IsingModel
-
-# Streaming PAUSE poll interval (seconds): how long to idle before re-reading
-# the occupancy budget when throttled to a full stop (battery / critical
-# thermal).
-_PAUSE_POLL_S = 0.5
 
 
 def zephyr_four_color_linear(linear_idx: int, m: int = 9, t: int = 2) -> int:
@@ -180,8 +174,6 @@ class MetalGibbsSampler:
         topology_graph = topology_obj.graph
         self.nodes = list(topology_graph.nodes())
         self.edges = list(topology_graph.edges())
-        self.nodelist = self.nodes
-        self.edgelist = self.edges
         self.properties = topology_obj.properties
 
         # Extract Zephyr parameters from topology
@@ -211,7 +203,7 @@ class MetalGibbsSampler:
         # Load sequential kernel
         self._kernel = lib.newFunctionWithName_("block_gibbs_sampler")
         if not self._kernel:
-            function_names = [lib.functionNames()[i] for i in range(len(lib.functionNames()))]
+            function_names = list(lib.functionNames())
             raise RuntimeError(f"Failed to find block_gibbs_sampler kernel. Available: {function_names}")
 
         self._pipeline, err = self.device.newComputePipelineStateWithFunction_error_(self._kernel, None)
@@ -221,7 +213,7 @@ class MetalGibbsSampler:
         # Load parallel kernel
         self._kernel_parallel = lib.newFunctionWithName_("block_gibbs_parallel")
         if not self._kernel_parallel:
-            function_names = [lib.functionNames()[i] for i in range(len(lib.functionNames()))]
+            function_names = list(lib.functionNames())
             raise RuntimeError(f"Failed to find block_gibbs_parallel kernel. Available: {function_names}")
 
         self._pipeline_parallel, err = self.device.newComputePipelineStateWithFunction_error_(self._kernel_parallel, None)
@@ -257,7 +249,6 @@ class MetalGibbsSampler:
         beta_schedule_type: str = "geometric",
         beta_schedule: Optional[np.ndarray] = None,
         seed: Optional[int] = None,
-        **kwargs
     ) -> List[dimod.SampleSet]:
         """Block-Gibbs sample one batch inside an ObjC autorelease pool.
 
@@ -272,7 +263,7 @@ class MetalGibbsSampler:
                 h, J, num_reads=num_reads, num_sweeps=num_sweeps,
                 num_sweeps_per_beta=num_sweeps_per_beta, beta_range=beta_range,
                 beta_schedule_type=beta_schedule_type,
-                beta_schedule=beta_schedule, seed=seed, **kwargs,
+                beta_schedule=beta_schedule, seed=seed,
             )
 
     def _sample_ising_impl(
@@ -286,7 +277,6 @@ class MetalGibbsSampler:
         beta_schedule_type: str = "geometric",
         beta_schedule: Optional[np.ndarray] = None,
         seed: Optional[int] = None,
-        **kwargs
     ) -> List[dimod.SampleSet]:
         """
         Sample from Ising model using block Gibbs sampling.
@@ -407,11 +397,6 @@ class MetalGibbsSampler:
             "final_energies", num_threads * 4)
 
         # Execute kernel
-        _duty_cycle: Optional[DutyCycleController] = kwargs.get(
-            'duty_cycle',
-        )
-        _t0 = time.perf_counter()
-
         cmd_buf = self._command_queue.commandBuffer()
         encoder = cmd_buf.computeCommandEncoder()
 
@@ -488,11 +473,6 @@ class MetalGibbsSampler:
         cmd_buf.commit()
         cmd_buf.waitUntilCompleted()
 
-        # Duty-cycle yielding after GPU dispatch
-        if _duty_cycle and _duty_cycle.enabled:
-            _compute_s = time.perf_counter() - _t0
-            time.sleep(_duty_cycle.compute_sleep(_compute_s))
-
         # Check for errors
         if cmd_buf.status() != Metal.MTLCommandBufferStatusCompleted:
             error = cmd_buf.error()
@@ -551,8 +531,8 @@ class MetalGibbsSampler:
         occupancy budget (max concurrent GPU threads per command buffer) from
         ``scheduler.get_thread_budget()``, re-read **before** each batch:
 
-        - ``0`` → PAUSE: idle ``_PAUSE_POLL_S`` and re-check without pulling
-          models. Stop-aware so teardown never blocks.
+        - ``0`` → PAUSE: idle and re-check without pulling models. Stop-aware
+          so teardown never blocks.
         - ``UNCAPPED`` → one full-batch dispatch (idle/headless throughput).
         - else → keep the full problem batch and split the reads across
           dispatches so ``problems x reads <= budget`` (each read-buffer an
@@ -576,35 +556,12 @@ class MetalGibbsSampler:
         Yields:
             ``(IsingModel, dimod.SampleSet)`` for each completed problem.
         """
-        # CPU-side politeness: lower this (producer) thread's QoS so we yield
-        # P-cores to the foreground UI. Matches the SA streaming path.
-        apply_qos_utility()
+        def setup(model_iter):
+            # Gibbs has no beta-priming; start with an empty first batch.
+            return [], None
 
-        model_iter = iter(models)
-        batch_seed = (
-            seed if seed is not None else int(np.random.randint(0, 2**31))
-        )
-
-        while True:
-            budget = _resolve_budget(scheduler)
-            # PAUSE: idle and re-check without consuming the feeder.
-            while budget == 0:
-                if stop_event is not None and stop_event.is_set():
-                    return
-                time.sleep(_PAUSE_POLL_S)
-                budget = _resolve_budget(scheduler)
-
-            # Full problem batch (occupancy is bounded by splitting reads).
-            batch_models: List[IsingModel] = []
-            while len(batch_models) < max_threadgroups:
-                try:
-                    batch_models.append(next(model_iter))
-                except StopIteration:
-                    break
-            if not batch_models:
-                return
-
-            samplesets = self._sample_read_split(
+        def dispatch_batch(batch_models, budget, batch_seed, _ctx):
+            return self._sample_read_split(
                 batch_models,
                 num_reads=num_reads,
                 reads_per_buffer=reads_per_buffer_for_budget(
@@ -616,10 +573,16 @@ class MetalGibbsSampler:
                 beta_schedule_type=beta_schedule_type,
                 seed=batch_seed,
             )
-            batch_seed = (batch_seed + 1) & 0x7FFFFFFF
 
-            for model, ss in zip(batch_models, samplesets):
-                yield (model, ss)
+        yield from stream_read_split_batches(
+            models,
+            max_threadgroups=max_threadgroups,
+            seed=seed,
+            scheduler=scheduler,
+            stop_event=stop_event,
+            setup_fn=setup,
+            dispatch_batch_fn=dispatch_batch,
+        )
 
     def _sample_read_split(
         self,
@@ -646,20 +609,11 @@ class MetalGibbsSampler:
             num_sweeps=num_sweeps, num_sweeps_per_beta=num_sweeps_per_beta,
             beta_range=beta_range, beta_schedule_type=beta_schedule_type,
         )
-        if reads_per_buffer >= num_reads:
-            return self.sample_ising(h=h, J=j, num_reads=num_reads,
-                                     seed=seed, **common)
 
-        parts: List[List[dimod.SampleSet]] = [[] for _ in models]
-        done = 0
-        buf_idx = 0
-        while done < num_reads:
-            rc = min(reads_per_buffer, num_reads - done)
-            buf_seed = (seed + buf_idx * 0x9E3779B1) & 0x7FFFFFFF
-            ss_list = self.sample_ising(h=h, J=j, num_reads=rc,
-                                        seed=buf_seed, **common)
-            for prob_idx, ss in enumerate(ss_list):
-                parts[prob_idx].append(ss)
-            done += rc
-            buf_idx += 1
-        return [dimod.concatenate(p) for p in parts]
+        def dispatch(read_count: int, buf_seed: int) -> List[dimod.SampleSet]:
+            return self.sample_ising(h=h, J=j, num_reads=read_count,
+                                     seed=buf_seed, **common)
+
+        return concat_read_split(
+            models, num_reads, reads_per_buffer, seed, dispatch,
+        )

@@ -2,8 +2,8 @@
 
 # Try to import CUDA components (only available with cupy)
 try:
-    from .gpu_miner import GPUMiner
-    from .cuda_miner import CudaMiner
+    from GPU.gpu_miner import GPUMiner
+    from GPU.cuda_miner import CudaMiner
     CUDA_AVAILABLE = True
 except ImportError:
     CUDA_AVAILABLE = False
@@ -12,14 +12,14 @@ except ImportError:
 
 # Try to import CUDA Gibbs sampler (separate class, same CudaMiner)
 try:
-    from .cuda_gibbs_sa import CudaGibbsSampler
+    from GPU.cuda_gibbs_sa import CudaGibbsSampler
 except ImportError:
     CudaGibbsSampler = None
 
 # Try to import Modal components
 try:
-    from .modal_sampler import ModalSampler, gpu_app
-    from .modal_miner import ModalMiner
+    from GPU.modal_sampler import ModalSampler, gpu_app
+    from GPU.modal_miner import ModalMiner
     MODAL_AVAILABLE = True
 except ImportError:
     MODAL_AVAILABLE = False
@@ -29,8 +29,8 @@ except ImportError:
 
 # Try to import Metal components (only available on macOS)
 try:
-    from .metal_sa import MetalSASampler
-    from .metal_miner import MetalMiner
+    from GPU.metal_sa import MetalSASampler
+    from GPU.metal_miner import MetalMiner
     METAL_AVAILABLE = True
 except ImportError:
     METAL_AVAILABLE = False
@@ -39,7 +39,7 @@ except ImportError:
 
 # Try to import Metal Gibbs components (only available on macOS)
 try:
-    from .metal_gibbs_sa import MetalGibbsSampler
+    from GPU.metal_gibbs_sa import MetalGibbsSampler
     METAL_GIBBS_AVAILABLE = True
 except ImportError:
     METAL_GIBBS_AVAILABLE = False
@@ -48,12 +48,7 @@ except ImportError:
 # Check if GPU functionality is available
 GPU_AVAILABLE = CUDA_AVAILABLE or MODAL_AVAILABLE
 
-__all__ = [
-    'ModalSampler',
-    'ModalMiner',
-    'gpu_app', 'GPU_AVAILABLE', 'METAL_AVAILABLE',
-    'MODAL_AVAILABLE',
-]
+__all__ = ['GPU_AVAILABLE', 'METAL_AVAILABLE', 'MODAL_AVAILABLE']
 
 # Add CUDA components if available
 if CUDA_AVAILABLE:

@@ -9,7 +9,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 sys.path.append(str(Path(__file__).parent.parent))
 
@@ -20,8 +20,16 @@ import numpy as np
 from scipy import stats as scipy_stats
 
 from dwave_topologies import DEFAULT_TOPOLOGY
+from shared.allowed_value_spec import AllowedValueSet
 from shared.energy_utils import energy_to_difficulty
 from shared.nonce_prefilter import IsingTopologyCache
+from shared.quantum_proof_of_work import DEFAULT_ALLOWED_H, DEFAULT_ALLOWED_J
+
+# Greedy energy is only meaningful against the field distribution the
+# benchmarked nonces were mined under, so the spec is selected explicitly
+# (--h-spec) rather than assumed. "ternary" is the legacy h in {-1,0,+1};
+# "zero" is the J-only zero-field class the live testnet uses.
+_H_SPECS = {"ternary": DEFAULT_ALLOWED_H, "zero": AllowedValueSet((0,))}
 
 
 def load_benchmark(path: str) -> Dict[str, Any]:
@@ -60,9 +68,13 @@ def extract_block_details(
 def compute_greedy_energies(
     nonces: List[int],
     cache: IsingTopologyCache,
+    allowed_h,
+    allowed_j,
 ) -> List[float]:
-    """Compute greedy descent energy for each nonce."""
-    return [cache.greedy_descent_fast(n) for n in nonces]
+    """Compute greedy descent energy for each nonce under the given specs."""
+    return [
+        cache.greedy_descent_fast(n, allowed_h, allowed_j) for n in nonces
+    ]
 
 
 def generate_random_nonces(count: int) -> List[int]:
@@ -205,8 +217,6 @@ def plot_greedy_mined_vs_random(
     fig.savefig(output_dir / 'greedy_mined_vs_random.png', dpi=150)
     plt.close(fig)
 
-    return ks_stat, ks_p
-
 
 def plot_energy_distributions(
     by_type: Dict[str, List[Dict]],
@@ -269,16 +279,15 @@ def plot_mining_timeline(
             continue
         # Cumulative: times are absolute timestamps; convert to minutes
         # from first block
-        if times:
-            cumulative = list(range(1, len(times) + 1))
-            # Normalize to minutes from start
-            t0 = times[0]
-            minutes = [(t - t0) / 60 for t in times]
-            ax.plot(
-                minutes, cumulative,
-                label=mtype, color=colors.get(mtype, '#999'),
-                marker='.', markersize=4,
-            )
+        cumulative = list(range(1, len(times) + 1))
+        # Normalize to minutes from start
+        t0 = times[0]
+        minutes = [(t - t0) / 60 for t in times]
+        ax.plot(
+            minutes, cumulative,
+            label=mtype, color=colors.get(mtype, '#999'),
+            marker='.', markersize=4,
+        )
 
     ax.set_xlabel('Time (minutes from first block)')
     ax.set_ylabel('Cumulative Blocks')
@@ -390,14 +399,16 @@ def run(args) -> int:
     nodes = sorted(topo.graph.nodes)
     edges = list(topo.graph.edges)
     cache = IsingTopologyCache(nodes, edges)
-    print("Topology cache built")
+    allowed_h = _H_SPECS[args.h_spec]
+    allowed_j = DEFAULT_ALLOWED_J
+    print(f"Topology cache built (h_spec={args.h_spec})")
 
     # Compute greedy energies for mined nonces
     greedy_by_type: Dict[str, List[float]] = {}
     all_mined_greedy: List[float] = []
     for mtype, blocks in by_type.items():
         nonces = [b['nonce'] for b in blocks]
-        greedy = compute_greedy_energies(nonces, cache)
+        greedy = compute_greedy_energies(nonces, cache, allowed_h, allowed_j)
         greedy_by_type[mtype] = greedy
         all_mined_greedy.extend(greedy)
         print(f"  {mtype}: {len(greedy)} greedy energies computed")
@@ -405,7 +416,9 @@ def run(args) -> int:
     # Random control group (same count as mined blocks)
     n_random = max(len(all_mined_greedy), 50)
     random_nonces = generate_random_nonces(n_random)
-    random_greedy = compute_greedy_energies(random_nonces, cache)
+    random_greedy = compute_greedy_energies(
+        random_nonces, cache, allowed_h, allowed_j,
+    )
     print(f"  random: {len(random_greedy)} control energies computed")
 
     # Generate plots
@@ -451,6 +464,12 @@ def main():
     parser.add_argument(
         '--output', '-o', default='.',
         help='Output directory for plots (default: current dir)',
+    )
+    parser.add_argument(
+        '--h-spec', choices=sorted(_H_SPECS), default='zero',
+        help="Linear-field spec the benchmarked nonces were mined under: "
+        "'zero' (J-only, the live testnet) or 'ternary' (legacy h in "
+        "{-1,0,1}). Greedy energy is only comparable under the matching spec.",
     )
     args = parser.parse_args()
     return run(args)

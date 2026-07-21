@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import struct
 
+import numpy as np
+
 # ChaCha constants: "expand 32-byte k" as four little-endian u32 words
 _CONSTANTS = (0x61707865, 0x3320646e, 0x79622d32, 0x6b206574)
 
@@ -155,3 +157,80 @@ class ChaCha8Rng:
         value = self._buffer[self._index]
         self._index += 1
         return value
+
+
+# ── Vectorized keystream (numpy) ──────────────────────────────────────────────
+# Produces the SAME u32 sequence as repeated ``ChaCha8Rng.next_u32()`` but for
+# many words at once: each ChaCha8 block is independent given its counter, so all
+# blocks compute in parallel as a single (n_blocks, 16) uint32 array. Used by the
+# vectorized Ising-model generation to skip the ~46k-element Python sample loop
+# (the feeder's throughput wall). ``test_chacha8_vectorized`` asserts it matches
+# the scalar RNG word-for-word.
+
+
+def _rotr_vec(x: np.ndarray, count: int) -> np.ndarray:
+    """Rotate a uint32 array right by ``count`` bits (uint32 wraps)."""
+    return ((x >> count) | (x << (32 - count)))
+
+
+def _quarter_round_vec(s: np.ndarray, a: int, b: int, c: int, d: int) -> None:
+    """ChaCha quarter round across the block axis (s is (B, 16) uint32)."""
+    s[:, a] = s[:, a] + s[:, b]
+    s[:, d] = _rotr_vec(s[:, d] ^ s[:, a], 16)
+    s[:, c] = s[:, c] + s[:, d]
+    s[:, b] = _rotr_vec(s[:, b] ^ s[:, c], 20)
+    s[:, a] = s[:, a] + s[:, b]
+    s[:, d] = _rotr_vec(s[:, d] ^ s[:, a], 24)
+    s[:, c] = s[:, c] + s[:, d]
+    s[:, b] = _rotr_vec(s[:, b] ^ s[:, c], 25)
+
+
+def _chacha_block_vec(states: np.ndarray) -> np.ndarray:
+    """ChaCha8 block function over a (B, 16) uint32 array of initial states."""
+    w = states.copy()
+    for _ in range(4):  # 4 double-rounds = 8 rounds
+        _quarter_round_vec(w, 0, 4, 8, 12)
+        _quarter_round_vec(w, 1, 5, 9, 13)
+        _quarter_round_vec(w, 2, 6, 10, 14)
+        _quarter_round_vec(w, 3, 7, 11, 15)
+        _quarter_round_vec(w, 0, 5, 10, 15)
+        _quarter_round_vec(w, 1, 6, 11, 12)
+        _quarter_round_vec(w, 2, 7, 8, 13)
+        _quarter_round_vec(w, 3, 4, 9, 14)
+    return w + states  # uint32 wraps
+
+
+def keystream_words(
+    key: bytes, n_words: int, *, counter: int = 0, stream: int = 0,
+) -> np.ndarray:
+    """First ``n_words`` keystream u32 words as a uint32 array.
+
+    Byte-identical to calling :meth:`ChaCha8Rng.next_u32` ``n_words`` times on
+    ``ChaCha8Rng(key, counter, stream)``: words are emitted block by block (16
+    per block), the counter incrementing per block.
+
+    Args:
+        key: 32-byte seed/key.
+        n_words: Number of u32 words to produce.
+        counter: Starting 64-bit block counter (0 for ``from_seed``).
+        stream: 64-bit stream id (0 for ``from_seed``).
+
+    Returns:
+        ``uint32`` array of length ``n_words``.
+    """
+    if len(key) != 32:
+        raise ValueError(f"Key must be 32 bytes, got {len(key)}")
+    if n_words <= 0:
+        return np.empty(0, dtype=np.uint32)
+    n_blocks = (n_words + 15) // 16
+    key_words = np.frombuffer(key, dtype="<u4")  # 8 little-endian u32
+    counters = (np.uint64(counter) + np.arange(n_blocks, dtype=np.uint64))
+    states = np.empty((n_blocks, 16), dtype=np.uint32)
+    states[:, 0:4] = _CONSTANTS
+    states[:, 4:12] = key_words
+    states[:, 12] = (counters & np.uint64(_U32_MASK)).astype(np.uint32)
+    states[:, 13] = (counters >> np.uint64(32)).astype(np.uint32)
+    states[:, 14] = np.uint32(stream & _U32_MASK)
+    states[:, 15] = np.uint32((stream >> 32) & _U32_MASK)
+    out = _chacha_block_vec(states)
+    return out.reshape(-1)[:n_words]

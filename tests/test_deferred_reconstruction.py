@@ -118,7 +118,7 @@ def test_base_finalize_sample_is_identity() -> None:
     miner = _UnitMiner()
     ss = _make_sampleset(4, 3)
     defect = object()  # arbitrary non-None object
-    result = miner._finalize_sample(ss, defect)
+    result = miner._finalize_sample(ss, defect, [0, 1, 2])
     assert result is ss, "_finalize_sample base must return the sampleset unchanged"
 
 
@@ -186,8 +186,8 @@ class _FinalizeSpy(_UnitMiner):
         self.finalize_calls: list = []
         self.eval_calls: list = []
 
-    def _finalize_sample(self, sampleset: Any, defect_info: Any) -> Any:
-        self.finalize_calls.append((sampleset, defect_info))
+    def _finalize_sample(self, sampleset: Any, defect_info: Any, nodes: Any) -> Any:
+        self.finalize_calls.append((sampleset, defect_info, nodes))
         # Return a full-width sampleset so evaluate can proceed.
         full = _make_sampleset(
             n_rows=sampleset.record.sample.shape[0],
@@ -231,9 +231,10 @@ def test_reduced_width_with_defect_info_calls_finalize_then_evaluate() -> None:
     assert len(miner.finalize_calls) == 1, (
         "_finalize_sample must be called once for a reduced-width survivor"
     )
-    called_ss, called_defect = miner.finalize_calls[0]
+    called_ss, called_defect, called_nodes = miner.finalize_calls[0]
     assert called_ss is ss
     assert called_defect is fake_defect
+    assert called_nodes == nodes, "_finalize_sample must receive the topology nodes"
     assert len(miner.eval_calls) == 1, (
         "evaluate_sampleset must be called after _finalize_sample"
     )
@@ -300,9 +301,10 @@ def test_mempool_reduced_width_with_defect_info_calls_finalize_then_evaluate() -
     assert len(miner.finalize_calls) == 1, (
         "_finalize_sample must be called once for a reduced-width QPU mempool sample"
     )
-    called_ss, called_defect = miner.finalize_calls[0]
+    called_ss, called_defect, called_nodes = miner.finalize_calls[0]
     assert called_ss is ss
     assert called_defect is fake_defect
+    assert called_nodes == nodes, "_finalize_sample must receive the topology nodes"
     assert len(miner.eval_calls) == 1, (
         "evaluate_sampleset must be called after _finalize_sample"
     )

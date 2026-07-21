@@ -11,11 +11,63 @@ pump contract (queue depth, defect_info attachment, cancel-on-close).
 from __future__ import annotations
 
 import multiprocessing as mp
+import time as _time
 from typing import Any, List, Optional, Tuple
 
 import dimod
+import numpy as np
+import pytest
 
-from QPU.dwave_sampler import DefectInfo, DWaveSamplerWrapper
+from QPU.dwave_sampler import (
+    DefectInfo,
+    DWaveSamplerWrapper,
+    _default_submit_workers,
+)
+
+
+class TestDefaultSubmitWorkers:
+    """Submit-pool sizing scales with the node but never exceeds queue_depth."""
+
+    @pytest.mark.parametrize(
+        "cpu,queue_depth,expected",
+        [
+            (4, 30, 4),   # the deployed 4-core node: capped at cpu, frees gen cores
+            (8, 30, 8),   # bigger box: more submit threads
+            (4, 2, 2),    # shallow queue caps below cpu
+            (1, 30, 1),   # single-core floor
+        ],
+    )
+    def test_scales_with_cpu_capped_at_queue_depth(
+        self, cpu, queue_depth, expected, monkeypatch
+    ):
+        monkeypatch.setattr("os.cpu_count", lambda: cpu)
+        assert _default_submit_workers(queue_depth) == expected
+
+    def test_unknown_cpu_count_falls_back_to_eight(self, monkeypatch):
+        monkeypatch.setattr("os.cpu_count", lambda: None)
+        assert _default_submit_workers(30) == 8
+
+
+@pytest.fixture(autouse=True)
+def _patch_wait_for_completions(monkeypatch):
+    """Drive the pump's wait seam with a done()-poll over the fake futures.
+
+    Production blocks via ``Future.wait_multiple``, which needs real cloud
+    Future event machinery the fakes don't have. This emulates its
+    ``(done, remaining)`` contract: block up to ``timeout``, returning early
+    once ``min_done`` fakes report ``done()``.
+    """
+    def _fake_wait(futures, *, min_done, timeout):
+        deadline = _time.time() + (timeout or 0.0)
+        while True:
+            done = [f for f in futures if f.done()]
+            if len(done) >= (min_done or 1) or _time.time() >= deadline:
+                return done, [f for f in futures if not f.done()]
+            _time.sleep(0.005)
+
+    monkeypatch.setattr(
+        "QPU.dwave_sampler._wait_for_completions", _fake_wait
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -69,11 +121,18 @@ def _make_defect(offset: float = 10.0) -> DefectInfo:
 class _FakeSamplerWrapper:
     """Minimal stand-in for DWaveSamplerWrapper.
 
-    Each ``sample_ising_async`` call consumes one entry from ``_results``, a
-    list of ``(FakeFuture, Optional[DefectInfo])`` tuples to return in order.
+    Each ``_submit_prepared`` call consumes one entry from ``_results`` and
+    returns its future. ``_results`` stays a list of ``(FakeFuture,
+    Optional[DefectInfo])`` tuples for construction convenience, but the pump
+    now reads ``defect_info`` from the model (ReducedProblem), so the tuple's
+    second element is ignored here.
     """
 
     job_label = "test_label"
+    # The pump rebuilds via the real _submit_prepared in production; the fake
+    # bypasses rebuild_ising entirely, so these are never read.
+    live_nodes: List[int] = [0, 1]
+    live_edges: List[Tuple[int, int]] = [(0, 1)]
 
     def __init__(
         self, results: List[Tuple[_FakeFuture, Optional[DefectInfo]]]
@@ -81,12 +140,16 @@ class _FakeSamplerWrapper:
         self._results = list(results)
         self._call_count = 0
         self._reconstruct_calls = 0
+        # The pump submits concurrently on a thread pool, so this is called from
+        # multiple threads — guard the counter + result list.
+        self._lock = __import__("threading").Lock()
 
-    def sample_ising_async(
-        self, h: Any, J: Any, **kwargs: Any
-    ) -> Tuple[_FakeFuture, Optional[DefectInfo]]:
-        self._call_count += 1
-        return self._results.pop(0)
+    def _submit_prepared(
+        self, h_vec: Any, j_vec: Any, **kwargs: Any
+    ) -> _FakeFuture:
+        with self._lock:
+            self._call_count += 1
+            return self._results.pop(0)[0]
 
     def reconstruct_full_sampleset(
         self, ss: dimod.SampleSet, defect_info: DefectInfo
@@ -100,12 +163,19 @@ class _FakeSamplerWrapper:
 
 
 class _FakeModel:
-    """Minimal IsingModel stand-in."""
+    """Minimal ReducedProblem stand-in.
 
-    def __init__(self, idx: int) -> None:
-        self.h = {0: float(idx), 1: -float(idx)}
-        self.J = {(0, 1): -1.0}
+    Carries the array payload + provenance + per-nonce defect_info the pump now
+    reads off the model. The fake ``_submit_prepared`` ignores the arrays, so
+    their values don't matter — only the attributes must exist.
+    """
+
+    def __init__(self, idx: int, defect_info: Optional[DefectInfo] = None) -> None:
+        self.h_vec = np.zeros(2, dtype=np.float64)
+        self.j_vec = np.zeros(1, dtype=np.float64)
+        self.defect_info = defect_info
         self.nonce = idx
+        self.salt = b""
 
 
 class _ListFeeder:
@@ -168,7 +238,7 @@ def test_defect_info_attached_to_sampleset_info():
     defect = _make_defect(offset=42.0)
     results = _build_results(2, defect=defect)
     sampler = _FakeSamplerWrapper(results)
-    models = _ListFeeder([_FakeModel(i) for i in range(2)])
+    models = _ListFeeder([_FakeModel(i, defect) for i in range(2)])
 
     gen = sampler.sample_ising_streaming(models, num_reads=8, queue_depth=2)
     _, ss = next(gen)
@@ -421,8 +491,8 @@ def test_raw_energies_not_shifted():
     defect = _make_defect(offset=offset)
 
     ss = _make_ss(energy=raw_energy)
-    sampler = _FakeSamplerWrapper([((_FakeFuture(ss, 0), defect))])
-    models = _ListFeeder([_FakeModel(0)])
+    sampler = _FakeSamplerWrapper([(_FakeFuture(ss, 0), defect)])
+    models = _ListFeeder([_FakeModel(0, defect)])
 
     gen = sampler.sample_ising_streaming(models, num_reads=8, queue_depth=1)
     _, yielded_ss = next(gen)
@@ -437,33 +507,68 @@ def test_raw_energies_not_shifted():
 # Tests: DWaveMiner._finalize_sample
 # ---------------------------------------------------------------------------
 
+def _make_shared_ss(n_reads: int = 1, energy: float = -100.0):
+    """Build the real production input: a positional _SharedSampleSet.
+
+    Two live columns (nodes 0, 1) carry [+1, -1]; the stream driver discards
+    dimod labels, so this is a raw int8 matrix, not a labeled dimod SampleSet.
+    """
+    import numpy as np
+    from shared.base_miner import _SharedSampleSet
+
+    sample = np.tile(np.array([1, -1], dtype=np.int8), (n_reads, 1))
+    return _SharedSampleSet(sample, np.full(n_reads, energy, dtype=np.float64))
+
+
 def test_finalize_sample_reconstructs_without_live_sampler():
     """_finalize_sample reconstructs even when self.sampler is None.
 
     The worker miner has no D-Wave connection (sampler is None); reconstruction
     must not depend on one. Regression for the graph_id-change crash where a
     newly-offline qubit forced reconstruction on the connection-less worker.
+    The driver ships a label-less ``_SharedSampleSet``, so reconstruction is
+    positional against ``nodes``.
     """
     from QPU.dwave_miner import DWaveMiner
 
     miner = DWaveMiner.__new__(DWaveMiner)
     miner.sampler = None  # the production condition that crashed
 
-    # _make_ss has vars {0, 1}; the defect clamps qubit 99 to +1, offset +10.
-    full = miner._finalize_sample(_make_ss(energy=-100.0), _make_defect(offset=10.0))
+    # Live columns map to nodes [0, 1]; the defect clamps qubit 99 to +1,
+    # offset +10. Full topology order is [0, 1, 99].
+    nodes = [0, 1, 99]
+    full = miner._finalize_sample(
+        _make_shared_ss(energy=-100.0), _make_defect(offset=10.0), nodes,
+    )
 
-    sample = full.first.sample
-    assert set(sample) == {0, 1, 99}, "clamped qubit must reappear"
-    assert sample[99] == 1, "clamped qubit must carry its fixed spin"
-    assert full.first.energy == -90.0, "energy must be reduced energy + offset"
+    row = full.record.sample[0]
+    assert list(row) == [1, -1, 1], "clamped qubit must reappear with its spin"
+    assert full.record.energy[0] == -90.0, "energy must be reduced energy + offset"
 
 
 def test_finalize_sample_preserves_all_reads():
-    """Reconstruction returns one full-topology sample per input read."""
+    """Reconstruction returns one full-topology sample per read, row content intact.
+
+    Uses per-row-distinct spins so a vectorization bug (broadcasting one row, or
+    filling the wrong axis) cannot pass a shape-only assertion.
+    """
+    import numpy as np
+
     from QPU.dwave_miner import DWaveMiner
+    from shared.base_miner import _SharedSampleSet
 
     miner = DWaveMiner.__new__(DWaveMiner)
     miner.sampler = None
 
-    result = miner._finalize_sample(_make_ss(n_reads=4), _make_defect())
-    assert len(result) == 4
+    # Live columns map to nodes [0, 1]; node 99 clamped to +1. Four distinct rows.
+    reduced = np.array(
+        [[1, -1], [-1, 1], [1, 1], [-1, -1]], dtype=np.int8,
+    )
+    shared_ss = _SharedSampleSet(reduced, np.zeros(4, dtype=np.float64))
+
+    result = miner._finalize_sample(shared_ss, _make_defect(), [0, 1, 99])
+
+    assert result.record.sample.shape == (4, 3)
+    # Each row: [node0, node1, node99(=+1 clamp)].
+    for i in range(4):
+        assert list(result.record.sample[i]) == [reduced[i, 0], reduced[i, 1], 1]

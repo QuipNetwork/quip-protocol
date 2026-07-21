@@ -15,13 +15,9 @@ from __future__ import annotations
 import os
 import signal
 import threading
-from typing import (
-    List, Tuple,
-)
 
 import dimod
 from shared.base_miner import BaseMiner
-from shared.miner_types import BlockRequirements
 from GPU.gpu_scheduler import (
     KernelScheduler,
     configure_mps_thread_limit,
@@ -161,21 +157,6 @@ class GPUMiner(BaseMiner):
             return False
 
         return True
-
-    def _adapt_mining_params(
-        self,
-        current_requirements: BlockRequirements,
-        nodes: List[int],
-        edges: List[Tuple[int, int]],
-    ) -> dict:
-        """Compute adaptive params from difficulty."""
-        return self.adapt_parameters(
-            current_requirements.difficulty_energy,
-            current_requirements.min_diversity,
-            current_requirements.min_solutions,
-            num_nodes=len(nodes),
-            num_edges=len(edges),
-        )
 
     def _post_sample(
         self, sampleset: dimod.SampleSet,

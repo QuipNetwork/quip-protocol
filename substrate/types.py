@@ -31,6 +31,12 @@ if TYPE_CHECKING:
     from shared.miner_types import BlockRequirements
 
 
+def _require_len(name: str, value: bytes, n: int = 32) -> None:
+    """Raise ValueError if *value* is not exactly *n* bytes long."""
+    if len(value) != n:
+        raise ValueError(f"{name} must be {n} bytes, got {len(value)}")
+
+
 @dataclass(frozen=True)
 class PowConstants:
     """Pallet constants the miner needs for local decay computation.
@@ -116,25 +122,15 @@ class SubstrateMiningContext:
     epoch_length: int = 0                       # blocks per decay step (0 = disabled)
 
     def __post_init__(self) -> None:
-        if len(self.last_proof_block_hash) != 32:
-            raise ValueError(
-                "last_proof_block_hash must be 32 bytes, got "
-                f"{len(self.last_proof_block_hash)}"
-            )
-        if len(self.topology_hash) != 32:
-            raise ValueError(
-                f"topology_hash must be 32 bytes, got {len(self.topology_hash)}"
-            )
+        _require_len("last_proof_block_hash", self.last_proof_block_hash)
+        _require_len("topology_hash", self.topology_hash)
         if len(self.miner_account_bytes) != 32:
             raise ValueError(
                 "miner_account_bytes must be the 32-byte canonical miner "
                 f"identity (blake2_256(SCALE(account_id))), got "
                 f"{len(self.miner_account_bytes)}"
             )
-        if len(self.block_hash) != 32:
-            raise ValueError(
-                f"block_hash must be 32 bytes, got {len(self.block_hash)}"
-            )
+        _require_len("block_hash", self.block_hash)
         if self.block_number < 0:
             raise ValueError(
                 f"block_number must be non-negative, got {self.block_number}"
@@ -199,15 +195,20 @@ class SubstrateMiningContext:
             nodes=list(nodes),
             edges=list(edges),
             buffer_size=buffer_size,
+            allowed_h=self.allowed_h_values,
         )
+
+    def uses_decay_ratchet(self) -> bool:
+        """PoW work always takes the decay-ratchet loop (see ``WorkContext``)."""
+        return True
 
 
 @dataclass(frozen=True)
 class WinningSolution:
     """Mirror of `pallet_quantum_pow::types::WinningSolution`.
 
-    Persisted in `QuantumPow.WinningSolutions[block_number]` alongside the
-    `BlockWinner` event. ``difficulty`` is the *active* threshold the proof
+    Persisted in ``QuantumPow.WinningSolutions[block_number]`` alongside the
+    ``BlockWinner`` event. ``difficulty`` is the *active* threshold the proof
     had to clear (decay applied, pre-adjust); the next block's threshold
     is whatever ``QuantumPow.Difficulty`` storage holds after the post-win
     adjustment, which is NOT duplicated here.
@@ -217,6 +218,10 @@ class WinningSolution:
     nonce re-derivation self-contained — no chain-state lookup needed,
     so it stays correct even after the prior winning block is pruned
     beyond ``BlockHashCount``.
+
+    Spec 111 renamed the pallet type to ``QBlock`` and appended
+    ``topology_hash`` + ``device_access_time_us``; both decode as ``None``
+    from older runtimes.
     """
 
     miner: bytes
@@ -226,17 +231,20 @@ class WinningSolution:
     submitted_at: int
     difficulty: SubstrateDifficulty
     last_proof_block_hash: bytes
+    # Spec-111 additions (mirror `QBlock`'s trailing fields). ``None`` when
+    # decoded from a pre-111 runtime that doesn't carry them.
+    topology_hash: Optional[bytes] = None
+    # Miner-reported compute time for the winning proof, µs (QPU access
+    # time for QPU wins, wall clock for CPU/GPU). Self-reported; None on
+    # pre-111 chains.
+    device_access_time_us: Optional[int] = None
 
     def __post_init__(self) -> None:
-        if len(self.miner) != 32:
-            raise ValueError(f"miner must be 32 bytes, got {len(self.miner)}")
-        if len(self.salt) != 32:
-            raise ValueError(f"salt must be 32 bytes, got {len(self.salt)}")
-        if len(self.last_proof_block_hash) != 32:
-            raise ValueError(
-                "last_proof_block_hash must be 32 bytes, got "
-                f"{len(self.last_proof_block_hash)}"
-            )
+        _require_len("miner", self.miner)
+        _require_len("salt", self.salt)
+        _require_len("last_proof_block_hash", self.last_proof_block_hash)
+        if self.topology_hash is not None:
+            _require_len("topology_hash", self.topology_hash)
 
 
 @dataclass(frozen=True)
@@ -252,8 +260,7 @@ class WinningSolutionWithNonce:
     nonce: bytes
 
     def __post_init__(self) -> None:
-        if len(self.nonce) != 32:
-            raise ValueError(f"nonce must be 32 bytes, got {len(self.nonce)}")
+        _require_len("nonce", self.nonce)
 
 
 @dataclass(frozen=True)
