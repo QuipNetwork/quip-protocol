@@ -52,3 +52,31 @@ def test_energy_truncates_toward_zero():
     # energy_truncates_toward_zero test (golden `energy` cases are all
     # integer-valued so this path is otherwise never hit via the function).
     assert scoring.energy_milli([1], [0.0015], [], []) == 1
+
+
+def test_energy_milli_saturates_at_i64_boundary():
+    # Python's int(e*1000) is unbounded and even raises OverflowError for very
+    # large e; Rust's `(e * 1000.0) as i64` saturates. Python must replicate
+    # Rust's saturating cast so cross-language scores agree at the boundary.
+    i64_max = (1 << 63) - 1
+    assert scoring.energy_milli([1], [1e16], [], []) == i64_max
+    # Must not raise (Python's bare int() would raise OverflowError here).
+    assert scoring.energy_milli([1], [1e308], [], []) == i64_max
+
+
+def test_energy_milli_saturates_at_negative_i64_boundary():
+    i64_min = -(1 << 63)
+    assert scoring.energy_milli([1], [-1e16], [], []) == i64_min
+
+
+def test_energy_milli_skips_negative_edge_index():
+    # A naive `u < len(spins)` guard is true for u=-1, so Python would wrap
+    # around to spins[-1] instead of skipping the OOB edge like Rust's usize
+    # indices (which cannot go negative). Edge (-1, 0) must be skipped.
+    assert scoring.energy_milli([1, -1], [], [1.0], [(-1, 0)]) == 0
+
+
+def test_set_diversity_zero_width_solutions_is_zero():
+    # Zero-length solution vectors must not raise ZeroDivisionError; the
+    # shared reference and Rust both return 0.0 for this case.
+    assert scoring.set_diversity([[], []]) == 0.0

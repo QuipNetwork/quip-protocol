@@ -238,7 +238,17 @@ pub async fn drive_miner(bin_path: &str, socket: &str) -> DriverReport {
         .spawn()
         .expect("spawn miner");
 
-    let status = child.wait().await.expect("wait for miner");
+    // Bound the wait so a hung miner can't hang the test suite; on timeout,
+    // kill the child and report a sentinel exit code so callers fail loudly
+    // instead of blocking forever.
+    let exit_code =
+        match tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await {
+            Ok(status) => status.expect("wait for miner").code().unwrap_or(-1),
+            Err(_) => {
+                let _ = child.kill().await;
+                -1
+            }
+        };
     // The session handler sends the outcome as the miner closes its stream on
     // exit; the timeout guards a miner that dies before ever connecting.
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), orx)
@@ -253,6 +263,6 @@ pub async fn drive_miner(bin_path: &str, socket: &str) -> DriverReport {
         handshake_ok: outcome.handshake_ok,
         results_received: outcome.results_received,
         rejects: outcome.rejects,
-        exit_code: status.code().unwrap_or(-1),
+        exit_code,
     }
 }

@@ -163,6 +163,7 @@ async fn run_session(uri: &str, miner_id: &str) -> Result<(), Box<dyn std::error
     let mut inbound = client.session(ReceiverStream::new(rx)).await?.into_inner();
 
     let mut config: Option<SessionConfig> = None;
+    let mut grace_ms: u64 = 5000;
     loop {
         let idle = config.as_ref().map(|c| c.idle_timeout_s).unwrap_or(300) as u64;
         let next = tokio::time::timeout(Duration::from_secs(idle), inbound.message()).await;
@@ -191,14 +192,27 @@ async fn run_session(uri: &str, miner_id: &str) -> Result<(), Box<dyn std::error
             Some(coord_msg::Msg::Ping(_)) => {
                 tx.send(status_msg(miner_id)).await?;
             }
-            Some(coord_msg::Msg::Shutdown(_)) => break,
+            Some(coord_msg::Msg::Shutdown(s)) => {
+                grace_ms = if s.grace_ms == 0 {
+                    5000
+                } else {
+                    s.grace_ms as u64
+                };
+                break;
+            }
             None => {}
         }
     }
     // Signal end-of-outbound so tonic flushes every buffered reply, then drain
     // inbound until the coordinator closes its side. Without this the process
     // (and its runtime) can tear down before queued Results reach the socket.
+    // Bounded by grace_ms: a coordinator that never closes its side (or dies)
+    // must not hang this drain forever.
     drop(tx);
-    while inbound.message().await?.is_some() {}
+    let drain = async {
+        while inbound.message().await?.is_some() {}
+        Ok::<(), tonic::Status>(())
+    };
+    let _ = tokio::time::timeout(Duration::from_millis(grace_ms), drain).await;
     Ok(())
 }

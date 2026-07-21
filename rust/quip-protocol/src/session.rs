@@ -56,6 +56,9 @@ pub fn build_hello(
     supported: &[JobKind],
 ) -> Result<Hello, SessionError> {
     let token = std::env::var("QUIP_SESSION_TOKEN").map_err(|_| SessionError::MissingToken)?;
+    if token.is_empty() {
+        return Err(SessionError::MissingToken);
+    }
     Ok(Hello {
         miner_id: miner_id.into(),
         session_token: token,
@@ -87,6 +90,14 @@ mod tests {
         assert_eq!(h.session_token, "tok-123");
         assert_eq!(h.protocol_version, 1);
         assert_eq!(h.miner_id, "cpu-0");
+
+        // An empty (but present) token is treated the same as a missing one.
+        std::env::set_var("QUIP_SESSION_TOKEN", "");
+        assert!(matches!(
+            build_hello("cpu-0", "cpu", "sa", &[JobKind::IsingSample]),
+            Err(SessionError::MissingToken)
+        ));
+        std::env::remove_var("QUIP_SESSION_TOKEN");
     }
 
     #[test]

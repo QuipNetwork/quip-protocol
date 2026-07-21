@@ -38,7 +38,11 @@ pub fn set_diversity(solutions: &[Vec<i8>]) -> f64 {
     if solutions.len() < 2 {
         return 0.0;
     }
-    let n = solutions[0].len() as f64;
+    let n = solutions[0].len();
+    if n == 0 {
+        return 0.0;
+    }
+    let n = n as f64;
     let mut sum = 0.0f64;
     let mut pairs = 0u64;
     for i in 0..solutions.len() {
@@ -85,5 +89,20 @@ mod tests {
         // a vs one-bit-flipped: min(1, 2)=1 over N=3 -> 1/3
         assert!((set_diversity(&[vec![1, 1, 1], vec![-1, 1, 1]]) - 1.0 / 3.0).abs() < 1e-12);
         assert_eq!(set_diversity(&[vec![1, 1]]), 0.0); // <2 solutions
+    }
+
+    #[test]
+    fn diversity_zero_width_solutions_is_zero_not_nan() {
+        // Two zero-length solution vectors would divide by n=0; must return
+        // 0.0, matching the shared reference (not NaN).
+        assert_eq!(set_diversity(&[vec![], vec![]]), 0.0);
+    }
+
+    #[test]
+    fn energy_milli_saturates_at_i64_boundary() {
+        // e = 1e16 -> e*1000 = 1e19, overflows i64::MAX (~9.223e18) -> saturates.
+        assert_eq!(energy_milli(&[1], &[1e16], &[], &[]), i64::MAX);
+        // Far past the boundary; must saturate, not panic or produce garbage.
+        assert_eq!(energy_milli(&[1], &[1e308], &[], &[]), i64::MAX);
     }
 }
