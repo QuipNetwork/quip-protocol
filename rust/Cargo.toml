@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["quip-proto"]
+members = ["quip-proto", "quip-protocol"]
 # quip-protocol, quip-mock-coordinator, quip-mock-miner are added by later tasks
 # as their crates land; listing not-yet-created members breaks `cargo` entirely.
 

@@ -1,0 +1,13 @@
+[package]
+name = "quip-protocol"
+version = "0.3.0"
+edition = "2021"
+
+[dependencies]
+quip-proto = { path = "../quip-proto" }
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"
