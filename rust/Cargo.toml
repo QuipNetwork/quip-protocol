@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["quip-proto", "quip-protocol"]
-# quip-protocol, quip-mock-coordinator, quip-mock-miner are added by later tasks
-# as their crates land; listing not-yet-created members breaks `cargo` entirely.
+members = ["quip-proto", "quip-protocol", "quip-mock-miner"]
+# quip-mock-coordinator is added by a later task as its crate lands;
+# listing not-yet-created members breaks `cargo` entirely.
 
 [workspace.dependencies]
 tonic = "0.12"
