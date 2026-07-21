@@ -55,6 +55,14 @@ def build() -> dict:
         for s in ([[1, 1, -1], [-1, -1, 1]], [[1, 1, 1], [-1, 1, 1]])
     ]
 
+    # Truncation-toward-zero cases: energy*1000 has a fractional part >= 0.5,
+    # so int() (truncate toward zero) and round() diverge. Single float multiply
+    # => identical IEEE-754 result in Rust ((e*1000.0) as i64) and Python.
+    truncation_cases = [
+        {"energy": e, "energy_milli": _int(e)}
+        for e in (0.0015, -0.0015, 0.9999, -0.9999, 2.4999, -2.4999)
+    ]
+
     return {
         "version": 1,
         "chacha8": [{
@@ -79,6 +87,7 @@ def build() -> dict:
         }],
         "energy": energy_cases,
         "diversity": diversity_cases,
+        "truncation": truncation_cases,
     }
 
 

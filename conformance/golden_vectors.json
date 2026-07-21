@@ -224,5 +224,31 @@
       "nonce_hex": "b4179357b751254ed0e68b5e969dcb50e73fd8c56be192b79d286ff2722d6a72"
     }
   ],
+  "truncation": [
+    {
+      "energy": 0.0015,
+      "energy_milli": 1
+    },
+    {
+      "energy": -0.0015,
+      "energy_milli": -1
+    },
+    {
+      "energy": 0.9999,
+      "energy_milli": 999
+    },
+    {
+      "energy": -0.9999,
+      "energy_milli": -999
+    },
+    {
+      "energy": 2.4999,
+      "energy_milli": 2499
+    },
+    {
+      "energy": -2.4999,
+      "energy_milli": -2499
+    }
+  ],
   "version": 1
 }

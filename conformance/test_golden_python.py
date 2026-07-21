@@ -27,3 +27,8 @@ def test_energy_cases_are_self_consistent():
     case = data["ising"][0]
     assert len(case["h_milli"]) == len(case["nodes"])
     assert len(case["j_milli"]) == len(case["edges"])
+    assert len(data["truncation"]) >= 4
+    for c in data["truncation"]:
+        assert int(c["energy"] * 1000) == c["energy_milli"]
+    # at least one case where truncation != rounding (proves the hazard is exercised)
+    assert any(int(c["energy"] * 1000) != round(c["energy"] * 1000) for c in data["truncation"])
