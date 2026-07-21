@@ -39,6 +39,17 @@ def build() -> dict:
     h_milli = [int(round(h[n] * 1000)) for n in nodes]
     j_milli = [int(round(j[e] * 1000)) for e in edges]
 
+    # Multi-block cases: the 16-word ChaCha8 buffer refills (regen()/counter
+    # increment) on crossing a block boundary. These cases pin that path,
+    # which the single-block cases above never exercise.
+    seed2 = bytes(range(32, 64))
+    nonce2 = derive_nonce(bytes(32), bytes([1] * 32), bytes([3] * 32))
+    nodes2 = list(range(24))
+    edges2 = [(i, (i + 1) % 24) for i in range(24)]
+    h2, j2 = generate_ising_model_from_nonce(nonce2, nodes2, edges2, ALLOWED_H, ALLOWED_J)
+    h2_milli = [int(round(h2[n] * 1000)) for n in nodes2]
+    j2_milli = [int(round(j2[e] * 1000)) for e in edges2]
+
     energy_cases = []
     for spins in ([1, -1, 1, -1], [1, 1, 1, 1], [-1, 1, -1, 1]):
         e = energy_of_solution(spins, h, j, nodes)
@@ -69,6 +80,10 @@ def build() -> dict:
             "seed_hex": seed.hex(),
             "n_words": 8,
             "words": [int(w) for w in keystream_words(seed, 8)],
+        }, {
+            "seed_hex": seed2.hex(),
+            "n_words": 40,
+            "words": [int(w) for w in keystream_words(seed2, 40)],
         }],
         "derive_nonce": [{
             "last_proof_hex": bytes(32).hex(),
@@ -84,6 +99,14 @@ def build() -> dict:
             "allowed_j_milli": [-1000, 1000],
             "h_milli": h_milli,
             "j_milli": j_milli,
+        }, {
+            "nonce_hex": nonce2.hex(),
+            "nodes": nodes2,
+            "edges": [list(e) for e in edges2],
+            "allowed_h_milli": [-1000, 0, 1000],
+            "allowed_j_milli": [-1000, 1000],
+            "h_milli": h2_milli,
+            "j_milli": j2_milli,
         }],
         "energy": energy_cases,
         "diversity": diversity_cases,

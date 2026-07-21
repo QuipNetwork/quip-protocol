@@ -15,30 +15,32 @@ fn hex32(s: &str) -> [u8; 32] {
 #[test]
 fn chacha8_keystream_matches_golden() {
     let g = golden();
-    let case = &g["chacha8"][0];
-    let seed = hex32(case["seed_hex"].as_str().unwrap());
-    let mut rng = ChaCha8Rng::from_seed(seed);
-    let expected: Vec<u64> = case["words"].as_array().unwrap()
-        .iter().map(|w| w.as_u64().unwrap()).collect();
-    for &w in &expected {
-        assert_eq!(rng.next_u32() as u64, w);
+    for case in g["chacha8"].as_array().unwrap() {
+        let seed = hex32(case["seed_hex"].as_str().unwrap());
+        let mut rng = ChaCha8Rng::from_seed(seed);
+        let expected: Vec<u64> = case["words"].as_array().unwrap()
+            .iter().map(|w| w.as_u64().unwrap()).collect();
+        for &w in &expected {
+            assert_eq!(rng.next_u32() as u64, w);
+        }
     }
 }
 
 #[test]
 fn ising_draw_order_matches_golden() {
     let g = golden();
-    let case = &g["ising"][0];
-    let nonce = hex32(case["nonce_hex"].as_str().unwrap());
-    let n_nodes = case["nodes"].as_array().unwrap().len();
-    let n_edges = case["edges"].as_array().unwrap().len();
-    let allowed_h: Vec<i32> = case["allowed_h_milli"].as_array().unwrap()
-        .iter().map(|v| v.as_i64().unwrap() as i32).collect();
-    let allowed_j: Vec<i32> = case["allowed_j_milli"].as_array().unwrap()
-        .iter().map(|v| v.as_i64().unwrap() as i32).collect();
-    let (h, j) = draw_ising_milli(nonce, n_nodes, n_edges, &allowed_h, &allowed_j);
-    let exp_h: Vec<i32> = case["h_milli"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap() as i32).collect();
-    let exp_j: Vec<i32> = case["j_milli"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap() as i32).collect();
-    assert_eq!(h, exp_h);
-    assert_eq!(j, exp_j);
+    for case in g["ising"].as_array().unwrap() {
+        let nonce = hex32(case["nonce_hex"].as_str().unwrap());
+        let n_nodes = case["nodes"].as_array().unwrap().len();
+        let n_edges = case["edges"].as_array().unwrap().len();
+        let allowed_h: Vec<i32> = case["allowed_h_milli"].as_array().unwrap()
+            .iter().map(|v| v.as_i64().unwrap() as i32).collect();
+        let allowed_j: Vec<i32> = case["allowed_j_milli"].as_array().unwrap()
+            .iter().map(|v| v.as_i64().unwrap() as i32).collect();
+        let (h, j) = draw_ising_milli(nonce, n_nodes, n_edges, &allowed_h, &allowed_j);
+        let exp_h: Vec<i32> = case["h_milli"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap() as i32).collect();
+        let exp_j: Vec<i32> = case["j_milli"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap() as i32).collect();
+        assert_eq!(h, exp_h);
+        assert_eq!(j, exp_j);
+    }
 }
