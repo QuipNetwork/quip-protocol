@@ -14,7 +14,7 @@ pub fn energy_milli(spins: &[i8], h: &[f64], j: &[f64], edges: &[(usize, usize)]
         }
     }
     for (k, &(u, v)) in edges.iter().enumerate() {
-        if k < j.len() {
+        if k < j.len() && u < spins.len() && v < spins.len() {
             e += j[k] * sign(spins[u]) * sign(spins[v]);
         }
     }
@@ -67,6 +67,15 @@ mod tests {
         // E = 0.0015 -> int(1.5) -> 1 (truncation, not round to 2)
         let e = energy_milli(&[1], &[0.0015], &[], &[]);
         assert_eq!(e, 1);
+    }
+
+    #[test]
+    fn energy_oob_edge_is_skipped_not_panicking() {
+        // edge (0, 5) references node 5, out of range for a 2-spin problem; must
+        // be skipped like a length-mismatched h/j entry, not panic.
+        // E = (1*1) + (1*-1) = 0 -> 0 milli
+        let e = energy_milli(&[1, -1], &[1.0, 1.0], &[1.0], &[(0, 5)]);
+        assert_eq!(e, 0);
     }
 
     #[test]

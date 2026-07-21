@@ -37,3 +37,18 @@ def test_truncation_matches_golden():
 def test_diversity_matches_golden():
     for c in GOLDEN["diversity"]:
         assert abs(scoring.set_diversity(c["solutions"]) - c["diversity"]) < 1e-9
+
+
+def test_energy_oob_edge_is_skipped_not_raising():
+    # edge (0, 5) references node 5, out of range for a 2-spin problem; must be
+    # skipped like a length-mismatched h/j entry, not raise IndexError.
+    # E = (1*1) + (1*-1) = 0 -> 0 milli
+    assert scoring.energy_milli([1, -1], [1.0, 1.0], [1.0], [(0, 5)]) == 0
+
+
+def test_energy_truncates_toward_zero():
+    # E = 0.0015 -> int(1.5) -> 1 (truncation, not round to 2); exercises the
+    # truncation branch through scoring.energy_milli itself, mirroring Rust's
+    # energy_truncates_toward_zero test (golden `energy` cases are all
+    # integer-valued so this path is otherwise never hit via the function).
+    assert scoring.energy_milli([1], [0.0015], [], []) == 1

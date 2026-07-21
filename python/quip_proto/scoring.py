@@ -11,7 +11,7 @@ def energy_milli(spins, h, j, edges):
         if i < len(h):
             e += h[i] * _sign(s)
     for k, (u, v) in enumerate(edges):
-        if k < len(j):
+        if k < len(j) and u < len(spins) and v < len(spins):
             e += j[k] * _sign(spins[u]) * _sign(spins[v])
     if not math.isfinite(e):
         return 1 << 62
