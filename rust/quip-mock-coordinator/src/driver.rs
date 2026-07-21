@@ -3,7 +3,7 @@
 
 use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
 use quip_proto::v1::{
-    coord_msg, ising_problem, miner_msg, CoordMsg, Configure, EdgeList, IsingProblem, Job, JobKind,
+    coord_msg, ising_problem, miner_msg, Configure, CoordMsg, EdgeList, IsingProblem, Job, JobKind,
     MinerMsg, Shutdown, Topology, Welcome,
 };
 use quip_protocol::wire::encode_i32_le;
@@ -76,7 +76,10 @@ fn coord(msg: coord_msg::Msg) -> CoordMsg {
 /// A minimal, well-formed two-spin Ising problem with an edge (0,1).
 fn valid_ising() -> IsingProblem {
     IsingProblem {
-        graph: Some(ising_problem::Graph::Edges(EdgeList { u: vec![0], v: vec![1] })),
+        graph: Some(ising_problem::Graph::Edges(EdgeList {
+            u: vec![0],
+            v: vec![1],
+        })),
         h_milli_le32: encode_i32_le(&[1000, -1000]),
         j_milli_le32: encode_i32_le(&[500]),
         num_reads: 1,
@@ -104,14 +107,22 @@ async fn run_script(
 
     // 1. First inbound message must be a valid Hello.
     match inbound.message().await {
-        Ok(Some(MinerMsg { msg: Some(miner_msg::Msg::Hello(h)) })) => {
+        Ok(Some(MinerMsg {
+            msg: Some(miner_msg::Msg::Hello(h)),
+        })) => {
             outcome.handshake_ok = h.session_token == "test-token" && h.protocol_version == 1;
         }
         _ => return outcome,
     }
 
     // 2. Handshake response + topology.
-    if tx.send(Ok(coord(coord_msg::Msg::Welcome(Welcome { protocol_version: 1 })))).await.is_err() {
+    if tx
+        .send(Ok(coord(coord_msg::Msg::Welcome(Welcome {
+            protocol_version: 1,
+        }))))
+        .await
+        .is_err()
+    {
         return outcome;
     }
     let configure = Configure {
@@ -121,35 +132,68 @@ async fn run_script(
         reconnect_window_s: 60,
         backend_toml: String::new(),
     };
-    let _ = tx.send(Ok(coord(coord_msg::Msg::Configure(configure)))).await;
+    let _ = tx
+        .send(Ok(coord(coord_msg::Msg::Configure(configure))))
+        .await;
     let topology = Topology {
         hash: vec![],
         nodes: vec![0, 1],
-        edges: Some(EdgeList { u: vec![0], v: vec![1] }),
+        edges: Some(EdgeList {
+            u: vec![0],
+            v: vec![1],
+        }),
     };
     let _ = tx.send(Ok(coord(coord_msg::Msg::Topology(topology)))).await;
 
     // 3. Two valid jobs with far-future deadlines -> expect two Results.
     let future = now_unix_ms() + 3_600_000;
-    let _ = tx.send(Ok(coord(coord_msg::Msg::Job(job(b"job-1", future, valid_ising()))))).await;
-    let _ = tx.send(Ok(coord(coord_msg::Msg::Job(job(b"job-2", future, valid_ising()))))).await;
+    let _ = tx
+        .send(Ok(coord(coord_msg::Msg::Job(job(
+            b"job-1",
+            future,
+            valid_ising(),
+        )))))
+        .await;
+    let _ = tx
+        .send(Ok(coord(coord_msg::Msg::Job(job(
+            b"job-2",
+            future,
+            valid_ising(),
+        )))))
+        .await;
 
     // 4. Cancel (no buffered work here; miner reports via Status).
     let _ = tx
-        .send(Ok(coord(coord_msg::Msg::Cancel(quip_proto::v1::Cancel { max_generation: 1 }))))
+        .send(Ok(coord(coord_msg::Msg::Cancel(quip_proto::v1::Cancel {
+            max_generation: 1,
+        }))))
         .await;
 
     // 5. Malformed job: h byte length not a multiple of 4 -> expect Reject{MALFORMED}.
     let mut malformed = valid_ising();
     malformed.h_milli_le32 = vec![0x01, 0x02, 0x03]; // len 3, not a multiple of 4
-    let _ = tx.send(Ok(coord(coord_msg::Msg::Job(job(b"job-bad", future, malformed))))).await;
+    let _ = tx
+        .send(Ok(coord(coord_msg::Msg::Job(job(
+            b"job-bad", future, malformed,
+        )))))
+        .await;
 
     // 6. Expired job: valid problem, deadline in the past -> expect Reject{EXPIRED}.
     let past = now_unix_ms().saturating_sub(60_000);
-    let _ = tx.send(Ok(coord(coord_msg::Msg::Job(job(b"job-old", past, valid_ising()))))).await;
+    let _ = tx
+        .send(Ok(coord(coord_msg::Msg::Job(job(
+            b"job-old",
+            past,
+            valid_ising(),
+        )))))
+        .await;
 
     // 7. Shutdown -> miner flushes and exits 0, closing its send stream.
-    let _ = tx.send(Ok(coord(coord_msg::Msg::Shutdown(Shutdown { grace_ms: 1000 })))).await;
+    let _ = tx
+        .send(Ok(coord(coord_msg::Msg::Shutdown(Shutdown {
+            grace_ms: 1000,
+        }))))
+        .await;
 
     // Drain the miner's replies until it closes the stream.
     while let Ok(Some(MinerMsg { msg: Some(m) })) = inbound.message().await {
@@ -175,7 +219,9 @@ pub async fn drive_miner(bin_path: &str, socket: &str) -> DriverReport {
     let incoming = UnixListenerStream::new(uds);
 
     let (otx, orx) = oneshot::channel::<SessionOutcome>();
-    let svc = MockCoordinator { outcome_tx: Mutex::new(Some(otx)) };
+    let svc = MockCoordinator {
+        outcome_tx: Mutex::new(Some(otx)),
+    };
     let server = tokio::spawn(async move {
         Server::builder()
             .add_service(MinerServiceServer::new(svc))

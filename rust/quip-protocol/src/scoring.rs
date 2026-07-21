@@ -1,25 +1,43 @@
-fn sign(s: i8) -> f64 { if s > 0 { 1.0 } else { -1.0 } }
+fn sign(s: i8) -> f64 {
+    if s > 0 {
+        1.0
+    } else {
+        -1.0
+    }
+}
 
 pub fn energy_milli(spins: &[i8], h: &[f64], j: &[f64], edges: &[(usize, usize)]) -> i64 {
     let mut e = 0.0f64;
     for (i, &s) in spins.iter().enumerate() {
-        if i < h.len() { e += h[i] * sign(s); }
+        if i < h.len() {
+            e += h[i] * sign(s);
+        }
     }
     for (k, &(u, v)) in edges.iter().enumerate() {
-        if k < j.len() { e += j[k] * sign(spins[u]) * sign(spins[v]); }
+        if k < j.len() {
+            e += j[k] * sign(spins[u]) * sign(spins[v]);
+        }
     }
-    if !e.is_finite() { return 1i64 << 62; }
+    if !e.is_finite() {
+        return 1i64 << 62;
+    }
     (e * 1000.0) as i64 // truncation toward zero, matches Python int(energy*1000)
 }
 
 pub fn hamming_flip_invariant(a: &[i8], b: &[i8]) -> u32 {
     let n = a.len();
-    let raw = a.iter().zip(b).filter(|(x, y)| sign(**x) != sign(**y)).count();
+    let raw = a
+        .iter()
+        .zip(b)
+        .filter(|(x, y)| sign(**x) != sign(**y))
+        .count();
     raw.min(n - raw) as u32
 }
 
 pub fn set_diversity(solutions: &[Vec<i8>]) -> f64 {
-    if solutions.len() < 2 { return 0.0; }
+    if solutions.len() < 2 {
+        return 0.0;
+    }
     let n = solutions[0].len() as f64;
     let mut sum = 0.0f64;
     let mut pairs = 0u64;

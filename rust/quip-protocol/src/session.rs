@@ -1,12 +1,17 @@
 use quip_proto::v1::{Configure, Hello, JobKind};
 
 #[derive(Debug, PartialEq)]
-pub enum SessionError { MissingToken, BadWelcome(u32) }
+pub enum SessionError {
+    MissingToken,
+    BadWelcome(u32),
+}
 
 impl std::fmt::Display for SessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SessionError::MissingToken => write!(f, "QUIP_SESSION_TOKEN environment variable not set"),
+            SessionError::MissingToken => {
+                write!(f, "QUIP_SESSION_TOKEN environment variable not set")
+            }
             SessionError::BadWelcome(v) => write!(f, "unexpected protocol version in Welcome: {v}"),
         }
     }
@@ -15,7 +20,13 @@ impl std::fmt::Display for SessionError {
 impl std::error::Error for SessionError {}
 
 #[repr(i32)]
-pub enum ExitCode { Clean = 0, ConfigInvalid = 64, EnvIncompatible = 69, InternalFatal = 70, TokenRejected = 77 }
+pub enum ExitCode {
+    Clean = 0,
+    ConfigInvalid = 64,
+    EnvIncompatible = 69,
+    InternalFatal = 70,
+    TokenRejected = 77,
+}
 
 pub struct SessionConfig {
     pub miner_id: String,
@@ -38,7 +49,12 @@ impl SessionConfig {
     }
 }
 
-pub fn build_hello(miner_id: &str, backend: &str, algorithm: &str, supported: &[JobKind]) -> Result<Hello, SessionError> {
+pub fn build_hello(
+    miner_id: &str,
+    backend: &str,
+    algorithm: &str,
+    supported: &[JobKind],
+) -> Result<Hello, SessionError> {
     let token = std::env::var("QUIP_SESSION_TOKEN").map_err(|_| SessionError::MissingToken)?;
     Ok(Hello {
         miner_id: miner_id.into(),
@@ -75,7 +91,13 @@ mod tests {
 
     #[test]
     fn configure_applies_defaults_for_zero_fields() {
-        let c = Configure { queue_depth: 0, idle_timeout_s: 0, heartbeat_s: 0, reconnect_window_s: 0, backend_toml: String::new() };
+        let c = Configure {
+            queue_depth: 0,
+            idle_timeout_s: 0,
+            heartbeat_s: 0,
+            reconnect_window_s: 0,
+            backend_toml: String::new(),
+        };
         let cfg = SessionConfig::from_configure("cpu-0".into(), &c);
         assert_eq!(cfg.queue_depth, 3);
         assert_eq!(cfg.idle_timeout_s, 300);

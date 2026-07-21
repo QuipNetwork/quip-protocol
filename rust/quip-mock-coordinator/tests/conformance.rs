@@ -18,7 +18,11 @@ fn miner_bin() -> String {
         .expect("build quip-mock-miner");
     assert!(status.success(), "failed to build quip-mock-miner");
 
-    let name = if cfg!(windows) { "quip-mock-miner.exe" } else { "quip-mock-miner" };
+    let name = if cfg!(windows) {
+        "quip-mock-miner.exe"
+    } else {
+        "quip-mock-miner"
+    };
     let mut p = std::env::current_exe().expect("test exe path");
     p.pop(); // deps/
     p.pop(); // <profile>/
@@ -33,7 +37,11 @@ async fn mock_miner_passes_conformance() {
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
     assert!(report.handshake_ok, "handshake failed");
     assert_eq!(report.results_received, 2, "expected 2 job results");
-    assert!(report.rejects.contains(&(quip_proto::v1::RejectReason::Malformed as i32)));
-    assert!(report.rejects.contains(&(quip_proto::v1::RejectReason::Expired as i32)));
+    assert!(report
+        .rejects
+        .contains(&(quip_proto::v1::RejectReason::Malformed as i32)));
+    assert!(report
+        .rejects
+        .contains(&(quip_proto::v1::RejectReason::Expired as i32)));
     assert_eq!(report.exit_code, 0, "clean shutdown expected");
 }

@@ -47,6 +47,43 @@ test:
       when: never
     - if: $CI_COMMIT_BRANCH
 
+rust:
+  stage: test
+  image: rust:1.97
+  tags: [linux, amd64]
+  before_script:
+    - apt-get update && apt-get install -y protobuf-compiler
+  script:
+    - cd rust
+    - cargo fmt --all --check
+    - cargo clippy --workspace --all-targets -- -D warnings
+    - cargo test --workspace
+  cache:
+    key: cargo-$CI_COMMIT_REF_SLUG
+    paths: [rust/target/, .cargo/]
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+conformance:
+  stage: test
+  image: python:3.11
+  tags: [linux, amd64]
+  before_script:
+    - pip install -e ".[dev]" grpcio-tools numpy blake3
+  script:
+    - python conformance/gen_golden_vectors.py --stdout | diff - conformance/golden_vectors.json
+    - PYTHONPATH=python python -m pytest conformance/ -v
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
 # ---------------------------------------------------------------------------
 # Version-tag gate (tags only — fail fast if tag ≠ pyproject.toml version)
 # ---------------------------------------------------------------------------

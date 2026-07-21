@@ -1,8 +1,8 @@
 use clap::Parser;
 use quip_proto::v1::miner_service_client::MinerServiceClient;
 use quip_proto::v1::{
-    coord_msg, ising_problem, miner_msg, CoordMsg, IsingProblem, Job, JobKind, JobRequest, MinerMsg,
-    Ready, Reject, RejectReason, Result as JobResult, Solution, Status,
+    coord_msg, ising_problem, miner_msg, CoordMsg, IsingProblem, Job, JobKind, JobRequest,
+    MinerMsg, Ready, Reject, RejectReason, Result as JobResult, Solution, Status,
 };
 use quip_protocol::scoring::energy_milli;
 use quip_protocol::session::{build_hello, SessionConfig};
@@ -15,30 +15,47 @@ use tonic::transport::{Endpoint, Uri};
 #[derive(Parser)]
 #[command(version = concat!(env!("CARGO_PKG_VERSION"), " protocol 1"))]
 struct Cli {
-    #[arg(long)] quip_coordinator: Option<String>,
-    #[arg(long)] miner_id: Option<String>,
-    #[arg(long)] capabilities: bool,
-    #[arg(long)] check: bool,
-    #[arg(long, default_value = "info")] log_level: String,
+    #[arg(long)]
+    quip_coordinator: Option<String>,
+    #[arg(long)]
+    miner_id: Option<String>,
+    #[arg(long)]
+    capabilities: bool,
+    #[arg(long)]
+    check: bool,
+    #[arg(long, default_value = "info")]
+    log_level: String,
 }
 
 fn print_capabilities() {
     // schema lives in quip-protocol; mock advertises a permissive envelope
-    println!(r#"{{"backend":"mock","algorithm":"sa","supported_kinds":["ISING_SAMPLE"],"max_nodes":100000,"max_edges":1000000}}"#);
+    println!(
+        r#"{{"backend":"mock","algorithm":"sa","supported_kinds":["ISING_SAMPLE"],"max_nodes":100000,"max_edges":1000000}}"#
+    );
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    if cli.capabilities { print_capabilities(); return Ok(()); }
-    if cli.check { return Ok(()); } // mock is always runnable
-    let uri = cli.quip_coordinator.expect("--quip-coordinator required for session mode");
+    if cli.capabilities {
+        print_capabilities();
+        return Ok(());
+    }
+    if cli.check {
+        return Ok(());
+    } // mock is always runnable
+    let uri = cli
+        .quip_coordinator
+        .expect("--quip-coordinator required for session mode");
     let miner_id = cli.miner_id.unwrap_or_else(|| "mock-0".into());
     run_session(&uri, &miner_id).await
 }
 
 fn now_unix_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn miner(msg: miner_msg::Msg) -> MinerMsg {
@@ -57,13 +74,19 @@ fn status_msg(miner_id: &str) -> MinerMsg {
 
 /// Milli-int-encoded field -> float vector; an empty field decodes to an empty vec.
 fn decode_milli_f64(bytes: &[u8]) -> Result<Vec<f64>, quip_protocol::wire::WireError> {
-    Ok(decode_i32_le(bytes)?.iter().map(|&v| v as f64 / 1000.0).collect())
+    Ok(decode_i32_le(bytes)?
+        .iter()
+        .map(|&v| v as f64 / 1000.0)
+        .collect())
 }
 
 fn edges_of(ising: &IsingProblem) -> Vec<(usize, usize)> {
     match &ising.graph {
         Some(ising_problem::Graph::Edges(e)) => {
-            e.u.iter().zip(&e.v).map(|(&u, &v)| (u as usize, v as usize)).collect()
+            e.u.iter()
+                .zip(&e.v)
+                .map(|(&u, &v)| (u as usize, v as usize))
+                .collect()
         }
         _ => Vec::new(),
     }
@@ -101,7 +124,10 @@ fn handle_job(job: Job) -> Vec<MinerMsg> {
     let energy = energy_milli(&spins, &h, &j, &edges);
     let result = JobResult {
         job_id,
-        solutions: vec![Solution { spins_bytes: vec![0x01u8; n], energy_milli: energy }],
+        solutions: vec![Solution {
+            spins_bytes: vec![0x01u8; n],
+            energy_milli: energy,
+        }],
         meta: None,
     };
     vec![
@@ -141,7 +167,7 @@ async fn run_session(uri: &str, miner_id: &str) -> Result<(), Box<dyn std::error
         let idle = config.as_ref().map(|c| c.idle_timeout_s).unwrap_or(300) as u64;
         let next = tokio::time::timeout(Duration::from_secs(idle), inbound.message()).await;
         let cm: CoordMsg = match next {
-            Err(_) => break,       // idle timeout with no job -> clean exit
+            Err(_) => break, // idle timeout with no job -> clean exit
             Ok(Ok(Some(cm))) => cm,
             Ok(Ok(None)) => break, // coordinator closed the stream
             Ok(Err(status)) => return Err(status.into()),

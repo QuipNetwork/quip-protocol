@@ -83,3 +83,12 @@ telemetry/
 
 # Downloaded + validated PoW win archives (tools/download_and_validate_wins.py)
 qpu_results_wins/
+
+# Local implementation plans (never committed)
+.plans/
+
+# Rust build output
+rust/target/
+
+# Python bytecode cache (nested packages)
+python/**/__pycache__/

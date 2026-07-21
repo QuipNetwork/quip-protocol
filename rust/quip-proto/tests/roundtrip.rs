@@ -15,7 +15,9 @@ fn hello_roundtrips_through_prost() {
         native_topology_hash: None,
         features: vec![],
     };
-    let msg = MinerMsg { msg: Some(miner_msg::Msg::Hello(hello.clone())) };
+    let msg = MinerMsg {
+        msg: Some(miner_msg::Msg::Hello(hello.clone())),
+    };
     let bytes = msg.encode_to_vec();
     let decoded = MinerMsg::decode(&bytes[..]).unwrap();
     match decoded.msg.unwrap() {
