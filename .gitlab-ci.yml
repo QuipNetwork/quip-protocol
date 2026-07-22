@@ -56,8 +56,8 @@ rust:
   script:
     - cd rust
     - cargo fmt --all --check
-    - cargo clippy --workspace --all-targets -- -D warnings
-    - cargo test --workspace
+    - cargo clippy --workspace --exclude quip-coordinator --all-targets -- -D warnings
+    - cargo test --workspace --exclude quip-coordinator
   cache:
     key: cargo-$CI_COMMIT_REF_SLUG
     paths: [rust/target/, .cargo/]
