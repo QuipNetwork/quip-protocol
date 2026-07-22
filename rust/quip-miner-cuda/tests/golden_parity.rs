@@ -11,6 +11,9 @@ use serde_json::Value;
 use std::fs;
 use std::sync::OnceLock;
 
+mod common;
+use common::cuda_available;
+
 fn golden() -> Value {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -31,6 +34,10 @@ fn device() -> &'static CudaDevice {
 /// Golden Ising cases: run the energy kernel on the GPU and compare bit-exact.
 #[test]
 fn gpu_energy_kernel_matches_golden_vectors() {
+    if !cuda_available() {
+        eprintln!("SKIP gpu_energy_kernel_matches_golden_vectors: no usable CUDA device");
+        return;
+    }
     let dev = device();
     for case in golden()["energy"].as_array().unwrap() {
         let spins: Vec<i8> = case["spins"]
@@ -105,6 +112,10 @@ fn truncation_matches_golden() {
 /// Live SA/Gibbs sample: every returned energy equals consensus scoring.
 #[test]
 fn live_sample_energies_match_energy_milli() {
+    if !cuda_available() {
+        eprintln!("SKIP live_sample_energies_match_energy_milli: no usable CUDA device");
+        return;
+    }
     let dev = device();
     let graph = IsingGraph::new(
         vec![1.0, -0.5, 0.0, 0.25],
@@ -142,6 +153,10 @@ fn live_sample_energies_match_energy_milli() {
 /// Positive-sign convention pin via GPU energy kernel.
 #[test]
 fn positive_sign_convention_on_gpu() {
+    if !cuda_available() {
+        eprintln!("SKIP positive_sign_convention_on_gpu: no usable CUDA device");
+        return;
+    }
     let dev = device();
     // spins [+1,-1]; h=[1.0, -0.5]; edge (0,1) J=2.0
     // E = 1 + 0.5 - 2.0 = -0.5 → -500 milli
@@ -156,6 +171,10 @@ fn positive_sign_convention_on_gpu() {
 /// SA finds ferro ground state (sanity that the kernel actually anneals).
 #[test]
 fn sa_finds_ground_state_on_ferro() {
+    if !cuda_available() {
+        eprintln!("SKIP sa_finds_ground_state_on_ferro: no usable CUDA device");
+        return;
+    }
     let dev = device();
     let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
     let params = SampleParams {
