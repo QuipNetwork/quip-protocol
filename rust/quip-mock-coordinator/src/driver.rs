@@ -4,7 +4,7 @@
 use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
 use quip_proto::v1::{
     coord_msg, ising_problem, miner_msg, Configure, CoordMsg, EdgeList, IsingProblem, Job, JobKind,
-    MinerMsg, Shutdown, Topology, Welcome,
+    MinerMsg, RejectReason, Shutdown, Topology, Welcome,
 };
 use quip_protocol::wire::encode_i32_le;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,21 +15,64 @@ use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
+/// A reject observed during the scripted session, bound to its job_id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedReject {
+    pub job_id: Vec<u8>,
+    pub reason: i32,
+}
+
 /// Outcome of driving one miner through the conformance session.
 #[derive(Debug, Clone)]
 pub struct DriverReport {
     pub handshake_ok: bool,
-    pub results_received: usize,
-    pub rejects: Vec<i32>,
+    /// True when a `Ready` arrived after `Configure` was sent.
+    pub ready_received: bool,
+    /// Credits advertised on each `JobRequest` (must be non-empty for pass).
+    pub job_request_credits: Vec<u32>,
+    /// `job_id` of every `Result` received (order preserved).
+    pub result_job_ids: Vec<Vec<u8>>,
+    /// Every `Reject`, bound to its `job_id` (not just the reason code).
+    pub rejects: Vec<ObservedReject>,
+    /// True when a `Status` arrived after `Cancel` (cancel acknowledgement).
+    pub cancel_acked: bool,
     pub exit_code: i32,
+}
+
+impl DriverReport {
+    /// Full conformance verdict — every axis the harness grades.
+    pub fn is_conformant(&self) -> bool {
+        self.handshake_ok
+            && self.ready_received
+            && !self.job_request_credits.is_empty()
+            && self.job_request_credits.iter().all(|&c| c > 0)
+            && self.result_job_ids.len() == 2
+            && self.result_job_ids.iter().any(|id| id == b"job-1")
+            && self.result_job_ids.iter().any(|id| id == b"job-2")
+            && self.has_reject(b"job-bad-h", RejectReason::Malformed)
+            && self.has_reject(b"job-bad-j", RejectReason::Malformed)
+            && self.has_reject(b"job-gate", RejectReason::UnsupportedKind)
+            && self.has_reject(b"job-old", RejectReason::Expired)
+            && self.cancel_acked
+            && self.exit_code == 0
+    }
+
+    pub fn has_reject(&self, job_id: &[u8], reason: RejectReason) -> bool {
+        self.rejects
+            .iter()
+            .any(|r| r.job_id == job_id && r.reason == reason as i32)
+    }
 }
 
 /// Everything the scripted session observes, excluding the child's exit code.
 #[derive(Debug, Default)]
 struct SessionOutcome {
     handshake_ok: bool,
-    results_received: usize,
-    rejects: Vec<i32>,
+    ready_received: bool,
+    job_request_credits: Vec<u32>,
+    result_job_ids: Vec<Vec<u8>>,
+    rejects: Vec<ObservedReject>,
+    cancel_acked: bool,
 }
 
 struct MockCoordinator {
@@ -91,6 +134,17 @@ fn job(job_id: &[u8], deadline_ms: u64, ising: IsingProblem) -> Job {
     Job {
         job_id: job_id.to_vec(),
         kind: JobKind::IsingSample as i32,
+        generation: 1,
+        deadline_ms,
+        ising: Some(ising),
+        provenance: None,
+    }
+}
+
+fn job_kind(job_id: &[u8], deadline_ms: u64, kind: JobKind, ising: IsingProblem) -> Job {
+    Job {
+        job_id: job_id.to_vec(),
+        kind: kind as i32,
         generation: 1,
         deadline_ms,
         ising: Some(ising),
@@ -170,15 +224,38 @@ async fn run_script(
         .await;
 
     // 5. Malformed job: h byte length not a multiple of 4 -> expect Reject{MALFORMED}.
-    let mut malformed = valid_ising();
-    malformed.h_milli_le32 = vec![0x01, 0x02, 0x03]; // len 3, not a multiple of 4
+    let mut malformed_h = valid_ising();
+    malformed_h.h_milli_le32 = vec![0x01, 0x02, 0x03]; // len 3, not a multiple of 4
     let _ = tx
         .send(Ok(coord(coord_msg::Msg::Job(job(
-            b"job-bad", future, malformed,
+            b"job-bad-h",
+            future,
+            malformed_h,
         )))))
         .await;
 
-    // 6. Expired job: valid problem, deadline in the past -> expect Reject{EXPIRED}.
+    // 6. Malformed job: j byte length not a multiple of 4 -> expect Reject{MALFORMED}.
+    let mut malformed_j = valid_ising();
+    malformed_j.j_milli_le32 = vec![0x01, 0x02, 0x03];
+    let _ = tx
+        .send(Ok(coord(coord_msg::Msg::Job(job(
+            b"job-bad-j",
+            future,
+            malformed_j,
+        )))))
+        .await;
+
+    // 7. Unsupported kind: GATE_CIRCUIT -> expect Reject{UNSUPPORTED_KIND}.
+    let _ = tx
+        .send(Ok(coord(coord_msg::Msg::Job(job_kind(
+            b"job-gate",
+            future,
+            JobKind::GateCircuit,
+            valid_ising(),
+        )))))
+        .await;
+
+    // 8. Expired job: valid problem, deadline in the past -> expect Reject{EXPIRED}.
     let past = now_unix_ms().saturating_sub(60_000);
     let _ = tx
         .send(Ok(coord(coord_msg::Msg::Job(job(
@@ -188,7 +265,7 @@ async fn run_script(
         )))))
         .await;
 
-    // 7. Shutdown -> miner flushes and exits 0, closing its send stream.
+    // 9. Shutdown -> miner flushes and exits 0, closing its send stream.
     let _ = tx
         .send(Ok(coord(coord_msg::Msg::Shutdown(Shutdown {
             grace_ms: 1000,
@@ -198,8 +275,16 @@ async fn run_script(
     // Drain the miner's replies until it closes the stream.
     while let Ok(Some(MinerMsg { msg: Some(m) })) = inbound.message().await {
         match m {
-            miner_msg::Msg::Result(_) => outcome.results_received += 1,
-            miner_msg::Msg::Reject(r) => outcome.rejects.push(r.reason),
+            miner_msg::Msg::Ready(_) => outcome.ready_received = true,
+            miner_msg::Msg::JobRequest(jr) => outcome.job_request_credits.push(jr.credits),
+            miner_msg::Msg::Result(r) => outcome.result_job_ids.push(r.job_id),
+            miner_msg::Msg::Reject(r) => outcome.rejects.push(ObservedReject {
+                job_id: r.job_id,
+                reason: r.reason,
+            }),
+            // This script only emits Status as the Cancel acknowledgement
+            // (no Ping), so any Status counts as the cancel ack.
+            miner_msg::Msg::Status(_) => outcome.cancel_acked = true,
             _ => {}
         }
     }
@@ -261,8 +346,52 @@ pub async fn drive_miner(bin_path: &str, socket: &str) -> DriverReport {
 
     DriverReport {
         handshake_ok: outcome.handshake_ok,
-        results_received: outcome.results_received,
+        ready_received: outcome.ready_received,
+        job_request_credits: outcome.job_request_credits,
+        result_job_ids: outcome.result_job_ids,
         rejects: outcome.rejects,
+        cancel_acked: outcome.cancel_acked,
         exit_code,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bare_report() -> DriverReport {
+        DriverReport {
+            handshake_ok: true,
+            ready_received: false,
+            job_request_credits: vec![],
+            result_job_ids: vec![],
+            rejects: vec![],
+            cancel_acked: false,
+            exit_code: 0,
+        }
+    }
+
+    #[test]
+    fn under_asserted_report_is_not_conformant() {
+        // Regression: handshake+exit alone used to green-light non-conformant miners.
+        let mut r = bare_report();
+        r.handshake_ok = true;
+        r.exit_code = 0;
+        assert!(
+            !r.is_conformant(),
+            "Ready / JobRequest / per-job rejects / Cancel ack are required"
+        );
+    }
+
+    #[test]
+    fn per_job_id_reject_binding() {
+        let mut r = bare_report();
+        r.rejects.push(ObservedReject {
+            job_id: b"job-bad-h".to_vec(),
+            reason: RejectReason::Malformed as i32,
+        });
+        assert!(r.has_reject(b"job-bad-h", RejectReason::Malformed));
+        assert!(!r.has_reject(b"job-old", RejectReason::Malformed));
+        assert!(!r.has_reject(b"job-bad-h", RejectReason::Expired));
     }
 }
