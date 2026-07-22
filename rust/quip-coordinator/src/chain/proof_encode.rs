@@ -55,6 +55,7 @@ pub fn build_quantum_proof(proof: &Proof, ctx: &ProofBuildContext) -> Result<Qua
         nonce,
         salt: ctx.salt,
         solutions: packed,
+        device_access_time_us: proof.device_access_time_us,
     })
 }
 
@@ -97,10 +98,12 @@ mod tests {
             order_id: vec![],
             generation: 1,
             salt: ctx.salt.to_vec(),
+            device_access_time_us: 123_456,
         };
         let qp = build_quantum_proof(&proof, &ctx).expect("build");
         assert_eq!(qp.topology_hash, H256::from(ctx.topology_hash));
         assert_eq!(qp.salt, ctx.salt);
+        assert_eq!(qp.device_access_time_us, 123_456);
         assert_eq!(qp.solutions.len(), 1);
         // 4 spins * 1 bit = 1 byte
         assert_eq!(qp.solutions[0].len(), 1);

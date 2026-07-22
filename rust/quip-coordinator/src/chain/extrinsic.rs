@@ -220,6 +220,7 @@ mod tests {
             nonce: U256::from(42u64),
             salt: [7u8; 32],
             solutions: vec![vec![0b01]],
+            device_access_time_us: 0,
         };
         let call = encode_submit_proof_call(&proof);
         let ctx = SignedExtensionContext {

@@ -258,6 +258,11 @@ async fn run_session<C: ChainClient>(
                                 // Job message. Live RealChainClient submit
                                 // requires proof.salt == 32 bytes.
                                 salt: vec![],
+                                device_access_time_us: result
+                                    .meta
+                                    .as_ref()
+                                    .map(|m| m.device_access_time_us)
+                                    .unwrap_or(0),
                             };
                             if let Ok(crate::chain::SubmitAction::Success) =
                                 chain.submit_proof(&proof).await
@@ -739,6 +744,11 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                                             .unwrap_or_default(),
                                         generation: job.generation,
                                         salt: vec![],
+                                        device_access_time_us: result
+                                            .meta
+                                            .as_ref()
+                                            .map(|m| m.device_access_time_us)
+                                            .unwrap_or(0),
                                     };
                                     if let Ok(crate::chain::SubmitAction::Success) =
                                         chain.submit_proof(&proof).await

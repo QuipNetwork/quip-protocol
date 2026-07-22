@@ -23,6 +23,10 @@ pub struct Proof {
     /// PoW salt (32 bytes). Required for live `submit_proof`; empty for
     /// FakeChain paths that only record the proof.
     pub salt: Vec<u8>,
+    /// Miner-reported compute time in microseconds, from the result's
+    /// `SamplerMeta.device_access_time_us`. Plumbed into the on-chain
+    /// `QuantumProof`; `0` = unreported.
+    pub device_access_time_us: u64,
 }
 
 /// Classify a pallet/dispatch error string into a fire-loop action.

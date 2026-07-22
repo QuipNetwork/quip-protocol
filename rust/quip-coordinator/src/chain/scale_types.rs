@@ -33,14 +33,17 @@ pub struct MiningSnapshotScale {
 
 /// Proof payload for `QuantumPow.submit_proof` (pallet index 10, call index 4).
 ///
-/// Energies / diversity / device_access_time are **not** sent — the chain
-/// recomputes them. `solutions` is a list of bit-packed spin vectors.
+/// Energies / diversity are **not** sent — the chain recomputes them.
+/// `solutions` is a list of bit-packed spin vectors. `device_access_time_us`
+/// is miner-reported compute time in microseconds (self-reported
+/// observability, unverifiable; `0` = unreported).
 #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
 pub struct QuantumProof {
     pub topology_hash: H256,
     pub nonce: U256,
     pub salt: [u8; 32],
     pub solutions: Vec<Vec<u8>>,
+    pub device_access_time_us: u64,
 }
 
 /// Ising params nested in a mempool `JobOrder`.
@@ -166,6 +169,7 @@ mod tests {
             nonce: U256::from(0x1234_5678u64),
             salt: [0xcd; 32],
             solutions: vec![vec![0b1010_0101], vec![0x00, 0xff]],
+            device_access_time_us: 987_654,
         };
         let encoded = proof.encode();
         let decoded = QuantumProof::decode(&mut &encoded[..]).expect("decode");
@@ -201,6 +205,7 @@ mod tests {
             nonce: U256::zero(),
             salt: [0u8; 32],
             solutions: vec![vec![0]],
+            device_access_time_us: 0,
         };
         let call = encode_submit_proof_call(&proof);
         assert_eq!(call[0], QUANTUM_POW_PALLET_INDEX);
