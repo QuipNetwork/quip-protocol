@@ -1,0 +1,35 @@
+[package]
+name = "quip-miner-cpu"
+version = "0.3.0"
+edition = "2021"
+description = "CPU Ising miners: simulated annealing and single-site Gibbs (v0.3)"
+
+[lib]
+name = "quip_miner_cpu"
+path = "src/lib.rs"
+
+[[bin]]
+name = "quip-cpu-sa"
+path = "src/bin/quip_cpu_sa.rs"
+
+[[bin]]
+name = "quip-cpu-gibbs"
+path = "src/bin/quip_cpu_gibbs.rs"
+
+[dependencies]
+quip-proto = { path = "../quip-proto" }
+quip-protocol = { path = "../quip-protocol" }
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["net"] }
+tower = "0.5"
+hyper-util = { version = "0.1", features = ["tokio"] }
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+rand = { version = "0.8", features = ["small_rng"] }
+
+[dev-dependencies]
+quip-mock-coordinator = { path = "../quip-mock-coordinator" }
+serde_json = "1"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process"] }
