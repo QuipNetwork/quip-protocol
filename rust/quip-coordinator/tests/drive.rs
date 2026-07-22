@@ -1,0 +1,107 @@
+//! Integration: drive quip-mock-miner end-to-end over UDS with a 2-entry
+//! JSONL list, via the generalized `JobSource`-driven harness.
+
+use quip_coordinator::chain::{FakeChain, MiningSnapshot};
+use quip_coordinator::config::LaunchEntry;
+use quip_coordinator::drive::{aggregate, drain_all, DriveManyParams, ListSource};
+use quip_proto::v1::Configure;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Sibling `quip-mock-miner` binary (not same package → no CARGO_BIN_EXE_*).
+fn mock_miner() -> String {
+    let status = std::process::Command::new(env!("CARGO"))
+        .args(["build", "-p", "quip-mock-miner"])
+        .status()
+        .expect("build quip-mock-miner");
+    assert!(status.success(), "failed to build quip-mock-miner");
+    let name = if cfg!(windows) {
+        "quip-mock-miner.exe"
+    } else {
+        "quip-mock-miner"
+    };
+    let mut p = std::env::current_exe().expect("test exe path");
+    p.pop();
+    p.pop();
+    p.push(name);
+    p.to_string_lossy().into_owned()
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+#[tokio::test]
+async fn drives_two_entry_list_end_to_end() {
+    let miner = mock_miner();
+    let deadline = now_ms() + 3_600_000;
+
+    // Two explicit entries; mock-miner always returns an all-+1 solution.
+    let list_text = "{\"h_milli\":[1000,-1000],\"j_milli\":[500],\"edges\":[[0,1]]}\n\
+                      {\"h_milli\":[0,0,0],\"j_milli\":[100,100],\"edges\":[[0,1],[1,2]]}\n";
+    let mut src = ListSource::parse(list_text, None, deadline).expect("parse list");
+    let jobs = drain_all(&mut src);
+    assert_eq!(jobs.len(), 2, "expected exactly 2 jobs from the list");
+
+    let snap = MiningSnapshot {
+        last_proof_block_hash: [0u8; 32],
+        topology_hash: vec![0u8; 32],
+        nodes: vec![],
+        edges: vec![],
+        allowed_h_milli: vec![0],
+        allowed_j_milli: vec![0],
+        min_solutions: 0,
+        max_energy_milli: 0,
+        min_diversity_milli: 0,
+        block_number: 0,
+    };
+    let chain = Arc::new(FakeChain::new(snap, None));
+
+    let entry = LaunchEntry {
+        miner_id: "cpu-0".into(),
+        binary: miner.clone(),
+        configure: Configure {
+            queue_depth: 3,
+            idle_timeout_s: 30,
+            heartbeat_s: 15,
+            reconnect_window_s: 60,
+            backend_toml: String::new(),
+        },
+    };
+
+    let sock = format!("/tmp/quip-drive-e2e-{}.sock", std::process::id());
+    let token = "drive-e2e-token";
+    let report = quip_coordinator::drive::run_drive(DriveManyParams {
+        miner_bin: &miner,
+        sock_path: &sock,
+        miner_id: "cpu-0",
+        token,
+        entry: &entry,
+        topology: None,
+        jobs,
+        chain: Arc::clone(&chain),
+        overall_timeout: Duration::from_secs(20),
+    })
+    .await;
+
+    assert!(report.handshake_ok, "handshake failed");
+    assert_eq!(
+        report.rows.len(),
+        2,
+        "expected 2 result rows, got {:?}",
+        report.rows
+    );
+    assert!(
+        report.rows.iter().all(|r| r.passed && !r.rejected),
+        "expected every job to pass with loose gates: {:?}",
+        report.rows
+    );
+
+    let agg = aggregate(&report.rows);
+    assert_eq!(agg.total_jobs, 2);
+    assert_eq!(agg.passed, 2);
+    assert_eq!(agg.rejected, 0);
+}
