@@ -19,6 +19,7 @@ use parity_scale_codec::Decode;
 use quantum_validation::AllowedValueSpec;
 use quip_transaction_crypto::HybridPair;
 use serde_json::Value;
+use sp_core::crypto::Ss58Codec;
 use sp_core::Pair as _;
 use std::sync::Mutex;
 
@@ -282,13 +283,16 @@ impl ChainClient for RealChainClient {
             .map_err(|e| ChainError::Submit(format!("encode proof: {e}")))?;
         let call = encode_submit_proof_call(&quantum);
 
-        // Chain state for signed extensions.
+        // Chain state for signed extensions. `system_accountNextIndex` expects
+        // an SS58-encoded address (the node rejects a hex account with a
+        // "Base 58 requirement is violated" param error), so encode the
+        // derived account with the default SS58 prefix.
+        let account_ss58 =
+            quip_transaction_crypto::account_id_from_public(&pair.public()).to_ss58check();
         let nonce_val = self
             .rpc_call(
                 "system_accountNextIndex",
-                Value::Array(vec![Value::String(hex_encode(AsRef::<[u8; 32]>::as_ref(
-                    &quip_transaction_crypto::account_id_from_public(&pair.public()),
-                )))]),
+                Value::Array(vec![Value::String(account_ss58)]),
             )
             .await?;
         let account_nonce = nonce_val.as_u64().unwrap_or(0) as u32;

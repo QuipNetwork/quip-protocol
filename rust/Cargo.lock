@@ -2781,6 +2781,7 @@ dependencies = [
  "quip-proto",
  "quip-protocol",
  "quip-transaction-crypto",
+ "rand",
  "serde",
  "serde_json",
  "sp-core",
