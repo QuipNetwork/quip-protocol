@@ -38,14 +38,19 @@ fn loose_snapshot() -> MiningSnapshot {
     // Gates loose enough that mock-miner's all-+1 solution is accepted.
     let nodes = vec![0, 1, 2, 3];
     let edges = vec![(0, 1), (1, 2), (2, 3), (0, 3)];
-    let hash = quip_coordinator::topology::topology_hash(&nodes, &edges);
+    let h = [-1000, 0, 1000];
+    let j = [-1000, 1000];
+    let spin = [-1000, 1000];
+    let hash =
+        quip_coordinator::topology::topology_hash_sets(&nodes, &edges, &h, &j, &spin).to_vec();
     MiningSnapshot {
         last_proof_block_hash: [7u8; 32],
         topology_hash: hash,
         nodes,
         edges,
-        allowed_h_milli: vec![-1000, 0, 1000],
-        allowed_j_milli: vec![-1000, 1000],
+        allowed_h_milli: h.to_vec(),
+        allowed_j_milli: j.to_vec(),
+        allowed_spin_milli: spin.to_vec(),
         min_solutions: 1,
         max_energy_milli: i64::MAX / 2, // energy ceiling (strict <)
         min_diversity_milli: 0,
@@ -58,7 +63,13 @@ async fn e2e_mock_miner_pow_submit_via_fake_chain() {
     let snap = loose_snapshot();
     let chain = Arc::new(FakeChain::new(snap.clone(), None));
 
-    let topology = Topology::from_nodes_edges(snap.nodes.clone(), snap.edges.clone());
+    let topology = Topology::from_nodes_edges(
+        snap.nodes.clone(),
+        snap.edges.clone(),
+        &snap.allowed_h_milli,
+        &snap.allowed_j_milli,
+        &snap.allowed_spin_milli,
+    );
     // Ensure topology hash matches snapshot.
     assert_eq!(topology.hash, snap.topology_hash);
 

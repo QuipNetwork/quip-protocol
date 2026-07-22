@@ -20,6 +20,9 @@ pub struct Proof {
     pub is_pow: bool,
     pub order_id: Vec<u8>,
     pub generation: u64,
+    /// PoW salt (32 bytes). Required for live `submit_proof`; empty for
+    /// FakeChain paths that only record the proof.
+    pub salt: Vec<u8>,
 }
 
 /// Classify a pallet/dispatch error string into a fire-loop action.

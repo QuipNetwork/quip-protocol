@@ -45,16 +45,14 @@ fn main() -> StdExitCode {
         }
     };
 
-    // Real chain is CONFIRM-isolated; construct for wiring only.
+    // Real chain is wired (RPC + hybrid sign). Full producers/session loop
+    // still needs a live node; config-load path validates wiring only.
+    // Integration is covered by tests/e2e.rs with FakeChain.
     let _chain = RealChainClient::new(cfg.validators.clone(), cfg.signer_key.clone());
     let _tokens: Vec<String> = cfg.launch.iter().map(|_| gen_session_token()).collect();
 
-    // Full runtime (producers + session server + supervisor) requires a live
-    // node via RealChainClient. Until external crates are wired, exit cleanly
-    // after a successful config load so operators can validate configs.
-    // Integration is covered by tests/e2e.rs with FakeChain.
     eprintln!(
-        "quip-coordinator: config ok ({} miners); real chain submit is CONFIRM-pending",
+        "quip-coordinator: config ok ({} miners); chain client ready (needs live node for RPC)",
         cfg.launch.len()
     );
 

@@ -67,7 +67,6 @@ impl ChainClient for FakeChain {
             Err(ChainError::Unavailable(s)) => Err(ChainError::Unavailable(s.clone())),
             Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
             Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),
-            Err(ChainError::ConfirmPending(s)) => Err(ChainError::ConfirmPending(s)),
         }
     }
 }

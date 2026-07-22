@@ -209,17 +209,17 @@ async fn run_session<C: ChainClient>(
                 }
             }
             Some(miner_msg::Msg::Result(result)) => {
-                let (job, topo_edges, best) = {
+                let (job, topo_nodes, topo_edges, best) = {
                     let mut st = state.lock().await;
                     st.router.ack(&miner_id);
                     let job = st.inflight.remove(&result.job_id);
-                    let edges = st
+                    let (nodes, edges) = st
                         .topology
                         .as_ref()
-                        .map(|t| t.edge_pairs())
+                        .map(|t| (t.nodes.clone(), t.edge_pairs()))
                         .unwrap_or_default();
                     let best = st.current_best_milli;
-                    (job, edges, best)
+                    (job, nodes, edges, best)
                 };
                 if let Some(job) = job {
                     if let Some(ising) = job.ising.as_ref() {
@@ -228,8 +228,13 @@ async fn run_session<C: ChainClient>(
                             min_diversity_milli: 0,
                             min_solutions: 0,
                         });
-                        let validated =
-                            validate_result(ising, &result.solutions, &gates, &topo_edges);
+                        let validated = validate_result(
+                            ising,
+                            &result.solutions,
+                            &gates,
+                            &topo_nodes,
+                            &topo_edges,
+                        );
                         {
                             let mut st = state.lock().await;
                             st.results_validated += 1;
@@ -248,6 +253,11 @@ async fn run_session<C: ChainClient>(
                                     .map(|p| p.order_id.clone())
                                     .unwrap_or_default(),
                                 generation: job.generation,
+                                // Salt is chosen when the PoW job is derived;
+                                // session does not yet thread it through the
+                                // Job message. Live RealChainClient submit
+                                // requires proof.salt == 32 bytes.
+                                salt: vec![],
                             };
                             if let Ok(crate::chain::SubmitAction::Success) =
                                 chain.submit_proof(&proof).await
@@ -381,6 +391,7 @@ pub async fn serve_one_session_expecting(
             edges: vec![],
             allowed_h_milli: vec![0],
             allowed_j_milli: vec![0],
+            allowed_spin_milli: vec![-1000, 1000],
             min_solutions: 0,
             max_energy_milli: 0,
             min_diversity_milli: 0,
@@ -678,16 +689,16 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                         }
                     }
                     Some(miner_msg::Msg::Result(result)) => {
-                        let (job, topo_edges, best) = {
+                        let (job, topo_nodes, topo_edges, best) = {
                             let mut st = state.lock().await;
                             st.router.ack(&miner_id);
                             let job = st.inflight.remove(&result.job_id);
-                            let edges = st
+                            let (nodes, edges) = st
                                 .topology
                                 .as_ref()
-                                .map(|t| t.edge_pairs())
+                                .map(|t| (t.nodes.clone(), t.edge_pairs()))
                                 .unwrap_or_default();
-                            (job, edges, st.current_best_milli)
+                            (job, nodes, edges, st.current_best_milli)
                         };
                         if let Some(job) = job {
                             if let Some(ising) = job.ising.as_ref() {
@@ -696,8 +707,13 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                                     min_diversity_milli: 0,
                                     min_solutions: 0,
                                 });
-                                let validated =
-                                    validate_result(ising, &result.solutions, &gates, &topo_edges);
+                                let validated = validate_result(
+                                    ising,
+                                    &result.solutions,
+                                    &gates,
+                                    &topo_nodes,
+                                    &topo_edges,
+                                );
                                 {
                                     let mut st = state.lock().await;
                                     st.results_validated += 1;
@@ -722,6 +738,7 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                                             .map(|p| p.order_id.clone())
                                             .unwrap_or_default(),
                                         generation: job.generation,
+                                        salt: vec![],
                                     };
                                     if let Ok(crate::chain::SubmitAction::Success) =
                                         chain.submit_proof(&proof).await
