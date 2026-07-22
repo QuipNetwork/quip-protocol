@@ -1,0 +1,189 @@
+//! Per-job scoring rows, aggregate stats, and stdout/JSONL report output.
+
+use serde_json::json;
+use std::io::Write;
+use std::path::Path;
+
+/// One row: a job's validated `Result` scored against its quality gates.
+#[derive(Debug, Clone)]
+pub struct JobRow {
+    pub job_id: Vec<u8>,
+    /// True when the job was PoW/nonce-derived (`job_id` is a nonce);
+    /// false for explicit-entry jobs (`job_id` is a synthetic label).
+    pub is_pow: bool,
+    pub n_solutions: usize,
+    pub best_energy_milli: i64,
+    pub diversity_milli: u32,
+    pub passed: bool,
+    pub device_access_time_us: u64,
+    pub wall_ms: u64,
+    /// True if the miner rejected the job outright (no `Result` returned).
+    pub rejected: bool,
+}
+
+/// Aggregate stats over a full drive run.
+#[derive(Debug, Clone, Default)]
+pub struct Aggregate {
+    pub total_jobs: usize,
+    pub passed: usize,
+    pub rejected: usize,
+    pub wall_ms_total: u64,
+    pub throughput_per_s: f64,
+}
+
+/// Compute aggregate stats from per-job rows.
+pub fn aggregate(rows: &[JobRow]) -> Aggregate {
+    let total_jobs = rows.len();
+    let passed = rows.iter().filter(|r| r.passed).count();
+    let rejected = rows.iter().filter(|r| r.rejected).count();
+    let wall_ms_total: u64 = rows.iter().map(|r| r.wall_ms).sum();
+    let throughput_per_s = if wall_ms_total > 0 {
+        total_jobs as f64 / (wall_ms_total as f64 / 1000.0)
+    } else {
+        0.0
+    };
+    Aggregate {
+        total_jobs,
+        passed,
+        rejected,
+        wall_ms_total,
+        throughput_per_s,
+    }
+}
+
+/// Print a human-readable table: one row per job, then an aggregate summary.
+pub fn print_table(rows: &[JobRow], agg: &Aggregate) {
+    println!(
+        "{:<4} {:<18} {:>10} {:>12} {:>10} {:>6} {:>8}",
+        "#", "job_id", "n_sol", "best_energy", "diversity", "pass", "wall_ms"
+    );
+    for (i, r) in rows.iter().enumerate() {
+        let job_id_hex = hex(&r.job_id);
+        let status = if r.rejected {
+            "REJECT"
+        } else if r.passed {
+            "pass"
+        } else {
+            "fail"
+        };
+        println!(
+            "{:<4} {:<18} {:>10} {:>12} {:>10} {:>6} {:>8}",
+            i + 1,
+            truncate_hex(&job_id_hex),
+            r.n_solutions,
+            r.best_energy_milli,
+            r.diversity_milli,
+            status,
+            r.wall_ms
+        );
+    }
+    println!(
+        "--- {} jobs, {} passed, {} rejected, {:.2} jobs/s ---",
+        agg.total_jobs, agg.passed, agg.rejected, agg.throughput_per_s
+    );
+}
+
+fn truncate_hex(s: &str) -> String {
+    if s.len() > 16 {
+        format!("{}..", &s[..16])
+    } else {
+        s.to_string()
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn row_to_json(r: &JobRow) -> serde_json::Value {
+    json!({
+        "job_id": hex(&r.job_id),
+        "is_pow": r.is_pow,
+        "n_solutions": r.n_solutions,
+        "best_energy_milli": r.best_energy_milli,
+        "diversity_milli": r.diversity_milli,
+        "passed": r.passed,
+        "rejected": r.rejected,
+        "device_access_time_us": r.device_access_time_us,
+        "wall_ms": r.wall_ms,
+    })
+}
+
+/// Write one JSON object per job followed by a trailing aggregate record.
+pub fn write_jsonl(path: &Path, rows: &[JobRow], agg: &Aggregate) -> std::io::Result<()> {
+    let mut f = std::fs::File::create(path)?;
+    for r in rows {
+        writeln!(f, "{}", row_to_json(r))?;
+    }
+    writeln!(
+        f,
+        "{}",
+        json!({
+            "aggregate": true,
+            "total_jobs": agg.total_jobs,
+            "passed": agg.passed,
+            "rejected": agg.rejected,
+            "wall_ms_total": agg.wall_ms_total,
+            "throughput_per_s": agg.throughput_per_s,
+        })
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(passed: bool, rejected: bool, wall_ms: u64) -> JobRow {
+        JobRow {
+            job_id: vec![1, 2, 3],
+            is_pow: true,
+            n_solutions: 1,
+            best_energy_milli: -500,
+            diversity_milli: 200,
+            passed,
+            device_access_time_us: 100,
+            wall_ms,
+            rejected,
+        }
+    }
+
+    #[test]
+    fn aggregate_counts_pass_and_reject() {
+        let rows = vec![
+            row(true, false, 10),
+            row(false, false, 20),
+            row(false, true, 5),
+        ];
+        let agg = aggregate(&rows);
+        assert_eq!(agg.total_jobs, 3);
+        assert_eq!(agg.passed, 1);
+        assert_eq!(agg.rejected, 1);
+        assert_eq!(agg.wall_ms_total, 35);
+        assert!(agg.throughput_per_s > 0.0);
+    }
+
+    #[test]
+    fn aggregate_of_empty_rows_has_zero_throughput() {
+        let agg = aggregate(&[]);
+        assert_eq!(agg.total_jobs, 0);
+        assert_eq!(agg.throughput_per_s, 0.0);
+    }
+
+    #[test]
+    fn jsonl_round_trips_through_serde_json() {
+        let rows = vec![row(true, false, 10), row(false, true, 0)];
+        let agg = aggregate(&rows);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.jsonl");
+        write_jsonl(&path, &rows, &agg).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3); // 2 rows + 1 aggregate
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["passed"], true);
+        let last: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(last["aggregate"], true);
+        assert_eq!(last["total_jobs"], 2);
+    }
+}

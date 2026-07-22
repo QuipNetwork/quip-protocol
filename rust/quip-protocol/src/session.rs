@@ -1,4 +1,7 @@
-use quip_proto::v1::{Configure, Hello, JobKind};
+use quip_proto::v1::{Configure, Hello, JobKind, Welcome};
+
+/// Protocol version this SDK speaks. `Welcome.protocol_version` must equal this.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, PartialEq)]
 pub enum SessionError {
@@ -19,13 +22,34 @@ impl std::fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
+/// Sysexits-style process exit codes (also carried on `Fatal.exit_code`).
 #[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitCode {
     Clean = 0,
+    /// Missing/invalid CLI or config (e.g. no `--quip-coordinator`, bad Welcome).
     ConfigInvalid = 64,
+    /// Host/env cannot run this miner (`--check` failed).
     EnvIncompatible = 69,
+    /// Unexpected internal failure.
     InternalFatal = 70,
+    /// `QUIP_SESSION_TOKEN` missing/empty or rejected.
     TokenRejected = 77,
+}
+
+impl ExitCode {
+    pub fn as_i32(self) -> i32 {
+        self as i32
+    }
+}
+
+impl From<SessionError> for ExitCode {
+    fn from(e: SessionError) -> Self {
+        match e {
+            SessionError::MissingToken => ExitCode::TokenRejected,
+            SessionError::BadWelcome(_) => ExitCode::ConfigInvalid,
+        }
+    }
 }
 
 pub struct SessionConfig {
@@ -62,7 +86,7 @@ pub fn build_hello(
     Ok(Hello {
         miner_id: miner_id.into(),
         session_token: token,
-        protocol_version: 1,
+        protocol_version: PROTOCOL_VERSION,
         backend: backend.into(),
         algorithm: algorithm.into(),
         supported_kinds: supported.iter().map(|k| *k as i32).collect(),
@@ -73,10 +97,18 @@ pub fn build_hello(
     })
 }
 
+/// Reject a `Welcome` whose `protocol_version` is not what this SDK speaks.
+pub fn check_welcome(w: &Welcome) -> Result<(), SessionError> {
+    if w.protocol_version != PROTOCOL_VERSION {
+        return Err(SessionError::BadWelcome(w.protocol_version));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quip_proto::v1::{Configure, JobKind};
+    use quip_proto::v1::{Configure, JobKind, Welcome};
 
     #[test]
     fn hello_requires_token() {
@@ -114,5 +146,41 @@ mod tests {
         assert_eq!(cfg.idle_timeout_s, 300);
         assert_eq!(cfg.heartbeat_s, 15);
         assert_eq!(cfg.reconnect_window_s, 60);
+    }
+
+    #[test]
+    fn welcome_rejects_non_v1_protocol_version() {
+        assert!(check_welcome(&Welcome {
+            protocol_version: 1
+        })
+        .is_ok());
+        assert_eq!(
+            check_welcome(&Welcome {
+                protocol_version: 2
+            }),
+            Err(SessionError::BadWelcome(2))
+        );
+        assert_eq!(
+            check_welcome(&Welcome {
+                protocol_version: 0
+            }),
+            Err(SessionError::BadWelcome(0))
+        );
+    }
+
+    #[test]
+    fn session_error_maps_to_documented_exit_codes() {
+        assert_eq!(
+            ExitCode::from(SessionError::MissingToken),
+            ExitCode::TokenRejected
+        );
+        assert_eq!(
+            ExitCode::from(SessionError::BadWelcome(2)),
+            ExitCode::ConfigInvalid
+        );
+        assert_eq!(ExitCode::ConfigInvalid.as_i32(), 64);
+        assert_eq!(ExitCode::EnvIncompatible.as_i32(), 69);
+        assert_eq!(ExitCode::InternalFatal.as_i32(), 70);
+        assert_eq!(ExitCode::TokenRejected.as_i32(), 77);
     }
 }

@@ -1,8 +1,12 @@
-//! Chain access behind `ChainClient`. Real impl is CONFIRM-isolated; tests use `FakeChain`.
+//! Chain access behind `ChainClient`. Real impl talks Substrate JSON-RPC;
+//! tests use `FakeChain`.
 
+pub mod extrinsic;
 pub mod fake;
 pub mod mempool;
+pub mod proof_encode;
 pub mod real;
+pub mod scale_types;
 pub mod snapshot;
 pub mod submit;
 
@@ -20,8 +24,6 @@ pub enum ChainError {
     Unavailable(String),
     Decode(String),
     Submit(String),
-    /// External-crate API not yet wired (CONFIRM markers).
-    ConfirmPending(&'static str),
 }
 
 impl std::fmt::Display for ChainError {
@@ -30,7 +32,6 @@ impl std::fmt::Display for ChainError {
             ChainError::Unavailable(s) => write!(f, "chain unavailable: {s}"),
             ChainError::Decode(s) => write!(f, "decode error: {s}"),
             ChainError::Submit(s) => write!(f, "submit error: {s}"),
-            ChainError::ConfirmPending(s) => write!(f, "CONFIRM crate API: {s}"),
         }
     }
 }
@@ -38,10 +39,6 @@ impl std::fmt::Display for ChainError {
 impl std::error::Error for ChainError {}
 
 /// Async chain seam: snapshot fetch, mempool orders, extrinsic submit.
-///
-/// The real impl (`RealChainClient`) depends on external crates
-/// (`quip-protocol-rs`, `hybrid-sig`) that are not available in this workspace;
-/// its methods are `todo!("CONFIRM crate API: …")`. `FakeChain` is the tested path.
 #[async_trait]
 pub trait ChainClient: Send + Sync {
     /// Fetch the mining snapshot at `at` (or best head). `None` if not ready.

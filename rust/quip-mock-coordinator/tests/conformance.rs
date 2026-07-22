@@ -1,4 +1,5 @@
 use quip_mock_coordinator::driver::drive_miner;
+use quip_proto::v1::RejectReason;
 
 /// Path to the sibling `quip-mock-miner` binary.
 ///
@@ -33,15 +34,65 @@ fn miner_bin() -> String {
 #[tokio::test]
 async fn mock_miner_passes_conformance() {
     let miner = miner_bin();
-    let socket = format!("/tmp/quip-conf-{}.sock", std::process::id());
+    let socket = format!(
+        "/tmp/quip-conf-{}-{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
-    assert!(report.handshake_ok, "handshake failed");
-    assert_eq!(report.results_received, 2, "expected 2 job results");
-    assert!(report
-        .rejects
-        .contains(&(quip_proto::v1::RejectReason::Malformed as i32)));
-    assert!(report
-        .rejects
-        .contains(&(quip_proto::v1::RejectReason::Expired as i32)));
-    assert_eq!(report.exit_code, 0, "clean shutdown expected");
+
+    assert!(report.handshake_ok, "handshake failed: {report:?}");
+    assert!(
+        report.ready_received,
+        "Ready must arrive after Configure: {report:?}"
+    );
+    assert!(
+        !report.job_request_credits.is_empty(),
+        "expected at least one JobRequest{{credits}}: {report:?}"
+    );
+    assert!(
+        report.job_request_credits.iter().all(|&c| c > 0),
+        "JobRequest credits must be > 0: {report:?}"
+    );
+    assert_eq!(
+        report.result_job_ids.len(),
+        2,
+        "expected 2 Results: {report:?}"
+    );
+    assert!(
+        report.result_job_ids.iter().any(|id| id == b"job-1"),
+        "missing Result for job-1: {report:?}"
+    );
+    assert!(
+        report.result_job_ids.iter().any(|id| id == b"job-2"),
+        "missing Result for job-2: {report:?}"
+    );
+    assert!(
+        report.has_reject(b"job-bad-h", RejectReason::Malformed),
+        "missing per-job_id Reject MALFORMED for job-bad-h: {report:?}"
+    );
+    assert!(
+        report.has_reject(b"job-bad-j", RejectReason::Malformed),
+        "missing per-job_id Reject MALFORMED for job-bad-j: {report:?}"
+    );
+    assert!(
+        report.has_reject(b"job-gate", RejectReason::UnsupportedKind),
+        "missing per-job_id Reject UNSUPPORTED_KIND for job-gate: {report:?}"
+    );
+    assert!(
+        report.has_reject(b"job-old", RejectReason::Expired),
+        "missing per-job_id Reject EXPIRED for job-old: {report:?}"
+    );
+    assert!(
+        report.cancel_acked,
+        "Cancel must be acknowledged via Status: {report:?}"
+    );
+    assert_eq!(report.exit_code, 0, "clean shutdown expected: {report:?}");
+    assert!(
+        report.is_conformant(),
+        "full DriverReport must pass: {report:?}"
+    );
 }

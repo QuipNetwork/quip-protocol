@@ -1,6 +1,6 @@
 //! Mining snapshot types and head-change generation key.
 
-use crate::topology::topology_hash;
+use crate::topology::{topology_hash_sets, DEFAULT_SPIN_SET};
 
 /// Chain mining snapshot consumed by the PoW producer.
 #[derive(Debug, Clone)]
@@ -11,6 +11,8 @@ pub struct MiningSnapshot {
     pub edges: Vec<(u32, u32)>,
     pub allowed_h_milli: Vec<i32>,
     pub allowed_j_milli: Vec<i32>,
+    /// Allowed spin milli values (Set); default binary `±1000` when empty.
+    pub allowed_spin_milli: Vec<i32>,
     pub min_solutions: u32,
     /// Energy ceiling: solutions must be strictly below this (milli).
     pub max_energy_milli: i64,
@@ -38,7 +40,19 @@ pub fn snapshot_topology_hash(snap: &MiningSnapshot) -> Vec<u8> {
     if snap.topology_hash.len() == 32 {
         snap.topology_hash.clone()
     } else {
-        topology_hash(&snap.nodes, &snap.edges)
+        let spin = if snap.allowed_spin_milli.is_empty() {
+            DEFAULT_SPIN_SET.as_slice()
+        } else {
+            snap.allowed_spin_milli.as_slice()
+        };
+        topology_hash_sets(
+            &snap.nodes,
+            &snap.edges,
+            &snap.allowed_h_milli,
+            &snap.allowed_j_milli,
+            spin,
+        )
+        .to_vec()
     }
 }
 
@@ -54,6 +68,7 @@ mod tests {
             edges: vec![(0, 1)],
             allowed_h_milli: vec![-1000, 0, 1000],
             allowed_j_milli: vec![-1000, 1000],
+            allowed_spin_milli: vec![-1000, 1000],
             min_solutions: 5,
             max_energy_milli: -14_000_000,
             min_diversity_milli: 200,

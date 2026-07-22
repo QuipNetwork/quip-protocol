@@ -1,12 +1,21 @@
-//! Session-cached topology and deterministic topology hash.
+//! Session-cached topology and the chain-canonical topology hash.
 //!
-//! > **CONFIRM crate API:** the exact chain `topology_hash` construction.
-//! > This local hash must equal the chain's H256, or PoW jobs reference a
-//! > hash miners cannot resolve. Confirm against `quip-protocol-rs`.
+//! The hash matches `pallet_quantum_pow::topology::hash_topology`:
+//! `blake2_256(SCALE.encode((sorted_nodes, canonical_sorted_edges,
+//! allowed_h.canonical_bytes(), allowed_j.canonical_bytes(),
+//! allowed_spin.canonical_bytes())))`.
+
+use parity_scale_codec::Encode;
+use quantum_validation::{AllowedValueSpec, MilliValue};
+use sp_core::hashing::blake2_256;
+
+/// Default binary spin set (`±MILLI_SCALE`) used when a caller has no spin spec.
+pub const DEFAULT_SPIN_SET: [MilliValue; 2] = [-1000, 1000];
 
 /// A hardware (or logical) graph identified by a deterministic hash.
 #[derive(Debug, Clone)]
 pub struct Topology {
+    /// 32-byte chain-canonical topology hash.
     pub hash: Vec<u8>,
     pub nodes: Vec<u32>,
     /// Parallel edge endpoint arrays `(u, v)`.
@@ -14,8 +23,15 @@ pub struct Topology {
 }
 
 impl Topology {
-    pub fn from_nodes_edges(nodes: Vec<u32>, edges: Vec<(u32, u32)>) -> Self {
-        let hash = topology_hash(&nodes, &edges);
+    /// Build a topology using the given allowed-value *sets* (Set-variant specs).
+    pub fn from_nodes_edges(
+        nodes: Vec<u32>,
+        edges: Vec<(u32, u32)>,
+        allowed_h: &[MilliValue],
+        allowed_j: &[MilliValue],
+        allowed_spin: &[MilliValue],
+    ) -> Self {
+        let hash = topology_hash_sets(&nodes, &edges, allowed_h, allowed_j, allowed_spin).to_vec();
         let (u, v): (Vec<u32>, Vec<u32>) = edges.into_iter().unzip();
         Self {
             hash,
@@ -45,31 +61,110 @@ impl Topology {
     }
 }
 
-/// Deterministic BLAKE3 hash of nodes then edges (u,v pairs in order).
+/// Canonical chain topology hash for full `AllowedValueSpec` inputs.
 ///
-/// Placeholder until `quip-protocol-rs` confirms the canonical chain hash.
-pub fn topology_hash(nodes: &[u32], edges: &[(u32, u32)]) -> Vec<u8> {
-    let mut h = blake3::Hasher::new();
-    for n in nodes {
-        h.update(&n.to_le_bytes());
-    }
-    for (u, v) in edges {
-        h.update(&u.to_le_bytes());
-        h.update(&v.to_le_bytes());
-    }
-    h.finalize().as_bytes().to_vec()
+/// Byte-identical to `pallet_quantum_pow::topology::hash_topology`.
+pub fn topology_hash(
+    nodes: &[u32],
+    edges: &[(u32, u32)],
+    allowed_h: &AllowedValueSpec<&[MilliValue]>,
+    allowed_j: &AllowedValueSpec<&[MilliValue]>,
+    allowed_spin: &AllowedValueSpec<&[MilliValue]>,
+) -> [u8; 32] {
+    let mut canonical_nodes = nodes.to_vec();
+    canonical_nodes.sort_unstable();
+
+    let mut canonical_edges: Vec<(u32, u32)> = edges
+        .iter()
+        .map(|&(u, v)| if u <= v { (u, v) } else { (v, u) })
+        .collect();
+    canonical_edges.sort_unstable();
+
+    blake2_256(
+        &(
+            canonical_nodes,
+            canonical_edges,
+            allowed_h.canonical_bytes(),
+            allowed_j.canonical_bytes(),
+            allowed_spin.canonical_bytes(),
+        )
+            .encode(),
+    )
+}
+
+/// Convenience wrapper when all three specs are discrete sets.
+pub fn topology_hash_sets(
+    nodes: &[u32],
+    edges: &[(u32, u32)],
+    allowed_h: &[MilliValue],
+    allowed_j: &[MilliValue],
+    allowed_spin: &[MilliValue],
+) -> [u8; 32] {
+    topology_hash(
+        nodes,
+        edges,
+        &AllowedValueSpec::Set(allowed_h),
+        &AllowedValueSpec::Set(allowed_j),
+        &AllowedValueSpec::Set(allowed_spin),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Pinned against the pallet construction: sorted nodes, min/max edges,
+    /// set-canonical specs, SCALE-encoded tuple, blake2_256.
     #[test]
-    fn hash_is_deterministic_and_order_sensitive() {
-        let h1 = topology_hash(&[0, 1, 2], &[(0, 1), (1, 2)]);
-        let h2 = topology_hash(&[0, 1, 2], &[(0, 1), (1, 2)]);
-        assert_eq!(h1, h2);
-        assert_eq!(h1.len(), 32);
-        assert_ne!(h1, topology_hash(&[0, 1, 2], &[(1, 2), (0, 1)]));
+    fn golden_topology_hash_known_fixture() {
+        let nodes = [0u32, 1, 2];
+        let edges = [(0u32, 1), (1, 2)];
+        let h: &[i32] = &[-1000, 0, 1000];
+        let j: &[i32] = &[-1000, 1000];
+        let spin: &[i32] = &[-1000, 1000];
+
+        let got = topology_hash_sets(&nodes, &edges, h, j, spin);
+        // Precomputed offline (Python blake2b-256 of the SCALE payload).
+        let expected =
+            hex_literal("56dff5ca824517ba7f0593ec12a5dd102eb0a14f775b35c415467e0e0d6e19c2");
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn hash_is_order_independent_for_nodes_and_edges() {
+        let h: &[i32] = &[-1000, 0, 1000];
+        let j: &[i32] = &[-1000, 1000];
+        let spin: &[i32] = &DEFAULT_SPIN_SET;
+        let a = topology_hash_sets(&[2, 0, 1], &[(1, 0), (2, 1)], h, j, spin);
+        let b = topology_hash_sets(&[0, 1, 2], &[(0, 1), (1, 2)], h, j, spin);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn hash_is_order_independent_for_set_elements() {
+        let nodes = [0u32, 1];
+        let edges = [(0u32, 1)];
+        let spin: &[i32] = &DEFAULT_SPIN_SET;
+        let a = topology_hash_sets(&nodes, &edges, &[1000, -1000, 0], &[-1000, 1000], spin);
+        let b = topology_hash_sets(&nodes, &edges, &[-1000, 0, 1000], &[1000, -1000], spin);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn hash_changes_when_specs_differ() {
+        let nodes = [0u32, 1];
+        let edges = [(0u32, 1)];
+        let spin: &[i32] = &DEFAULT_SPIN_SET;
+        let a = topology_hash_sets(&nodes, &edges, &[-1000, 0, 1000], &[-1000, 1000], spin);
+        let b = topology_hash_sets(&nodes, &edges, &[-1000, 1000], &[-1000, 1000], spin);
+        assert_ne!(a, b);
+    }
+
+    fn hex_literal(s: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("hex");
+        }
+        out
     }
 }

@@ -18,6 +18,21 @@ pub fn derive_pow_job(
     deadline_ms: u64,
 ) -> Job {
     let nonce = derive_nonce(snap.last_proof_block_hash, miner_account, salt);
+    build_ising_job_from_nonce(snap, nonce, generation, deadline_ms)
+}
+
+/// Build an `ISING_SAMPLE` job from an already-known nonce (skips
+/// `derive_nonce`). Used by drive-mode nonce-ref replay, where the nonce is
+/// read from a file rather than derived from a live chain head.
+///
+/// Still golden-pinned: draws via `draw_ising_milli`, the same code the
+/// network uses.
+pub fn build_ising_job_from_nonce(
+    snap: &MiningSnapshot,
+    nonce: [u8; 32],
+    generation: u64,
+    deadline_ms: u64,
+) -> Job {
     let (h, j) = draw_ising_milli(
         nonce,
         snap.nodes.len(),
@@ -64,6 +79,7 @@ mod tests {
             edges: vec![(0, 1), (1, 2), (2, 3), (0, 3)],
             allowed_h_milli: vec![-1000, 0, 1000],
             allowed_j_milli: vec![-1000, 1000],
+            allowed_spin_milli: vec![-1000, 1000],
             min_solutions: 5,
             max_energy_milli: -14_000_000,
             min_diversity_milli: 200,
