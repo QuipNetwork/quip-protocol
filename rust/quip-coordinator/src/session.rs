@@ -12,7 +12,7 @@ use quip_proto::v1::{
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -25,13 +25,6 @@ pub fn gen_session_token() -> String {
     let mut buf = [0u8; 32];
     getrandom::getrandom(&mut buf).expect("os rng");
     buf.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn coord(msg: coord_msg::Msg) -> CoordMsg {
@@ -787,7 +780,6 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                     _ => {}
                 }
             }
-            let _ = now_unix_ms(); // silence unused in some builds
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
