@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 from quip_proto import miner_pb2, scoring, wire
 
@@ -139,11 +139,27 @@ def handle_job(
         label=f"quip-{job_id.hex()[:8] if job_id else 'job'}",
     )
 
+    # ``scoring.energy_milli`` indexes ``spins[u]``/``spins[v]`` by edge
+    # endpoint, so edges must be positions into the dense spin vector (which is
+    # ordered by ``nodes``), not raw qubit ids. These coincide for inline
+    # EdgeList jobs (nodes == 0..n-1) but not for sparse session topologies.
+    pos = {int(n): i for i, n in enumerate(nodes)}
+    scored_edges: List[Tuple[int, int]] = []
+    scored_j: List[float] = []
+    for k, (u, v) in enumerate(edges):
+        if k >= len(j_vals):
+            break
+        iu = pos.get(int(u))
+        iv = pos.get(int(v))
+        if iu is not None and iv is not None:
+            scored_edges.append((iu, iv))
+            scored_j.append(j_vals[k])
+
     solutions = []
     for sample, _qpu_e in zip(result.samples, result.energies):
         spins = sample_dict_to_vector(sample, nodes if nodes else sorted(sample))
         # Consensus energy: always recompute via golden-matched scorer
-        e_milli = scoring.energy_milli(spins, h, j_vals, edges)
+        e_milli = scoring.energy_milli(spins, h, scored_j, scored_edges)
         solutions.append(
             miner_pb2.Solution(
                 spins_bytes=spins_to_bytes(spins),

@@ -84,6 +84,37 @@ def test_valid_job_produces_result_with_access_time():
     sampler.close()
 
 
+def test_sparse_session_topology_scores_edges():
+    # Session topology with non-dense qubit ids (10, 20): the consensus energy
+    # must map edges to spin-vector positions, otherwise the J coupling is
+    # silently dropped and the reported energy diverges from the coordinator's.
+    sampler = OceanSampler(mock=True)
+    job = miner_pb2.Job(
+        job_id=b"sparse",
+        kind=miner_pb2.ISING_SAMPLE,
+        deadline_ms=int(time.time() * 1000) + 3_600_000,
+        ising=miner_pb2.IsingProblem(
+            # No inline EdgeList -> resolve against the session topology.
+            h_milli_le32=wire.encode_i32_le([1000, -1000]),
+            j_milli_le32=wire.encode_i32_le([500]),
+            num_reads=1,
+        ),
+    )
+    msgs = handle_job(
+        job, sampler, session_nodes=[10, 20], session_edges=[(10, 20)]
+    )
+    result = next(m.result for m in msgs if m.WhichOneof("msg") == "result")
+    sol = result.solutions[0]
+    spins = wire.decode_spins(sol.spins_bytes)
+    # Positional scoring: edge (10,20) -> spin positions (0,1).
+    expected = scoring.energy_milli(spins, [1.0, -1.0], [0.5], [(0, 1)])
+    assert sol.energy_milli == expected
+    # The coupling must actually be counted (ground state is -2500 milli, not
+    # the -2000 an unmapped/dropped edge would yield).
+    assert sol.energy_milli == -2500
+    sampler.close()
+
+
 def test_unsupported_kind():
     sampler = OceanSampler(mock=True)
     job = miner_pb2.Job(

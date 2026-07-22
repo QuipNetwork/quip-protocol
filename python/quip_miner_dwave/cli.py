@@ -13,7 +13,6 @@ from quip_miner_dwave import (
     EXIT_CONFIG_INVALID,
     EXIT_ENV_INCOMPATIBLE,
     EXIT_INTERNAL_FATAL,
-    EXIT_TOKEN_REJECTED,
     __version__,
 )
 from quip_miner_dwave.ocean import (

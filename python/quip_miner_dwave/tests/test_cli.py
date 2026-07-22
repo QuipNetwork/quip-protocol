@@ -1,5 +1,4 @@
 """CLI surface tests."""
-import os
 
 from quip_miner_dwave import (
     EXIT_CLEAN,
