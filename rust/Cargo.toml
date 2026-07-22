@@ -6,6 +6,7 @@ members = [
     "quip-mock-miner",
     "quip-mock-coordinator",
     "quip-coordinator",
+    "quip-miner-metal",
 ]
 
 [workspace.dependencies]

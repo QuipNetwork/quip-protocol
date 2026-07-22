@@ -1,0 +1,40 @@
+[package]
+name = "quip-miner-metal"
+version = "0.3.0"
+edition = "2021"
+description = "Metal Ising miners: simulated annealing and heat-bath Gibbs (v0.3, Apple Silicon)"
+
+[lib]
+name = "quip_miner_metal"
+path = "src/lib.rs"
+
+[[bin]]
+name = "quip-metal-sa"
+path = "src/bin/quip_metal_sa.rs"
+
+[[bin]]
+name = "quip-metal-gibbs"
+path = "src/bin/quip_metal_gibbs.rs"
+
+[dependencies]
+quip-proto = { path = "../quip-proto" }
+quip-protocol = { path = "../quip-protocol" }
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["net"] }
+tower = "0.5"
+hyper-util = { version = "0.1", features = ["tokio"] }
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+
+# Metal + IOKit are macOS-only; keep Linux CI green by gating the dependency.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.33"
+io-kit-sys = "0.5"
+core-foundation-sys = "0.8"
+
+[dev-dependencies]
+quip-mock-coordinator = { path = "../quip-mock-coordinator" }
+serde_json = "1"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process"] }
