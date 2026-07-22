@@ -344,9 +344,17 @@ fn solve_one(
     h: &[MilliValue],
     adj: &[Vec<(usize, i32)>],
 ) -> Vec<i8> {
-    let mut s: Vec<i8> = (0..n).map(|_| if rng.gen::<bool>() { 1 } else { -1 }).collect();
+    let mut s: Vec<i8> = (0..n)
+        .map(|_| if rng.gen::<bool>() { 1 } else { -1 })
+        .collect();
     let mut lf: Vec<i64> = (0..n)
-        .map(|p| h[p] as i64 + adj[p].iter().map(|&(q, j)| j as i64 * s[q] as i64).sum::<i64>())
+        .map(|p| {
+            h[p] as i64
+                + adj[p]
+                    .iter()
+                    .map(|&(q, j)| j as i64 * s[q] as i64)
+                    .sum::<i64>()
+        })
         .collect();
     loop {
         let mut improved = false;
@@ -422,7 +430,10 @@ async fn devnet_submit_proof_end_to_end() {
         snap.nodes.len()
     );
     assert_eq!(snap.min_solutions, 5, "default min_solutions");
-    assert_eq!(snap.max_energy_milli, -1_200_000, "default max_energy_milli");
+    assert_eq!(
+        snap.max_energy_milli, -1_200_000,
+        "default max_energy_milli"
+    );
     assert_eq!(snap.min_diversity_milli, 200, "default min_diversity_milli");
     println!("M1 PASS: real MiningSnapshot decoded from live v0.2 chain");
 
