@@ -1,0 +1,99 @@
+"""Consensus scoring + job reject paths (offline mock sampler)."""
+import time
+
+from quip_proto import miner_pb2, scoring, wire
+
+from quip_miner_dwave.job import handle_job
+from quip_miner_dwave.ocean import OceanSampler
+
+
+def test_energy_milli_matches_golden_shape():
+    # Two-spin ferromagnetic: h=[1,-1], J=[0.5], spins=[+1,+1]
+    spins = [1, 1]
+    h = [1.0, -1.0]
+    j = [0.5]
+    edges = [(0, 1)]
+    e = scoring.energy_milli(spins, h, j, edges)
+    # E = 1*1 + (-1)*1 + 0.5*1*1 = 0.5 → 500 milli
+    assert e == 500
+
+
+def test_malformed_and_expired_rejects():
+    sampler = OceanSampler(mock=True)
+    # MALFORMED h
+    bad = miner_pb2.Job(
+        job_id=b"bad",
+        kind=miner_pb2.ISING_SAMPLE,
+        deadline_ms=int(time.time() * 1000) + 60_000,
+        ising=miner_pb2.IsingProblem(
+            h_milli_le32=b"\x01\x02\x03",
+            j_milli_le32=wire.encode_i32_le([500]),
+            edges=miner_pb2.EdgeList(u=[0], v=[1]),
+            num_reads=1,
+        ),
+    )
+    msgs = handle_job(bad, sampler, session_nodes=[0, 1], session_edges=[(0, 1)])
+    assert len(msgs) == 1
+    assert msgs[0].reject.reason == miner_pb2.MALFORMED
+
+    # EXPIRED
+    expired = miner_pb2.Job(
+        job_id=b"old",
+        kind=miner_pb2.ISING_SAMPLE,
+        deadline_ms=int(time.time() * 1000) - 60_000,
+        ising=miner_pb2.IsingProblem(
+            h_milli_le32=wire.encode_i32_le([1000, -1000]),
+            j_milli_le32=wire.encode_i32_le([500]),
+            edges=miner_pb2.EdgeList(u=[0], v=[1]),
+            num_reads=1,
+        ),
+    )
+    msgs = handle_job(expired, sampler, session_nodes=[0, 1], session_edges=[(0, 1)])
+    assert msgs[0].reject.reason == miner_pb2.EXPIRED
+    sampler.close()
+
+
+def test_valid_job_produces_result_with_access_time():
+    sampler = OceanSampler(mock=True)
+    job = miner_pb2.Job(
+        job_id=b"job-1",
+        kind=miner_pb2.ISING_SAMPLE,
+        deadline_ms=int(time.time() * 1000) + 3_600_000,
+        ising=miner_pb2.IsingProblem(
+            h_milli_le32=wire.encode_i32_le([1000, -1000]),
+            j_milli_le32=wire.encode_i32_le([500]),
+            edges=miner_pb2.EdgeList(u=[0], v=[1]),
+            num_reads=1,
+        ),
+    )
+    msgs = handle_job(job, sampler, session_nodes=[0, 1], session_edges=[(0, 1)])
+    kinds = [m.WhichOneof("msg") for m in msgs]
+    assert "result" in kinds
+    assert "job_request" in kinds
+    result = next(m.result for m in msgs if m.WhichOneof("msg") == "result")
+    assert result.job_id == b"job-1"
+    assert len(result.solutions) >= 1
+    assert result.meta.device_access_time_us > 0
+    # Consensus energy matches scorer on returned spins
+    sol = result.solutions[0]
+    spins = wire.decode_spins(sol.spins_bytes)
+    expected = scoring.energy_milli(
+        spins, [1.0, -1.0], [0.5], [(0, 1)]
+    )
+    assert sol.energy_milli == expected
+    sampler.close()
+
+
+def test_unsupported_kind():
+    sampler = OceanSampler(mock=True)
+    job = miner_pb2.Job(
+        job_id=b"gate",
+        kind=miner_pb2.GATE_CIRCUIT,
+        deadline_ms=int(time.time() * 1000) + 60_000,
+        ising=miner_pb2.IsingProblem(
+            h_milli_le32=wire.encode_i32_le([1000]),
+        ),
+    )
+    msgs = handle_job(job, sampler, session_nodes=[], session_edges=[])
+    assert msgs[0].reject.reason == miner_pb2.UNSUPPORTED_KIND
+    sampler.close()
