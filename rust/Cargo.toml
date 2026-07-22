@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["quip-proto", "quip-protocol", "quip-mock-miner", "quip-mock-coordinator"]
+members = [
+    "quip-proto",
+    "quip-protocol",
+    "quip-mock-miner",
+    "quip-mock-coordinator",
+    "quip-coordinator",
+]
 
 [workspace.dependencies]
 tonic = "0.12"
