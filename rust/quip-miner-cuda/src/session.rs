@@ -61,6 +61,10 @@ pub struct AlgorithmIdentity {
 const DEFAULT_NUM_SWEEPS: usize = 64;
 const DEFAULT_MAX_NODES: u32 = 100_000;
 const DEFAULT_MAX_EDGES: u32 = 1_000_000;
+/// Upper bound on coordinator-requested reads so a hostile coordinator cannot
+/// launch an unbounded GPU job (each read allocates `num_reads * N` device
+/// bytes, twice) or an unbounded host result vector.
+const DEFAULT_MAX_READS: u32 = 100_000;
 
 fn print_capabilities(id: AlgorithmIdentity) {
     println!(
@@ -164,6 +168,10 @@ fn handle_job(
         Ok(g) => g,
         Err(reason) => return vec![reject(job_id, reason)],
     };
+
+    if ising.num_reads > DEFAULT_MAX_READS {
+        return vec![reject(job_id, RejectReason::TooLarge)];
+    }
 
     if gov.should_throttle() {
         std::thread::sleep(Duration::from_millis(50));
