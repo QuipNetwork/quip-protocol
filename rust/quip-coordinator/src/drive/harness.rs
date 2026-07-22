@@ -266,16 +266,16 @@ async fn handle_result(
     result: JobResult,
     run: &Arc<RunState>,
 ) {
-    let (job, topo_edges) = {
+    let (job, topo_nodes, topo_edges) = {
         let mut st = state.lock().await;
         st.router.ack(miner_id);
         let job = st.inflight.remove(&result.job_id);
-        let edges = st
+        let (nodes, edges) = st
             .topology
             .as_ref()
-            .map(|t| t.edge_pairs())
+            .map(|t| (t.nodes.clone(), t.edge_pairs()))
             .unwrap_or_default();
-        (job, edges)
+        (job, nodes, edges)
     };
     let Some(job) = job else { return };
     let Some(ising) = job.ising.as_ref() else {
@@ -286,7 +286,7 @@ async fn handle_result(
         min_diversity_milli: 0,
         min_solutions: 0,
     });
-    let validated = validate_result(ising, &result.solutions, &gates, &topo_edges);
+    let validated = validate_result(ising, &result.solutions, &gates, &topo_nodes, &topo_edges);
     let wall_ms = run.wall_ms_since_dispatch(&result.job_id);
     let device_us = result
         .meta

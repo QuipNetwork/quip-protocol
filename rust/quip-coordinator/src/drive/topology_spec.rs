@@ -5,7 +5,7 @@
 //! the network is sub-project #2, behind the same seam (a `TopologySpec`).
 
 use crate::chain::MiningSnapshot;
-use crate::topology::Topology;
+use crate::topology::{Topology, DEFAULT_SPIN_SET};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +39,10 @@ struct TopologySpecJson {
     edges: Vec<(u32, u32)>,
     allowed_h_milli: Vec<i32>,
     allowed_j_milli: Vec<i32>,
+    /// Allowed solution-spin values; defaults to the binary set `±1000` when
+    /// omitted, matching a chain topology with no explicit spin spec.
+    #[serde(default)]
+    allowed_spin_milli: Vec<i32>,
     #[serde(default)]
     gates: Option<GatesJson>,
 }
@@ -93,6 +97,7 @@ pub struct TopologySpec {
     pub topology: Topology,
     pub allowed_h_milli: Vec<i32>,
     pub allowed_j_milli: Vec<i32>,
+    pub allowed_spin_milli: Vec<i32>,
     pub min_solutions: u32,
     pub max_energy_milli: i64,
     pub min_diversity_milli: u32,
@@ -109,6 +114,7 @@ impl TopologySpec {
             edges: self.topology.edge_pairs(),
             allowed_h_milli: self.allowed_h_milli.clone(),
             allowed_j_milli: self.allowed_j_milli.clone(),
+            allowed_spin_milli: self.allowed_spin_milli.clone(),
             min_solutions: self.min_solutions,
             max_energy_milli: self.max_energy_milli,
             min_diversity_milli: self.min_diversity_milli,
@@ -148,12 +154,24 @@ pub fn parse_topology_spec(text: &str) -> Result<TopologySpec, TopologySpecError
     }
     validate_edges(&raw.nodes, &raw.edges)?;
 
-    let topology = Topology::from_nodes_edges(raw.nodes, raw.edges);
+    let allowed_spin_milli = if raw.allowed_spin_milli.is_empty() {
+        DEFAULT_SPIN_SET.to_vec()
+    } else {
+        raw.allowed_spin_milli
+    };
+    let topology = Topology::from_nodes_edges(
+        raw.nodes,
+        raw.edges,
+        &raw.allowed_h_milli,
+        &raw.allowed_j_milli,
+        &allowed_spin_milli,
+    );
     let gates = raw.gates.unwrap_or_default();
     Ok(TopologySpec {
         topology,
         allowed_h_milli: raw.allowed_h_milli,
         allowed_j_milli: raw.allowed_j_milli,
+        allowed_spin_milli,
         min_solutions: gates.min_solutions,
         max_energy_milli: gates.max_energy_milli,
         min_diversity_milli: gates.min_diversity_milli,

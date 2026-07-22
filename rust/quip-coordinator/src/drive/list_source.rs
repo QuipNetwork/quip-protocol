@@ -233,6 +233,7 @@ mod tests {
             edges: vec![(0, 1), (1, 2), (2, 3), (0, 3)],
             allowed_h_milli: vec![-1000, 0, 1000],
             allowed_j_milli: vec![-1000, 1000],
+            allowed_spin_milli: vec![-1000, 1000],
             min_solutions: 1,
             max_energy_milli: i64::MAX,
             min_diversity_milli: 0,

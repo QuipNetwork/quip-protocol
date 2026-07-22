@@ -1,4 +1,3 @@
-import os
 import sys
 from pathlib import Path
 
@@ -25,3 +24,17 @@ def test_configure_defaults():
     c = miner_pb2.Configure()  # all zero
     cfg = session.session_config_from_configure("qpu-0", c)
     assert (cfg.queue_depth, cfg.idle_timeout_s, cfg.heartbeat_s, cfg.reconnect_window_s) == (3, 300, 15, 60)
+
+
+def test_welcome_rejects_non_v1_protocol_version():
+    session.check_welcome(miner_pb2.Welcome(protocol_version=1))
+    with pytest.raises(session.BadWelcome) as ei:
+        session.check_welcome(miner_pb2.Welcome(protocol_version=2))
+    assert ei.value.version == 2
+
+
+def test_documented_exit_codes():
+    assert session.EXIT_CONFIG_INVALID == 64
+    assert session.EXIT_ENV_INCOMPATIBLE == 69
+    assert session.EXIT_INTERNAL_FATAL == 70
+    assert session.EXIT_TOKEN_REJECTED == 77
