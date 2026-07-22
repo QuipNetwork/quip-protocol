@@ -1,7 +1,7 @@
 //! quip-coordinator binary: CLI, runtime wiring, graceful shutdown.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use quip_coordinator::chain::{FakeChain, MiningSnapshot, RealChainClient};
+use quip_coordinator::chain::RealChainClient;
 use quip_coordinator::config::{parse_config, LaunchEntry};
 use quip_coordinator::drive::{
     aggregate, drain_all, parse_topology_spec, print_table, run_drive, write_jsonl,
@@ -13,7 +13,6 @@ use quip_proto::v1::{Configure, Job};
 use quip_protocol::session::ExitCode;
 use std::path::PathBuf;
 use std::process::ExitCode as StdExitCode;
-use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -141,28 +140,12 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Placeholder snapshot for chain-less drive runs with no topology at all
-/// (explicit-only lists): the `FakeChain` still needs one to construct.
-fn empty_snapshot() -> MiningSnapshot {
-    MiningSnapshot {
-        last_proof_block_hash: [0u8; 32],
-        topology_hash: vec![0u8; 32],
-        nodes: vec![],
-        edges: vec![],
-        allowed_h_milli: vec![0],
-        allowed_j_milli: vec![0],
-        min_solutions: 0,
-        max_energy_milli: 0,
-        min_diversity_milli: 0,
-        block_number: 0,
-    }
-}
+type BuiltJobs = (Vec<Job>, Option<Topology>);
 
-type BuiltJobs = (Vec<Job>, Option<Topology>, Option<MiningSnapshot>);
-
-/// Load the requested job source, returning its jobs plus the topology/
-/// snapshot (if any) so drive setup can wire `FakeChain` and the wire
-/// `Topology` message consistently.
+/// Load the requested job source, returning its jobs plus the wire `Topology`
+/// message (if any). Any synthetic `MiningSnapshot` needed to re-derive
+/// nonce-ref list entries is consumed inside `ListSource::load` and is not
+/// returned: drive mode has no chain to wire it into.
 fn build_jobs(args: &DriveArgs, deadline_ms: u64) -> Result<BuiltJobs, String> {
     match args.source {
         DriveSourceKind::Random => {
@@ -177,8 +160,7 @@ fn build_jobs(args: &DriveArgs, deadline_ms: u64) -> Result<BuiltJobs, String> {
             let mut src =
                 RandomSource::new(&spec, miner_account, args.seed, args.count, deadline_ms);
             let jobs = drain_all(&mut src);
-            let snapshot = spec.to_snapshot();
-            Ok((jobs, Some(spec.topology), Some(snapshot)))
+            Ok((jobs, Some(spec.topology)))
         }
         DriveSourceKind::List => {
             let list_path = args
@@ -197,7 +179,7 @@ fn build_jobs(args: &DriveArgs, deadline_ms: u64) -> Result<BuiltJobs, String> {
             let mut src = ListSource::load(list_path, snapshot.as_ref(), deadline_ms)
                 .map_err(|e| e.to_string())?;
             let jobs = drain_all(&mut src);
-            Ok((jobs, topology, snapshot))
+            Ok((jobs, topology))
         }
     }
 }
@@ -215,7 +197,7 @@ fn run_drive_cli(args: DriveArgs) -> StdExitCode {
 
 async fn drive_main(args: DriveArgs) -> StdExitCode {
     let deadline_ms = now_unix_ms() + args.deadline_ms;
-    let (jobs, topology, snapshot) = match build_jobs(&args, deadline_ms) {
+    let (jobs, topology) = match build_jobs(&args, deadline_ms) {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -223,10 +205,6 @@ async fn drive_main(args: DriveArgs) -> StdExitCode {
         }
     };
 
-    let chain = Arc::new(FakeChain::new(
-        snapshot.unwrap_or_else(empty_snapshot),
-        None,
-    ));
     let entry = LaunchEntry {
         miner_id: "drive-0".into(),
         binary: args.miner.to_string_lossy().into_owned(),
@@ -250,7 +228,6 @@ async fn drive_main(args: DriveArgs) -> StdExitCode {
         entry: &entry,
         topology,
         jobs,
-        chain,
         overall_timeout,
     })
     .await;

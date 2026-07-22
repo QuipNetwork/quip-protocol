@@ -9,13 +9,12 @@
 //! (`session.rs`) keeps the multi-miner reroute behavior; this is a
 //! deliberate drive-mode-only deviation.
 
-use crate::chain::{ChainClient, Proof};
 use crate::config::LaunchEntry;
 use crate::drive::report::JobRow;
 use crate::router::MinerCaps;
 use crate::session::CoordinatorState;
 use crate::topology::Topology;
-use crate::validate::{beats_current, validate_result};
+use crate::validate::validate_result;
 use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
 use quip_proto::v1::{
     coord_msg, miner_msg, Configure, CoordMsg, Job, MinerMsg, QualityGates, Reject,
@@ -33,7 +32,7 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 /// Inputs for a full drive-many run.
-pub struct DriveManyParams<'a, C: ChainClient + 'static> {
+pub struct DriveManyParams<'a> {
     pub miner_bin: &'a str,
     pub sock_path: &'a str,
     pub miner_id: &'a str,
@@ -41,7 +40,6 @@ pub struct DriveManyParams<'a, C: ChainClient + 'static> {
     pub entry: &'a LaunchEntry,
     pub topology: Option<Topology>,
     pub jobs: Vec<Job>,
-    pub chain: Arc<C>,
     /// Hard ceiling on the whole run (bounds a stuck or rejecting miner).
     pub overall_timeout: Duration,
 }
@@ -130,16 +128,15 @@ impl RunState {
 /// tonic service used by `run_drive`: stages every job in `jobs` on
 /// handshake, then drives the same Ready/JobRequest/Result/Reject flow as
 /// production, recording a `JobRow` per terminal outcome.
-struct DriveManyService<C: ChainClient + 'static> {
+struct DriveManyService {
     state: Arc<Mutex<CoordinatorState>>,
-    chain: Arc<C>,
     jobs: Arc<Mutex<Vec<Job>>>,
     run: Arc<RunState>,
     miner_id: String,
 }
 
 #[tonic::async_trait]
-impl<C: ChainClient + 'static> MinerService for DriveManyService<C> {
+impl MinerService for DriveManyService {
     type SessionStream = ReceiverStream<Result<CoordMsg, Status>>;
 
     async fn session(
@@ -149,13 +146,12 @@ impl<C: ChainClient + 'static> MinerService for DriveManyService<C> {
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel::<Result<CoordMsg, Status>>(64);
         let state = Arc::clone(&self.state);
-        let chain = Arc::clone(&self.chain);
         let jobs = Arc::clone(&self.jobs);
         let run = Arc::clone(&self.run);
         let miner_id = self.miner_id.clone();
 
         tokio::spawn(async move {
-            run_drive_session(&mut inbound, &tx, state, chain, jobs, run, miner_id).await;
+            run_drive_session(&mut inbound, &tx, state, jobs, run, miner_id).await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -262,16 +258,15 @@ async fn dispatch_jobs(
     true
 }
 
-/// Validate a `Result` against its job's gates, submit a would-be proof to
-/// `chain` when it beats the current best, and record a `JobRow`.
-async fn handle_result<C: ChainClient>(
+/// Validate a `Result` against its job's gates and record a `JobRow`. Drive
+/// mode scores and reports only — it never submits to a chain.
+async fn handle_result(
     state: &Arc<Mutex<CoordinatorState>>,
-    chain: &Arc<C>,
     miner_id: &str,
     result: JobResult,
     run: &Arc<RunState>,
 ) {
-    let (job, topo_edges, best) = {
+    let (job, topo_edges) = {
         let mut st = state.lock().await;
         st.router.ack(miner_id);
         let job = st.inflight.remove(&result.job_id);
@@ -280,7 +275,7 @@ async fn handle_result<C: ChainClient>(
             .as_ref()
             .map(|t| t.edge_pairs())
             .unwrap_or_default();
-        (job, edges, st.current_best_milli)
+        (job, edges)
     };
     let Some(job) = job else { return };
     let Some(ising) = job.ising.as_ref() else {
@@ -309,56 +304,6 @@ async fn handle_result<C: ChainClient>(
         wall_ms,
         rejected: false,
     });
-    if validated.accepted && beats_current(validated.best_energy_milli, best) {
-        let scored = ScoredResult {
-            job: &job,
-            result: &result,
-            best_energy_milli: validated.best_energy_milli,
-            diversity_milli: validated.diversity_milli,
-            n_valid: validated.n_valid,
-        };
-        submit_if_winning(state, chain, scored).await;
-    }
-}
-
-/// A validated `Result` that beat the current best and is ready to submit.
-struct ScoredResult<'a> {
-    job: &'a Job,
-    result: &'a JobResult,
-    best_energy_milli: i64,
-    diversity_milli: u32,
-    n_valid: u32,
-}
-
-async fn submit_if_winning<C: ChainClient>(
-    state: &Arc<Mutex<CoordinatorState>>,
-    chain: &Arc<C>,
-    scored: ScoredResult<'_>,
-) {
-    let proof = Proof {
-        job_id: scored.result.job_id.clone(),
-        best_energy_milli: scored.best_energy_milli,
-        diversity_milli: scored.diversity_milli,
-        n_valid: scored.n_valid,
-        solutions: scored.result.solutions.clone(),
-        is_pow: scored
-            .job
-            .provenance
-            .as_ref()
-            .map(|p| p.is_pow)
-            .unwrap_or(false),
-        order_id: scored
-            .job
-            .provenance
-            .as_ref()
-            .map(|p| p.order_id.clone())
-            .unwrap_or_default(),
-        generation: scored.job.generation,
-    };
-    if let Ok(crate::chain::SubmitAction::Success) = chain.submit_proof(&proof).await {
-        let mut st = state.lock().await;
-        st.current_best_milli = Some(scored.best_energy_milli);
-    }
 }
 
 /// Record a `Reject` as a failing row (see module docs for the no-reroute
@@ -396,10 +341,9 @@ async fn handle_fatal(state: &Arc<Mutex<CoordinatorState>>, run: &Arc<RunState>)
     }
 }
 
-async fn handle_message<C: ChainClient + 'static>(
+async fn handle_message(
     msg: MinerMsg,
     state: &Arc<Mutex<CoordinatorState>>,
-    chain: &Arc<C>,
     miner_id: &str,
     tx: &mpsc::Sender<Result<CoordMsg, Status>>,
     run: &Arc<RunState>,
@@ -413,7 +357,7 @@ async fn handle_message<C: ChainClient + 'static>(
             dispatch_jobs(state, miner_id, req.credits, tx, run).await
         }
         Some(miner_msg::Msg::Result(result)) => {
-            handle_result(state, chain, miner_id, result, run).await;
+            handle_result(state, miner_id, result, run).await;
             true
         }
         Some(miner_msg::Msg::Reject(rej)) => {
@@ -428,11 +372,10 @@ async fn handle_message<C: ChainClient + 'static>(
     }
 }
 
-async fn run_drive_session<C: ChainClient + 'static>(
+async fn run_drive_session(
     inbound: &mut Streaming<MinerMsg>,
     tx: &mpsc::Sender<Result<CoordMsg, Status>>,
     state: Arc<Mutex<CoordinatorState>>,
-    chain: Arc<C>,
     jobs: Arc<Mutex<Vec<Job>>>,
     run: Arc<RunState>,
     miner_id: String,
@@ -452,8 +395,7 @@ async fn run_drive_session<C: ChainClient + 'static>(
             Ok(Some(m)) => m,
             _ => break,
         };
-        let keep_going =
-            handle_message(msg, &state, &chain, &miner_id, tx, &run, seed_credits).await;
+        let keep_going = handle_message(msg, &state, &miner_id, tx, &run, seed_credits).await;
         if !keep_going {
             break;
         }
@@ -466,7 +408,7 @@ async fn run_drive_session<C: ChainClient + 'static>(
 
 /// Full drive-many run: spawn the miner over UDS, stage every job, validate
 /// every `Result`, and send a clean `Shutdown` once all jobs are terminal.
-pub async fn run_drive<C: ChainClient + 'static>(p: DriveManyParams<'_, C>) -> DriveManyReport {
+pub async fn run_drive(p: DriveManyParams<'_>) -> DriveManyReport {
     let sock_path = p.sock_path;
     let miner_id = p.miner_id;
     let _ = std::fs::remove_file(sock_path);
@@ -489,7 +431,6 @@ pub async fn run_drive<C: ChainClient + 'static>(p: DriveManyParams<'_, C>) -> D
 
     let svc = DriveManyService {
         state: Arc::clone(&state),
-        chain: Arc::clone(&p.chain),
         jobs,
         run: Arc::clone(&run),
         miner_id: miner_id.to_string(),

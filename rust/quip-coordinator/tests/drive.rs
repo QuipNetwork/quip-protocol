@@ -1,11 +1,9 @@
 //! Integration: drive quip-mock-miner end-to-end over UDS with a 2-entry
 //! JSONL list, via the generalized `JobSource`-driven harness.
 
-use quip_coordinator::chain::{FakeChain, MiningSnapshot};
 use quip_coordinator::config::LaunchEntry;
 use quip_coordinator::drive::{aggregate, drain_all, DriveManyParams, ListSource};
 use quip_proto::v1::Configure;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Sibling `quip-mock-miner` binary (not same package → no CARGO_BIN_EXE_*).
@@ -46,20 +44,6 @@ async fn drives_two_entry_list_end_to_end() {
     let jobs = drain_all(&mut src);
     assert_eq!(jobs.len(), 2, "expected exactly 2 jobs from the list");
 
-    let snap = MiningSnapshot {
-        last_proof_block_hash: [0u8; 32],
-        topology_hash: vec![0u8; 32],
-        nodes: vec![],
-        edges: vec![],
-        allowed_h_milli: vec![0],
-        allowed_j_milli: vec![0],
-        min_solutions: 0,
-        max_energy_milli: 0,
-        min_diversity_milli: 0,
-        block_number: 0,
-    };
-    let chain = Arc::new(FakeChain::new(snap, None));
-
     let entry = LaunchEntry {
         miner_id: "cpu-0".into(),
         binary: miner.clone(),
@@ -82,7 +66,6 @@ async fn drives_two_entry_list_end_to_end() {
         entry: &entry,
         topology: None,
         jobs,
-        chain: Arc::clone(&chain),
         overall_timeout: Duration::from_secs(20),
     })
     .await;
