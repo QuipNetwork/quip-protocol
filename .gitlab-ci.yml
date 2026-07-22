@@ -76,6 +76,18 @@ conformance:
     - pip install -e ".[dev]" grpcio-tools numpy blake3
   script:
     - python conformance/gen_golden_vectors.py --stdout | diff - conformance/golden_vectors.json
+    # Proto↔stub drift guard: regenerate Python *_pb2 stubs from the normative
+    # .proto and fail if the checked-in copies are stale (mirrors golden drift).
+    - |
+      set -e
+      TMP=$(mktemp -d)
+      python -m grpc_tools.protoc \
+        -I proto \
+        --python_out="$TMP" \
+        --grpc_python_out="$TMP" \
+        proto/quip/v1/miner.proto
+      diff -u python/quip/v1/miner_pb2.py "$TMP/quip/v1/miner_pb2.py"
+      diff -u python/quip/v1/miner_pb2_grpc.py "$TMP/quip/v1/miner_pb2_grpc.py"
     - PYTHONPATH=python python -m pytest conformance/ -v
   rules:
     - if: $CI_COMMIT_TAG

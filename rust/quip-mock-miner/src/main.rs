@@ -1,12 +1,13 @@
 use clap::Parser;
 use quip_proto::v1::miner_service_client::MinerServiceClient;
 use quip_proto::v1::{
-    coord_msg, ising_problem, miner_msg, CoordMsg, IsingProblem, Job, JobKind, JobRequest,
+    coord_msg, ising_problem, miner_msg, CoordMsg, Fatal, IsingProblem, Job, JobKind, JobRequest,
     MinerMsg, Ready, Reject, RejectReason, Result as JobResult, Solution, Status,
 };
 use quip_protocol::scoring::energy_milli;
-use quip_protocol::session::{build_hello, SessionConfig};
+use quip_protocol::session::{build_hello, check_welcome, ExitCode, SessionConfig, SessionError};
 use quip_protocol::wire::decode_i32_le;
+use std::process::ExitCode as ProcessExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -34,19 +35,31 @@ fn print_capabilities() {
     );
 }
 
+/// Map a session/CLI failure to a documented exit code (64/69/70/77).
+fn coded_exit(code: ExitCode) -> ProcessExitCode {
+    ProcessExitCode::from(code.as_i32() as u8)
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> ProcessExitCode {
+    match run().await {
+        Ok(()) => ProcessExitCode::SUCCESS,
+        Err(code) => coded_exit(code),
+    }
+}
+
+async fn run() -> Result<(), ExitCode> {
     let cli = Cli::parse();
     if cli.capabilities {
         print_capabilities();
         return Ok(());
     }
     if cli.check {
+        // Mock is always runnable on this host; a real miner would probe CUDA/Metal
+        // and return EnvIncompatible (69) when the backend cannot start.
         return Ok(());
-    } // mock is always runnable
-    let uri = cli
-        .quip_coordinator
-        .expect("--quip-coordinator required for session mode");
+    }
+    let uri = cli.quip_coordinator.ok_or(ExitCode::ConfigInvalid)?;
     let miner_id = cli.miner_id.unwrap_or_else(|| "mock-0".into());
     run_session(&uri, &miner_id).await
 }
@@ -72,6 +85,14 @@ fn status_msg(miner_id: &str) -> MinerMsg {
     }))
 }
 
+fn fatal_msg(code: ExitCode, reason: impl Into<String>) -> MinerMsg {
+    miner(miner_msg::Msg::Fatal(Fatal {
+        exit_code: code.as_i32() as u32,
+        reason: reason.into(),
+        restart_required: true,
+    }))
+}
+
 /// Milli-int-encoded field -> float vector; an empty field decodes to an empty vec.
 fn decode_milli_f64(bytes: &[u8]) -> Result<Vec<f64>, quip_protocol::wire::WireError> {
     Ok(decode_i32_le(bytes)?
@@ -92,32 +113,42 @@ fn edges_of(ising: &IsingProblem) -> Vec<(usize, usize)> {
     }
 }
 
+fn reject(job_id: Vec<u8>, reason: RejectReason) -> MinerMsg {
+    miner(miner_msg::Msg::Reject(Reject {
+        job_id,
+        reason: reason as i32,
+    }))
+}
+
 /// Validate a job and produce the reply(s): a `Reject` on bad input, otherwise a
 /// `Result` (all-+1 spins) followed by a `JobRequest` for one more credit.
 fn handle_job(job: Job) -> Vec<MinerMsg> {
     let job_id = job.job_id.clone();
+
+    // UNSUPPORTED_KIND: only ISING_SAMPLE is implemented by this reference miner.
+    if job.kind != JobKind::IsingSample as i32 {
+        return vec![reject(job_id, RejectReason::UnsupportedKind)];
+    }
+
     let ising = job.ising.unwrap_or_default();
 
     // MALFORMED: h field is not a valid i32-LE array (length not a multiple of 4).
     let h = match decode_milli_f64(&ising.h_milli_le32) {
         Ok(h) => h,
-        Err(_) => {
-            return vec![miner(miner_msg::Msg::Reject(Reject {
-                job_id,
-                reason: RejectReason::Malformed as i32,
-            }))];
-        }
+        Err(_) => return vec![reject(job_id, RejectReason::Malformed)],
+    };
+
+    // MALFORMED: j field must also be a valid i32-LE array (mirror h handling).
+    let j = match decode_milli_f64(&ising.j_milli_le32) {
+        Ok(j) => j,
+        Err(_) => return vec![reject(job_id, RejectReason::Malformed)],
     };
 
     // EXPIRED: the deadline has already passed.
     if job.deadline_ms < now_unix_ms() {
-        return vec![miner(miner_msg::Msg::Reject(Reject {
-            job_id,
-            reason: RejectReason::Expired as i32,
-        }))];
+        return vec![reject(job_id, RejectReason::Expired)];
     }
 
-    let j = decode_milli_f64(&ising.j_milli_le32).unwrap_or_default();
     let edges = edges_of(&ising);
     let n = h.len();
     let spins = vec![1i8; n];
@@ -136,9 +167,15 @@ fn handle_job(job: Job) -> Vec<MinerMsg> {
     ]
 }
 
-async fn run_session(uri: &str, miner_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_session(uri: &str, miner_id: &str) -> Result<(), ExitCode> {
+    // Resolve token before any network I/O so a missing QUIP_SESSION_TOKEN
+    // always maps to exit 77 (never InternalFatal from a connect failure).
+    let hello = build_hello(miner_id, "mock", "sa", &[JobKind::IsingSample])
+        .map_err(|e: SessionError| ExitCode::from(e))?;
+
     let path = uri.strip_prefix("unix://").unwrap_or(uri).to_string();
-    let channel = Endpoint::try_from("http://[::]:50051")? // dummy authority, unused for UDS
+    let channel = Endpoint::try_from("http://[::]:50051") // dummy authority, unused for UDS
+        .map_err(|_| ExitCode::InternalFatal)?
         .connect_with_connector(tower::service_fn(move |_: Uri| {
             let p = path.clone();
             async move {
@@ -146,24 +183,26 @@ async fn run_session(uri: &str, miner_id: &str) -> Result<(), Box<dyn std::error
                 Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(s))
             }
         }))
-        .await?;
+        .await
+        .map_err(|_| ExitCode::InternalFatal)?;
     let mut client = MinerServiceClient::new(channel);
 
     let (tx, rx) = mpsc::channel::<MinerMsg>(16);
     // Send Hello before opening the inbound stream so the coordinator's handshake
     // has something to read immediately.
-    tx.send(miner(miner_msg::Msg::Hello(build_hello(
-        miner_id,
-        "mock",
-        "sa",
-        &[JobKind::IsingSample],
-    )?)))
-    .await?;
+    tx.send(miner(miner_msg::Msg::Hello(hello)))
+        .await
+        .map_err(|_| ExitCode::InternalFatal)?;
 
-    let mut inbound = client.session(ReceiverStream::new(rx)).await?.into_inner();
+    let mut inbound = client
+        .session(ReceiverStream::new(rx))
+        .await
+        .map_err(|_| ExitCode::InternalFatal)?
+        .into_inner();
 
     let mut config: Option<SessionConfig> = None;
     let mut grace_ms: u64 = 5000;
+    let mut session_err: Option<ExitCode> = None;
     loop {
         let idle = config.as_ref().map(|c| c.idle_timeout_s).unwrap_or(300) as u64;
         let next = tokio::time::timeout(Duration::from_secs(idle), inbound.message()).await;
@@ -171,26 +210,40 @@ async fn run_session(uri: &str, miner_id: &str) -> Result<(), Box<dyn std::error
             Err(_) => break, // idle timeout with no job -> clean exit
             Ok(Ok(Some(cm))) => cm,
             Ok(Ok(None)) => break, // coordinator closed the stream
-            Ok(Err(status)) => return Err(status.into()),
+            Ok(Err(_)) => return Err(ExitCode::InternalFatal),
         };
         match cm.msg {
-            Some(coord_msg::Msg::Welcome(_)) => {}
+            Some(coord_msg::Msg::Welcome(w)) => {
+                if let Err(e) = check_welcome(&w) {
+                    let reason = e.to_string();
+                    let code = ExitCode::from(e);
+                    let _ = tx.send(fatal_msg(code, reason)).await;
+                    session_err = Some(code);
+                    break;
+                }
+            }
             Some(coord_msg::Msg::Configure(c)) => {
                 config = Some(SessionConfig::from_configure(miner_id.into(), &c));
-                tx.send(miner(miner_msg::Msg::Ready(Ready {}))).await?;
+                tx.send(miner(miner_msg::Msg::Ready(Ready {})))
+                    .await
+                    .map_err(|_| ExitCode::InternalFatal)?;
             }
             Some(coord_msg::Msg::Topology(_)) => {}
             Some(coord_msg::Msg::Job(job)) => {
                 for reply in handle_job(job) {
-                    tx.send(reply).await?;
+                    tx.send(reply).await.map_err(|_| ExitCode::InternalFatal)?;
                 }
             }
             Some(coord_msg::Msg::Cancel(_)) => {
                 // No jobs buffered in this mock; acknowledge via Status.
-                tx.send(status_msg(miner_id)).await?;
+                tx.send(status_msg(miner_id))
+                    .await
+                    .map_err(|_| ExitCode::InternalFatal)?;
             }
             Some(coord_msg::Msg::Ping(_)) => {
-                tx.send(status_msg(miner_id)).await?;
+                tx.send(status_msg(miner_id))
+                    .await
+                    .map_err(|_| ExitCode::InternalFatal)?;
             }
             Some(coord_msg::Msg::Shutdown(s)) => {
                 grace_ms = if s.grace_ms == 0 {
@@ -214,5 +267,81 @@ async fn run_session(uri: &str, miner_id: &str) -> Result<(), Box<dyn std::error
         Ok::<(), tonic::Status>(())
     };
     let _ = tokio::time::timeout(Duration::from_millis(grace_ms), drain).await;
-    Ok(())
+    match session_err {
+        Some(code) => Err(code),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quip_protocol::wire::encode_i32_le;
+
+    fn sample_job(job_id: &[u8], kind: JobKind, j_bytes: Vec<u8>) -> Job {
+        Job {
+            job_id: job_id.to_vec(),
+            kind: kind as i32,
+            generation: 1,
+            deadline_ms: now_unix_ms() + 60_000,
+            ising: Some(IsingProblem {
+                graph: Some(ising_problem::Graph::Edges(quip_proto::v1::EdgeList {
+                    u: vec![0],
+                    v: vec![1],
+                })),
+                h_milli_le32: encode_i32_le(&[1000, -1000]),
+                j_milli_le32: j_bytes,
+                num_reads: 1,
+                gates: None,
+            }),
+            provenance: None,
+        }
+    }
+
+    fn first_reject_reason(msgs: &[MinerMsg]) -> Option<i32> {
+        msgs.iter().find_map(|m| match &m.msg {
+            Some(miner_msg::Msg::Reject(r)) => Some(r.reason),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn gate_circuit_rejects_unsupported_kind() {
+        let msgs = handle_job(sample_job(
+            b"gate",
+            JobKind::GateCircuit,
+            encode_i32_le(&[500]),
+        ));
+        assert_eq!(
+            first_reject_reason(&msgs),
+            Some(RejectReason::UnsupportedKind as i32)
+        );
+        assert_eq!(
+            match &msgs[0].msg {
+                Some(miner_msg::Msg::Reject(r)) => r.job_id.as_slice(),
+                _ => b"",
+            },
+            b"gate"
+        );
+    }
+
+    #[test]
+    fn malformed_j_rejects_malformed() {
+        let msgs = handle_job(sample_job(
+            b"bad-j",
+            JobKind::IsingSample,
+            vec![0x01, 0x02, 0x03], // len 3, not a multiple of 4
+        ));
+        assert_eq!(
+            first_reject_reason(&msgs),
+            Some(RejectReason::Malformed as i32)
+        );
+        assert_eq!(
+            match &msgs[0].msg {
+                Some(miner_msg::Msg::Reject(r)) => r.job_id.as_slice(),
+                _ => b"",
+            },
+            b"bad-j"
+        );
+    }
 }

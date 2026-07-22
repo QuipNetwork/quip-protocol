@@ -26,6 +26,9 @@ dependencies = [
     "dilithium-py>=1.0",
     # tomllib joined stdlib in 3.11 — fall back to the upstream package on 3.10.
     "tomli>=2.0.1; python_version < '3.11'",
+    # v0.3 quip_proto gRPC stubs + runtime (python/quip, python/quip_proto).
+    "grpcio>=1.60.0",
+    "protobuf>=4.25.0",
 ]
 
 [project.optional-dependencies]
@@ -78,7 +81,19 @@ quip-miner = "quip_cli:miner_main"
 py-modules = ["quip_cli"]
 
 [tool.setuptools.packages.find]
-include = ["shared*", "substrate*", "dwave_topologies*", "CPU*", "GPU*", "QPU*"]
+# Root packages are the v0.2 miner stack; python/ holds the v0.3 quip_proto
+# SDK (quip.v1 stubs + quip_proto helpers). Both must install via `pip install .`.
+where = [".", "python"]
+include = [
+    "shared*",
+    "substrate*",
+    "dwave_topologies*",
+    "CPU*",
+    "GPU*",
+    "QPU*",
+    "quip*",
+    "quip_proto*",
+]
 
 [tool.setuptools.package-data]
 dwave_topologies = ["topologies/*.json.gz", "embeddings/*.json.gz"]
