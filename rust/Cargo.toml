@@ -8,6 +8,7 @@ members = [
     "quip-coordinator",
     "quip-miner-metal",
     "quip-miner-cpu",
+    "quip-miner-cuda",
 ]
 
 [workspace.dependencies]
