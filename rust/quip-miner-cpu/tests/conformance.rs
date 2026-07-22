@@ -1,6 +1,7 @@
 //! Protocol conformance: spawn SA and Gibbs miners against quip-mock-coordinator.
 
 use quip_mock_coordinator::driver::drive_miner;
+use quip_proto::v1::RejectReason;
 use std::process::Command;
 
 /// Cross-package binary path (deps/ → profile/ → bin).
@@ -46,19 +47,30 @@ async fn quip_cpu_sa_passes_conformance() {
     );
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
     assert!(report.handshake_ok, "SA handshake failed");
-    assert_eq!(report.results_received, 2, "expected 2 job results");
+    assert_eq!(report.result_job_ids.len(), 2, "expected 2 job results");
     assert!(
-        report
-            .rejects
-            .contains(&(quip_proto::v1::RejectReason::Malformed as i32)),
-        "missing MALFORMED reject: {:?}",
+        report.result_job_ids.iter().any(|id| id == b"job-1"),
+        "missing result for job-1: {:?}",
+        report.result_job_ids
+    );
+    assert!(
+        report.result_job_ids.iter().any(|id| id == b"job-2"),
+        "missing result for job-2: {:?}",
+        report.result_job_ids
+    );
+    assert!(
+        report.has_reject(b"job-bad-h", RejectReason::Malformed),
+        "missing MALFORMED reject for job-bad-h: {:?}",
         report.rejects
     );
     assert!(
-        report
-            .rejects
-            .contains(&(quip_proto::v1::RejectReason::Expired as i32)),
-        "missing EXPIRED reject: {:?}",
+        report.has_reject(b"job-gate", RejectReason::UnsupportedKind),
+        "missing UNSUPPORTED_KIND reject for job-gate: {:?}",
+        report.rejects
+    );
+    assert!(
+        report.has_reject(b"job-old", RejectReason::Expired),
+        "missing EXPIRED reject for job-old: {:?}",
         report.rejects
     );
     assert_eq!(report.exit_code, 0, "clean shutdown expected");
@@ -78,13 +90,12 @@ async fn quip_cpu_gibbs_passes_conformance() {
     );
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
     assert!(report.handshake_ok, "Gibbs handshake failed");
-    assert_eq!(report.results_received, 2, "expected 2 job results");
-    assert!(report
-        .rejects
-        .contains(&(quip_proto::v1::RejectReason::Malformed as i32)));
-    assert!(report
-        .rejects
-        .contains(&(quip_proto::v1::RejectReason::Expired as i32)));
+    assert_eq!(report.result_job_ids.len(), 2, "expected 2 job results");
+    assert!(report.result_job_ids.iter().any(|id| id == b"job-1"));
+    assert!(report.result_job_ids.iter().any(|id| id == b"job-2"));
+    assert!(report.has_reject(b"job-bad-h", RejectReason::Malformed));
+    assert!(report.has_reject(b"job-gate", RejectReason::UnsupportedKind));
+    assert!(report.has_reject(b"job-old", RejectReason::Expired));
     assert_eq!(report.exit_code, 0, "clean shutdown expected");
 }
 
