@@ -17,8 +17,8 @@ use crate::topology::Topology;
 use crate::validate::validate_result;
 use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
 use quip_proto::v1::{
-    coord_msg, miner_msg, Configure, CoordMsg, Job, MinerMsg, QualityGates, Reject,
-    Result as JobResult, Shutdown, Welcome,
+    coord_msg, miner_msg, Configure, CoordMsg, Job, MinerMsg, Reject, Result as JobResult,
+    Shutdown, Welcome,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -56,10 +56,6 @@ pub struct DriveManyReport {
     pub total: usize,
     pub miner_exit_code: i32,
 }
-
-/// Run-fixed topology shared with every result handler: `(node ids, edges)`,
-/// built once per session and cloned by `Arc` rather than rebuilt per result.
-type SharedTopo = Arc<(Vec<u32>, Vec<(u32, u32)>)>;
 
 fn coord(msg: coord_msg::Msg) -> CoordMsg {
     CoordMsg { msg: Some(msg) }
@@ -138,11 +134,6 @@ struct DriveManyService {
     jobs: Arc<Mutex<Vec<Job>>>,
     run: Arc<RunState>,
     miner_id: String,
-    /// Validation-facing topology, resolved once at run setup and shared by
-    /// `Arc` (a refcount bump, never a data copy) with every result handler.
-    topo: SharedTopo,
-    /// Difficulty gates, fixed for the run.
-    gates: QualityGates,
 }
 
 #[tonic::async_trait]
@@ -159,11 +150,9 @@ impl MinerService for DriveManyService {
         let jobs = Arc::clone(&self.jobs);
         let run = Arc::clone(&self.run);
         let miner_id = self.miner_id.clone();
-        let topo = Arc::clone(&self.topo);
-        let gates = self.gates;
 
         tokio::spawn(async move {
-            run_drive_session(&mut inbound, &tx, state, jobs, run, miner_id, topo, gates).await;
+            run_drive_session(&mut inbound, &tx, state, jobs, run, miner_id).await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -279,22 +268,24 @@ async fn dispatch_jobs(
 /// mode scores and reports only — it never submits to a chain.
 ///
 /// Spawned per result rather than awaited inline (see [`handle_message`]): the
-/// state lock is held only long enough to ack the router and take the inflight
-/// job, then the CPU-bound `validate_result` runs on the blocking pool. `topo`
-/// (nodes, edges) and `gates` are fixed for the run, built once and shared by
-/// `Arc`/value so no per-result full-topology clone happens.
+/// state lock is held only long enough to ack the router, take the inflight
+/// job, and clone the run-resolved topology `Arc` + gates, then the CPU-bound
+/// `validate_result` runs on the blocking pool. The topology is a run constant
+/// (`CoordinatorState::resolved_topo`), so the `Arc::clone` is a refcount bump,
+/// never a data copy.
 async fn handle_result(
     state: &Arc<Mutex<CoordinatorState>>,
     miner_id: &str,
     result: JobResult,
     run: &Arc<RunState>,
-    topo: SharedTopo,
-    gates: QualityGates,
 ) {
-    let job = {
+    let (job, topo, gates) = {
         let mut st = state.lock().await;
         st.router.ack(miner_id);
-        st.inflight.remove(&result.job_id)
+        let job = st.inflight.remove(&result.job_id);
+        let topo = Arc::clone(&st.resolved_topo);
+        let gates = crate::validate::gates_from_target(st.target.as_ref());
+        (job, topo, gates)
     };
     let Some(job) = job else { return };
     let is_pow = job.provenance.as_ref().map(|p| p.is_pow).unwrap_or(false);
@@ -308,7 +299,7 @@ async fn handle_result(
         .map(|m| m.device_access_time_us)
         .unwrap_or(0);
     let validated = match tokio::task::spawn_blocking(move || {
-        validate_result(&ising, &solutions, &gates, &topo.0, &topo.1)
+        validate_result(&ising, &solutions, &gates, &topo)
     })
     .await
     {
@@ -364,10 +355,6 @@ async fn handle_fatal(state: &Arc<Mutex<CoordinatorState>>, run: &Arc<RunState>)
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "session-loop plumbing: state, run bookkeeping, outbound tx, and the run-fixed topo/gates all belong here"
-)]
 async fn handle_message(
     msg: MinerMsg,
     state: &Arc<Mutex<CoordinatorState>>,
@@ -375,8 +362,6 @@ async fn handle_message(
     tx: &mpsc::Sender<Result<CoordMsg, Status>>,
     run: &Arc<RunState>,
     seed_credits: u32,
-    topo: &SharedTopo,
-    gates: &QualityGates,
 ) -> bool {
     match msg.msg {
         Some(miner_msg::Msg::Ready(_)) => {
@@ -395,10 +380,8 @@ async fn handle_message(
             let run = Arc::clone(run);
             let tx = tx.clone();
             let miner_id = miner_id.to_string();
-            let topo = Arc::clone(topo);
-            let gates = *gates;
             drop(tokio::spawn(async move {
-                handle_result(&state, &miner_id, result, &run, topo, gates).await;
+                handle_result(&state, &miner_id, result, &run).await;
                 if run.is_complete() {
                     let _ = tx.send(Ok(shutdown_msg())).await;
                 }
@@ -417,10 +400,6 @@ async fn handle_message(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "session-loop plumbing: streams, shared state/jobs/run, id, and the run-fixed topo/gates"
-)]
 async fn run_drive_session(
     inbound: &mut Streaming<MinerMsg>,
     tx: &mpsc::Sender<Result<CoordMsg, Status>>,
@@ -428,8 +407,6 @@ async fn run_drive_session(
     jobs: Arc<Mutex<Vec<Job>>>,
     run: Arc<RunState>,
     miner_id: String,
-    topo: SharedTopo,
-    gates: QualityGates,
 ) {
     let Some(configure) = handshake(inbound, tx, &state, &jobs, &run, &miner_id).await else {
         return;
@@ -446,8 +423,7 @@ async fn run_drive_session(
             Ok(Some(m)) => m,
             _ => break,
         };
-        let keep_going =
-            handle_message(msg, &state, &miner_id, tx, &run, seed_credits, &topo, &gates).await;
+        let keep_going = handle_message(msg, &state, &miner_id, tx, &run, seed_credits).await;
         if !keep_going {
             break;
         }
@@ -471,25 +447,13 @@ pub async fn run_drive(p: DriveManyParams<'_>) -> DriveManyReport {
     let uds = UnixListener::bind(sock_path).expect("bind unix socket");
     let incoming = UnixListenerStream::new(uds);
 
-    // Resolve the validation-facing topology (node ids + edge pairs) and the
-    // difficulty gates exactly once, here at run setup. They are constants for
-    // the whole run: every result handler borrows the same `Arc`, so a solution
-    // vector is the only thing that varies per result — the graph is never
-    // rebuilt. The wire path keeps `st.topology` (SoA) for the one-time
-    // `to_proto` on handshake.
-    let topo: SharedTopo = Arc::new(
-        p.topology
-            .as_ref()
-            .map(|t| (t.nodes.clone(), t.edge_pairs()))
-            .unwrap_or_default(),
-    );
-    let gates = crate::validate::gates_from_target(p.target.as_ref());
-
     let mut st = CoordinatorState::new();
     st.expected_tokens.insert(miner_id.into(), p.token.into());
     st.configure
         .insert(miner_id.into(), p.entry.configure.clone());
-    st.topology = p.topology;
+    // Resolves the position-indexed scoring topology once (a run constant);
+    // every result handler borrows it by `Arc`, never rebuilding the graph.
+    st.set_topology(p.topology);
     st.target = p.target;
     let total = p.jobs.len();
     let state = Arc::new(Mutex::new(st));
@@ -501,8 +465,6 @@ pub async fn run_drive(p: DriveManyParams<'_>) -> DriveManyReport {
         jobs,
         run: Arc::clone(&run),
         miner_id: miner_id.to_string(),
-        topo,
-        gates,
     };
 
     let server = tokio::spawn(async move {

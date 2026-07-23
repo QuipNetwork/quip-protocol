@@ -4,7 +4,7 @@ use crate::chain::{ChainClient, Proof};
 use crate::config::LaunchEntry;
 use crate::router::{MinerCaps, Router};
 use crate::topology::Topology;
-use crate::validate::{beats_current, validate_result};
+use crate::validate::{beats_current, validate_result, ResolvedTopo};
 use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
 use quip_proto::v1::{
     coord_msg, miner_msg, Configure, CoordMsg, MinerMsg, Shutdown, Welcome,
@@ -36,6 +36,10 @@ pub struct CoordinatorState {
     pub expected_tokens: HashMap<String, String>,
     pub configure: HashMap<String, Configure>,
     pub topology: Option<Topology>,
+    /// Position-indexed scoring form of `topology`, resolved once via
+    /// [`CoordinatorState::set_topology`]. A run constant every result borrows
+    /// by `Arc`, so the graph is never rebuilt per result.
+    pub resolved_topo: Arc<ResolvedTopo>,
     /// Difficulty target advertised to miners via `SetTarget`.
     pub target: Option<quip_proto::v1::SetTarget>,
     pub router: Router,
@@ -52,6 +56,7 @@ impl CoordinatorState {
             expected_tokens: HashMap::new(),
             configure: HashMap::new(),
             topology: None,
+            resolved_topo: Arc::new(ResolvedTopo::default()),
             target: None,
             router: Router::new(),
             inflight: HashMap::new(),
@@ -59,6 +64,19 @@ impl CoordinatorState {
             results_validated: 0,
             last_abandoned_generation: 0,
         }
+    }
+
+    /// Set the session topology and resolve its position-indexed scoring form
+    /// once. Both drive and production go through here so `validate_result`
+    /// never rebuilds the graph per result.
+    pub fn set_topology(&mut self, topology: Option<Topology>) {
+        self.resolved_topo = Arc::new(
+            topology
+                .as_ref()
+                .map(|t| ResolvedTopo::new(&t.nodes, &t.edge_pairs()))
+                .unwrap_or_default(),
+        );
+        self.topology = topology;
     }
 }
 
@@ -212,28 +230,19 @@ async fn run_session<C: ChainClient>(
                 }
             }
             Some(miner_msg::Msg::Result(result)) => {
-                let (job, topo_nodes, topo_edges, best, gates) = {
+                let (job, topo, best, gates) = {
                     let mut st = state.lock().await;
                     st.router.ack(&miner_id);
                     let job = st.inflight.remove(&result.job_id);
-                    let (nodes, edges) = st
-                        .topology
-                        .as_ref()
-                        .map(|t| (t.nodes.clone(), t.edge_pairs()))
-                        .unwrap_or_default();
+                    let topo = Arc::clone(&st.resolved_topo);
                     let best = st.current_best_milli;
                     let gates = crate::validate::gates_from_target(st.target.as_ref());
-                    (job, nodes, edges, best, gates)
+                    (job, topo, best, gates)
                 };
                 if let Some(job) = job {
                     if let Some(ising) = job.ising.as_ref() {
-                        let validated = validate_result(
-                            ising,
-                            &result.solutions,
-                            &gates,
-                            &topo_nodes,
-                            &topo_edges,
-                        );
+                        let validated =
+                            validate_result(ising, &result.solutions, &gates, &topo);
                         {
                             let mut st = state.lock().await;
                             st.results_validated += 1;
@@ -488,7 +497,7 @@ pub async fn drive_pow_round<C: ChainClient + 'static>(p: DrivePowParams<'_, C>)
     st.expected_tokens.insert(miner_id.into(), p.token.into());
     st.configure
         .insert(miner_id.into(), p.entry.configure.clone());
-    st.topology = Some(p.topology);
+    st.set_topology(Some(p.topology));
     // Stage the PoW job before the miner connects so JobRequest can pull it.
     st.router.register_miner(
         miner_id,
@@ -693,27 +702,18 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                         }
                     }
                     Some(miner_msg::Msg::Result(result)) => {
-                        let (job, topo_nodes, topo_edges, best, gates) = {
+                        let (job, topo, best, gates) = {
                             let mut st = state.lock().await;
                             st.router.ack(&miner_id);
                             let job = st.inflight.remove(&result.job_id);
-                            let (nodes, edges) = st
-                                .topology
-                                .as_ref()
-                                .map(|t| (t.nodes.clone(), t.edge_pairs()))
-                                .unwrap_or_default();
+                            let topo = Arc::clone(&st.resolved_topo);
                             let gates = crate::validate::gates_from_target(st.target.as_ref());
-                            (job, nodes, edges, st.current_best_milli, gates)
+                            (job, topo, st.current_best_milli, gates)
                         };
                         if let Some(job) = job {
                             if let Some(ising) = job.ising.as_ref() {
-                                let validated = validate_result(
-                                    ising,
-                                    &result.solutions,
-                                    &gates,
-                                    &topo_nodes,
-                                    &topo_edges,
-                                );
+                                let validated =
+                                    validate_result(ising, &result.solutions, &gates, &topo);
                                 {
                                     let mut st = state.lock().await;
                                     st.results_validated += 1;
