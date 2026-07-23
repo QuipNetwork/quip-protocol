@@ -23,7 +23,11 @@ from quip_miner_dwave import (
     EXIT_INTERNAL_FATAL,
     EXIT_TOKEN_REJECTED,
 )
-from quip_miner_dwave.budget import QPUTimeManager, budget_from_backend_toml
+from quip_miner_dwave.budget import (
+    QPUTimeManager,
+    budget_from_backend_toml,
+    warn_unknown_backend_keys,
+)
 from quip_miner_dwave.job import handle_job
 from quip_miner_dwave.ocean import OceanSampler
 
@@ -202,6 +206,9 @@ def run_session(
                 config = session_sdk.session_config_from_configure(
                     miner_id, cm.configure
                 )
+                # Uniform config handling: warn on any key the dwave schema
+                # doesn't recognize before consuming the ones it does.
+                warn_unknown_backend_keys(cm.configure.backend_toml)
                 if pending_budget is None and cm.configure.backend_toml:
                     pending_budget = budget_from_backend_toml(
                         cm.configure.backend_toml

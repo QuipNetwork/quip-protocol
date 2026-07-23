@@ -18,6 +18,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from quip_miner_dwave.config import read_secret_file
+
 
 from quip_miner_dwave.defects import (
     DefectInfo,
@@ -149,11 +151,13 @@ class OceanSampler:
         solver_name: Optional[str] = None,
         region: Optional[str] = None,
         token: Optional[str] = None,
+        api_token_file: Optional[str] = None,
         mock: Optional[bool] = None,
         submit_workers: int = 4,
         defective_qubits: Optional[Sequence[int]] = None,
         defective_edges: Optional[set] = None,
     ):
+        self._api_token_file = api_token_file
         self._submit_pool = ThreadPoolExecutor(
             max_workers=max(1, submit_workers),
             thread_name_prefix="dwave-submit",
@@ -195,10 +199,18 @@ class OceanSampler:
             kwargs["solver"] = solver_name
         if region is not None:
             kwargs["region"] = region
+        # Token precedence: explicit arg > *_file (preferred) > .env literal
+        # (fallback) > SDK config. The file path is the only thing that travels;
+        # the secret is read locally and never logged.
+        file_token = read_secret_file(self._api_token_file) if self._api_token_file else None
         if token is not None:
             kwargs["token"] = token
+        elif file_token:
+            kwargs["token"] = file_token
         elif os.environ.get("DWAVE_API_KEY"):
             kwargs["token"] = os.environ["DWAVE_API_KEY"]
+        elif os.environ.get("DWAVE_API_TOKEN"):
+            kwargs["token"] = os.environ["DWAVE_API_TOKEN"]
         base = DWaveSampler(**kwargs)
         self._qpu_solver = base
         self._live_nodes = sorted(int(n) for n in base.nodelist)
