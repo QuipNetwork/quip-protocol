@@ -86,6 +86,13 @@ struct DriveArgs {
     /// Optional path to write a per-job + aggregate JSONL report.
     #[arg(long)]
     report: Option<PathBuf>,
+    /// GPU utilization ceiling 1–100 forwarded to the spawned miner's
+    /// `--utilization` (cuda/metal only; other backends reject it).
+    #[arg(long)]
+    utilization: Option<u32>,
+    /// Forward `--yielding` to the spawned miner (cuda/metal only).
+    #[arg(long, default_value_t = false)]
+    yielding: bool,
 }
 
 fn main() -> StdExitCode {
@@ -309,6 +316,8 @@ async fn drive_main(args: DriveArgs) -> StdExitCode {
         target,
         jobs,
         overall_timeout,
+        utilization: args.utilization,
+        yielding: args.yielding,
     })
     .await;
 
@@ -359,6 +368,8 @@ mod tests {
             num_reads: None,
             deadline_ms: 1000,
             report: None,
+            utilization: None,
+            yielding: false,
         }
     }
 

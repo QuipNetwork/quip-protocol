@@ -68,6 +68,8 @@ async fn drives_two_entry_list_end_to_end() {
         target: None,
         jobs,
         overall_timeout: Duration::from_secs(20),
+        utilization: None,
+        yielding: false,
     })
     .await;
 

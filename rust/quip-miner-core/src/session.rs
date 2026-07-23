@@ -158,6 +158,10 @@ async fn run_session<S: Sampler>(
                         }
                     }
                     Some(coord_msg::Msg::Configure(c)) => {
+                        // Hand the verbatim config subsection to the backend to
+                        // parse against its own schema (overrides CLI, warns on
+                        // unknown fields / overrides) before mining starts.
+                        sampler.apply_config(&c.backend_toml);
                         num_sweeps = num_sweeps_from_toml(&c.backend_toml);
                         config = Some(SessionConfig::from_configure(miner_id.into(), &c));
                         tx.send(miner(miner_msg::Msg::Ready(Ready {}))).await?;

@@ -3104,9 +3104,11 @@ dependencies = [
  "quip-mock-coordinator",
  "quip-proto",
  "quip-protocol",
+ "serde",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -3123,9 +3125,11 @@ dependencies = [
  "quip-mock-coordinator",
  "quip-proto",
  "quip-protocol",
+ "serde",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "toml",
 ]
 
 [[package]]

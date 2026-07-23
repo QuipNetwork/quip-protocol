@@ -43,6 +43,10 @@ pub struct DriveManyParams<'a> {
     pub jobs: Vec<Job>,
     /// Hard ceiling on the whole run (bounds a stuck or rejecting miner).
     pub overall_timeout: Duration,
+    /// Forwarded to the spawned miner's `--utilization` when set (GPU backends).
+    pub utilization: Option<u32>,
+    /// Forwarded as `--yielding` to the spawned miner (GPU backends).
+    pub yielding: bool,
 }
 
 /// Result of a drive-many run: per-job rows plus handshake/exit status.
@@ -475,14 +479,21 @@ pub async fn run_drive(p: DriveManyParams<'_>) -> DriveManyReport {
     });
 
     let socket_uri = format!("unix://{sock_path}");
-    let mut child = Command::new(p.miner_bin)
-        .arg("--quip-coordinator")
+    let mut cmd = Command::new(p.miner_bin);
+    cmd.arg("--quip-coordinator")
         .arg(&socket_uri)
         .arg("--miner-id")
         .arg(miner_id)
-        .env("QUIP_SESSION_TOKEN", p.token)
-        .spawn()
-        .expect("spawn miner");
+        .env("QUIP_SESSION_TOKEN", p.token);
+    // Mechanism A: forward governor flags to the spawned miner's own CLI
+    // (cuda/metal). config.toml still overrides these via backend_toml.
+    if let Some(util) = p.utilization {
+        cmd.arg("--utilization").arg(util.to_string());
+    }
+    if p.yielding {
+        cmd.arg("--yielding");
+    }
+    let mut child = cmd.spawn().expect("spawn miner");
 
     let exit_code = match tokio::time::timeout(p.overall_timeout, child.wait()).await {
         Ok(Ok(status)) => status.code().unwrap_or(-1),

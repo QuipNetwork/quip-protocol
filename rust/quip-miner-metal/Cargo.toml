@@ -33,6 +33,8 @@ core-foundation-sys = "0.8"
 # Objective-C block passed to `MTLCommandBuffer.addCompletedHandler`.
 crossbeam-channel = "0.5.16"
 block = "0.1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [dev-dependencies]
 quip-mock-coordinator = { path = "../quip-mock-coordinator" }
