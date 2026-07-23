@@ -57,6 +57,31 @@ pub(crate) const SA_MAX_NODES: usize = 4593;
 #[cfg(target_os = "macos")]
 pub(crate) const GIBBS_MAX_NODES: usize = 4800;
 
+/// Whether Gibbs uses the chromatic (node-parallel) kernel — the default.
+///
+/// `block_gibbs_parallel` puts one threadgroup per *sample* and lets its
+/// threads split each color's nodes over `threadgroup`-shared state, exploiting
+/// the chromatic independence of a sweep. `block_gibbs_sampler` instead runs
+/// one thread per read and walks all N nodes serially. Measured on an M4 Max
+/// over the full Advantage2 topology (4577 nodes): 36.5 vs 13.2 jobs/s — 2.75x
+/// — at equal solution quality (mean best energy within 0.01%, same diversity).
+///
+/// v0.2 shipped the sequential kernel as its default (`parallel=False`), so it
+/// has more field exposure; `QUIP_METAL_GIBBS_SEQUENTIAL=1` forces it as an
+/// escape hatch. SA is unaffected — its incremental delta-energy chain is
+/// inherently serial, so it has no node-parallel variant.
+#[cfg(target_os = "macos")]
+fn gibbs_node_parallel() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("QUIP_METAL_GIBBS_SEQUENTIAL").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn algo_max_nodes(algorithm: Algorithm) -> usize {
     match algorithm {
@@ -232,8 +257,12 @@ pub(crate) fn encode_batch(
     let d_samples = device.new_zeroed_buffer((num_threads * packed_size) as u64);
     let d_energies = device.new_zeroed_buffer((num_threads * 4) as u64); // i32
 
+    // Chromatic Gibbs uses a different pipeline but the *same* buffer layout —
+    // only the dispatch geometry below differs.
+    let node_parallel = matches!(algorithm, Algorithm::Gibbs) && gibbs_node_parallel();
     let pipeline = match algorithm {
         Algorithm::Sa => &device.sa,
+        Algorithm::Gibbs if node_parallel => &device.gibbs_parallel,
         Algorithm::Gibbs => &device.gibbs,
     };
 
@@ -298,16 +327,30 @@ pub(crate) fn encode_batch(
         }
     }
 
-    // One threadgroup per problem, `num_reads` threads (one per read) each:
-    // `problem_id = thread_id / num_reads` = the threadgroup index.
+    // Sequential kernels: one threadgroup per problem, `num_reads` threads (one
+    // per read) each — `problem_id = thread_id / num_reads` = the threadgroup
+    // index, so a model maps to a core and its reads are the threads inside.
+    //
+    // Chromatic Gibbs: one threadgroup per *sample* (`sample_id =
+    // problem*num_reads + read`), and its threads split each color's nodes.
+    // The group is capped at 256 by the kernel's `threadgroup int
+    // partial_energies[256]` reduction array.
+    let (groups, threads_per_group) = if node_parallel {
+        let t = 256
+            .min(pipeline.max_total_threads_per_threadgroup() as usize)
+            .max(1);
+        (num_threads, t) // num_threads == num_problems * num_reads == samples
+    } else {
+        (num_problems, num_reads)
+    };
     encoder.dispatch_thread_groups(
         MTLSize {
-            width: num_problems as NSUInteger,
+            width: groups as NSUInteger,
             height: 1,
             depth: 1,
         },
         MTLSize {
-            width: num_reads as NSUInteger,
+            width: threads_per_group as NSUInteger,
             height: 1,
             depth: 1,
         },
