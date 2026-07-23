@@ -6,7 +6,8 @@
 //! - Gibbs: heat-bath resample `P(s=+1) = 1/(1+exp(2 β h_eff))`.
 //! - Solution energies are always scored with
 //!   [`quip_protocol::scoring::energy_milli`] (positive sign, trunc toward 0).
-//! - Parallelism: rayon over reads (no multiprocessing).
+//! - Parallelism: model-level (one model per core via the streaming pump);
+//!   reads run sequentially and cache-local on a single core.
 //!
 //! Types (`Algorithm`, `SampleParams`, `SamplerResult`, base `IsingGraph`) and
 //! the beta schedule come from `quip-miner-core`; this module keeps only the
@@ -18,7 +19,6 @@ use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 use quip_protocol::scoring::energy_milli;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use rayon::prelude::*;
 
 /// Per-variable neighbor lists for O(degree) local fields.
 ///
@@ -155,7 +155,12 @@ fn score_spins(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
     }
 }
 
-/// Run `num_reads` independent anneals in parallel (rayon).
+/// Run `num_reads` independent anneals sequentially on one core.
+///
+/// Reads stay on a single core so the model's arrays (h/j/spins/edges) stay hot
+/// in that core's cache — fanning reads across cores bounced those cache lines
+/// and measured slower. Model-level parallelism (one model per core) lives in
+/// the streaming pump (`CpuSampler::sample_stream`).
 pub fn sample_ising(
     graph: &IsingGraph,
     params: &SampleParams,
@@ -168,7 +173,6 @@ pub fn sample_ising(
     let base_seed = params.seed;
 
     (0..num_reads)
-        .into_par_iter()
         .map(|read_idx| {
             // Distinct stream per read; seed 0 still diversifies via read index.
             let seed = base_seed

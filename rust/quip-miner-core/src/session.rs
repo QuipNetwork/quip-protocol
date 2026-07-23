@@ -6,10 +6,12 @@
 
 use crate::cli::CommonArgs;
 use crate::job::{
-    handle_job, miner, num_sweeps_from_toml, status_msg, SessionTarget, TopologyCache,
-    DEFAULT_NUM_SWEEPS,
+    finalize_result, miner, num_sweeps_from_toml, prepare_job, status_msg, Prepared, SessionTarget,
+    TopologyCache, DEFAULT_NUM_SWEEPS,
 };
-use crate::Sampler;
+use crate::{Sampler, StreamJob, StreamResult};
+use std::collections::HashMap;
+use std::sync::Arc;
 use quip_proto::v1::miner_service_client::MinerServiceClient;
 use quip_proto::v1::{coord_msg, miner_msg, CoordMsg, JobKind, JobRequest, MinerMsg, Ready};
 use quip_protocol::session::{build_hello, ExitCode, SessionConfig, SessionError};
@@ -41,11 +43,39 @@ fn print_capabilities(id: &BackendIdentity) {
     );
 }
 
+/// Emit a miner progress line every N completed jobs (v0.2 `mine_work_item`
+/// parity).
+const PROGRESS_LOG_INTERVAL: u64 = 10;
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "job count and elapsed seconds are small; the f64 rate is display-only"
+)]
+fn log_progress(
+    backend: &str,
+    jobs_done: u64,
+    elapsed: std::time::Duration,
+    reads: u32,
+    sweeps: u32,
+    best_energy_milli: i64,
+) {
+    let secs = elapsed.as_secs_f64();
+    let rate = if secs > 0.0 { jobs_done as f64 / secs } else { 0.0 };
+    let best = if best_energy_milli == i64::MAX {
+        "n/a".to_owned()
+    } else {
+        best_energy_milli.to_string()
+    };
+    eprintln!(
+        "{backend} progress: {jobs_done} jobs | {rate:.1} jobs/s | reads={reads} sweeps={sweeps} | best={best} milli"
+    );
+}
+
 async fn run_session<S: Sampler>(
     uri: &str,
     miner_id: &str,
     id: &BackendIdentity,
-    sampler: &S,
+    sampler: Arc<S>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = uri.strip_prefix("unix://").unwrap_or(uri).to_string();
     let channel = Endpoint::try_from("http://[::]:50051")? // dummy authority for UDS
@@ -65,83 +95,145 @@ async fn run_session<S: Sampler>(
 
     let mut inbound = client.session(ReceiverStream::new(rx)).await?.into_inner();
 
+    // Streaming sampler on a blocking thread: it pulls StreamJobs and emits
+    // StreamResults in completion order, keeping `stream_width` models in flight.
+    let width = sampler.stream_width().max(1);
+    let cap = width.max(8);
+    let (job_tx, job_rx) = mpsc::channel::<StreamJob>(cap);
+    let (res_tx, mut res_rx) = mpsc::channel::<StreamResult>(cap);
+    let sampler_thread = {
+        let s = Arc::clone(&sampler);
+        std::thread::spawn(move || s.sample_stream(job_rx, res_tx))
+    };
+
     let mut config: Option<SessionConfig> = None;
     let mut grace_ms: u64 = 5000;
     let mut num_sweeps = DEFAULT_NUM_SWEEPS;
     let mut jobs_done: u64 = 0;
     let mut topology: Option<TopologyCache> = None;
     let mut target: Option<SessionTarget> = None;
+    // job_id → (num_reads, num_sweeps) resolved at prepare, for the result meta.
+    let mut pending: HashMap<Vec<u8>, (u32, u32)> = HashMap::new();
+    // Progress logging (mirrors v0.2 mine_work_item's every-N-attempts line).
+    let session_start = std::time::Instant::now();
+    let mut best_energy_milli: i64 = i64::MAX;
 
     loop {
         let idle = config.as_ref().map(|c| c.idle_timeout_s).unwrap_or(300) as u64;
-        let next = tokio::time::timeout(Duration::from_secs(idle), inbound.message()).await;
-        let cm: CoordMsg = match next {
-            Err(_) => break, // idle timeout
-            Ok(Ok(Some(cm))) => cm,
-            Ok(Ok(None)) => break,
-            Ok(Err(status)) => return Err(status.into()),
-        };
-        match cm.msg {
-            Some(coord_msg::Msg::Welcome(w)) => {
-                if w.protocol_version != 1 {
-                    return Err(SessionError::BadWelcome(w.protocol_version).into());
+        tokio::select! {
+            biased;
+            // Drain completed results first so a busy sampler never backs up.
+            Some(sr) = res_rx.recv() => {
+                let (reads, sweeps) = pending.remove(&sr.job_id).unwrap_or((0, 0));
+                if let Ok(samples) = &sr.result {
+                    if let Some(e) = samples.iter().map(|r| r.energy_milli).min() {
+                        best_energy_milli = best_energy_milli.min(e);
+                    }
                 }
-            }
-            Some(coord_msg::Msg::Configure(c)) => {
-                num_sweeps = num_sweeps_from_toml(&c.backend_toml);
-                config = Some(SessionConfig::from_configure(miner_id.into(), &c));
-                tx.send(miner(miner_msg::Msg::Ready(Ready {}))).await?;
-                let depth = config.as_ref().map(|c| c.queue_depth).unwrap_or(3);
-                tx.send(miner(miner_msg::Msg::JobRequest(JobRequest {
-                    credits: depth,
-                })))
-                .await?;
-            }
-            Some(coord_msg::Msg::Topology(t)) => {
-                topology = Some(TopologyCache::from_proto(&t));
-            }
-            Some(coord_msg::Msg::SetTarget(s)) => {
-                target = Some(SessionTarget::from_proto(&s));
-            }
-            Some(coord_msg::Msg::Job(job)) => {
-                for reply in handle_job(
-                    job,
-                    sampler,
-                    id,
-                    num_sweeps,
-                    &mut jobs_done,
-                    topology.as_ref(),
-                    target.as_ref(),
-                ) {
+                for reply in finalize_result(sr, reads, sweeps, &mut jobs_done) {
                     tx.send(reply).await?;
                 }
+                if jobs_done > 0 && jobs_done.is_multiple_of(PROGRESS_LOG_INTERVAL) {
+                    log_progress(
+                        id.backend,
+                        jobs_done,
+                        session_start.elapsed(),
+                        reads,
+                        sweeps,
+                        best_energy_milli,
+                    );
+                }
             }
-            Some(coord_msg::Msg::Cancel(_)) => {
-                tx.send(status_msg(miner_id, jobs_done, sampler.utilization()))
-                    .await?;
-            }
-            Some(coord_msg::Msg::Ping(_)) => {
-                tx.send(status_msg(miner_id, jobs_done, sampler.utilization()))
-                    .await?;
-            }
-            Some(coord_msg::Msg::Shutdown(s)) => {
-                grace_ms = if s.grace_ms == 0 {
-                    5000
-                } else {
-                    s.grace_ms as u64
+            next = tokio::time::timeout(Duration::from_secs(idle), inbound.message()) => {
+                let cm: CoordMsg = match next {
+                    Err(_) => break, // idle timeout
+                    Ok(Ok(Some(cm))) => cm,
+                    Ok(Ok(None)) => break,
+                    Ok(Err(status)) => return Err(status.into()),
                 };
-                break;
+                match cm.msg {
+                    Some(coord_msg::Msg::Welcome(w)) => {
+                        if w.protocol_version != 1 {
+                            return Err(SessionError::BadWelcome(w.protocol_version).into());
+                        }
+                    }
+                    Some(coord_msg::Msg::Configure(c)) => {
+                        num_sweeps = num_sweeps_from_toml(&c.backend_toml);
+                        config = Some(SessionConfig::from_configure(miner_id.into(), &c));
+                        tx.send(miner(miner_msg::Msg::Ready(Ready {}))).await?;
+                        // Request enough credits to keep `width` models in flight.
+                        let depth = config
+                            .as_ref()
+                            .map_or(3, |c| c.queue_depth)
+                            .max(width as u32);
+                        tx.send(miner(miner_msg::Msg::JobRequest(JobRequest {
+                            credits: depth,
+                        })))
+                        .await?;
+                    }
+                    Some(coord_msg::Msg::Topology(t)) => {
+                        topology = Some(TopologyCache::from_proto(&t));
+                    }
+                    Some(coord_msg::Msg::SetTarget(s)) => {
+                        target = Some(SessionTarget::from_proto(&s));
+                    }
+                    Some(coord_msg::Msg::Job(job)) => {
+                        match prepare_job(
+                            job,
+                            &*sampler,
+                            id,
+                            num_sweeps,
+                            topology.as_ref(),
+                            target.as_ref(),
+                        ) {
+                            Prepared::Reject(msg) => tx.send(msg).await?,
+                            Prepared::Sample {
+                                job,
+                                num_reads,
+                                num_sweeps: ns,
+                            } => {
+                                let _ = pending.insert(job.job_id.clone(), (num_reads, ns));
+                                if job_tx.send(job).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Some(coord_msg::Msg::Cancel(_)) => {
+                        tx.send(status_msg(miner_id, jobs_done, sampler.utilization()))
+                            .await?;
+                    }
+                    Some(coord_msg::Msg::Ping(_)) => {
+                        tx.send(status_msg(miner_id, jobs_done, sampler.utilization()))
+                            .await?;
+                    }
+                    Some(coord_msg::Msg::Shutdown(s)) => {
+                        grace_ms = if s.grace_ms == 0 { 5000 } else { s.grace_ms as u64 };
+                        break;
+                    }
+                    None => {}
+                }
             }
-            None => {}
         }
     }
+
+    // Stop feeding, then drain in-flight results within the grace window.
+    drop(job_tx);
+    let grace = Duration::from_millis(grace_ms);
+    while let Ok(Some(sr)) = tokio::time::timeout(grace, res_rx.recv()).await {
+        let (reads, sweeps) = pending.remove(&sr.job_id).unwrap_or((0, 0));
+        for reply in finalize_result(sr, reads, sweeps, &mut jobs_done) {
+            tx.send(reply).await?;
+        }
+    }
+    let _ = sampler_thread.join();
 
     drop(tx);
     let drain = async {
         while inbound.message().await?.is_some() {}
         Ok::<(), tonic::Status>(())
     };
-    let _ = tokio::time::timeout(Duration::from_millis(grace_ms), drain).await;
+    let _ = tokio::time::timeout(grace, drain).await;
     Ok(())
 }
 
@@ -216,7 +308,7 @@ pub fn run<S: Sampler>(
         }
     };
 
-    match rt.block_on(run_session(&uri, &miner_id, &id, &sampler)) {
+    match rt.block_on(run_session(&uri, &miner_id, &id, Arc::new(sampler))) {
         Ok(()) => StdExitCode::SUCCESS,
         Err(e) => map_err_to_exit(e, id.backend),
     }

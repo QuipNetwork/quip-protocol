@@ -1,14 +1,18 @@
-//! Result revalidation via `quantum_validation` (authoritative, matches the
-//! pallet) with `quip_protocol::scoring` as a golden regression check.
+//! Result revalidation for the coordinator's own miner-gating decision.
+//!
+//! This is a *derivative* check, not the chain consensus path: the pallet does
+//! the authoritative byte-exact validation, so the coordinator is free to use
+//! an optimized representation as long as it reaches the same accept/reject
+//! decision. Energies are scored in place from wire spin bytes against a
+//! position-resolved graph ([`ResolvedTopo`]) — no per-solution decode and no
+//! node-id lookup. `quantum_validation::energy_of_solution` is retained only as
+//! a debug golden check.
 
-use quantum_validation::{
-    calculate_diversity, energy_of_solution, select_diverse, MilliValue, ValidationError,
-};
+use quantum_validation::{calculate_diversity, select_diverse, MilliValue};
 use quip_proto::v1::{ising_problem, IsingProblem, QualityGates, Solution};
-use quip_protocol::scoring::{
-    energy_milli as golden_energy_milli, set_diversity as golden_diversity,
-};
-use quip_protocol::wire::{decode_i32_le, decode_spins};
+use quip_protocol::wire::decode_i32_le;
+use rayon::prelude::*;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Validated {
@@ -18,19 +22,6 @@ pub struct Validated {
     pub accepted: bool,
 }
 
-/// Recompute energies, apply quality gates, return validation summary.
-///
-/// A solution is energy-valid when `energy < gates.min_energy_milli` (strict).
-/// The `min_energy_milli` field on wire gates carries the chain's
-/// `max_energy_milli` ceiling (see `derive_pow_job`).
-///
-/// Set is accepted when `n_valid >= min_solutions` and
-/// `diversity_milli >= min_diversity_milli`. Diversity uses the crate's
-/// half-up `round_div_u64` (not golden truncation).
-///
-/// `topology_nodes` / `topology_edges` are used when the problem references a
-/// topology hash; edge endpoints are **node ids** resolved via the nodes
-/// slice (matching `energy_of_solution`), not bare spin indices.
 /// Build validation gates from the session difficulty target (`SetTarget`), or
 /// a permissive default when no target has been advertised.
 #[must_use]
@@ -49,38 +40,126 @@ pub fn gates_from_target(target: Option<&quip_proto::v1::SetTarget>) -> QualityG
     )
 }
 
+/// Coordinator scoring topology, resolved once when a topology is set. Edge
+/// endpoints are stored as spin-vector **positions**, so per-solution energy
+/// scoring is pure indexing — no node-id lookup. A run constant shared by
+/// `Arc`; empty when no topology is set (inline jobs carry their own edges).
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedTopo {
+    edges_pos: Vec<(u32, u32)>,
+}
+
+impl ResolvedTopo {
+    /// Resolve node-id edges into position-indexed edges once, via a
+    /// `node id -> position` map. A well-formed topology references only its
+    /// own nodes, so every endpoint resolves; an unknown endpoint (a malformed
+    /// topology) maps to position 0 rather than being dropped, which would
+    /// misalign edges with the `j` coupling array. It is surfaced elsewhere.
+    #[must_use]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "topology node count is bounded far below u32::MAX"
+    )]
+    pub fn new(nodes: &[u32], edges_ids: &[(u32, u32)]) -> Self {
+        let pos: HashMap<u32, u32> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (n, i as u32))
+            .collect();
+        let edges_pos = edges_ids
+            .iter()
+            .map(|&(u, v)| {
+                (
+                    pos.get(&u).copied().unwrap_or(0),
+                    pos.get(&v).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        Self { edges_pos }
+    }
+}
+
+/// Map one wire spin byte to its `±1` value. `0x01 -> +1`, `0xFF -> -1`; any
+/// other byte is invalid (mirrors `wire::decode_spins`).
+#[inline]
+fn byte_spin(b: u8) -> Option<i64> {
+    match b {
+        0x01 => Some(1),
+        0xFF => Some(-1),
+        _ => None,
+    }
+}
+
+/// Energy of one solution read directly from its wire spin bytes against
+/// position-resolved edges. No per-solution allocation and no node lookup.
+/// Returns `None` on a wrong-length or invalid-byte solution (mirrors the
+/// consensus shape/spin checks). Golden-checked against
+/// `quantum_validation::energy_of_solution` in debug builds.
+fn energy_in_place(
+    spins: &[u8],
+    h_milli: &[MilliValue],
+    edges_pos: &[(u32, u32)],
+    j_milli: &[MilliValue],
+) -> Option<i64> {
+    if spins.len() != h_milli.len() {
+        return None;
+    }
+    let mut energy: i64 = 0;
+    for (&field, &sb) in h_milli.iter().zip(spins) {
+        energy += i64::from(field) * byte_spin(sb)?;
+    }
+    for (&(u, v), &coupling) in edges_pos.iter().zip(j_milli) {
+        let su = byte_spin(*spins.get(u as usize)?)?;
+        let sv = byte_spin(*spins.get(v as usize)?)?;
+        energy += i64::from(coupling) * su * sv;
+    }
+    Some(energy)
+}
+
+/// Recompute energies, apply quality gates, return the validation summary.
+///
+/// A solution is energy-valid when `energy < gates.min_energy_milli` (strict);
+/// the wire gate's `min_energy_milli` carries the chain's `max_energy_milli`
+/// ceiling (see `derive_pow_job`). The set is accepted when
+/// `n_valid >= min_solutions` and `diversity_milli >= min_diversity_milli`.
+///
+/// `topo` is the run-resolved position-indexed graph, used for topology-hash
+/// jobs; inline `EdgeList` jobs carry their own (already position-indexed)
+/// edges.
 pub fn validate_result(
     problem: &IsingProblem,
     solutions: &[Solution],
     gates: &QualityGates,
-    topology_nodes: &[u32],
-    topology_edges: &[(u32, u32)],
+    topo: &ResolvedTopo,
 ) -> Validated {
     let h_milli = decode_i32_le(&problem.h_milli_le32).unwrap_or_default();
     let j_milli = decode_i32_le(&problem.j_milli_le32).unwrap_or_default();
-    let (nodes, edges) = resolve_graph(problem, &h_milli, topology_nodes, topology_edges);
 
-    let mut spin_sets: Vec<Vec<i8>> = Vec::new();
-    let mut energies: Vec<i64> = Vec::new();
-
-    for sol in solutions {
-        let spins = match decode_spins(&sol.spins_bytes) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        match energy_of_solution(&spins, &h_milli, &edges, &j_milli, &nodes) {
-            Ok(e) => {
-                energies.push(e);
-                spin_sets.push(spins);
-            }
-            Err(ValidationError::InvalidSpinValue { .. })
-            | Err(ValidationError::SolutionLengthMismatch { .. }) => continue,
-            Err(_) => continue,
+    // Position-resolved edges: inline jobs carry their own (endpoints already
+    // spin indices); topology-hash jobs borrow the run constant.
+    let inline_edges: Vec<(u32, u32)>;
+    let edges_pos: &[(u32, u32)] = match &problem.graph {
+        Some(ising_problem::Graph::Edges(e)) => {
+            inline_edges = e.u.iter().zip(&e.v).map(|(&u, &v)| (u, v)).collect();
+            &inline_edges
         }
-    }
+        Some(ising_problem::Graph::TopologyHash(_)) => &topo.edges_pos,
+        None => &[],
+    };
 
-    // Golden regression: energy must match for index-aligned graphs.
-    debug_assert_energies_match(&spin_sets, &h_milli, &j_milli, &edges, &nodes, &energies);
+    // Energy gate: score each solution straight from its wire bytes, in
+    // parallel. `filter_map` + `unzip` preserve order and drop invalid rows.
+    // Survivors keep a borrow of their spin bytes (no copy) for the diversity
+    // pass below.
+    let (byte_rows, energies): (Vec<&[u8]>, Vec<i64>) = solutions
+        .par_iter()
+        .filter_map(|sol| {
+            let e = energy_in_place(&sol.spins_bytes, &h_milli, edges_pos, &j_milli)?;
+            Some((sol.spins_bytes.as_slice(), e))
+        })
+        .unzip();
+
+    debug_assert_energies_match(&byte_rows, &h_milli, edges_pos, &j_milli, &energies);
 
     let energy_valid_indices: Vec<usize> = energies
         .iter()
@@ -92,11 +171,12 @@ pub fn validate_result(
     let (best_energy_milli, diversity_milli) = if energy_valid_indices.is_empty() {
         (i64::MAX, 0u32)
     } else {
-        // Mirror pallet: select a diverse subset of energy-valid solutions,
-        // then score diversity on that subset; best energy over selected.
+        // Diversity reads the valid spin vectors as `&[i8]` reinterpreted from
+        // their wire bytes (0x01/0xFF -> +1/-1) — a zero-copy view, sound
+        // because every byte was validated during scoring.
         let energy_valid: Vec<&[i8]> = energy_valid_indices
             .iter()
-            .map(|&i| spin_sets[i].as_slice())
+            .map(|&i| bytemuck::cast_slice::<u8, i8>(byte_rows[i]))
             .collect();
         let target = energy_valid.len().min(gates.min_solutions.max(1) as usize);
         let selected = select_diverse(&energy_valid, target)
@@ -109,15 +189,6 @@ pub fn validate_result(
             .min()
             .unwrap_or(i64::MAX);
         (best, diversity)
-    };
-
-    // Golden diversity is truncation; accept-path uses the crate value.
-    let _golden_div_milli = {
-        let valid_spins: Vec<Vec<i8>> = energy_valid_indices
-            .iter()
-            .map(|&i| spin_sets[i].clone())
-            .collect();
-        (golden_diversity(&valid_spins) * 1000.0) as u32
     };
 
     let accepted = n_valid >= gates.min_solutions && diversity_milli >= gates.min_diversity_milli;
@@ -138,65 +209,40 @@ pub fn beats_current(candidate_milli: i64, current_best_milli: Option<i64>) -> b
     }
 }
 
-fn resolve_graph(
-    problem: &IsingProblem,
-    h_milli: &[MilliValue],
-    topology_nodes: &[u32],
-    topology_edges: &[(u32, u32)],
-) -> (Vec<u32>, Vec<(u32, u32)>) {
-    match &problem.graph {
-        Some(ising_problem::Graph::Edges(e)) => {
-            let edges: Vec<(u32, u32)> = e.u.iter().zip(&e.v).map(|(&u, &v)| (u, v)).collect();
-            // Inline edge lists treat endpoints as spin indices; nodes are
-            // the contiguous positions 0..len(h).
-            let nodes: Vec<u32> = (0..h_milli.len() as u32).collect();
-            (nodes, edges)
-        }
-        Some(ising_problem::Graph::TopologyHash(_)) => {
-            (topology_nodes.to_vec(), topology_edges.to_vec())
-        }
-        None => ((0..h_milli.len() as u32).collect(), Vec::new()),
-    }
-}
-
+/// Debug-only golden check: the in-place scorer must equal the consensus
+/// `energy_of_solution`. An identity node map makes the consensus scorer treat
+/// edge endpoints as the same positions `energy_in_place` used, so the two
+/// agree for both inline and topology-hash graphs.
 #[cfg(debug_assertions)]
 fn debug_assert_energies_match(
-    spin_sets: &[Vec<i8>],
+    byte_rows: &[&[u8]],
     h_milli: &[MilliValue],
+    edges_pos: &[(u32, u32)],
     j_milli: &[MilliValue],
-    edges: &[(u32, u32)],
-    nodes: &[u32],
     energies: &[i64],
 ) {
-    // Golden scoring treats edges as spin indices. Only compare when the
-    // nodes slice is the identity map 0..n (inline EdgeList graphs).
-    let identity =
-        nodes.len() == h_milli.len() && nodes.iter().enumerate().all(|(i, &n)| n as usize == i);
-    if !identity {
-        return;
-    }
-    let h: Vec<f64> = h_milli.iter().map(|&v| v as f64 / 1000.0).collect();
-    let j: Vec<f64> = j_milli.iter().map(|&v| v as f64 / 1000.0).collect();
-    let idx_edges: Vec<(usize, usize)> = edges
-        .iter()
-        .map(|&(u, v)| (u as usize, v as usize))
+    use quantum_validation::energy_of_solution;
+    use quip_protocol::wire::decode_spins;
+
+    let nodes: Vec<u32> = (0..h_milli.len())
+        .map(|i| u32::try_from(i).unwrap_or(u32::MAX))
         .collect();
-    for (spins, &e) in spin_sets.iter().zip(energies) {
-        let g = golden_energy_milli(spins, &h, &j, &idx_edges);
-        debug_assert_eq!(
-            g, e,
-            "quantum_validation energy {e} diverged from golden {g}"
-        );
+    for (bytes, &e) in byte_rows.iter().zip(energies) {
+        let Ok(spins) = decode_spins(bytes) else {
+            continue;
+        };
+        if let Ok(g) = energy_of_solution(&spins, h_milli, edges_pos, j_milli, &nodes) {
+            debug_assert_eq!(g, e, "energy_in_place {e} diverged from consensus {g}");
+        }
     }
 }
 
 #[cfg(not(debug_assertions))]
 fn debug_assert_energies_match(
-    _spin_sets: &[Vec<i8>],
+    _byte_rows: &[&[u8]],
     _h_milli: &[MilliValue],
+    _edges_pos: &[(u32, u32)],
     _j_milli: &[MilliValue],
-    _edges: &[(u32, u32)],
-    _nodes: &[u32],
     _energies: &[i64],
 ) {
 }
@@ -230,7 +276,7 @@ mod tests {
             min_diversity_milli: 0,
             min_solutions: 1,
         };
-        let v = validate_result(&problem, &[sol], &gates, &[], &[]);
+        let v = validate_result(&problem, &[sol], &gates, &ResolvedTopo::default());
         assert_eq!(v.best_energy_milli, -500);
         assert!(v.accepted);
         assert_eq!(v.n_valid, 1);
@@ -260,7 +306,7 @@ mod tests {
             min_diversity_milli: 0,
             min_solutions: 1,
         };
-        let v = validate_result(&problem, &[sol], &gates, &[], &[]);
+        let v = validate_result(&problem, &[sol], &gates, &ResolvedTopo::default());
         assert!(!v.accepted);
         assert_eq!(v.n_valid, 0);
     }
@@ -286,7 +332,8 @@ mod tests {
             min_diversity_milli: 0,
             min_solutions: 1,
         };
-        let v = validate_result(&problem, &[sol], &gates, &[10, 20], &[(10, 20)]);
+        let topo = ResolvedTopo::new(&[10, 20], &[(10, 20)]);
+        let v = validate_result(&problem, &[sol], &gates, &topo);
         assert_eq!(v.best_energy_milli, -500);
         assert!(v.accepted);
     }
@@ -319,7 +366,7 @@ mod tests {
             min_diversity_milli: 0,
             min_solutions: 2,
         };
-        let v = validate_result(&problem, &sols, &gates, &[], &[]);
+        let v = validate_result(&problem, &sols, &gates, &ResolvedTopo::default());
         assert_eq!(v.n_valid, 2);
         assert_eq!(v.diversity_milli, 500);
         assert!(v.accepted);

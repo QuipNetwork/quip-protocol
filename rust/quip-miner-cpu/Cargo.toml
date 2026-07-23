@@ -21,7 +21,8 @@ quip-proto = { path = "../quip-proto" }
 quip-protocol = { path = "../quip-protocol" }
 quip-miner-core = { path = "../quip-miner-core" }
 clap = { version = "4", features = ["derive"] }
-rayon = "1"
+crossbeam-channel = "0.5.16"
+tokio = { workspace = true }
 rand = { version = "0.8", features = ["small_rng"] }
 
 [dev-dependencies]

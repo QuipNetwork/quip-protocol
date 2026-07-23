@@ -706,6 +706,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7575182f7272186991736b70173b0ea045398f984bf5ebbb3804736ce1330c9d"
 
 [[package]]
+name = "bytemuck"
+version = "1.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -877,6 +883,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "crossbeam-channel"
+version = "0.5.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
+dependencies = [
+ "crossbeam-utils",
 ]
 
 [[package]]
@@ -2986,6 +3001,7 @@ dependencies = [
  "async-trait",
  "blake2",
  "blake3",
+ "bytemuck",
  "clap",
  "getrandom 0.2.17",
  "hyper-util",
@@ -2997,6 +3013,7 @@ dependencies = [
  "quip-protocol",
  "quip-transaction-crypto",
  "rand",
+ "rayon",
  "serde",
  "serde_json",
  "sp-core",
@@ -3066,12 +3083,12 @@ name = "quip-miner-cpu"
 version = "0.3.0"
 dependencies = [
  "clap",
+ "crossbeam-channel",
  "quip-miner-core",
  "quip-mock-coordinator",
  "quip-proto",
  "quip-protocol",
  "rand",
- "rayon",
  "serde_json",
  "tokio",
 ]

@@ -17,8 +17,8 @@ use crate::topology::Topology;
 use crate::validate::validate_result;
 use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
 use quip_proto::v1::{
-    coord_msg, miner_msg, Configure, CoordMsg, Job, MinerMsg, Reject,
-    Result as JobResult, Shutdown, Welcome,
+    coord_msg, miner_msg, Configure, CoordMsg, Job, MinerMsg, Reject, Result as JobResult,
+    Shutdown, Welcome,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -266,39 +266,51 @@ async fn dispatch_jobs(
 
 /// Validate a `Result` against its job's gates and record a `JobRow`. Drive
 /// mode scores and reports only — it never submits to a chain.
+///
+/// Spawned per result rather than awaited inline (see [`handle_message`]): the
+/// state lock is held only long enough to ack the router, take the inflight
+/// job, and clone the run-resolved topology `Arc` + gates, then the CPU-bound
+/// `validate_result` runs on the blocking pool. The topology is a run constant
+/// (`CoordinatorState::resolved_topo`), so the `Arc::clone` is a refcount bump,
+/// never a data copy.
 async fn handle_result(
     state: &Arc<Mutex<CoordinatorState>>,
     miner_id: &str,
     result: JobResult,
     run: &Arc<RunState>,
 ) {
-    let (job, topo_nodes, topo_edges, gates) = {
+    let (job, topo, gates) = {
         let mut st = state.lock().await;
         st.router.ack(miner_id);
         let job = st.inflight.remove(&result.job_id);
-        let (nodes, edges) = st
-            .topology
-            .as_ref()
-            .map(|t| (t.nodes.clone(), t.edge_pairs()))
-            .unwrap_or_default();
+        let topo = Arc::clone(&st.resolved_topo);
         let gates = crate::validate::gates_from_target(st.target.as_ref());
-        (job, nodes, edges, gates)
+        (job, topo, gates)
     };
     let Some(job) = job else { return };
-    let Some(ising) = job.ising.as_ref() else {
-        return;
-    };
-    let validated = validate_result(ising, &result.solutions, &gates, &topo_nodes, &topo_edges);
-    let wall_ms = run.wall_ms_since_dispatch(&result.job_id);
+    let is_pow = job.provenance.as_ref().map(|p| p.is_pow).unwrap_or(false);
+    let Some(ising) = job.ising else { return };
+    let job_id = result.job_id;
+    let solutions = result.solutions;
+    let n_solutions = solutions.len();
     let device_us = result
         .meta
         .as_ref()
         .map(|m| m.device_access_time_us)
         .unwrap_or(0);
+    let validated = match tokio::task::spawn_blocking(move || {
+        validate_result(&ising, &solutions, &gates, &topo)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(_) => return, // validation task panicked; leave the run to time out
+    };
+    let wall_ms = run.wall_ms_since_dispatch(&job_id);
     run.record(JobRow {
-        job_id: result.job_id.clone(),
-        is_pow: job.provenance.as_ref().map(|p| p.is_pow).unwrap_or(false),
-        n_solutions: result.solutions.len(),
+        job_id,
+        is_pow,
+        n_solutions,
         best_energy_milli: validated.best_energy_milli,
         diversity_milli: validated.diversity_milli,
         passed: validated.accepted,
@@ -359,7 +371,21 @@ async fn handle_message(
             dispatch_jobs(state, miner_id, req.credits, tx, run).await
         }
         Some(miner_msg::Msg::Result(result)) => {
-            handle_result(state, miner_id, result, run).await;
+            // Validate concurrently so the session task keeps draining the
+            // stream and dispatching replacement jobs instead of blocking
+            // ~300ms per result. The final row can land after the loop's own
+            // completion check, so signal shutdown from whichever spawned task
+            // completes the run.
+            let state = Arc::clone(state);
+            let run = Arc::clone(run);
+            let tx = tx.clone();
+            let miner_id = miner_id.to_string();
+            drop(tokio::spawn(async move {
+                handle_result(&state, &miner_id, result, &run).await;
+                if run.is_complete() {
+                    let _ = tx.send(Ok(shutdown_msg())).await;
+                }
+            }));
             true
         }
         Some(miner_msg::Msg::Reject(rej)) => {
@@ -425,7 +451,9 @@ pub async fn run_drive(p: DriveManyParams<'_>) -> DriveManyReport {
     st.expected_tokens.insert(miner_id.into(), p.token.into());
     st.configure
         .insert(miner_id.into(), p.entry.configure.clone());
-    st.topology = p.topology;
+    // Resolves the position-indexed scoring topology once (a run constant);
+    // every result handler borrows it by `Arc`, never rebuilding the graph.
+    st.set_topology(p.topology);
     st.target = p.target;
     let total = p.jobs.len();
     let state = Arc::new(Mutex::new(st));

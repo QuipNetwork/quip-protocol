@@ -3,6 +3,7 @@
 
 use crate::adapt::adapt_params;
 use crate::ising::{IsingGraph, SampleParams};
+use crate::{StreamJob, StreamResult};
 use crate::session::BackendIdentity;
 use crate::Sampler;
 use quip_proto::v1::{
@@ -11,7 +12,7 @@ use quip_proto::v1::{
 };
 use quip_protocol::wire::{decode_i32_le, encode_spins, WireError};
 use std::collections::HashMap;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Session-cached topology, used to resolve `TopologyHash` jobs to dense edges.
 ///
@@ -197,37 +198,50 @@ pub(crate) fn num_sweeps_from_toml(backend_toml: &str) -> usize {
     DEFAULT_NUM_SWEEPS
 }
 
-/// Handle one job: validate, sample, return `Result` + `JobRequest` (or `Reject`).
-pub(crate) fn handle_job<S: Sampler>(
+/// A validated job ready to sample, or an immediate reject reply.
+pub(crate) enum Prepared {
+    /// Reject reply to send now (no sampling).
+    Reject(MinerMsg),
+    /// Hand to the streaming sampler; `num_reads`/`num_sweeps` are the resolved
+    /// values, carried so [`finalize_result`] can build `SamplerMeta`.
+    Sample {
+        job: StreamJob,
+        num_reads: u32,
+        num_sweeps: u32,
+    },
+}
+
+/// Validate + resolve one job: reject reasons short-circuit; otherwise resolve
+/// the sampling budget (per-job override > SetTarget override > adapt > default)
+/// and return a [`StreamJob`] for the streaming sampler.
+pub(crate) fn prepare_job<S: Sampler>(
     job: Job,
     sampler: &S,
     id: &BackendIdentity,
     default_sweeps: usize,
-    jobs_done: &mut u64,
     cache: Option<&TopologyCache>,
     target: Option<&SessionTarget>,
-) -> Vec<MinerMsg> {
+) -> Prepared {
     let job_id = job.job_id.clone();
 
     if job.kind != JobKind::IsingSample as i32 {
-        return vec![reject(job_id, RejectReason::UnsupportedKind)];
+        return Prepared::Reject(reject(job_id, RejectReason::UnsupportedKind));
     }
     if job.deadline_ms < now_unix_ms() {
-        return vec![reject(job_id, RejectReason::Expired)];
+        return Prepared::Reject(reject(job_id, RejectReason::Expired));
     }
     let ising = match job.ising {
         Some(i) => i,
-        None => return vec![reject(job_id, RejectReason::Malformed)],
+        None => return Prepared::Reject(reject(job_id, RejectReason::Malformed)),
     };
 
     let graph = match parse_ising(&ising, id.max_nodes, id.max_edges, cache) {
         Ok(g) => g,
-        Err(reason) => return vec![reject(job_id, reason)],
+        Err(reason) => return Prepared::Reject(reject(job_id, reason)),
     };
 
-    // Resolve the sampling budget: per-job override > SetTarget override >
-    // adapt_params > default. adapt runs only when a target is set (the miner
-    // uses the parsed problem's node/edge counts and the topology's allowed_h).
+    // adapt runs only when a target is set (uses the parsed problem's node/edge
+    // counts and the topology's allowed_h).
     let adapt = target.map(|t| {
         let allowed_h = cache.map_or(&[][..], TopologyCache::allowed_h);
         adapt_params(
@@ -241,37 +255,48 @@ pub(crate) fn handle_job<S: Sampler>(
     });
     let t_reads = target.map_or(0, |t| t.num_reads);
     let t_sweeps = target.map_or(0, |t| t.num_sweeps);
-    let num_reads =
-        pick_param(ising.num_reads, t_reads, adapt.map(|a| a.num_reads), 1) as usize;
+    let num_reads = pick_param(ising.num_reads, t_reads, adapt.map(|a| a.num_reads), 1);
     let num_sweeps = pick_param(
         ising.num_sweeps,
         t_sweeps,
         adapt.map(|a| a.num_sweeps),
         default_sweeps as u32,
-    ) as usize;
+    );
 
-    if num_reads as u32 > sampler.max_reads() {
-        return vec![reject(job_id, RejectReason::TooLarge)];
-    }
-
-    if sampler.should_throttle() {
-        std::thread::sleep(Duration::from_millis(50));
+    if num_reads > sampler.max_reads() {
+        return Prepared::Reject(reject(job_id, RejectReason::TooLarge));
     }
 
     let params = SampleParams {
-        num_reads,
-        num_sweeps,
+        num_reads: num_reads as usize,
+        num_sweeps: num_sweeps as usize,
         seed: now_unix_ms(),
         ..Default::default()
     };
+    Prepared::Sample {
+        job: StreamJob {
+            job_id,
+            graph,
+            params,
+        },
+        num_reads,
+        num_sweeps,
+    }
+}
 
-    let t0 = Instant::now();
-    let samples = match sampler.sample(&graph, &params) {
+/// Turn a completed [`StreamResult`] into a `Result` + `JobRequest` (or a
+/// `Reject` if the sampler errored). `num_reads`/`num_sweeps` are the resolved
+/// values from [`prepare_job`], echoed into `SamplerMeta`.
+pub(crate) fn finalize_result(
+    sr: StreamResult,
+    num_reads: u32,
+    num_sweeps: u32,
+    jobs_done: &mut u64,
+) -> Vec<MinerMsg> {
+    let samples = match sr.result {
         Ok(s) => s,
-        Err(reason) => return vec![reject(job_id, reason)],
+        Err(reason) => return vec![reject(sr.job_id, reason)],
     };
-    let elapsed_us = t0.elapsed().as_micros() as u64;
-
     let solutions: Vec<Solution> = samples
         .into_iter()
         .map(|r| Solution {
@@ -283,12 +308,12 @@ pub(crate) fn handle_job<S: Sampler>(
     *jobs_done = jobs_done.saturating_add(1);
 
     let result = JobResult {
-        job_id,
+        job_id: sr.job_id,
         solutions,
         meta: Some(SamplerMeta {
-            reads: num_reads as u32,
-            sweeps: num_sweeps as u32,
-            device_access_time_us: elapsed_us,
+            reads: num_reads,
+            sweeps: num_sweeps,
+            device_access_time_us: sr.device_access_time_us,
             qpu_access_us: 0,
             extra: Default::default(),
         }),
