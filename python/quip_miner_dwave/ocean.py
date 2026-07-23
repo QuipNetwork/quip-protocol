@@ -18,8 +18,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from quip_miner_dwave.config import read_secret_file
-
 
 from quip_miner_dwave.defects import (
     DefectInfo,
@@ -151,13 +149,11 @@ class OceanSampler:
         solver_name: Optional[str] = None,
         region: Optional[str] = None,
         token: Optional[str] = None,
-        api_token_file: Optional[str] = None,
         mock: Optional[bool] = None,
         submit_workers: int = 4,
         defective_qubits: Optional[Sequence[int]] = None,
         defective_edges: Optional[set] = None,
     ):
-        self._api_token_file = api_token_file
         self._submit_pool = ThreadPoolExecutor(
             max_workers=max(1, submit_workers),
             thread_name_prefix="dwave-submit",
@@ -169,23 +165,51 @@ class OceanSampler:
         self._native_hash: Optional[bytes] = None
         self._is_mock = False
         self._qpu_solver = None
+        self._connected = False
+        # Connection overrides; unset values fall through to D-Wave's native
+        # config resolution (dwave.conf + standard env) in `_connect_real`.
+        self._solver_name = solver_name
+        self._region = region
+        self._token = token
 
         use_mock = mock if mock is not None else mock_mode_enabled()
         if sampler is not None:
             self.sampler = sampler
             self._is_mock = use_mock or isinstance(sampler, MockSampler)
+            self._connected = True
+            self._apply_native_hash()
         elif use_mock:
             self.sampler = MockSampler(backend=mock_backend())
             self._is_mock = True
+            self._connected = True
             logger.info(
                 "[QPU] mock sampler active (QUIP_DWAVE_MOCK, backend=%s)",
                 mock_backend(),
             )
+            self._apply_native_hash()
         else:
-            self.sampler = self._connect_real(solver_name, region, token)
-            self._is_mock = False
-            self._detect_defects()
+            # Real QPU: do NOT contact D-Wave here. The connection is deferred
+            # until the coordinator engages us (Configure calls ensure_connected)
+            # or another mode forces it (--check), so an idle or unconnected
+            # miner never opens a QPU session.
+            self.sampler = None
+            logger.info("[QPU] real sampler deferred until Configure")
 
+    def ensure_connected(self) -> None:
+        """Connect to the real QPU if not already (idempotent).
+
+        Mock and injected samplers are ready at construction; a real sampler
+        connects here — invoked when the coordinator sends Configure, or eagerly
+        by --check. Safe to call repeatedly.
+        """
+        if self._connected:
+            return
+        self.sampler = self._connect_real(self._solver_name, self._region, self._token)
+        self._detect_defects()
+        self._connected = True
+        self._apply_native_hash()
+
+    def _apply_native_hash(self) -> None:
         if self._live_nodes and self._live_edges is not None:
             self._native_hash = native_topology_hash(
                 self._live_nodes, self._live_edges
@@ -194,23 +218,20 @@ class OceanSampler:
     def _connect_real(self, solver_name, region, token):
         from dwave.system import DWaveSampler
 
+        # Comply with D-Wave's own config: DWaveSampler resolves credentials
+        # from ~/.config/dwave/dwave.conf and standard env. We only bridge the
+        # project's env names as explicit overrides when set; anything unset
+        # falls through to the SDK's native resolution.
         kwargs: Dict[str, Any] = {"request_timeout": (60, 300)}
-        if solver_name is not None:
+        solver_name = solver_name or os.environ.get("DWAVE_API_SOLVER")
+        if solver_name:
             kwargs["solver"] = solver_name
-        if region is not None:
-            kwargs["region"] = region
-        # Token precedence: explicit arg > *_file (preferred) > .env literal
-        # (fallback) > SDK config. The file path is the only thing that travels;
-        # the secret is read locally and never logged.
-        file_token = read_secret_file(self._api_token_file) if self._api_token_file else None
-        if token is not None:
+        endpoint = region or os.environ.get("DWAVE_REGION_URL")
+        if endpoint:
+            kwargs["endpoint"] = endpoint
+        token = token or os.environ.get("DWAVE_API_KEY")
+        if token:
             kwargs["token"] = token
-        elif file_token:
-            kwargs["token"] = file_token
-        elif os.environ.get("DWAVE_API_KEY"):
-            kwargs["token"] = os.environ["DWAVE_API_KEY"]
-        elif os.environ.get("DWAVE_API_TOKEN"):
-            kwargs["token"] = os.environ["DWAVE_API_TOKEN"]
         base = DWaveSampler(**kwargs)
         self._qpu_solver = base
         self._live_nodes = sorted(int(n) for n in base.nodelist)

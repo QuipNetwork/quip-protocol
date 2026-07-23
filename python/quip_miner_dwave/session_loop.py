@@ -206,6 +206,9 @@ def run_session(
                 config = session_sdk.session_config_from_configure(
                     miner_id, cm.configure
                 )
+                # The coordinator has engaged us: connect to the QPU now (a
+                # no-op in mock mode / when already connected).
+                sampler.ensure_connected()
                 # Uniform config handling: warn on any key the dwave schema
                 # doesn't recognize before consuming the ones it does.
                 warn_unknown_backend_keys(cm.configure.backend_toml)

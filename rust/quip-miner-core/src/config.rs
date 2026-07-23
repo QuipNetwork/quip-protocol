@@ -3,11 +3,10 @@
 //!
 //! Backends parse `Configure.backend_toml` (the verbatim `config.toml`
 //! subsection the coordinator forwards) against their own schema, then use
-//! these helpers so precedence (config > CLI), override warnings, unknown-field
-//! warnings, and secret-file reads look identical across every miner type.
+//! these helpers so precedence (config > CLI), override warnings, and
+//! unknown-field warnings look identical across every miner type.
 
 use std::fmt::Display;
-use std::path::Path;
 
 /// Keys the shared session loop consumes (not any single backend), so no
 /// backend should warn about them as unknown. Kept here so every backend's
@@ -47,23 +46,6 @@ where
     }
 }
 
-/// Read a secret from a file path (the `*_file` convention): `config.toml`
-/// carries the path, the miner reads the value here, and the literal secret
-/// never enters config, the wire, or the coordinator. Returns the trimmed
-/// contents, or `None` (with a warning) if the file can't be read. The value
-/// itself is never logged.
-#[must_use]
-pub fn read_secret_file(path: impl AsRef<Path>) -> Option<String> {
-    let path = path.as_ref();
-    match std::fs::read_to_string(path) {
-        Ok(contents) => Some(contents.trim().to_owned()),
-        Err(err) => {
-            eprintln!("config: cannot read secret file {}: {err}", path.display());
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,16 +60,5 @@ mod tests {
         assert_eq!(config_override("utilization", 100u32, None), 100);
         // works for bool (yielding)
         assert!(config_override("yielding", false, Some(true)));
-    }
-
-    #[test]
-    fn secret_file_reads_trimmed_contents() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("quip_miner_core_secret_test.txt");
-        std::fs::write(&path, "  tok-abc123\n").unwrap();
-        assert_eq!(read_secret_file(&path).as_deref(), Some("tok-abc123"));
-        let _ = std::fs::remove_file(&path);
-        // missing file -> None (warning printed, value never fabricated)
-        assert_eq!(read_secret_file(dir.join("quip_no_such_secret_file")), None);
     }
 }

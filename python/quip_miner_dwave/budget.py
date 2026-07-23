@@ -15,7 +15,9 @@ from quip_miner_dwave.config import warn_unknown_fields
 
 # Config keys the dwave backend recognizes in Configure.backend_toml. Anything
 # else (outside SESSION_KEYS) is a typo and gets warned about, uniform with the
-# Rust backends' unknown-field handling.
+# Rust backends' unknown-field handling. Connection credentials (token/solver/
+# region) are NOT here: they come from D-Wave's own config (dwave.conf + env),
+# not the coordinator.
 DWAVE_CONFIG_KEYS = frozenset(
     {
         "daily_budget",
@@ -24,9 +26,6 @@ DWAVE_CONFIG_KEYS = frozenset(
         "min_block_budget_seconds",
         "budget_cap",
         "budget_cap_seconds",
-        "api_token_file",
-        "solver",
-        "region",
         "anneal_time_us",
         "num_reads",
     }

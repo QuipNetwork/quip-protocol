@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import sys
 
 from quip_miner_dwave import (
@@ -116,14 +115,10 @@ def main(argv: list[str] | None = None) -> int:
 
     use_mock = args.mock or mock_mode_enabled()
     try:
-        # *_file convention for the D-Wave token at startup (preferred over the
-        # DWAVE_API_KEY .env literal, which stays a fallback). The coordinator's
-        # config.toml api_token_file arrives via Configure after the connection
-        # is made; wiring that requires deferring the connect (see quip-i6g.7).
-        sampler = OceanSampler(
-            mock=use_mock,
-            api_token_file=os.environ.get("QUIP_DWAVE_API_TOKEN_FILE"),
-        )
+        # Real-QPU construction does not connect; the connection is deferred
+        # until the coordinator sends Configure (or --check forces it). Mock
+        # mode is ready immediately.
+        sampler = OceanSampler(mock=use_mock)
     except Exception as exc:  # noqa: BLE001
         logging.getLogger(__name__).exception("sampler init failed: %s", exc)
         return EXIT_ENV_INCOMPATIBLE

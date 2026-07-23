@@ -2,14 +2,12 @@
 
 Python mirror of the Rust ``quip_miner_core::config`` helpers so every miner
 type behaves the same: config (from the coordinator's ``Configure``) overrides
-CLI/env with a warning, unrecognized keys warn, and secrets follow the
-``*_file`` convention (config carries a path; the value is read from that file
-and never travels over the wire).
+CLI/env with a warning, and unrecognized keys warn. Credentials are not carried
+here — the dwave miner uses D-Wave's own config (dwave.conf + env).
 """
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Iterable, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -41,16 +39,3 @@ def warn_unknown_fields(backend: str, present: Iterable[str], known: Iterable[st
     for key in present:
         if key not in known_all:
             logger.warning("config: unknown field '%s' for %s (ignored)", key, backend)
-
-
-def read_secret_file(path: str) -> Optional[str]:
-    """Read a secret from a file path (the ``*_file`` convention).
-
-    Returns the trimmed contents, or ``None`` (with a warning) if unreadable.
-    The value itself is never logged.
-    """
-    try:
-        return Path(path).expanduser().read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        logger.warning("config: cannot read secret file %s: %s", path, exc)
-        return None

@@ -4,11 +4,7 @@ from __future__ import annotations
 import logging
 
 from quip_miner_dwave.budget import DWAVE_CONFIG_KEYS, warn_unknown_backend_keys
-from quip_miner_dwave.config import (
-    config_override,
-    read_secret_file,
-    warn_unknown_fields,
-)
+from quip_miner_dwave.config import config_override, warn_unknown_fields
 
 
 def test_config_override_reports_only_on_change(caplog):
@@ -33,17 +29,9 @@ def test_warn_unknown_fields_filters_session_keys(caplog):
 
 def test_warn_unknown_backend_keys_parses_toml(caplog):
     with caplog.at_level(logging.WARNING):
-        warn_unknown_backend_keys('daily_budget = "1h"\napi_token_file = "/x"\nbogus = 1\n')
+        warn_unknown_backend_keys('daily_budget = "1h"\nnum_reads = 100\nbogus = 1\n')
     warned = [r.message for r in caplog.records]
     assert any("unknown field 'bogus'" in m for m in warned)
-    assert not any("daily_budget" in m or "api_token_file" in m for m in warned)
-
-
-def test_read_secret_file_trims_and_hides_value(tmp_path, caplog):
-    p = tmp_path / "tok"
-    p.write_text("  dw-secret-xyz\n")
-    assert read_secret_file(str(p)) == "dw-secret-xyz"
-    # missing file -> None with a warning that never contains a fabricated value
-    with caplog.at_level(logging.WARNING):
-        assert read_secret_file(str(tmp_path / "nope")) is None
-    assert any("cannot read secret file" in r.message for r in caplog.records)
+    # recognized keys are not flagged; connection creds live in D-Wave env, so
+    # they are NOT recognized here and would warn (intentional).
+    assert not any("daily_budget" in m or "num_reads" in m for m in warned)

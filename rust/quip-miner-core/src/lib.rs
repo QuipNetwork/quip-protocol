@@ -108,10 +108,9 @@ pub trait Sampler: Send + Sync + 'static {
     /// verbatim `config.toml` subsection the coordinator forwards. Called once
     /// when `Configure` arrives, before any job. Each backend parses against its
     /// own schema, applies recognized fields (config overrides CLI, see
-    /// [`config::config_override`]), warns on unknown fields
-    /// ([`config::warn_unknown_fields`]), and reads secrets via the `*_file`
-    /// convention ([`config::read_secret_file`]). Default: no configurable
-    /// settings (the CPU miner's shape).
+    /// [`config::config_override`]), and warns on unknown fields
+    /// ([`config::warn_unknown_fields`]). Default: no configurable settings (the
+    /// CPU miner's shape).
     fn apply_config(&self, _backend_toml: &str) {}
 }
 
