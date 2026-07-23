@@ -50,7 +50,11 @@ async fn quip_metal_sa_passes_conformance() {
     );
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
     assert!(report.handshake_ok, "SA handshake failed");
-    assert_eq!(report.result_job_ids.len(), 2, "expected 2 job results");
+    assert_eq!(
+        report.result_job_ids.len(),
+        3,
+        "expected 3 job results (job-1, job-2, job-hash)"
+    );
     assert!(
         report.has_reject(b"job-bad-h", quip_proto::v1::RejectReason::Malformed),
         "missing MALFORMED reject: {:?}",
@@ -78,7 +82,11 @@ async fn quip_metal_gibbs_passes_conformance() {
     );
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
     assert!(report.handshake_ok, "Gibbs handshake failed");
-    assert_eq!(report.result_job_ids.len(), 2, "expected 2 job results");
+    assert_eq!(
+        report.result_job_ids.len(),
+        3,
+        "expected 3 job results (job-1, job-2, job-hash)"
+    );
     assert!(report.has_reject(b"job-bad-h", quip_proto::v1::RejectReason::Malformed));
     assert!(report.has_reject(b"job-old", quip_proto::v1::RejectReason::Expired));
     assert_eq!(report.exit_code, 0, "clean shutdown expected");

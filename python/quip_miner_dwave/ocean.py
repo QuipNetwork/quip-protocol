@@ -49,6 +49,14 @@ def mock_mode_enabled() -> bool:
     return os.environ.get("QUIP_DWAVE_MOCK", "").strip() in ("1", "true", "yes")
 
 
+def mock_backend() -> str:
+    """Offline mock sampler backend: ``exact`` (default, brute-force — only
+    tiny problems) or ``sa`` (SimulatedAnnealingSampler — scales to realistic
+    topologies). Selected via ``QUIP_DWAVE_MOCK_BACKEND``."""
+    b = os.environ.get("QUIP_DWAVE_MOCK_BACKEND", "").strip().lower()
+    return "sa" if b == "sa" else "exact"
+
+
 def ocean_importable() -> bool:
     try:
         import dimod  # noqa: F401
@@ -163,9 +171,12 @@ class OceanSampler:
             self.sampler = sampler
             self._is_mock = use_mock or isinstance(sampler, MockSampler)
         elif use_mock:
-            self.sampler = MockSampler()
+            self.sampler = MockSampler(backend=mock_backend())
             self._is_mock = True
-            logger.info("[QPU] mock sampler active (QUIP_DWAVE_MOCK)")
+            logger.info(
+                "[QPU] mock sampler active (QUIP_DWAVE_MOCK, backend=%s)",
+                mock_backend(),
+            )
         else:
             self.sampler = self._connect_real(solver_name, region, token)
             self._is_mock = False

@@ -59,8 +59,8 @@ async fn mock_miner_passes_conformance() {
     );
     assert_eq!(
         report.result_job_ids.len(),
-        2,
-        "expected 2 Results: {report:?}"
+        3,
+        "expected 3 Results (job-1, job-2, job-hash): {report:?}"
     );
     assert!(
         report.result_job_ids.iter().any(|id| id == b"job-1"),
@@ -69,6 +69,10 @@ async fn mock_miner_passes_conformance() {
     assert!(
         report.result_job_ids.iter().any(|id| id == b"job-2"),
         "missing Result for job-2: {report:?}"
+    );
+    assert!(
+        report.result_job_ids.iter().any(|id| id == b"job-hash"),
+        "missing Result for topology-hash job-hash: {report:?}"
     );
     assert!(
         report.has_reject(b"job-bad-h", RejectReason::Malformed),

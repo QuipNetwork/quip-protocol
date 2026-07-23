@@ -6,10 +6,41 @@ use crate::session::BackendIdentity;
 use crate::Sampler;
 use quip_proto::v1::{
     ising_problem, miner_msg, IsingProblem, Job, JobKind, JobRequest, MinerMsg, Reject,
-    RejectReason, Result as JobResult, SamplerMeta, Solution, Status,
+    RejectReason, Result as JobResult, SamplerMeta, Solution, Status, Topology,
 };
 use quip_protocol::wire::{decode_i32_le, encode_spins, WireError};
+use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Session-cached topology, used to resolve `TopologyHash` jobs to dense edges.
+///
+/// Built once from the `Topology` message at Configure. `pos` maps each native
+/// node id to its dense position (id → index in received order), so sparse
+/// D-Wave qubit ids resolve without a per-job remap.
+pub(crate) struct TopologyCache {
+    hash: Vec<u8>,
+    edges: Vec<(u32, u32)>,
+    pos: HashMap<u32, usize>,
+}
+
+impl TopologyCache {
+    /// Build from a `Topology` message. Node ids map to their received-order
+    /// position; edges keep received order (the consensus `j`-zip invariant).
+    pub(crate) fn from_proto(t: &Topology) -> Self {
+        let mut pos = HashMap::with_capacity(t.nodes.len());
+        for (i, &node) in t.nodes.iter().enumerate() {
+            let _ = pos.insert(node, i);
+        }
+        let edges = t.edges.as_ref().map_or_else(Vec::new, |e| {
+            e.u.iter().zip(&e.v).map(|(&u, &v)| (u, v)).collect()
+        });
+        Self {
+            hash: t.hash.clone(),
+            edges,
+            pos,
+        }
+    }
+}
 
 pub(crate) const DEFAULT_NUM_SWEEPS: usize = 64;
 
@@ -49,8 +80,12 @@ fn decode_milli_f64(bytes: &[u8]) -> Result<Vec<f64>, WireError> {
         .collect())
 }
 
-fn edges_of(ising: &IsingProblem) -> Result<Vec<(usize, usize)>, RejectReason> {
+fn resolve_edges(
+    ising: &IsingProblem,
+    cache: Option<&TopologyCache>,
+) -> Result<Vec<(usize, usize)>, RejectReason> {
     match &ising.graph {
+        // Inline edges use dense 0..n-1 ids straight off the wire.
         Some(ising_problem::Graph::Edges(e)) => {
             if e.u.len() != e.v.len() {
                 return Err(RejectReason::Malformed);
@@ -61,8 +96,21 @@ fn edges_of(ising: &IsingProblem) -> Result<Vec<(usize, usize)>, RejectReason> {
                 .map(|(&u, &v)| (u as usize, v as usize))
                 .collect())
         }
-        // Topology-hash graphs are not resolved by a miner alone.
-        Some(ising_problem::Graph::TopologyHash(_)) => Err(RejectReason::Malformed),
+        // Topology-hash jobs resolve against the session-cached topology,
+        // mapping native (possibly sparse) node ids to dense positions.
+        Some(ising_problem::Graph::TopologyHash(h)) => {
+            let cache = cache.ok_or(RejectReason::TopologyMissing)?;
+            if *h != cache.hash {
+                return Err(RejectReason::TopologyMismatch);
+            }
+            let mut out = Vec::with_capacity(cache.edges.len());
+            for &(u, v) in &cache.edges {
+                let pu = *cache.pos.get(&u).ok_or(RejectReason::Malformed)?;
+                let pv = *cache.pos.get(&v).ok_or(RejectReason::Malformed)?;
+                out.push((pu, pv));
+            }
+            Ok(out)
+        }
         None => Ok(Vec::new()),
     }
 }
@@ -72,10 +120,11 @@ fn parse_ising(
     ising: &IsingProblem,
     max_nodes: u32,
     max_edges: u32,
+    cache: Option<&TopologyCache>,
 ) -> Result<IsingGraph, RejectReason> {
     let h = decode_milli_f64(&ising.h_milli_le32).map_err(|_| RejectReason::Malformed)?;
     let j = decode_milli_f64(&ising.j_milli_le32).map_err(|_| RejectReason::Malformed)?;
-    let edges = edges_of(ising)?;
+    let edges = resolve_edges(ising, cache)?;
     if !edges.is_empty() && j.len() != edges.len() {
         return Err(RejectReason::Malformed);
     }
@@ -114,6 +163,7 @@ pub(crate) fn handle_job<S: Sampler>(
     id: &BackendIdentity,
     num_sweeps: usize,
     jobs_done: &mut u64,
+    cache: Option<&TopologyCache>,
 ) -> Vec<MinerMsg> {
     let job_id = job.job_id.clone();
 
@@ -132,7 +182,7 @@ pub(crate) fn handle_job<S: Sampler>(
         return vec![reject(job_id, RejectReason::TooLarge)];
     }
 
-    let graph = match parse_ising(&ising, id.max_nodes, id.max_edges) {
+    let graph = match parse_ising(&ising, id.max_nodes, id.max_edges, cache) {
         Ok(g) => g,
         Err(reason) => return vec![reject(job_id, reason)],
     };
@@ -186,4 +236,95 @@ pub(crate) fn handle_job<S: Sampler>(
         miner(miner_msg::Msg::Result(result)),
         miner(miner_msg::Msg::JobRequest(JobRequest { credits: 1 })),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quip_proto::v1::{ising_problem::Graph, EdgeList, Topology};
+    use quip_protocol::wire::encode_i32_le;
+
+    fn hash_job(hash: Vec<u8>, h_milli: &[i32], j_milli: &[i32]) -> IsingProblem {
+        IsingProblem {
+            graph: Some(Graph::TopologyHash(hash)),
+            h_milli_le32: encode_i32_le(h_milli),
+            j_milli_le32: encode_i32_le(j_milli),
+            num_reads: 0,
+            gates: None,
+        }
+    }
+
+    #[test]
+    fn topology_cache_maps_sparse_ids_to_positions() {
+        let topo = Topology {
+            hash: vec![0xAB; 32],
+            nodes: vec![0, 12, 2400],
+            edges: Some(EdgeList {
+                u: vec![0, 12],
+                v: vec![12, 2400],
+            }),
+        };
+        let c = TopologyCache::from_proto(&topo);
+        assert_eq!(c.pos.get(&0), Some(&0));
+        assert_eq!(c.pos.get(&12), Some(&1));
+        assert_eq!(c.pos.get(&2400), Some(&2));
+        // received order, unsorted
+        assert_eq!(c.edges, vec![(0, 12), (12, 2400)]);
+        assert_eq!(c.hash, vec![0xAB; 32]);
+    }
+
+    #[test]
+    fn hash_job_resolves_sparse_edges_to_positions() {
+        let topo = Topology {
+            hash: vec![7; 32],
+            nodes: vec![0, 12, 2400],
+            edges: Some(EdgeList {
+                u: vec![0, 12],
+                v: vec![12, 2400],
+            }),
+        };
+        let cache = TopologyCache::from_proto(&topo);
+        let ising = hash_job(vec![7; 32], &[1000, -1000, 1000], &[1000, -1000]);
+        let g = parse_ising(&ising, 100_000, 1_000_000, Some(&cache)).unwrap();
+        assert_eq!(g.edges, vec![(0, 1), (1, 2)]);
+        assert_eq!(g.h, vec![1.0, -1.0, 1.0]);
+        assert_eq!(g.j, vec![1.0, -1.0]);
+    }
+
+    #[test]
+    fn hash_job_without_cache_rejects_missing() {
+        let ising = hash_job(vec![7; 32], &[1000], &[]);
+        let err = parse_ising(&ising, 100_000, 1_000_000, None).unwrap_err();
+        assert_eq!(err, RejectReason::TopologyMissing);
+    }
+
+    #[test]
+    fn hash_job_wrong_hash_rejects_mismatch() {
+        let topo = Topology {
+            hash: vec![1; 32],
+            nodes: vec![0],
+            edges: None,
+        };
+        let cache = TopologyCache::from_proto(&topo);
+        let ising = hash_job(vec![2; 32], &[1000], &[]);
+        let err = parse_ising(&ising, 100_000, 1_000_000, Some(&cache)).unwrap_err();
+        assert_eq!(err, RejectReason::TopologyMismatch);
+    }
+
+    #[test]
+    fn hash_job_edge_id_absent_from_map_rejects_malformed() {
+        // edge references id 999, which is not in nodes → no position.
+        let topo = Topology {
+            hash: vec![7; 32],
+            nodes: vec![0, 1],
+            edges: Some(EdgeList {
+                u: vec![0],
+                v: vec![999],
+            }),
+        };
+        let cache = TopologyCache::from_proto(&topo);
+        let ising = hash_job(vec![7; 32], &[1000, 1000], &[1000]);
+        let err = parse_ising(&ising, 100_000, 1_000_000, Some(&cache)).unwrap_err();
+        assert_eq!(err, RejectReason::Malformed);
+    }
 }

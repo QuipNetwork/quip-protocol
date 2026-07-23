@@ -19,6 +19,8 @@ enum RejectReason {
   OVERLOADED = 4;
   SHUTTING_DOWN = 5;
   MALFORMED = 6;
+  TOPOLOGY_MISMATCH = 7;
+  TOPOLOGY_MISSING = 8;
 }
 
 message MinerMsg {

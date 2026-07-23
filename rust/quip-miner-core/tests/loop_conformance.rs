@@ -56,6 +56,11 @@ async fn mock_sampler_passes_loop_conformance() {
         report.result_job_ids
     );
     assert!(
+        report.result_job_ids.iter().any(|id| id == b"job-hash"),
+        "missing result for topology-hash job-hash (cache/resolve regression): {:?}",
+        report.result_job_ids
+    );
+    assert!(
         report.has_reject(b"job-bad-h", RejectReason::Malformed),
         "missing MALFORMED reject for job-bad-h: {:?}",
         report.rejects

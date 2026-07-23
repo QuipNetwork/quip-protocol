@@ -54,13 +54,10 @@ pub enum TopologySpecError {
     EmptyNodes,
     EmptyAllowedH,
     EmptyAllowedJ,
-    /// `edges` reference positions in `nodes` (0-based), not arbitrary node
-    /// IDs; `endpoint` is out of range for `node_count`.
-    EdgeOutOfRange {
-        edge_index: usize,
-        endpoint: u32,
-        node_count: usize,
-    },
+    /// An `edges` endpoint is a node id not present in `nodes`. Edges reference
+    /// native node ids (possibly sparse), which the miner and consensus scorer
+    /// map to dense positions — so an id just has to exist in `nodes`.
+    EdgeUnknownNode { edge_index: usize, endpoint: u32 },
 }
 
 impl std::fmt::Display for TopologySpecError {
@@ -74,14 +71,13 @@ impl std::fmt::Display for TopologySpecError {
             TopologySpecError::EmptyAllowedJ => {
                 write!(f, "topology spec: allowed_j_milli must be non-empty")
             }
-            TopologySpecError::EdgeOutOfRange {
+            TopologySpecError::EdgeUnknownNode {
                 edge_index,
                 endpoint,
-                node_count,
             } => write!(
                 f,
-                "topology spec: edge {edge_index} references node position {endpoint}, \
-                 but only {node_count} nodes are defined"
+                "topology spec: edge {edge_index} references node id {endpoint}, \
+                 which is not in the topology"
             ),
         }
     }
@@ -124,14 +120,13 @@ impl TopologySpec {
 }
 
 fn validate_edges(nodes: &[u32], edges: &[(u32, u32)]) -> Result<(), TopologySpecError> {
-    let node_count = nodes.len();
+    let node_set: std::collections::HashSet<u32> = nodes.iter().copied().collect();
     for (edge_index, &(u, v)) in edges.iter().enumerate() {
         for endpoint in [u, v] {
-            if endpoint as usize >= node_count {
-                return Err(TopologySpecError::EdgeOutOfRange {
+            if !node_set.contains(&endpoint) {
+                return Err(TopologySpecError::EdgeUnknownNode {
                     edge_index,
                     endpoint,
-                    node_count,
                 });
             }
         }
@@ -254,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_out_of_range_edge() {
+    fn rejects_edge_with_unknown_node_id() {
         let text = r#"{
             "nodes": [0, 1],
             "edges": [[0, 5]],
@@ -263,11 +258,25 @@ mod tests {
         }"#;
         assert_eq!(
             parse_topology_spec(text).unwrap_err(),
-            TopologySpecError::EdgeOutOfRange {
+            TopologySpecError::EdgeUnknownNode {
                 edge_index: 0,
                 endpoint: 5,
-                node_count: 2,
             }
         );
+    }
+
+    #[test]
+    fn accepts_sparse_native_node_ids() {
+        // Native D-Wave-style sparse ids (gaps): edges reference ids, not
+        // positions. The miner and consensus scorer map ids → positions.
+        let text = r#"{
+            "nodes": [0, 12, 2400],
+            "edges": [[0, 12], [12, 2400]],
+            "allowed_h_milli": [-1000, 0, 1000],
+            "allowed_j_milli": [-1000, 1000]
+        }"#;
+        let spec = parse_topology_spec(text).unwrap();
+        assert_eq!(spec.topology.nodes, vec![0, 12, 2400]);
+        assert_eq!(spec.topology.edge_pairs(), vec![(0, 12), (12, 2400)]);
     }
 }

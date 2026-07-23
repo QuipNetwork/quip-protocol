@@ -2,7 +2,7 @@ use clap::Parser;
 use quip_proto::v1::miner_service_client::MinerServiceClient;
 use quip_proto::v1::{
     coord_msg, ising_problem, miner_msg, CoordMsg, Fatal, IsingProblem, Job, JobKind, JobRequest,
-    MinerMsg, Ready, Reject, RejectReason, Result as JobResult, Solution, Status,
+    MinerMsg, Ready, Reject, RejectReason, Result as JobResult, Solution, Status, Topology,
 };
 use quip_protocol::scoring::energy_milli;
 use quip_protocol::session::{build_hello, check_welcome, ExitCode, SessionConfig, SessionError};
@@ -101,15 +101,56 @@ fn decode_milli_f64(bytes: &[u8]) -> Result<Vec<f64>, quip_protocol::wire::WireE
         .collect())
 }
 
-fn edges_of(ising: &IsingProblem) -> Vec<(usize, usize)> {
-    match &ising.graph {
-        Some(ising_problem::Graph::Edges(e)) => {
-            e.u.iter()
-                .zip(&e.v)
-                .map(|(&u, &v)| (u as usize, v as usize))
-                .collect()
+/// Session-cached topology (mirrors quip-miner-core): resolves `TopologyHash`
+/// jobs to dense edges, mapping native (possibly sparse) node ids to positions.
+struct SessionTopo {
+    hash: Vec<u8>,
+    edges: Vec<(u32, u32)>,
+    pos: std::collections::HashMap<u32, usize>,
+}
+
+impl SessionTopo {
+    fn from_proto(t: &Topology) -> Self {
+        let mut pos = std::collections::HashMap::with_capacity(t.nodes.len());
+        for (i, &node) in t.nodes.iter().enumerate() {
+            let _ = pos.insert(node, i);
         }
-        _ => Vec::new(),
+        let edges = t.edges.as_ref().map_or_else(Vec::new, |e| {
+            e.u.iter().zip(&e.v).map(|(&u, &v)| (u, v)).collect()
+        });
+        Self {
+            hash: t.hash.clone(),
+            edges,
+            pos,
+        }
+    }
+}
+
+fn resolve_edges(
+    ising: &IsingProblem,
+    topo: Option<&SessionTopo>,
+) -> Result<Vec<(usize, usize)>, RejectReason> {
+    match &ising.graph {
+        Some(ising_problem::Graph::Edges(e)) => Ok(e
+            .u
+            .iter()
+            .zip(&e.v)
+            .map(|(&u, &v)| (u as usize, v as usize))
+            .collect()),
+        Some(ising_problem::Graph::TopologyHash(h)) => {
+            let topo = topo.ok_or(RejectReason::TopologyMissing)?;
+            if *h != topo.hash {
+                return Err(RejectReason::TopologyMismatch);
+            }
+            let mut out = Vec::with_capacity(topo.edges.len());
+            for &(u, v) in &topo.edges {
+                let pu = *topo.pos.get(&u).ok_or(RejectReason::Malformed)?;
+                let pv = *topo.pos.get(&v).ok_or(RejectReason::Malformed)?;
+                out.push((pu, pv));
+            }
+            Ok(out)
+        }
+        None => Ok(Vec::new()),
     }
 }
 
@@ -122,7 +163,7 @@ fn reject(job_id: Vec<u8>, reason: RejectReason) -> MinerMsg {
 
 /// Validate a job and produce the reply(s): a `Reject` on bad input, otherwise a
 /// `Result` (all-+1 spins) followed by a `JobRequest` for one more credit.
-fn handle_job(job: Job) -> Vec<MinerMsg> {
+fn handle_job(job: Job, topo: Option<&SessionTopo>) -> Vec<MinerMsg> {
     let job_id = job.job_id.clone();
 
     // UNSUPPORTED_KIND: only ISING_SAMPLE is implemented by this reference miner.
@@ -149,7 +190,10 @@ fn handle_job(job: Job) -> Vec<MinerMsg> {
         return vec![reject(job_id, RejectReason::Expired)];
     }
 
-    let edges = edges_of(&ising);
+    let edges = match resolve_edges(&ising, topo) {
+        Ok(e) => e,
+        Err(reason) => return vec![reject(job_id, reason)],
+    };
     let n = h.len();
     let spins = vec![1i8; n];
     let energy = energy_milli(&spins, &h, &j, &edges);
@@ -203,6 +247,7 @@ async fn run_session(uri: &str, miner_id: &str) -> Result<(), ExitCode> {
     let mut config: Option<SessionConfig> = None;
     let mut grace_ms: u64 = 5000;
     let mut session_err: Option<ExitCode> = None;
+    let mut session_topo: Option<SessionTopo> = None;
     loop {
         let idle = config.as_ref().map(|c| c.idle_timeout_s).unwrap_or(300) as u64;
         let next = tokio::time::timeout(Duration::from_secs(idle), inbound.message()).await;
@@ -228,9 +273,11 @@ async fn run_session(uri: &str, miner_id: &str) -> Result<(), ExitCode> {
                     .await
                     .map_err(|_| ExitCode::InternalFatal)?;
             }
-            Some(coord_msg::Msg::Topology(_)) => {}
+            Some(coord_msg::Msg::Topology(t)) => {
+                session_topo = Some(SessionTopo::from_proto(&t));
+            }
             Some(coord_msg::Msg::Job(job)) => {
-                for reply in handle_job(job) {
+                for reply in handle_job(job, session_topo.as_ref()) {
                     tx.send(reply).await.map_err(|_| ExitCode::InternalFatal)?;
                 }
             }
@@ -307,11 +354,10 @@ mod tests {
 
     #[test]
     fn gate_circuit_rejects_unsupported_kind() {
-        let msgs = handle_job(sample_job(
-            b"gate",
-            JobKind::GateCircuit,
-            encode_i32_le(&[500]),
-        ));
+        let msgs = handle_job(
+            sample_job(b"gate", JobKind::GateCircuit, encode_i32_le(&[500])),
+            None,
+        );
         assert_eq!(
             first_reject_reason(&msgs),
             Some(RejectReason::UnsupportedKind as i32)
@@ -327,11 +373,14 @@ mod tests {
 
     #[test]
     fn malformed_j_rejects_malformed() {
-        let msgs = handle_job(sample_job(
-            b"bad-j",
-            JobKind::IsingSample,
-            vec![0x01, 0x02, 0x03], // len 3, not a multiple of 4
-        ));
+        let msgs = handle_job(
+            sample_job(
+                b"bad-j",
+                JobKind::IsingSample,
+                vec![0x01, 0x02, 0x03], // len 3, not a multiple of 4
+            ),
+            None,
+        );
         assert_eq!(
             first_reject_reason(&msgs),
             Some(RejectReason::Malformed as i32)

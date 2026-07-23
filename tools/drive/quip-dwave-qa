@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Exec shim so `quip-coordinator drive --miner <this>` can spawn the Python
+# dwave miner. Resolves the repo venv + PYTHONPATH relative to this file, and
+# forces the offline mock sampler (drive mode passes no --mock flag).
+set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+export PYTHONPATH="$REPO/python${PYTHONPATH:+:$PYTHONPATH}"
+export QUIP_DWAVE_MOCK=1
+# SA backend scales to realistic topologies (ExactSolver brute-forces 2^n).
+export QUIP_DWAVE_MOCK_BACKEND="${QUIP_DWAVE_MOCK_BACKEND:-sa}"
+exec "$REPO/.venv/bin/python" -m quip_miner_dwave "$@"

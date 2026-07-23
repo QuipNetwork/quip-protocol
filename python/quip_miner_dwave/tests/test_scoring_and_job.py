@@ -128,3 +128,57 @@ def test_unsupported_kind():
     msgs = handle_job(job, sampler, session_nodes=[], session_edges=[])
     assert msgs[0].reject.reason == miner_pb2.UNSUPPORTED_KIND
     sampler.close()
+
+
+def _hash_job(job_id: bytes, topology_hash: bytes) -> "miner_pb2.Job":
+    return miner_pb2.Job(
+        job_id=job_id,
+        kind=miner_pb2.ISING_SAMPLE,
+        deadline_ms=int(time.time() * 1000) + 60_000,
+        ising=miner_pb2.IsingProblem(
+            topology_hash=topology_hash,
+            h_milli_le32=wire.encode_i32_le([1000, -1000]),
+            j_milli_le32=wire.encode_i32_le([500]),
+            num_reads=1,
+        ),
+    )
+
+
+def test_topology_hash_job_without_cache_rejects_missing():
+    sampler = OceanSampler(mock=True)
+    job = _hash_job(b"hash-missing", b"\x11" * 32)
+    msgs = handle_job(
+        job, sampler, session_nodes=[], session_edges=[], session_hash=None
+    )
+    assert len(msgs) == 1
+    assert msgs[0].reject.reason == miner_pb2.TOPOLOGY_MISSING
+    sampler.close()
+
+
+def test_topology_hash_job_wrong_hash_rejects_mismatch():
+    sampler = OceanSampler(mock=True)
+    job = _hash_job(b"hash-wrong", b"\x22" * 32)
+    msgs = handle_job(
+        job,
+        sampler,
+        session_nodes=[0, 1],
+        session_edges=[(0, 1)],
+        session_hash=b"\x11" * 32,
+    )
+    assert len(msgs) == 1
+    assert msgs[0].reject.reason == miner_pb2.TOPOLOGY_MISMATCH
+    sampler.close()
+
+
+def test_topology_hash_job_match_resolves_to_result():
+    sampler = OceanSampler(mock=True)
+    job = _hash_job(b"hash-ok", b"\x11" * 32)
+    msgs = handle_job(
+        job,
+        sampler,
+        session_nodes=[0, 1],
+        session_edges=[(0, 1)],
+        session_hash=b"\x11" * 32,
+    )
+    assert any(m.HasField("result") for m in msgs)
+    sampler.close()
