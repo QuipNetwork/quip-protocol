@@ -112,9 +112,9 @@ message IsingProblem {
   bytes  h_milli_le32 = 3;
   bytes  j_milli_le32 = 4;
   uint32 num_reads      = 5; // per-job override; 0 = unset -> SetTarget/adapt
-  QualityGates gates    = 6; // deprecated: moves to SetTarget (removed in T7)
   uint32 num_sweeps     = 7; // per-job override; 0 = unset
   uint32 anneal_time_us = 8; // per-job override; 0 = unset
+  reserved 6; // was `gates`; difficulty gates moved to SetTarget
 }
 
 message Provenance {
