@@ -17,7 +17,7 @@ use crate::topology::Topology;
 use crate::validate::validate_result;
 use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
 use quip_proto::v1::{
-    coord_msg, miner_msg, Configure, CoordMsg, Job, MinerMsg, Reject,
+    coord_msg, miner_msg, Configure, CoordMsg, Job, MinerMsg, QualityGates, Reject,
     Result as JobResult, Shutdown, Welcome,
 };
 use std::collections::HashMap;
@@ -56,6 +56,10 @@ pub struct DriveManyReport {
     pub total: usize,
     pub miner_exit_code: i32,
 }
+
+/// Run-fixed topology shared with every result handler: `(node ids, edges)`,
+/// built once per session and cloned by `Arc` rather than rebuilt per result.
+type SharedTopo = Arc<(Vec<u32>, Vec<(u32, u32)>)>;
 
 fn coord(msg: coord_msg::Msg) -> CoordMsg {
     CoordMsg { msg: Some(msg) }
@@ -266,39 +270,49 @@ async fn dispatch_jobs(
 
 /// Validate a `Result` against its job's gates and record a `JobRow`. Drive
 /// mode scores and reports only — it never submits to a chain.
+///
+/// Spawned per result rather than awaited inline (see [`handle_message`]): the
+/// state lock is held only long enough to ack the router and take the inflight
+/// job, then the CPU-bound `validate_result` runs on the blocking pool. `topo`
+/// (nodes, edges) and `gates` are fixed for the run, built once and shared by
+/// `Arc`/value so no per-result full-topology clone happens.
 async fn handle_result(
     state: &Arc<Mutex<CoordinatorState>>,
     miner_id: &str,
     result: JobResult,
     run: &Arc<RunState>,
+    topo: SharedTopo,
+    gates: QualityGates,
 ) {
-    let (job, topo_nodes, topo_edges, gates) = {
+    let job = {
         let mut st = state.lock().await;
         st.router.ack(miner_id);
-        let job = st.inflight.remove(&result.job_id);
-        let (nodes, edges) = st
-            .topology
-            .as_ref()
-            .map(|t| (t.nodes.clone(), t.edge_pairs()))
-            .unwrap_or_default();
-        let gates = crate::validate::gates_from_target(st.target.as_ref());
-        (job, nodes, edges, gates)
+        st.inflight.remove(&result.job_id)
     };
     let Some(job) = job else { return };
-    let Some(ising) = job.ising.as_ref() else {
-        return;
-    };
-    let validated = validate_result(ising, &result.solutions, &gates, &topo_nodes, &topo_edges);
-    let wall_ms = run.wall_ms_since_dispatch(&result.job_id);
+    let is_pow = job.provenance.as_ref().map(|p| p.is_pow).unwrap_or(false);
+    let Some(ising) = job.ising else { return };
+    let job_id = result.job_id;
+    let solutions = result.solutions;
+    let n_solutions = solutions.len();
     let device_us = result
         .meta
         .as_ref()
         .map(|m| m.device_access_time_us)
         .unwrap_or(0);
+    let validated = match tokio::task::spawn_blocking(move || {
+        validate_result(&ising, &solutions, &gates, &topo.0, &topo.1)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(_) => return, // validation task panicked; leave the run to time out
+    };
+    let wall_ms = run.wall_ms_since_dispatch(&job_id);
     run.record(JobRow {
-        job_id: result.job_id.clone(),
-        is_pow: job.provenance.as_ref().map(|p| p.is_pow).unwrap_or(false),
-        n_solutions: result.solutions.len(),
+        job_id,
+        is_pow,
+        n_solutions,
         best_energy_milli: validated.best_energy_milli,
         diversity_milli: validated.diversity_milli,
         passed: validated.accepted,
@@ -343,6 +357,10 @@ async fn handle_fatal(state: &Arc<Mutex<CoordinatorState>>, run: &Arc<RunState>)
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "session-loop plumbing: state, run bookkeeping, outbound tx, and the run-fixed topo/gates all belong here"
+)]
 async fn handle_message(
     msg: MinerMsg,
     state: &Arc<Mutex<CoordinatorState>>,
@@ -350,6 +368,8 @@ async fn handle_message(
     tx: &mpsc::Sender<Result<CoordMsg, Status>>,
     run: &Arc<RunState>,
     seed_credits: u32,
+    topo: &SharedTopo,
+    gates: &QualityGates,
 ) -> bool {
     match msg.msg {
         Some(miner_msg::Msg::Ready(_)) => {
@@ -359,7 +379,23 @@ async fn handle_message(
             dispatch_jobs(state, miner_id, req.credits, tx, run).await
         }
         Some(miner_msg::Msg::Result(result)) => {
-            handle_result(state, miner_id, result, run).await;
+            // Validate concurrently so the session task keeps draining the
+            // stream and dispatching replacement jobs instead of blocking
+            // ~300ms per result. The final row can land after the loop's own
+            // completion check, so signal shutdown from whichever spawned task
+            // completes the run.
+            let state = Arc::clone(state);
+            let run = Arc::clone(run);
+            let tx = tx.clone();
+            let miner_id = miner_id.to_string();
+            let topo = Arc::clone(topo);
+            let gates = *gates;
+            drop(tokio::spawn(async move {
+                handle_result(&state, &miner_id, result, &run, topo, gates).await;
+                if run.is_complete() {
+                    let _ = tx.send(Ok(shutdown_msg())).await;
+                }
+            }));
             true
         }
         Some(miner_msg::Msg::Reject(rej)) => {
@@ -392,12 +428,27 @@ async fn run_drive_session(
         return;
     }
     let seed_credits = configure.queue_depth.max(1);
+    // Topology and gates are fixed for the whole run; build them once and share
+    // by Arc/value so `handle_result` never rebuilds the full edge list.
+    let (topo, gates) = {
+        let st = state.lock().await;
+        let (nodes, edges) = st
+            .topology
+            .as_ref()
+            .map(|t| (t.nodes.clone(), t.edge_pairs()))
+            .unwrap_or_default();
+        (
+            Arc::new((nodes, edges)),
+            crate::validate::gates_from_target(st.target.as_ref()),
+        )
+    };
     loop {
         let msg = match inbound.message().await {
             Ok(Some(m)) => m,
             _ => break,
         };
-        let keep_going = handle_message(msg, &state, &miner_id, tx, &run, seed_credits).await;
+        let keep_going =
+            handle_message(msg, &state, &miner_id, tx, &run, seed_credits, &topo, &gates).await;
         if !keep_going {
             break;
         }
