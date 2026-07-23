@@ -92,7 +92,7 @@ include = [
     "GPU*",
     "QPU*",
     "quip*",
-    "quip_proto*",
+    # quip_proto is built by maturin (PyO3 extension), not setuptools.
 ]
 
 [tool.setuptools.package-data]

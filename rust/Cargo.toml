@@ -11,6 +11,9 @@ members = [
     "quip-miner-cpu",
     "quip-miner-cuda",
 ]
+# quip-protocol-py is a PyO3 extension built by maturin (needs a Python
+# interpreter); keep it out of the plain `cargo build --workspace` gate.
+exclude = ["quip-protocol-py"]
 
 [workspace.dependencies]
 tonic = "0.12"

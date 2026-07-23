@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1,<2"]
+build-backend = "maturin"
+
+[project]
+name = "quip_proto"
+version = "0.3.0"
+description = "quip.network v0.3 SDK: PyO3 consensus primitives + generated gRPC stubs"
+requires-python = ">=3.11"
+
+[tool.maturin]
+manifest-path = "../rust/quip-protocol-py/Cargo.toml"
+python-source = "."
+module-name = "quip_proto._core"
+features = ["pyo3/extension-module"]

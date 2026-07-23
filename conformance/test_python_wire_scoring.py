@@ -1,3 +1,4 @@
+import pytest
 import json
 import sys
 from pathlib import Path
@@ -69,11 +70,13 @@ def test_energy_milli_saturates_at_negative_i64_boundary():
     assert scoring.energy_milli([1], [-1e16], [], []) == i64_min
 
 
-def test_energy_milli_skips_negative_edge_index():
-    # A naive `u < len(spins)` guard is true for u=-1, so Python would wrap
-    # around to spins[-1] instead of skipping the OOB edge like Rust's usize
-    # indices (which cannot go negative). Edge (-1, 0) must be skipped.
-    assert scoring.energy_milli([1, -1], [], [1.0], [(-1, 0)]) == 0
+def test_energy_milli_rejects_negative_edge_index():
+    # scoring is now the PyO3 binding to Rust, whose edge indices are usize and
+    # cannot be negative. A negative index is a type error, not a silent skip —
+    # stricter than the old pure-Python guard and unreachable from the wire
+    # (which decodes u32 -> non-negative). This enforces Rust's contract.
+    with pytest.raises((OverflowError, ValueError)):
+        scoring.energy_milli([1, -1], [], [1.0], [(-1, 0)])
 
 
 def test_set_diversity_zero_width_solutions_is_zero():

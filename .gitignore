@@ -92,3 +92,10 @@ rust/target/
 
 # Python bytecode cache (nested packages)
 python/**/__pycache__/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+python/quip_proto/*.so

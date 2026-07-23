@@ -73,7 +73,12 @@ conformance:
   image: python:3.11
   tags: [linux, amd64]
   before_script:
-    - pip install -e ".[dev]" grpcio-tools numpy blake3
+    - pip install -e ".[dev]" grpcio-tools numpy blake3 maturin
+    # quip_proto's scoring/wire are a PyO3 extension; build it before tests
+    # import it. python:3.11 has no Rust toolchain, so install one first.
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+    - . "$HOME/.cargo/env"
+    - (cd python && maturin develop)
   script:
     - python conformance/gen_golden_vectors.py --stdout | diff - conformance/golden_vectors.json
     # Proto↔stub drift guard: regenerate Python *_pb2 stubs from the normative
