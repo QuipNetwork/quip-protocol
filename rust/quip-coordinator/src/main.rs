@@ -76,6 +76,10 @@ struct DriveArgs {
     /// Minimum unique solutions gate. Overrides the spec.
     #[arg(long)]
     min_solutions: Option<u32>,
+    /// Pin num_reads via the SetTarget control-plane override (bypasses adapt).
+    /// Useful for the dwave/QPU path, which does not adapt yet.
+    #[arg(long)]
+    num_reads: Option<u32>,
     /// Per-job deadline, milliseconds from now.
     #[arg(long, default_value_t = 3_600_000)]
     deadline_ms: u64,
@@ -175,7 +179,7 @@ fn set_target_from_spec(
         max_energy_milli,
         min_solutions: args.min_solutions.unwrap_or(spec.min_solutions),
         min_diversity_milli: spec.min_diversity_milli,
-        num_reads: 0,
+        num_reads: args.num_reads.unwrap_or(0),
         num_sweeps: 0,
         anneal_time_us: 0,
     }
@@ -352,6 +356,7 @@ mod tests {
             list: None,
             target_energy: None,
             min_solutions: None,
+            num_reads: None,
             deadline_ms: 1000,
             report: None,
         }
