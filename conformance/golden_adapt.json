@@ -329,5 +329,147 @@
       "difficulty": 1.0,
       "gse_c75": -10.974297244015219
     }
+  ],
+  "adapt_params_cpu_sa": [
+    {
+      "target_milli": -10000000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 1,
+      "bounds": "cpu_sa",
+      "num_reads": 64,
+      "num_sweeps": 64
+    },
+    {
+      "target_milli": -10000000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 5,
+      "bounds": "cpu_sa",
+      "num_reads": 64,
+      "num_sweeps": 64
+    },
+    {
+      "target_milli": -14000000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 1,
+      "bounds": "cpu_sa",
+      "num_reads": 64,
+      "num_sweeps": 64
+    },
+    {
+      "target_milli": -14000000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 5,
+      "bounds": "cpu_sa",
+      "num_reads": 64,
+      "num_sweeps": 64
+    },
+    {
+      "target_milli": -14700000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 1,
+      "bounds": "cpu_sa",
+      "num_reads": 268,
+      "num_sweeps": 2145
+    },
+    {
+      "target_milli": -14700000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 5,
+      "bounds": "cpu_sa",
+      "num_reads": 268,
+      "num_sweeps": 2145
+    },
+    {
+      "target_milli": -15200000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 1,
+      "bounds": "cpu_sa",
+      "num_reads": 512,
+      "num_sweeps": 4096
+    },
+    {
+      "target_milli": -15200000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 5,
+      "bounds": "cpu_sa",
+      "num_reads": 512,
+      "num_sweeps": 4096
+    },
+    {
+      "target_milli": -15700000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 1,
+      "bounds": "cpu_sa",
+      "num_reads": 512,
+      "num_sweeps": 4096
+    },
+    {
+      "target_milli": -15700000,
+      "num_nodes": 4577,
+      "num_edges": 41515,
+      "allowed_h_milli": [
+        -1000,
+        0,
+        1000
+      ],
+      "min_solutions": 5,
+      "bounds": "cpu_sa",
+      "num_reads": 512,
+      "num_sweeps": 4096
+    }
   ]
 }
