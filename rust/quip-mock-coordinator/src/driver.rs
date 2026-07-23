@@ -130,6 +130,8 @@ fn valid_ising() -> IsingProblem {
         h_milli_le32: encode_i32_le(&[1000, -1000]),
         j_milli_le32: encode_i32_le(&[500]),
         num_reads: 1,
+        num_sweeps: 0,
+        anneal_time_us: 0,
         gates: None,
     }
 }
@@ -142,6 +144,8 @@ fn hash_ising() -> IsingProblem {
         h_milli_le32: encode_i32_le(&[1000, -1000]),
         j_milli_le32: encode_i32_le(&[500]),
         num_reads: 1,
+        num_sweeps: 0,
+        anneal_time_us: 0,
         gates: None,
     }
 }
@@ -212,6 +216,7 @@ async fn run_script(
             u: vec![0],
             v: vec![1],
         }),
+        allowed_h_milli: vec![-1000, 0, 1000],
     };
     let _ = tx.send(Ok(coord(coord_msg::Msg::Topology(topology)))).await;
 

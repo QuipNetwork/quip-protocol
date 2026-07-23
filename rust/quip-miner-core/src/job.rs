@@ -250,6 +250,8 @@ mod tests {
             h_milli_le32: encode_i32_le(h_milli),
             j_milli_le32: encode_i32_le(j_milli),
             num_reads: 0,
+            num_sweeps: 0,
+            anneal_time_us: 0,
             gates: None,
         }
     }
@@ -259,6 +261,7 @@ mod tests {
         let topo = Topology {
             hash: vec![0xAB; 32],
             nodes: vec![0, 12, 2400],
+            allowed_h_milli: vec![],
             edges: Some(EdgeList {
                 u: vec![0, 12],
                 v: vec![12, 2400],
@@ -278,6 +281,7 @@ mod tests {
         let topo = Topology {
             hash: vec![7; 32],
             nodes: vec![0, 12, 2400],
+            allowed_h_milli: vec![],
             edges: Some(EdgeList {
                 u: vec![0, 12],
                 v: vec![12, 2400],
@@ -303,6 +307,7 @@ mod tests {
         let topo = Topology {
             hash: vec![1; 32],
             nodes: vec![0],
+            allowed_h_milli: vec![],
             edges: None,
         };
         let cache = TopologyCache::from_proto(&topo);
@@ -317,6 +322,7 @@ mod tests {
         let topo = Topology {
             hash: vec![7; 32],
             nodes: vec![0, 1],
+            allowed_h_milli: vec![],
             edges: Some(EdgeList {
                 u: vec![0],
                 v: vec![999],

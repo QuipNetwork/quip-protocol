@@ -57,6 +57,7 @@ impl Topology {
                 u: self.edges.0.clone(),
                 v: self.edges.1.clone(),
             }),
+            allowed_h_milli: Vec::new(), // populated in T6 (coordinator threads allowed_h)
         }
     }
 }

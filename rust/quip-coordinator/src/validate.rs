@@ -200,6 +200,8 @@ mod tests {
             h_milli_le32: encode_i32_le(&[1000, -500]),
             j_milli_le32: encode_i32_le(&[2000]),
             num_reads: 1,
+            num_sweeps: 0,
+            anneal_time_us: 0,
             gates: None,
         };
         let sol = Solution {
@@ -229,6 +231,8 @@ mod tests {
             h_milli_le32: encode_i32_le(&[1000]),
             j_milli_le32: vec![],
             num_reads: 1,
+            num_sweeps: 0,
+            anneal_time_us: 0,
             gates: None,
         };
         let sol = Solution {
@@ -254,6 +258,8 @@ mod tests {
             h_milli_le32: encode_i32_le(&[1000, -500]),
             j_milli_le32: encode_i32_le(&[2000]),
             num_reads: 1,
+            num_sweeps: 0,
+            anneal_time_us: 0,
             gates: None,
         };
         let sol = Solution {
@@ -280,6 +286,8 @@ mod tests {
             h_milli_le32: encode_i32_le(&[0, 0]),
             j_milli_le32: vec![],
             num_reads: 2,
+            num_sweeps: 0,
+            anneal_time_us: 0,
             gates: None,
         };
         let sols = [

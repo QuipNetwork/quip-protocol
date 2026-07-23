@@ -52,6 +52,8 @@ pub fn build_ising_job_from_nonce(
             h_milli_le32: encode_i32_le(&h),
             j_milli_le32: encode_i32_le(&j),
             num_reads: 0,
+            num_sweeps: 0,
+            anneal_time_us: 0,
             gates: Some(QualityGates {
                 min_energy_milli: snap.max_energy_milli,
                 min_diversity_milli: snap.min_diversity_milli,

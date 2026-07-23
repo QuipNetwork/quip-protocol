@@ -121,6 +121,8 @@ fn build_explicit_job(entry: &ListEntryJson, generation: u64, deadline_ms: u64) 
             h_milli_le32: encode_i32_le(&h),
             j_milli_le32: encode_i32_le(&j),
             num_reads: entry.num_reads.unwrap_or(0),
+            num_sweeps: 0,
+            anneal_time_us: 0,
             gates: Some(QualityGates {
                 min_energy_milli: gates.map(|g| g.max_energy_milli).unwrap_or(i64::MAX),
                 min_diversity_milli: gates.map(|g| g.min_diversity_milli).unwrap_or(0),

@@ -22,6 +22,8 @@ pub fn job_order_to_job(order: &JobOrder) -> Job {
             h_milli_le32: encode_i32_le(&order.h_milli),
             j_milli_le32: encode_i32_le(&order.j_milli),
             num_reads: 0,
+            num_sweeps: 0,
+            anneal_time_us: 0,
             gates: Some(QualityGates {
                 min_energy_milli: order.min_energy_milli.unwrap_or(0),
                 min_diversity_milli: order.min_diversity_milli.unwrap_or(0),

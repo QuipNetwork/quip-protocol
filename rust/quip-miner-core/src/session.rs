@@ -96,6 +96,7 @@ async fn run_session<S: Sampler>(
             Some(coord_msg::Msg::Topology(t)) => {
                 topology = Some(TopologyCache::from_proto(&t));
             }
+            Some(coord_msg::Msg::SetTarget(_)) => {} // T5: cache target + adapt
             Some(coord_msg::Msg::Job(job)) => {
                 for reply in handle_job(job, sampler, id, num_sweeps, &mut jobs_done, topology.as_ref())
                 {
