@@ -65,6 +65,7 @@ async fn drives_two_entry_list_end_to_end() {
         token,
         entry: &entry,
         topology: None,
+        target: None,
         jobs,
         overall_timeout: Duration::from_secs(20),
     })

@@ -39,6 +39,7 @@ pub struct DriveManyParams<'a> {
     pub token: &'a str,
     pub entry: &'a LaunchEntry,
     pub topology: Option<Topology>,
+    pub target: Option<quip_proto::v1::SetTarget>,
     pub jobs: Vec<Job>,
     /// Hard ceiling on the whole run (bounds a stuck or rejecting miner).
     pub overall_timeout: Duration,
@@ -233,6 +234,11 @@ async fn handshake(
                 .send(Ok(coord(coord_msg::Msg::Topology(topo.to_proto()))))
                 .await;
         }
+        if let Some(target) = st.target.as_ref() {
+            let _ = tx
+                .send(Ok(coord(coord_msg::Msg::SetTarget(*target))))
+                .await;
+        }
     }
     Some(configure)
 }
@@ -424,6 +430,7 @@ pub async fn run_drive(p: DriveManyParams<'_>) -> DriveManyReport {
     st.configure
         .insert(miner_id.into(), p.entry.configure.clone());
     st.topology = p.topology;
+    st.target = p.target;
     let total = p.jobs.len();
     let state = Arc::new(Mutex::new(st));
     let jobs = Arc::new(Mutex::new(p.jobs));

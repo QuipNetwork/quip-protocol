@@ -36,6 +36,8 @@ pub struct CoordinatorState {
     pub expected_tokens: HashMap<String, String>,
     pub configure: HashMap<String, Configure>,
     pub topology: Option<Topology>,
+    /// Difficulty target advertised to miners via `SetTarget`.
+    pub target: Option<quip_proto::v1::SetTarget>,
     pub router: Router,
     /// job_id → Job, for validation context.
     pub inflight: HashMap<Vec<u8>, quip_proto::v1::Job>,
@@ -50,6 +52,7 @@ impl CoordinatorState {
             expected_tokens: HashMap::new(),
             configure: HashMap::new(),
             topology: None,
+            target: None,
             router: Router::new(),
             inflight: HashMap::new(),
             current_best_milli: None,
