@@ -1,12 +1,20 @@
 //! CPU heat-bath Gibbs miner (`quip-cpu-gibbs`).
 
-use quip_miner_cpu::sampler_core::Algorithm;
-use quip_miner_cpu::session::{run_cli, AlgorithmIdentity};
+use clap::Parser;
+use quip_miner_core::{run, CommonArgs};
+use quip_miner_cpu::{Algorithm, CpuSampler, CPU_GIBBS_IDENTITY};
 use std::process::ExitCode;
 
+#[derive(Parser)]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " protocol 1"))]
+struct Cli {
+    #[command(flatten)]
+    common: CommonArgs,
+}
+
 fn main() -> ExitCode {
-    run_cli(AlgorithmIdentity {
-        algorithm: "gibbs",
-        sampler: Algorithm::Gibbs,
+    let cli = Cli::parse();
+    run(CPU_GIBBS_IDENTITY, &cli.common, || {
+        Ok(CpuSampler::new(Algorithm::Gibbs))
     })
 }
