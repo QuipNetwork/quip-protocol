@@ -2,12 +2,11 @@
 //! pallet) with `quip_protocol::scoring` as a golden regression check.
 
 use quantum_validation::{
-    calculate_diversity, energy_of_solution, select_diverse, MilliValue, ValidationError,
+    calculate_diversity, energy_of_solution, select_diverse, MilliValue,
 };
 use quip_proto::v1::{ising_problem, IsingProblem, QualityGates, Solution};
-use quip_protocol::scoring::{
-    energy_milli as golden_energy_milli, set_diversity as golden_diversity,
-};
+use quip_protocol::scoring::energy_milli as golden_energy_milli;
+use rayon::prelude::*;
 use quip_protocol::wire::{decode_i32_le, decode_spins};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,24 +59,18 @@ pub fn validate_result(
     let j_milli = decode_i32_le(&problem.j_milli_le32).unwrap_or_default();
     let (nodes, edges) = resolve_graph(problem, &h_milli, topology_nodes, topology_edges);
 
-    let mut spin_sets: Vec<Vec<i8>> = Vec::new();
-    let mut energies: Vec<i64> = Vec::new();
-
-    for sol in solutions {
-        let spins = match decode_spins(&sol.spins_bytes) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        match energy_of_solution(&spins, &h_milli, &edges, &j_milli, &nodes) {
-            Ok(e) => {
-                energies.push(e);
-                spin_sets.push(spins);
-            }
-            Err(ValidationError::InvalidSpinValue { .. })
-            | Err(ValidationError::SolutionLengthMismatch { .. }) => continue,
-            Err(_) => continue,
-        }
-    }
+    // Energy gate: score every solution. Each is independent, so fan the decode
+    // + energy computation across cores with rayon. `filter_map` + `unzip`
+    // preserve input order and drop only undecodable / invalid rows — identical
+    // to the previous sequential loop, just parallel.
+    let (spin_sets, energies): (Vec<Vec<i8>>, Vec<i64>) = solutions
+        .par_iter()
+        .filter_map(|sol| {
+            let spins = decode_spins(&sol.spins_bytes).ok()?;
+            let e = energy_of_solution(&spins, &h_milli, &edges, &j_milli, &nodes).ok()?;
+            Some((spins, e))
+        })
+        .unzip();
 
     // Golden regression: energy must match for index-aligned graphs.
     debug_assert_energies_match(&spin_sets, &h_milli, &j_milli, &edges, &nodes, &energies);
@@ -109,15 +102,6 @@ pub fn validate_result(
             .min()
             .unwrap_or(i64::MAX);
         (best, diversity)
-    };
-
-    // Golden diversity is truncation; accept-path uses the crate value.
-    let _golden_div_milli = {
-        let valid_spins: Vec<Vec<i8>> = energy_valid_indices
-            .iter()
-            .map(|&i| spin_sets[i].clone())
-            .collect();
-        (golden_diversity(&valid_spins) * 1000.0) as u32
     };
 
     let accepted = n_valid >= gates.min_solutions && diversity_milli >= gates.min_diversity_milli;
