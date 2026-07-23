@@ -1,50 +1,11 @@
 //! Launch SA / Gibbs kernels and score solutions with consensus energy_milli.
 
-use crate::beta::build_beta_schedule;
-use crate::csr::IsingGraph;
 use crate::cuda_device::{CudaDevice, CudaError};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
+use quip_miner_core::beta::{default_ising_beta_range, geometric_beta_schedule};
+use quip_miner_core::{Algorithm, CsrGraph, IsingGraph, SampleParams, SamplerResult};
 use quip_protocol::scoring::energy_milli;
 use thiserror::Error;
-
-/// Sampling algorithm selected by the binary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Algorithm {
-    /// Metropolis-Hastings simulated annealing.
-    Sa,
-    /// Single-site heat-bath Gibbs along the same beta ladder.
-    Gibbs,
-}
-
-/// Per-job sampling knobs.
-#[derive(Clone, Debug)]
-pub struct SampleParams {
-    pub num_reads: usize,
-    pub num_sweeps: usize,
-    pub sweeps_per_beta: usize,
-    /// Optional `(hot_beta, cold_beta)`. `None` → auto from biases.
-    pub beta_range: Option<(f64, f64)>,
-    pub seed: u64,
-}
-
-impl Default for SampleParams {
-    fn default() -> Self {
-        Self {
-            num_reads: 1,
-            num_sweeps: 64,
-            sweeps_per_beta: 1,
-            beta_range: None,
-            seed: 0,
-        }
-    }
-}
-
-/// One completed read: spins in {-1,+1} and consensus milli-energy.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SamplerResult {
-    pub spins: Vec<i8>,
-    pub energy_milli: i64,
-}
 
 #[derive(Debug, Error)]
 pub enum SampleError {
@@ -58,6 +19,26 @@ impl From<cudarc::driver::DriverError> for SampleError {
     fn from(e: cudarc::driver::DriverError) -> Self {
         SampleError::Driver(e.to_string())
     }
+}
+
+/// Geometric beta schedule cast to f32 for kernel upload, plus sweeps-per-beta.
+///
+/// Uses the shared f64 schedule and casts each element to f32 — bit-identical
+/// to the prior in-crate f32 schedule (which also computed in f64 and cast).
+fn build_beta_schedule(
+    graph: &IsingGraph,
+    num_sweeps: usize,
+    sweeps_per_beta: usize,
+    beta_range: Option<(f64, f64)>,
+) -> (Vec<f32>, usize) {
+    let sweeps_per = sweeps_per_beta.max(1);
+    let num_betas = (num_sweeps / sweeps_per).max(1);
+    let (hot, cold) = beta_range.unwrap_or_else(|| default_ising_beta_range(graph));
+    let sched: Vec<f32> = geometric_beta_schedule(hot, cold, num_betas)
+        .iter()
+        .map(|&b| b as f32)
+        .collect();
+    (sched, sweeps_per)
 }
 
 fn score_spins(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
@@ -101,19 +82,21 @@ pub fn sample_ising(
             .collect());
     }
 
+    let csr = CsrGraph::from_base(graph);
+
     // Host CSR may be empty (no edges); still need non-empty device buffers
     // for row_ptr (N+1) and h (N). Pad col/j with a dummy if nnz==0.
-    let row_ptr = &graph.row_ptr;
-    let (col_ind, j_csr) = if graph.nnz() == 0 {
+    let row_ptr = &csr.row_ptr;
+    let (col_ind, j_csr) = if csr.nnz() == 0 {
         (vec![0i32], vec![0.0f32])
     } else {
-        (graph.col_ind.clone(), graph.j_csr.clone())
+        (csr.col_ind.clone(), csr.j_csr.clone())
     };
 
     let d_row = stream.clone_htod(row_ptr)?;
     let d_col = stream.clone_htod(&col_ind)?;
     let d_j = stream.clone_htod(&j_csr)?;
-    let d_h = stream.clone_htod(&graph.h_f32)?;
+    let d_h = stream.clone_htod(&csr.h_f32)?;
     let d_beta = stream.clone_htod(&beta)?;
     let mut d_work = stream.alloc_zeros::<i8>(num_reads * n)?;
     let mut d_out = stream.alloc_zeros::<i8>(num_reads * n)?;
