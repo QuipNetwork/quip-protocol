@@ -43,6 +43,34 @@ fn print_capabilities(id: &BackendIdentity) {
     );
 }
 
+/// Emit a miner progress line every N completed jobs (v0.2 `mine_work_item`
+/// parity).
+const PROGRESS_LOG_INTERVAL: u64 = 10;
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "job count and elapsed seconds are small; the f64 rate is display-only"
+)]
+fn log_progress(
+    backend: &str,
+    jobs_done: u64,
+    elapsed: std::time::Duration,
+    reads: u32,
+    sweeps: u32,
+    best_energy_milli: i64,
+) {
+    let secs = elapsed.as_secs_f64();
+    let rate = if secs > 0.0 { jobs_done as f64 / secs } else { 0.0 };
+    let best = if best_energy_milli == i64::MAX {
+        "n/a".to_owned()
+    } else {
+        best_energy_milli.to_string()
+    };
+    eprintln!(
+        "{backend} progress: {jobs_done} jobs | {rate:.1} jobs/s | reads={reads} sweeps={sweeps} | best={best} milli"
+    );
+}
+
 async fn run_session<S: Sampler>(
     uri: &str,
     miner_id: &str,
@@ -86,6 +114,9 @@ async fn run_session<S: Sampler>(
     let mut target: Option<SessionTarget> = None;
     // job_id → (num_reads, num_sweeps) resolved at prepare, for the result meta.
     let mut pending: HashMap<Vec<u8>, (u32, u32)> = HashMap::new();
+    // Progress logging (mirrors v0.2 mine_work_item's every-N-attempts line).
+    let session_start = std::time::Instant::now();
+    let mut best_energy_milli: i64 = i64::MAX;
 
     loop {
         let idle = config.as_ref().map(|c| c.idle_timeout_s).unwrap_or(300) as u64;
@@ -94,8 +125,23 @@ async fn run_session<S: Sampler>(
             // Drain completed results first so a busy sampler never backs up.
             Some(sr) = res_rx.recv() => {
                 let (reads, sweeps) = pending.remove(&sr.job_id).unwrap_or((0, 0));
+                if let Ok(samples) = &sr.result {
+                    if let Some(e) = samples.iter().map(|r| r.energy_milli).min() {
+                        best_energy_milli = best_energy_milli.min(e);
+                    }
+                }
                 for reply in finalize_result(sr, reads, sweeps, &mut jobs_done) {
                     tx.send(reply).await?;
+                }
+                if jobs_done > 0 && jobs_done.is_multiple_of(PROGRESS_LOG_INTERVAL) {
+                    log_progress(
+                        id.backend,
+                        jobs_done,
+                        session_start.elapsed(),
+                        reads,
+                        sweeps,
+                        best_energy_milli,
+                    );
                 }
             }
             next = tokio::time::timeout(Duration::from_secs(idle), inbound.message()) => {
