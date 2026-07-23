@@ -5,7 +5,9 @@
 //! Shutdown / idle timeout. Backends supply only a [`Sampler`].
 
 use crate::cli::CommonArgs;
-use crate::job::{handle_job, miner, num_sweeps_from_toml, status_msg, DEFAULT_NUM_SWEEPS};
+use crate::job::{
+    handle_job, miner, num_sweeps_from_toml, status_msg, TopologyCache, DEFAULT_NUM_SWEEPS,
+};
 use crate::Sampler;
 use quip_proto::v1::miner_service_client::MinerServiceClient;
 use quip_proto::v1::{coord_msg, miner_msg, CoordMsg, JobKind, JobRequest, MinerMsg, Ready};
@@ -64,6 +66,7 @@ async fn run_session<S: Sampler>(
     let mut grace_ms: u64 = 5000;
     let mut num_sweeps = DEFAULT_NUM_SWEEPS;
     let mut jobs_done: u64 = 0;
+    let mut topology: Option<TopologyCache> = None;
 
     loop {
         let idle = config.as_ref().map(|c| c.idle_timeout_s).unwrap_or(300) as u64;
@@ -90,9 +93,12 @@ async fn run_session<S: Sampler>(
                 })))
                 .await?;
             }
-            Some(coord_msg::Msg::Topology(_)) => {}
+            Some(coord_msg::Msg::Topology(t)) => {
+                topology = Some(TopologyCache::from_proto(&t));
+            }
             Some(coord_msg::Msg::Job(job)) => {
-                for reply in handle_job(job, sampler, id, num_sweeps, &mut jobs_done) {
+                for reply in handle_job(job, sampler, id, num_sweeps, &mut jobs_done, topology.as_ref())
+                {
                     tx.send(reply).await?;
                 }
             }

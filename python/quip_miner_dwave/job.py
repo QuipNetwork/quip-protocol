@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from quip_proto import miner_pb2, scoring, wire
 
@@ -67,8 +67,15 @@ def handle_job(
     *,
     session_nodes: Sequence[int],
     session_edges: Sequence[Tuple[int, int]],
+    session_hash: Optional[bytes] = None,
 ) -> List[miner_pb2.MinerMsg]:
-    """Validate and solve one job; return Result+JobRequest or Reject messages."""
+    """Validate and solve one job; return Result+JobRequest or Reject messages.
+
+    ``session_hash`` is the hash of the cached ``Topology`` (``None`` until one
+    arrives). A ``topology_hash`` job with no cache rejects ``TOPOLOGY_MISSING``;
+    a hash that differs from the cache rejects ``TOPOLOGY_MISMATCH`` — matching
+    the Rust miners so both reject a topology desync identically.
+    """
     job_id = job.job_id
 
     if job.kind not in (
@@ -116,6 +123,24 @@ def handle_job(
                 )
             )
         ]
+
+    if ising.WhichOneof("graph") == "topology_hash":
+        if session_hash is None:
+            return [
+                miner_pb2.MinerMsg(
+                    reject=miner_pb2.Reject(
+                        job_id=job_id, reason=miner_pb2.TOPOLOGY_MISSING
+                    )
+                )
+            ]
+        if bytes(ising.topology_hash) != bytes(session_hash):
+            return [
+                miner_pb2.MinerMsg(
+                    reject=miner_pb2.Reject(
+                        job_id=job_id, reason=miner_pb2.TOPOLOGY_MISMATCH
+                    )
+                )
+            ]
 
     nodes, edges = resolve_graph(ising, session_nodes, session_edges, len(h))
     if not nodes and h:

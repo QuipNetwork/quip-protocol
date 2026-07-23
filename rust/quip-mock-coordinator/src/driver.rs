@@ -46,9 +46,10 @@ impl DriverReport {
             && self.ready_received
             && !self.job_request_credits.is_empty()
             && self.job_request_credits.iter().all(|&c| c > 0)
-            && self.result_job_ids.len() == 2
+            && self.result_job_ids.len() == 3
             && self.result_job_ids.iter().any(|id| id == b"job-1")
             && self.result_job_ids.iter().any(|id| id == b"job-2")
+            && self.result_job_ids.iter().any(|id| id == b"job-hash")
             && self.has_reject(b"job-bad-h", RejectReason::Malformed)
             && self.has_reject(b"job-bad-j", RejectReason::Malformed)
             && self.has_reject(b"job-gate", RejectReason::UnsupportedKind)
@@ -117,12 +118,27 @@ fn coord(msg: coord_msg::Msg) -> CoordMsg {
 }
 
 /// A minimal, well-formed two-spin Ising problem with an edge (0,1).
+/// Hash of the `Topology` the script sends; the hash job references it.
+const TOPOLOGY_HASH: [u8; 32] = [0x11; 32];
+
 fn valid_ising() -> IsingProblem {
     IsingProblem {
         graph: Some(ising_problem::Graph::Edges(EdgeList {
             u: vec![0],
             v: vec![1],
         })),
+        h_milli_le32: encode_i32_le(&[1000, -1000]),
+        j_milli_le32: encode_i32_le(&[500]),
+        num_reads: 1,
+        gates: None,
+    }
+}
+
+/// Same problem as `valid_ising`, but referenced by `topology_hash` — the miner
+/// must resolve it against the cached `Topology` (nodes [0,1], edge (0,1)).
+fn hash_ising() -> IsingProblem {
+    IsingProblem {
+        graph: Some(ising_problem::Graph::TopologyHash(TOPOLOGY_HASH.to_vec())),
         h_milli_le32: encode_i32_le(&[1000, -1000]),
         j_milli_le32: encode_i32_le(&[500]),
         num_reads: 1,
@@ -190,7 +206,7 @@ async fn run_script(
         .send(Ok(coord(coord_msg::Msg::Configure(configure))))
         .await;
     let topology = Topology {
-        hash: vec![],
+        hash: TOPOLOGY_HASH.to_vec(),
         nodes: vec![0, 1],
         edges: Some(EdgeList {
             u: vec![0],
@@ -213,6 +229,17 @@ async fn run_script(
             b"job-2",
             future,
             valid_ising(),
+        )))))
+        .await;
+
+    // 3b. Topology-hash job: same problem by hash -> miner resolves it against
+    // the cached Topology and returns a Result (regression guard for the
+    // session cache + hash resolution).
+    let _ = tx
+        .send(Ok(coord(coord_msg::Msg::Job(job(
+            b"job-hash",
+            future,
+            hash_ising(),
         )))))
         .await;
 

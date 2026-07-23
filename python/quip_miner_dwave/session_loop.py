@@ -95,6 +95,7 @@ def run_session(
     config: Optional[session_sdk.SessionConfig] = None
     session_nodes: list[int] = []
     session_edges: list[Tuple[int, int]] = []
+    session_hash: Optional[bytes] = None
     pending_budget = budget
     exit_code = EXIT_CLEAN
 
@@ -162,6 +163,7 @@ def run_session(
             elif which == "topology":
                 topo = cm.topology
                 session_nodes = list(topo.nodes)
+                session_hash = bytes(topo.hash)
                 if topo.HasField("edges"):
                     session_edges = list(zip(topo.edges.u, topo.edges.v))
                 else:
@@ -186,6 +188,7 @@ def run_session(
                     sampler,
                     session_nodes=session_nodes,
                     session_edges=session_edges,
+                    session_hash=session_hash,
                 )
                 for reply in replies:
                     kind = reply.WhichOneof("msg")
