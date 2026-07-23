@@ -206,7 +206,8 @@ mod tests {
                 h_milli_le32: vec![0; 8], // 2 nodes
                 j_milli_le32: vec![0; 4], // 1 edge
                 num_reads: 0,
-                gates: None,
+                num_sweeps: 0,
+                anneal_time_us: 0,
             }),
             provenance: Some(Provenance {
                 is_pow: generation != 0,

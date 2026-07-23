@@ -96,6 +96,7 @@ def run_session(
     session_nodes: list[int] = []
     session_edges: list[Tuple[int, int]] = []
     session_hash: Optional[bytes] = None
+    session_target: Optional[miner_pb2.SetTarget] = None
     pending_budget = budget
     exit_code = EXIT_CLEAN
 
@@ -169,6 +170,8 @@ def run_session(
                 else:
                     session_edges = []
                 sampler.set_session_topology(session_nodes, session_edges)
+            elif which == "set_target":
+                session_target = cm.set_target
             elif which == "job":
                 if (
                     pending_budget is not None
@@ -189,6 +192,7 @@ def run_session(
                     session_nodes=session_nodes,
                     session_edges=session_edges,
                     session_hash=session_hash,
+                    session_target=session_target,
                 )
                 for reply in replies:
                     kind = reply.WhichOneof("msg")

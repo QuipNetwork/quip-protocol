@@ -44,6 +44,7 @@ message CoordMsg {
     Cancel    cancel    = 5;
     Ping      ping      = 6;
     Shutdown  shutdown  = 7;
+    SetTarget set_target = 8;
   }
 }
 
@@ -76,6 +77,20 @@ message Topology {
   bytes  hash  = 1;
   repeated uint32 nodes = 2;
   EdgeList edges = 3;
+  repeated int32 allowed_h_milli = 4; // for the miner's adapt difficulty band
+}
+
+// Difficulty target, pushed by the coordinator after Topology and re-sent
+// whenever difficulty changes. The miner adapts its sampling budget from
+// max_energy_milli; num_reads/num_sweeps/anneal_time_us are optional explicit
+// overrides (0 = unset -> adapt).
+message SetTarget {
+  int64  max_energy_milli    = 1; // acceptance ceiling AND adapt target
+  uint32 min_solutions       = 2;
+  uint32 min_diversity_milli = 3;
+  uint32 num_reads      = 4; // 0 = unset
+  uint32 num_sweeps     = 5; // 0 = unset
+  uint32 anneal_time_us = 6; // 0 = unset
 }
 
 message EdgeList {
@@ -96,8 +111,10 @@ message IsingProblem {
   }
   bytes  h_milli_le32 = 3;
   bytes  j_milli_le32 = 4;
-  uint32 num_reads    = 5;
-  QualityGates gates  = 6;
+  uint32 num_reads      = 5; // per-job override; 0 = unset -> SetTarget/adapt
+  uint32 num_sweeps     = 7; // per-job override; 0 = unset
+  uint32 anneal_time_us = 8; // per-job override; 0 = unset
+  reserved 6; // was `gates`; difficulty gates moved to SetTarget
 }
 
 message Provenance {

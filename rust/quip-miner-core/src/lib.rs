@@ -6,6 +6,7 @@
 //! else (Hello/Welcome, Configure, credits, Reject reasons, Status, Shutdown,
 //! idle timeout, exit codes).
 
+pub mod adapt;
 pub mod beta;
 pub mod cli;
 pub mod csr;

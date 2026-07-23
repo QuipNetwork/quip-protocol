@@ -1,6 +1,7 @@
 //! Job validation and dispatch: wire fields → [`IsingGraph`] → [`Sampler`] →
 //! `Result`/`Reject`.
 
+use crate::adapt::adapt_params;
 use crate::ising::{IsingGraph, SampleParams};
 use crate::session::BackendIdentity;
 use crate::Sampler;
@@ -21,6 +22,7 @@ pub(crate) struct TopologyCache {
     hash: Vec<u8>,
     edges: Vec<(u32, u32)>,
     pos: HashMap<u32, usize>,
+    allowed_h: Vec<i32>,
 }
 
 impl TopologyCache {
@@ -38,7 +40,46 @@ impl TopologyCache {
             hash: t.hash.clone(),
             edges,
             pos,
+            allowed_h: t.allowed_h_milli.clone(),
         }
+    }
+
+    pub(crate) fn allowed_h(&self) -> &[i32] {
+        &self.allowed_h
+    }
+}
+
+/// Session difficulty target from `SetTarget`. The miner adapts its sampling
+/// budget from `max_energy_milli`; the `num_*` fields are optional overrides.
+pub(crate) struct SessionTarget {
+    pub(crate) max_energy_milli: i64,
+    pub(crate) min_solutions: u32,
+    pub(crate) num_reads: u32,
+    pub(crate) num_sweeps: u32,
+}
+
+impl SessionTarget {
+    // anneal_time_us is ignored on the SA/GPU Rust path (QPU adapt lives in the
+    // Python dwave miner).
+    pub(crate) fn from_proto(s: &quip_proto::v1::SetTarget) -> Self {
+        Self {
+            max_energy_milli: s.max_energy_milli,
+            min_solutions: s.min_solutions,
+            num_reads: s.num_reads,
+            num_sweeps: s.num_sweeps,
+        }
+    }
+}
+
+/// Resolve one sampling param: per-job override, else `SetTarget` override,
+/// else the adapted value, else the fallback. `0` means "unset".
+fn pick_param(job: u32, target: u32, adapt: Option<u32>, fallback: u32) -> u32 {
+    if job != 0 {
+        job
+    } else if target != 0 {
+        target
+    } else {
+        adapt.unwrap_or(fallback)
     }
 }
 
@@ -161,9 +202,10 @@ pub(crate) fn handle_job<S: Sampler>(
     job: Job,
     sampler: &S,
     id: &BackendIdentity,
-    num_sweeps: usize,
+    default_sweeps: usize,
     jobs_done: &mut u64,
     cache: Option<&TopologyCache>,
+    target: Option<&SessionTarget>,
 ) -> Vec<MinerMsg> {
     let job_id = job.job_id.clone();
 
@@ -178,24 +220,44 @@ pub(crate) fn handle_job<S: Sampler>(
         None => return vec![reject(job_id, RejectReason::Malformed)],
     };
 
-    if ising.num_reads > sampler.max_reads() {
-        return vec![reject(job_id, RejectReason::TooLarge)];
-    }
-
     let graph = match parse_ising(&ising, id.max_nodes, id.max_edges, cache) {
         Ok(g) => g,
         Err(reason) => return vec![reject(job_id, reason)],
     };
 
+    // Resolve the sampling budget: per-job override > SetTarget override >
+    // adapt_params > default. adapt runs only when a target is set (the miner
+    // uses the parsed problem's node/edge counts and the topology's allowed_h).
+    let adapt = target.map(|t| {
+        let allowed_h = cache.map_or(&[][..], TopologyCache::allowed_h);
+        adapt_params(
+            t.max_energy_milli,
+            t.min_solutions.max(1),
+            graph.h.len(),
+            graph.edges.len(),
+            allowed_h,
+            &id.adapt,
+        )
+    });
+    let t_reads = target.map_or(0, |t| t.num_reads);
+    let t_sweeps = target.map_or(0, |t| t.num_sweeps);
+    let num_reads =
+        pick_param(ising.num_reads, t_reads, adapt.map(|a| a.num_reads), 1) as usize;
+    let num_sweeps = pick_param(
+        ising.num_sweeps,
+        t_sweeps,
+        adapt.map(|a| a.num_sweeps),
+        default_sweeps as u32,
+    ) as usize;
+
+    if num_reads as u32 > sampler.max_reads() {
+        return vec![reject(job_id, RejectReason::TooLarge)];
+    }
+
     if sampler.should_throttle() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let num_reads = if ising.num_reads == 0 {
-        1
-    } else {
-        ising.num_reads as usize
-    };
     let params = SampleParams {
         num_reads,
         num_sweeps,
@@ -250,7 +312,8 @@ mod tests {
             h_milli_le32: encode_i32_le(h_milli),
             j_milli_le32: encode_i32_le(j_milli),
             num_reads: 0,
-            gates: None,
+            num_sweeps: 0,
+            anneal_time_us: 0,
         }
     }
 
@@ -259,6 +322,7 @@ mod tests {
         let topo = Topology {
             hash: vec![0xAB; 32],
             nodes: vec![0, 12, 2400],
+            allowed_h_milli: vec![],
             edges: Some(EdgeList {
                 u: vec![0, 12],
                 v: vec![12, 2400],
@@ -278,6 +342,7 @@ mod tests {
         let topo = Topology {
             hash: vec![7; 32],
             nodes: vec![0, 12, 2400],
+            allowed_h_milli: vec![],
             edges: Some(EdgeList {
                 u: vec![0, 12],
                 v: vec![12, 2400],
@@ -303,6 +368,7 @@ mod tests {
         let topo = Topology {
             hash: vec![1; 32],
             nodes: vec![0],
+            allowed_h_milli: vec![],
             edges: None,
         };
         let cache = TopologyCache::from_proto(&topo);
@@ -312,11 +378,41 @@ mod tests {
     }
 
     #[test]
+    fn param_precedence_job_over_target_over_adapt_over_fallback() {
+        // per-job override wins over everything
+        assert_eq!(pick_param(5, 7, Some(268), 1), 5);
+        // SetTarget override wins when no per-job override
+        assert_eq!(pick_param(0, 7, Some(268), 1), 7);
+        // adapt value when neither override set
+        assert_eq!(pick_param(0, 0, Some(268), 1), 268);
+        // fallback when no target/adapt (e.g. no SetTarget cached)
+        assert_eq!(pick_param(0, 0, None, 64), 64);
+    }
+
+    #[test]
+    fn session_target_from_proto_carries_target_and_overrides() {
+        let s = quip_proto::v1::SetTarget {
+            max_energy_milli: -14_700_000,
+            min_solutions: 5,
+            min_diversity_milli: 200,
+            num_reads: 0,
+            num_sweeps: 99,
+            anneal_time_us: 0,
+        };
+        let t = SessionTarget::from_proto(&s);
+        assert_eq!(t.max_energy_milli, -14_700_000);
+        assert_eq!(t.min_solutions, 5);
+        assert_eq!(t.num_sweeps, 99);
+        assert_eq!(t.num_reads, 0);
+    }
+
+    #[test]
     fn hash_job_edge_id_absent_from_map_rejects_malformed() {
         // edge references id 999, which is not in nodes → no position.
         let topo = Topology {
             hash: vec![7; 32],
             nodes: vec![0, 1],
+            allowed_h_milli: vec![],
             edges: Some(EdgeList {
                 u: vec![0],
                 v: vec![999],

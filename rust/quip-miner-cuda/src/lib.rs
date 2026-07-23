@@ -28,11 +28,23 @@ const DEFAULT_MAX_EDGES: u32 = 1_000_000;
 const DEFAULT_MAX_READS: u32 = 100_000;
 
 /// Backend identity for `quip-cuda-sa`.
+/// CUDA adapt envelope (from `GPU/cuda_miner.py`).
+const CUDA_ADAPT: quip_miner_core::adapt::AdaptBounds = quip_miner_core::adapt::AdaptBounds {
+    min_sweeps: 256,
+    max_sweeps: 2048,
+    min_reads: 64,
+    max_reads: 256,
+    reads_solution_min_factor: 0,
+    reads_solution_max_factor: 0,
+    reads_solution_floor_factor: 0,
+};
+
 pub const CUDA_SA_IDENTITY: BackendIdentity = BackendIdentity {
     backend: "cuda",
     algorithm: "sa",
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
+    adapt: CUDA_ADAPT,
 };
 
 /// Backend identity for `quip-cuda-gibbs`.
@@ -41,6 +53,7 @@ pub const CUDA_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
     algorithm: "gibbs",
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
+    adapt: CUDA_ADAPT,
 };
 
 /// CUDA sampler backend: one GPU device plus an NVML utilization governor.

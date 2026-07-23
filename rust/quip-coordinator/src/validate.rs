@@ -31,6 +31,24 @@ pub struct Validated {
 /// `topology_nodes` / `topology_edges` are used when the problem references a
 /// topology hash; edge endpoints are **node ids** resolved via the nodes
 /// slice (matching `energy_of_solution`), not bare spin indices.
+/// Build validation gates from the session difficulty target (`SetTarget`), or
+/// a permissive default when no target has been advertised.
+#[must_use]
+pub fn gates_from_target(target: Option<&quip_proto::v1::SetTarget>) -> QualityGates {
+    target.map_or(
+        QualityGates {
+            min_energy_milli: i64::MAX,
+            min_diversity_milli: 0,
+            min_solutions: 0,
+        },
+        |t| QualityGates {
+            min_energy_milli: t.max_energy_milli,
+            min_diversity_milli: t.min_diversity_milli,
+            min_solutions: t.min_solutions,
+        },
+    )
+}
+
 pub fn validate_result(
     problem: &IsingProblem,
     solutions: &[Solution],
@@ -200,7 +218,8 @@ mod tests {
             h_milli_le32: encode_i32_le(&[1000, -500]),
             j_milli_le32: encode_i32_le(&[2000]),
             num_reads: 1,
-            gates: None,
+            num_sweeps: 0,
+            anneal_time_us: 0,
         };
         let sol = Solution {
             spins_bytes: encode_spins(&[1, -1]),
@@ -229,7 +248,8 @@ mod tests {
             h_milli_le32: encode_i32_le(&[1000]),
             j_milli_le32: vec![],
             num_reads: 1,
-            gates: None,
+            num_sweeps: 0,
+            anneal_time_us: 0,
         };
         let sol = Solution {
             spins_bytes: encode_spins(&[1]),
@@ -254,7 +274,8 @@ mod tests {
             h_milli_le32: encode_i32_le(&[1000, -500]),
             j_milli_le32: encode_i32_le(&[2000]),
             num_reads: 1,
-            gates: None,
+            num_sweeps: 0,
+            anneal_time_us: 0,
         };
         let sol = Solution {
             spins_bytes: encode_spins(&[1, -1]),
@@ -280,7 +301,8 @@ mod tests {
             h_milli_le32: encode_i32_le(&[0, 0]),
             j_milli_le32: vec![],
             num_reads: 2,
-            gates: None,
+            num_sweeps: 0,
+            anneal_time_us: 0,
         };
         let sols = [
             Solution {

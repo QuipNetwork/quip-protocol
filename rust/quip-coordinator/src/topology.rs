@@ -20,6 +20,9 @@ pub struct Topology {
     pub nodes: Vec<u32>,
     /// Parallel edge endpoint arrays `(u, v)`.
     pub edges: (Vec<u32>, Vec<u32>),
+    /// Allowed h-field values (milli), advertised so the miner can pick its
+    /// adapt difficulty band.
+    pub allowed_h: Vec<i32>,
 }
 
 impl Topology {
@@ -37,6 +40,7 @@ impl Topology {
             hash,
             nodes,
             edges: (u, v),
+            allowed_h: allowed_h.to_vec(),
         }
     }
 
@@ -57,6 +61,7 @@ impl Topology {
                 u: self.edges.0.clone(),
                 v: self.edges.1.clone(),
             }),
+            allowed_h_milli: self.allowed_h.clone(),
         }
     }
 }

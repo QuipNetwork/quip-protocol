@@ -7,7 +7,7 @@ use crate::topology::Topology;
 use crate::validate::{beats_current, validate_result};
 use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
 use quip_proto::v1::{
-    coord_msg, miner_msg, Configure, CoordMsg, MinerMsg, QualityGates, Shutdown, Welcome,
+    coord_msg, miner_msg, Configure, CoordMsg, MinerMsg, Shutdown, Welcome,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -36,6 +36,8 @@ pub struct CoordinatorState {
     pub expected_tokens: HashMap<String, String>,
     pub configure: HashMap<String, Configure>,
     pub topology: Option<Topology>,
+    /// Difficulty target advertised to miners via `SetTarget`.
+    pub target: Option<quip_proto::v1::SetTarget>,
     pub router: Router,
     /// job_id → Job, for validation context.
     pub inflight: HashMap<Vec<u8>, quip_proto::v1::Job>,
@@ -50,6 +52,7 @@ impl CoordinatorState {
             expected_tokens: HashMap::new(),
             configure: HashMap::new(),
             topology: None,
+            target: None,
             router: Router::new(),
             inflight: HashMap::new(),
             current_best_milli: None,
@@ -209,7 +212,7 @@ async fn run_session<C: ChainClient>(
                 }
             }
             Some(miner_msg::Msg::Result(result)) => {
-                let (job, topo_nodes, topo_edges, best) = {
+                let (job, topo_nodes, topo_edges, best, gates) = {
                     let mut st = state.lock().await;
                     st.router.ack(&miner_id);
                     let job = st.inflight.remove(&result.job_id);
@@ -219,15 +222,11 @@ async fn run_session<C: ChainClient>(
                         .map(|t| (t.nodes.clone(), t.edge_pairs()))
                         .unwrap_or_default();
                     let best = st.current_best_milli;
-                    (job, nodes, edges, best)
+                    let gates = crate::validate::gates_from_target(st.target.as_ref());
+                    (job, nodes, edges, best, gates)
                 };
                 if let Some(job) = job {
                     if let Some(ising) = job.ising.as_ref() {
-                        let gates = ising.gates.unwrap_or(QualityGates {
-                            min_energy_milli: i64::MAX,
-                            min_diversity_milli: 0,
-                            min_solutions: 0,
-                        });
                         let validated = validate_result(
                             ising,
                             &result.solutions,
@@ -694,7 +693,7 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                         }
                     }
                     Some(miner_msg::Msg::Result(result)) => {
-                        let (job, topo_nodes, topo_edges, best) = {
+                        let (job, topo_nodes, topo_edges, best, gates) = {
                             let mut st = state.lock().await;
                             st.router.ack(&miner_id);
                             let job = st.inflight.remove(&result.job_id);
@@ -703,15 +702,11 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                                 .as_ref()
                                 .map(|t| (t.nodes.clone(), t.edge_pairs()))
                                 .unwrap_or_default();
-                            (job, nodes, edges, st.current_best_milli)
+                            let gates = crate::validate::gates_from_target(st.target.as_ref());
+                            (job, nodes, edges, st.current_best_milli, gates)
                         };
                         if let Some(job) = job {
                             if let Some(ising) = job.ising.as_ref() {
-                                let gates = ising.gates.unwrap_or(QualityGates {
-                                    min_energy_milli: i64::MAX,
-                                    min_diversity_milli: 0,
-                                    min_solutions: 0,
-                                });
                                 let validated = validate_result(
                                     ising,
                                     &result.solutions,

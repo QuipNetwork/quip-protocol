@@ -34,11 +34,23 @@ const DEFAULT_MAX_EDGES: u32 = 1_000_000;
 const DEFAULT_MAX_READS: u32 = 100_000;
 
 /// Backend identity for `quip-metal-sa`.
+/// Metal adapt envelope (from `GPU/metal_miner.py`).
+const METAL_ADAPT: quip_miner_core::adapt::AdaptBounds = quip_miner_core::adapt::AdaptBounds {
+    min_sweeps: 256,
+    max_sweeps: 2048,
+    min_reads: 64,
+    max_reads: 256,
+    reads_solution_min_factor: 0,
+    reads_solution_max_factor: 0,
+    reads_solution_floor_factor: 0,
+};
+
 pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
     backend: "metal",
     algorithm: "sa",
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
+    adapt: METAL_ADAPT,
 };
 
 /// Backend identity for `quip-metal-gibbs`.
@@ -47,6 +59,7 @@ pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
     algorithm: "gibbs",
     max_nodes: DEFAULT_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
+    adapt: METAL_ADAPT,
 };
 
 /// Metal sampler backend: one Apple GPU device plus an IOKit utilization

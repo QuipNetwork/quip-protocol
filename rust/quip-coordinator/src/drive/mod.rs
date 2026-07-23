@@ -70,7 +70,8 @@ mod tests {
                 h_milli_le32: vec![0; 4],
                 j_milli_le32: vec![],
                 num_reads: 0,
-                gates: None,
+                num_sweeps: 0,
+                anneal_time_us: 0,
             }),
             provenance: Some(Provenance {
                 is_pow: true,

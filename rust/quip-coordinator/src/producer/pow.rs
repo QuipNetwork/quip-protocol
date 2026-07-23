@@ -1,7 +1,7 @@
 //! Derive PoW `Job`s from mining snapshots via golden-pinned ChaCha8 + derive_nonce.
 
 use crate::chain::snapshot::MiningSnapshot;
-use quip_proto::v1::{ising_problem, IsingProblem, Job, JobKind, Provenance, QualityGates};
+use quip_proto::v1::{ising_problem, IsingProblem, Job, JobKind, Provenance};
 use quip_protocol::chacha8::draw_ising_milli;
 use quip_protocol::derive::derive_nonce;
 use quip_protocol::wire::encode_i32_le;
@@ -52,11 +52,8 @@ pub fn build_ising_job_from_nonce(
             h_milli_le32: encode_i32_le(&h),
             j_milli_le32: encode_i32_le(&j),
             num_reads: 0,
-            gates: Some(QualityGates {
-                min_energy_milli: snap.max_energy_milli,
-                min_diversity_milli: snap.min_diversity_milli,
-                min_solutions: snap.min_solutions,
-            }),
+            num_sweeps: 0,
+            anneal_time_us: 0,
         }),
         provenance: Some(Provenance {
             is_pow: true,
@@ -105,9 +102,6 @@ mod tests {
         assert_eq!(j.len(), 4);
         assert!(h.iter().all(|v| [-1000, 0, 1000].contains(v)));
         assert!(j.iter().all(|v| [-1000, 1000].contains(v)));
-        let gates = ising.gates.unwrap();
-        assert_eq!(gates.min_solutions, 5);
-        assert_eq!(gates.min_energy_milli, -14_000_000);
     }
 
     #[test]

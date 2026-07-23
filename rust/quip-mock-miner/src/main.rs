@@ -276,6 +276,7 @@ async fn run_session(uri: &str, miner_id: &str) -> Result<(), ExitCode> {
             Some(coord_msg::Msg::Topology(t)) => {
                 session_topo = Some(SessionTopo::from_proto(&t));
             }
+            Some(coord_msg::Msg::SetTarget(_)) => {}
             Some(coord_msg::Msg::Job(job)) => {
                 for reply in handle_job(job, session_topo.as_ref()) {
                     tx.send(reply).await.map_err(|_| ExitCode::InternalFatal)?;
@@ -339,7 +340,8 @@ mod tests {
                 h_milli_le32: encode_i32_le(&[1000, -1000]),
                 j_milli_le32: j_bytes,
                 num_reads: 1,
-                gates: None,
+                num_sweeps: 0,
+                anneal_time_us: 0,
             }),
             provenance: None,
         }

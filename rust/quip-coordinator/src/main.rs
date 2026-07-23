@@ -69,6 +69,17 @@ struct DriveArgs {
     /// JSONL model list (`--source list`).
     #[arg(long)]
     list: Option<PathBuf>,
+    /// Difficulty target energy (the adapt target, in energy units). Overrides
+    /// the spec's gate; the miner adapts its reads/sweeps from this.
+    #[arg(long)]
+    target_energy: Option<f64>,
+    /// Minimum unique solutions gate. Overrides the spec.
+    #[arg(long)]
+    min_solutions: Option<u32>,
+    /// Pin num_reads via the SetTarget control-plane override (bypasses adapt).
+    /// Useful for the dwave/QPU path, which does not adapt yet.
+    #[arg(long)]
+    num_reads: Option<u32>,
     /// Per-job deadline, milliseconds from now.
     #[arg(long, default_value_t = 3_600_000)]
     deadline_ms: u64,
@@ -144,7 +155,35 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-type BuiltJobs = (Vec<Job>, Option<Topology>);
+type BuiltJobs = (Vec<Job>, Option<Topology>, Option<quip_proto::v1::SetTarget>);
+
+/// Convert a CLI energy value to milli-units.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "CLI target energy is a bounded value; milli fits i64"
+)]
+fn energy_to_milli(e: f64) -> i64 {
+    (e * 1000.0) as i64
+}
+
+/// Build the `SetTarget` a drive run advertises, from the spec's gates, with
+/// optional CLI overrides (`--target-energy`, `--min-solutions`).
+fn set_target_from_spec(
+    spec: &quip_coordinator::drive::TopologySpec,
+    args: &DriveArgs,
+) -> quip_proto::v1::SetTarget {
+    let max_energy_milli = args
+        .target_energy
+        .map_or(spec.max_energy_milli, energy_to_milli);
+    quip_proto::v1::SetTarget {
+        max_energy_milli,
+        min_solutions: args.min_solutions.unwrap_or(spec.min_solutions),
+        min_diversity_milli: spec.min_diversity_milli,
+        num_reads: args.num_reads.unwrap_or(0),
+        num_sweeps: 0,
+        anneal_time_us: 0,
+    }
+}
 
 /// Load the requested job source, returning its jobs plus the wire `Topology`
 /// message (if any). Any synthetic `MiningSnapshot` needed to re-derive
@@ -163,27 +202,29 @@ fn build_jobs(args: &DriveArgs, deadline_ms: u64) -> Result<BuiltJobs, String> {
             let mut src =
                 RandomSource::new(&spec, miner_account, args.seed, args.count, deadline_ms);
             let jobs = drain_all(&mut src);
-            Ok((jobs, Some(spec.topology)))
+            let target = set_target_from_spec(&spec, args);
+            Ok((jobs, Some(spec.topology), Some(target)))
         }
         DriveSourceKind::List => {
             let list_path = args
                 .list
                 .as_ref()
                 .ok_or("--source list requires --list <models.jsonl>")?;
-            let (topology, snapshot) = match &topo_path {
+            let (topology, snapshot, target) = match &topo_path {
                 Some(p) => {
                     let text = std::fs::read_to_string(p).map_err(|e| {
                         format!("cannot read topology spec {}: {e}", p.display())
                     })?;
                     let spec = parse_topology_spec(&text).map_err(|e| e.to_string())?;
-                    (Some(spec.topology.clone()), Some(spec.to_snapshot()))
+                    let target = set_target_from_spec(&spec, args);
+                    (Some(spec.topology.clone()), Some(spec.to_snapshot()), Some(target))
                 }
-                None => (None, None),
+                None => (None, None, None),
             };
             let mut src = ListSource::load(list_path, snapshot.as_ref(), deadline_ms)
                 .map_err(|e| e.to_string())?;
             let jobs = drain_all(&mut src);
-            Ok((jobs, topology))
+            Ok((jobs, topology, target))
         }
     }
 }
@@ -235,7 +276,7 @@ fn run_drive_cli(args: DriveArgs) -> StdExitCode {
 
 async fn drive_main(args: DriveArgs) -> StdExitCode {
     let deadline_ms = now_unix_ms() + args.deadline_ms;
-    let (jobs, topology) = match build_jobs(&args, deadline_ms) {
+    let (jobs, topology, target) = match build_jobs(&args, deadline_ms) {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -265,6 +306,7 @@ async fn drive_main(args: DriveArgs) -> StdExitCode {
         token: &token,
         entry: &entry,
         topology,
+        target,
         jobs,
         overall_timeout,
     })
@@ -312,6 +354,9 @@ mod tests {
             count: 10,
             seed: 0,
             list: None,
+            target_energy: None,
+            min_solutions: None,
+            num_reads: None,
             deadline_ms: 1000,
             report: None,
         }
