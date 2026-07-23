@@ -67,4 +67,10 @@ impl Sampler for CpuSampler {
     ) -> Result<Vec<SamplerResult>, RejectReason> {
         Ok(sample_ising(graph, params, self.algorithm))
     }
+
+    // stream_width stays at the default 1: `sample` already parallelizes across
+    // reads with rayon, saturating all cores, so Layer-1 model concurrency would
+    // only oversubscribe. The CPU still streams via the session pump (its sampler
+    // runs on a dedicated thread); its lookahead parity gap is the coordinator
+    // feeder (Layer 2), not miner-side. See streaming-parity design.
 }
