@@ -25,6 +25,8 @@ pub struct BackendIdentity {
     pub algorithm: &'static str,
     pub max_nodes: u32,
     pub max_edges: u32,
+    /// Sampling-parameter envelope used by `adapt::adapt_params`.
+    pub adapt: crate::adapt::AdaptBounds,
 }
 
 /// Failure to open a device / build a sampler, surfaced as `EnvIncompatible`.
