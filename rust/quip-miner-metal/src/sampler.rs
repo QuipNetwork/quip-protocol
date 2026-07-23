@@ -4,51 +4,15 @@
 //! with [`quip_protocol::scoring::energy_milli`] (f64 consensus). There is no
 //! GPU energy kernel — Metal Shading Language has no `double`.
 
-#[cfg(target_os = "macos")]
-use crate::beta::build_beta_schedule;
-use crate::csr::IsingGraph;
-#[cfg(target_os = "macos")]
-use quip_protocol::scoring::energy_milli;
+use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 use thiserror::Error;
 
-/// Sampling algorithm selected by the binary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Algorithm {
-    /// Metropolis-Hastings simulated annealing.
-    Sa,
-    /// Single-site heat-bath Gibbs along the same beta ladder.
-    Gibbs,
-}
-
-/// Per-job sampling knobs.
-#[derive(Clone, Debug)]
-pub struct SampleParams {
-    pub num_reads: usize,
-    pub num_sweeps: usize,
-    pub sweeps_per_beta: usize,
-    /// Optional `(hot_beta, cold_beta)`. `None` → auto from biases.
-    pub beta_range: Option<(f64, f64)>,
-    pub seed: u64,
-}
-
-impl Default for SampleParams {
-    fn default() -> Self {
-        Self {
-            num_reads: 1,
-            num_sweeps: 64,
-            sweeps_per_beta: 1,
-            beta_range: None,
-            seed: 0,
-        }
-    }
-}
-
-/// One completed read: spins in {-1,+1} and consensus milli-energy.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SamplerResult {
-    pub spins: Vec<i8>,
-    pub energy_milli: i64,
-}
+#[cfg(target_os = "macos")]
+use quip_miner_core::beta::{default_ising_beta_range, geometric_beta_schedule};
+#[cfg(target_os = "macos")]
+use quip_miner_core::CsrGraph;
+#[cfg(target_os = "macos")]
+use quip_protocol::scoring::energy_milli;
 
 #[derive(Debug, Error)]
 pub enum SampleError {
@@ -80,6 +44,27 @@ struct KernelParams {
     num_reads: i32,
     n: i32,
     base_seed: u32,
+}
+
+/// Geometric beta schedule cast to f32 for kernel upload, plus sweeps-per-beta.
+///
+/// Uses the shared f64 schedule and casts each element to f32 — bit-identical
+/// to the prior in-crate f32 schedule.
+#[cfg(target_os = "macos")]
+fn build_beta_schedule(
+    graph: &IsingGraph,
+    num_sweeps: usize,
+    sweeps_per_beta: usize,
+    beta_range: Option<(f64, f64)>,
+) -> (Vec<f32>, usize) {
+    let sweeps_per = sweeps_per_beta.max(1);
+    let num_betas = (num_sweeps / sweeps_per).max(1);
+    let (hot, cold) = beta_range.unwrap_or_else(|| default_ising_beta_range(graph));
+    let sched: Vec<f32> = geometric_beta_schedule(hot, cold, num_betas)
+        .iter()
+        .map(|&b| b as f32)
+        .collect();
+    (sched, sweeps_per)
 }
 
 /// Run `num_reads` independent anneals on the GPU for one explicit problem.
@@ -115,19 +100,21 @@ pub fn sample_ising(
             .collect());
     }
 
+    let csr = CsrGraph::from_base(graph);
+
     // Host CSR may be empty (no edges); still need non-empty device buffers
     // for row_ptr (N+1) and h (N). Pad col/j with a dummy if nnz==0.
-    let row_ptr = &graph.row_ptr;
-    let (col_ind, j_csr) = if graph.nnz() == 0 {
+    let row_ptr = &csr.row_ptr;
+    let (col_ind, j_csr) = if csr.nnz() == 0 {
         (vec![0i32], vec![0.0f32])
     } else {
-        (graph.col_ind.clone(), graph.j_csr.clone())
+        (csr.col_ind.clone(), csr.j_csr.clone())
     };
 
     let d_row = device.new_buffer_from_slice(row_ptr);
     let d_col = device.new_buffer_from_slice(&col_ind);
     let d_j = device.new_buffer_from_slice(&j_csr);
-    let d_h = device.new_buffer_from_slice(&graph.h_f32);
+    let d_h = device.new_buffer_from_slice(&csr.h_f32);
     let d_beta = device.new_buffer_from_slice(&beta);
     let workspace_bytes = (num_reads * n) as u64;
     let d_work = device.new_zeroed_buffer(workspace_bytes);
@@ -221,7 +208,8 @@ fn read_i8_buffer(buf: &metal::Buffer, count: usize) -> Result<Vec<i8>, SampleEr
     Ok(out)
 }
 
-/// Stub for non-macOS: sample path is never reached by `run_cli`.
+/// Stub for non-macOS: sample path is never reached by the harness (`open`
+/// fails first with `Unavailable`).
 #[cfg(not(target_os = "macos"))]
 pub fn sample_ising(
     _device: &(),
