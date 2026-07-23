@@ -6,6 +6,7 @@ members = [
     "quip-mock-miner",
     "quip-mock-coordinator",
     "quip-coordinator",
+    "quip-miner-core",
     "quip-miner-metal",
     "quip-miner-cpu",
     "quip-miner-cuda",

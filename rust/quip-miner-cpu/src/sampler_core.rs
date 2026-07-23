@@ -7,171 +7,54 @@
 //! - Solution energies are always scored with
 //!   [`quip_protocol::scoring::energy_milli`] (positive sign, trunc toward 0).
 //! - Parallelism: rayon over reads (no multiprocessing).
+//!
+//! Types (`Algorithm`, `SampleParams`, `SamplerResult`, base `IsingGraph`) and
+//! the beta schedule come from `quip-miner-core`; this module keeps only the
+//! CPU annealing kernels and a private adjacency ([`CpuGraph`]) built from the
+//! base graph.
 
+use quip_miner_core::beta::{default_ising_beta_range, geometric_beta_schedule};
+use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 use quip_protocol::scoring::energy_milli;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 
-/// Sampling algorithm selected by the binary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Algorithm {
-    /// Metropolis-Hastings simulated annealing (neal default).
-    Sa,
-    /// Single-site heat-bath Gibbs along the same beta ladder.
-    Gibbs,
+/// Per-variable neighbor lists for O(degree) local fields.
+///
+/// Built from the base [`IsingGraph`] with the same defensive posture as
+/// `energy_milli`: edges out of range for `h.len()` are skipped, and couplings
+/// shorter than the edge list are treated as 0.
+struct CpuGraph {
+    h: Vec<f64>,
+    /// `neighbors[var]` = `(neighbor, coupling)` pairs.
+    neighbors: Vec<Vec<(usize, f64)>>,
 }
 
-/// Per-job sampling knobs.
-#[derive(Clone, Debug)]
-pub struct SampleParams {
-    pub num_reads: usize,
-    pub num_sweeps: usize,
-    pub sweeps_per_beta: usize,
-    /// Optional `(hot_beta, cold_beta)`. `None` → auto from biases.
-    pub beta_range: Option<(f64, f64)>,
-    pub seed: u64,
-}
-
-impl Default for SampleParams {
-    fn default() -> Self {
-        Self {
-            num_reads: 1,
-            num_sweeps: 64,
-            sweeps_per_beta: 1,
-            beta_range: None,
-            seed: 0,
-        }
-    }
-}
-
-/// One completed read: spins in {-1,+1} and consensus milli-energy.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SamplerResult {
-    pub spins: Vec<i8>,
-    pub energy_milli: i64,
-}
-
-/// Dense Ising problem with CSR-style adjacency for O(degree) local fields.
-#[derive(Clone, Debug)]
-pub struct IsingGraph {
-    pub h: Vec<f64>,
-    pub j: Vec<f64>,
-    pub edges: Vec<(usize, usize)>,
-    /// Per-variable neighbor list: `(neighbor, coupling)`.
-    pub neighbors: Vec<Vec<(usize, f64)>>,
-}
-
-impl IsingGraph {
-    /// Build adjacency from flat h / j / edge lists.
-    ///
-    /// Edges whose endpoints are out of range for `h.len()` are skipped (same
-    /// defensive posture as `energy_milli`). Couplings shorter than edges are
-    /// treated as 0 for the missing entries.
-    pub fn new(h: Vec<f64>, j: Vec<f64>, edges: Vec<(usize, usize)>) -> Self {
-        let n = h.len();
+impl CpuGraph {
+    fn from_base(g: &IsingGraph) -> Self {
+        let n = g.h.len();
         let mut neighbors = vec![Vec::new(); n];
-        for (k, &(u, v)) in edges.iter().enumerate() {
+        for (k, &(u, v)) in g.edges.iter().enumerate() {
             if u >= n || v >= n {
                 continue;
             }
-            let coup = j.get(k).copied().unwrap_or(0.0);
+            let coup = g.j.get(k).copied().unwrap_or(0.0);
             neighbors[u].push((v, coup));
             neighbors[v].push((u, coup));
         }
         Self {
-            h,
-            j,
-            edges,
+            h: g.h.clone(),
             neighbors,
         }
     }
 
-    pub fn num_nodes(&self) -> usize {
+    fn num_nodes(&self) -> usize {
         self.h.len()
     }
 }
 
-/// Default hot/cold beta from per-variable effective-field magnitudes.
-///
-/// Port of neal / `shared/beta_schedule._default_ising_beta_range`:
-/// - hot: `ln(2) / (2 * max_abs_field)` so worst-case flip ≈ 50%
-/// - cold: low single-qubit excitation rate on the smallest non-zero gap
-pub fn default_ising_beta_range(graph: &IsingGraph) -> (f64, f64) {
-    let n = graph.num_nodes();
-    if n == 0 {
-        return (0.1, 1.0);
-    }
-
-    let mut sum_abs = vec![0.0f64; n];
-    let mut min_abs: Vec<Option<f64>> = vec![None; n];
-
-    for (i, &hi) in graph.h.iter().enumerate() {
-        let a = hi.abs();
-        sum_abs[i] += a;
-        if a > 0.0 {
-            min_abs[i] = Some(a);
-        }
-    }
-    for (k, &(u, v)) in graph.edges.iter().enumerate() {
-        if u >= n || v >= n {
-            continue;
-        }
-        let a = graph.j.get(k).copied().unwrap_or(0.0).abs();
-        sum_abs[u] += a;
-        sum_abs[v] += a;
-        if a > 0.0 {
-            for node in [u, v] {
-                min_abs[node] = Some(match min_abs[node] {
-                    Some(m) => m.min(a),
-                    None => a,
-                });
-            }
-        }
-    }
-
-    let min_gaps: Vec<f64> = min_abs.into_iter().flatten().collect();
-    if min_gaps.is_empty() {
-        return (0.1, 1.0);
-    }
-
-    let max_eff = sum_abs.iter().cloned().fold(0.0f64, f64::max);
-    let hot_beta = if max_eff == 0.0 {
-        1.0
-    } else {
-        std::f64::consts::LN_2 / (2.0 * max_eff)
-    };
-
-    let min_eff = min_gaps.iter().cloned().fold(f64::INFINITY, f64::min);
-    let number_min_gaps = min_gaps.iter().filter(|&&g| g == min_eff).count() as f64;
-    let max_excitation = 0.01f64;
-    let cold_beta = (number_min_gaps / max_excitation).ln() / (2.0 * min_eff);
-
-    // Ensure cold is at least as large as hot (schedule increases β).
-    (hot_beta, cold_beta.max(hot_beta))
-}
-
-/// Geometric beta ladder with `num_betas` points from hot → cold.
-pub fn geometric_beta_schedule(hot: f64, cold: f64, num_betas: usize) -> Vec<f64> {
-    if num_betas == 0 {
-        return Vec::new();
-    }
-    if num_betas == 1 {
-        return vec![cold];
-    }
-    // Guard geometric schedule: both ends must be strictly positive.
-    let hot = hot.max(f64::MIN_POSITIVE);
-    let cold = cold.max(f64::MIN_POSITIVE);
-    let log_hot = hot.ln();
-    let log_cold = cold.ln();
-    (0..num_betas)
-        .map(|i| {
-            let t = i as f64 / (num_betas - 1) as f64;
-            (log_hot + t * (log_cold - log_hot)).exp()
-        })
-        .collect()
-}
-
+/// Geometric beta schedule for one sample request (f64 for CPU precision).
 fn build_beta_schedule(graph: &IsingGraph, params: &SampleParams) -> Vec<f64> {
     let sweeps_per = params.sweeps_per_beta.max(1);
     let num_betas = (params.num_sweeps / sweeps_per).max(1);
@@ -190,7 +73,7 @@ fn spin_sign(s: i8) -> f64 {
 }
 
 /// Local field `h_i + Σ_j J_ij s_j`.
-fn effective_field(var: usize, spins: &[i8], graph: &IsingGraph) -> f64 {
+fn effective_field(var: usize, spins: &[i8], graph: &CpuGraph) -> f64 {
     let mut heff = graph.h.get(var).copied().unwrap_or(0.0);
     for &(nbr, jij) in &graph.neighbors[var] {
         heff += jij * spin_sign(spins[nbr]);
@@ -199,7 +82,7 @@ fn effective_field(var: usize, spins: &[i8], graph: &IsingGraph) -> f64 {
 }
 
 /// ΔE for flipping spin `var` (positive-sign Ising convention).
-fn flip_energy(var: usize, spins: &[i8], graph: &IsingGraph) -> f64 {
+fn flip_energy(var: usize, spins: &[i8], graph: &CpuGraph) -> f64 {
     let s = spin_sign(spins[var]);
     -2.0 * s * effective_field(var, spins, graph)
 }
@@ -231,7 +114,7 @@ fn gibbs_sample_spin(heff: f64, beta: f64, rng: &mut SmallRng) -> i8 {
 }
 
 fn anneal_one_read(
-    graph: &IsingGraph,
+    graph: &CpuGraph,
     beta_schedule: &[f64],
     sweeps_per_beta: usize,
     algorithm: Algorithm,
@@ -279,6 +162,7 @@ pub fn sample_ising(
     algorithm: Algorithm,
 ) -> Vec<SamplerResult> {
     let num_reads = params.num_reads.max(1);
+    let cpu = CpuGraph::from_base(graph);
     let beta_schedule = build_beta_schedule(graph, params);
     let sweeps_per = params.sweeps_per_beta.max(1);
     let base_seed = params.seed;
@@ -292,7 +176,7 @@ pub fn sample_ising(
                 .wrapping_add(read_idx as u64)
                 .wrapping_add(1);
             let mut rng = SmallRng::seed_from_u64(seed);
-            let spins = anneal_one_read(graph, &beta_schedule, sweeps_per, algorithm, &mut rng);
+            let spins = anneal_one_read(&cpu, &beta_schedule, sweeps_per, algorithm, &mut rng);
             score_spins(&spins, graph)
         })
         .collect()

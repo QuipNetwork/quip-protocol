@@ -2,9 +2,9 @@
 //!
 //! Requires a CUDA device. Run with `cargo test -p quip-miner-cuda`.
 
-use quip_miner_cuda::csr::IsingGraph;
 use quip_miner_cuda::cuda_device::CudaDevice;
-use quip_miner_cuda::sampler::{gpu_energy_milli, sample_ising, Algorithm, SampleParams};
+use quip_miner_cuda::sampler::{gpu_energy_milli, sample_ising};
+use quip_miner_cuda::{Algorithm, IsingGraph, SampleParams};
 use quip_protocol::scoring::energy_milli;
 use quip_protocol::wire::{decode_spins, encode_spins};
 use serde_json::Value;

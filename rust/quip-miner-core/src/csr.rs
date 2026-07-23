@@ -1,12 +1,15 @@
-//! CSR (compressed sparse row) builder for undirected Ising graphs.
+//! CSR (compressed sparse row) representation of an Ising graph for GPU upload.
 //!
+//! Built from the base [`crate::ising::IsingGraph`] by the GPU backends.
 //! Couplings are stored once per directed half-edge so local-field walks are
-//! O(degree). Value dtype is f32 for kernel dynamics; the host keeps f64
-//! copies for consensus scoring.
+//! O(degree). Value dtype is f32 for kernel dynamics; f64 copies of `h`/`j` are
+//! kept for consensus scoring.
 
-/// Dense Ising problem with CSR adjacency for GPU upload.
+use crate::ising::IsingGraph;
+
+/// Ising problem with CSR adjacency plus f32 upload buffers.
 #[derive(Clone, Debug)]
-pub struct IsingGraph {
+pub struct CsrGraph {
     pub h: Vec<f64>,
     pub j: Vec<f64>,
     pub edges: Vec<(usize, usize)>,
@@ -20,20 +23,20 @@ pub struct IsingGraph {
     pub h_f32: Vec<f32>,
 }
 
-impl IsingGraph {
-    /// Build adjacency from flat h / j / edge lists.
+impl CsrGraph {
+    /// Build CSR adjacency from the base problem.
     ///
     /// Edges whose endpoints are out of range for `h.len()` are skipped (same
     /// defensive posture as `energy_milli`). Couplings shorter than edges are
     /// treated as 0 for the missing entries.
-    pub fn new(h: Vec<f64>, j: Vec<f64>, edges: Vec<(usize, usize)>) -> Self {
-        let n = h.len();
+    pub fn from_base(g: &IsingGraph) -> Self {
+        let n = g.h.len();
         let mut adj: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
-        for (k, &(u, v)) in edges.iter().enumerate() {
+        for (k, &(u, v)) in g.edges.iter().enumerate() {
             if u >= n || v >= n {
                 continue;
             }
-            let coup = j.get(k).copied().unwrap_or(0.0) as f32;
+            let coup = g.j.get(k).copied().unwrap_or(0.0) as f32;
             adj[u].push((v, coup));
             if u != v {
                 adj[v].push((u, coup));
@@ -55,11 +58,11 @@ impl IsingGraph {
             row_ptr[i + 1] = col_ind.len() as i32;
         }
 
-        let h_f32: Vec<f32> = h.iter().map(|&v| v as f32).collect();
+        let h_f32: Vec<f32> = g.h.iter().map(|&v| v as f32).collect();
         Self {
-            h,
-            j,
-            edges,
+            h: g.h.clone(),
+            j: g.j.clone(),
+            edges: g.edges.clone(),
             row_ptr,
             col_ind,
             j_csr,
@@ -82,7 +85,7 @@ mod tests {
 
     #[test]
     fn csr_symmetric_two_node() {
-        let g = IsingGraph::new(vec![1.0, -1.0], vec![0.5], vec![(0, 1)]);
+        let g = CsrGraph::from_base(&IsingGraph::new(vec![1.0, -1.0], vec![0.5], vec![(0, 1)]));
         assert_eq!(g.row_ptr, vec![0, 1, 2]);
         assert_eq!(g.col_ind, vec![1, 0]);
         assert_eq!(g.j_csr, vec![0.5, 0.5]);
@@ -91,7 +94,7 @@ mod tests {
 
     #[test]
     fn empty_graph() {
-        let g = IsingGraph::new(vec![], vec![], vec![]);
+        let g = CsrGraph::from_base(&IsingGraph::new(vec![], vec![], vec![]));
         assert_eq!(g.row_ptr, vec![0]);
         assert_eq!(g.nnz(), 0);
     }

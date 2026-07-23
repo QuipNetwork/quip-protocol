@@ -19,12 +19,7 @@ path = "src/bin/quip_metal_gibbs.rs"
 [dependencies]
 quip-proto = { path = "../quip-proto" }
 quip-protocol = { path = "../quip-protocol" }
-tonic = { workspace = true }
-prost = { workspace = true }
-tokio = { workspace = true }
-tokio-stream = { version = "0.1", features = ["net"] }
-tower = "0.5"
-hyper-util = { version = "0.1", features = ["tokio"] }
+quip-miner-core = { path = "../quip-miner-core" }
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 

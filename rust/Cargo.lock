@@ -3045,7 +3045,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "quip-miner-cpu"
+name = "quip-miner-core"
 version = "0.3.0"
 dependencies = [
  "clap",
@@ -3054,13 +3054,26 @@ dependencies = [
  "quip-mock-coordinator",
  "quip-proto",
  "quip-protocol",
- "rand",
- "rayon",
  "serde_json",
  "tokio",
  "tokio-stream",
  "tonic",
  "tower 0.5.3",
+]
+
+[[package]]
+name = "quip-miner-cpu"
+version = "0.3.0"
+dependencies = [
+ "clap",
+ "quip-miner-core",
+ "quip-mock-coordinator",
+ "quip-proto",
+ "quip-protocol",
+ "rand",
+ "rayon",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -3069,18 +3082,14 @@ version = "0.3.0"
 dependencies = [
  "clap",
  "cudarc",
- "hyper-util",
  "nvml-wrapper",
- "prost",
+ "quip-miner-core",
  "quip-mock-coordinator",
  "quip-proto",
  "quip-protocol",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
- "tokio-stream",
- "tonic",
- "tower 0.5.3",
 ]
 
 [[package]]
@@ -3089,19 +3098,15 @@ version = "0.3.0"
 dependencies = [
  "clap",
  "core-foundation-sys",
- "hyper-util",
  "io-kit-sys",
  "metal",
- "prost",
+ "quip-miner-core",
  "quip-mock-coordinator",
  "quip-proto",
  "quip-protocol",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
- "tokio-stream",
- "tonic",
- "tower 0.5.3",
 ]
 
 [[package]]

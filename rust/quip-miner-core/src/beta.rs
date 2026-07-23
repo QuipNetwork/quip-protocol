@@ -2,10 +2,18 @@
 //!
 //! Port of neal / `shared/beta_schedule._default_ising_beta_range` and the
 //! geometric schedule used by the CPU miner and Python GPU samplers.
+//!
+//! `geometric_beta_schedule` returns `f64`. The CPU Metropolis uses it
+//! directly; the GPU backends cast each element to `f32` at upload. cuda/metal
+//! already computed the schedule in f64 and cast per element, so the shared
+//! f64 math with a per-element cast is bit-identical to the prior behavior.
 
-use crate::csr::IsingGraph;
+use crate::ising::IsingGraph;
 
 /// Default hot/cold beta from per-variable effective-field magnitudes.
+///
+/// - hot: `ln(2) / (2 * max_abs_field)` so worst-case flip ≈ 50%
+/// - cold: low single-qubit excitation rate on the smallest non-zero gap
 pub fn default_ising_beta_range(graph: &IsingGraph) -> (f64, f64) {
     let n = graph.num_nodes();
     if n == 0 {
@@ -56,17 +64,21 @@ pub fn default_ising_beta_range(graph: &IsingGraph) -> (f64, f64) {
     let max_excitation = 0.01f64;
     let cold_beta = (number_min_gaps / max_excitation).ln() / (2.0 * min_eff);
 
+    // Ensure cold is at least as large as hot (schedule increases β).
     (hot_beta, cold_beta.max(hot_beta))
 }
 
-/// Geometric beta ladder with `num_betas` points from hot → cold.
-pub fn geometric_beta_schedule(hot: f64, cold: f64, num_betas: usize) -> Vec<f32> {
+/// Geometric beta ladder with `num_betas` points from hot → cold, in f64.
+///
+/// GPU backends cast the result to f32 per element; the CPU miner uses it as is.
+pub fn geometric_beta_schedule(hot: f64, cold: f64, num_betas: usize) -> Vec<f64> {
     if num_betas == 0 {
         return Vec::new();
     }
     if num_betas == 1 {
-        return vec![cold as f32];
+        return vec![cold];
     }
+    // Guard geometric schedule: both ends must be strictly positive.
     let hot = hot.max(f64::MIN_POSITIVE);
     let cold = cold.max(f64::MIN_POSITIVE);
     let log_hot = hot.ln();
@@ -74,22 +86,9 @@ pub fn geometric_beta_schedule(hot: f64, cold: f64, num_betas: usize) -> Vec<f32
     (0..num_betas)
         .map(|i| {
             let t = i as f64 / (num_betas - 1) as f64;
-            (log_hot + t * (log_cold - log_hot)).exp() as f32
+            (log_hot + t * (log_cold - log_hot)).exp()
         })
         .collect()
-}
-
-/// Build the schedule used for a sample request.
-pub fn build_beta_schedule(
-    graph: &IsingGraph,
-    num_sweeps: usize,
-    sweeps_per_beta: usize,
-    beta_range: Option<(f64, f64)>,
-) -> (Vec<f32>, usize) {
-    let sweeps_per = sweeps_per_beta.max(1);
-    let num_betas = (num_sweeps / sweeps_per).max(1);
-    let (hot, cold) = beta_range.unwrap_or_else(|| default_ising_beta_range(graph));
-    (geometric_beta_schedule(hot, cold, num_betas), sweeps_per)
 }
 
 #[cfg(test)]
@@ -100,10 +99,20 @@ mod tests {
     fn geometric_schedule_endpoints() {
         let s = geometric_beta_schedule(0.1, 10.0, 5);
         assert_eq!(s.len(), 5);
-        assert!((s[0] as f64 - 0.1).abs() < 1e-5);
-        assert!((s[4] as f64 - 10.0).abs() < 1e-4);
+        assert!((s[0] - 0.1).abs() < 1e-9);
+        assert!((s[4] - 10.0).abs() < 1e-9);
         for w in s.windows(2) {
             assert!(w[0] < w[1]);
         }
+    }
+
+    #[test]
+    fn gpu_f32_cast_matches_prior_behavior() {
+        // GPU wrapper = f64 schedule cast per element; equals computing in f64
+        // then `as f32` (cuda/metal's prior code path).
+        let f64s = geometric_beta_schedule(0.1, 10.0, 5);
+        let f32s: Vec<f32> = f64s.iter().map(|&b| b as f32).collect();
+        assert_eq!(f32s.len(), 5);
+        assert!((f32s[0] as f64 - 0.1).abs() < 1e-5);
     }
 }
