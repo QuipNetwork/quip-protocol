@@ -3113,16 +3113,16 @@ dependencies = [
 name = "quip-miner-metal"
 version = "0.3.0"
 dependencies = [
- "block",
  "clap",
  "core-foundation-sys",
- "crossbeam-channel",
  "io-kit-sys",
  "metal",
+ "objc",
  "quip-miner-core",
  "quip-mock-coordinator",
  "quip-proto",
  "quip-protocol",
+ "rayon",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
