@@ -22,12 +22,17 @@ quip-protocol = { path = "../quip-protocol" }
 quip-miner-core = { path = "../quip-miner-core" }
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
+tokio = { workspace = true }
 
 # Metal + IOKit are macOS-only; keep Linux CI green by gating the dependency.
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.33"
 io-kit-sys = "0.5"
 core-foundation-sys = "0.8"
+# Streaming: internal completion-signal channel (host owner thread) + the
+# Objective-C block passed to `MTLCommandBuffer.addCompletedHandler`.
+crossbeam-channel = "0.5.16"
+block = "0.1"
 
 [dev-dependencies]
 quip-mock-coordinator = { path = "../quip-mock-coordinator" }

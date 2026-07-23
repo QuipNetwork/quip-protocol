@@ -18,6 +18,10 @@ pub mod sampler;
 pub mod iokit_gov;
 #[cfg(target_os = "macos")]
 pub mod metal_device;
+#[cfg(target_os = "macos")]
+pub mod streaming;
+#[cfg(target_os = "macos")]
+pub mod topology;
 
 pub use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 
@@ -27,11 +31,14 @@ pub use sampler::sample_ising;
 use quip_miner_core::{run, BackendIdentity, CommonArgs};
 use std::process::ExitCode;
 
-const DEFAULT_MAX_NODES: u32 = 100_000;
+/// SA kernel `N` cap: `thread int8_t delta_energy[4593]` in `kernels/sa.metal`.
+/// A job over this would overrun kernel-local storage, so it must reject
+/// `TooLarge` rather than clamp.
+const SA_MAX_NODES: u32 = 4593;
+/// Gibbs kernel `N` cap: `thread int8_t packed_state[600]` (600*8) in
+/// `kernels/gibbs.metal`.
+const GIBBS_MAX_NODES: u32 = 4800;
 const DEFAULT_MAX_EDGES: u32 = 1_000_000;
-/// Device-memory bound on reads; a job over this is rejected `TooLarge`.
-#[cfg(target_os = "macos")]
-const DEFAULT_MAX_READS: u32 = 100_000;
 
 /// Backend identity for `quip-metal-sa`.
 /// Metal adapt envelope (from `GPU/metal_miner.py`).
@@ -48,7 +55,7 @@ const METAL_ADAPT: quip_miner_core::adapt::AdaptBounds = quip_miner_core::adapt:
 pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
     backend: "metal",
     algorithm: "sa",
-    max_nodes: DEFAULT_MAX_NODES,
+    max_nodes: SA_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     adapt: METAL_ADAPT,
 };
@@ -57,7 +64,7 @@ pub const METAL_SA_IDENTITY: BackendIdentity = BackendIdentity {
 pub const METAL_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
     backend: "metal",
     algorithm: "gibbs",
-    max_nodes: DEFAULT_MAX_NODES,
+    max_nodes: GIBBS_MAX_NODES,
     max_edges: DEFAULT_MAX_EDGES,
     adapt: METAL_ADAPT,
 };
@@ -99,6 +106,18 @@ impl quip_miner_core::Sampler for MetalSampler {
         })
     }
 
+    fn sample_stream(
+        &self,
+        jobs: tokio::sync::mpsc::Receiver<quip_miner_core::StreamJob>,
+        out: tokio::sync::mpsc::Sender<quip_miner_core::StreamResult>,
+    ) {
+        streaming::run_stream(&self.device, self.algorithm, jobs, out);
+    }
+
+    fn stream_width(&self) -> usize {
+        streaming::stream_width(&self.device, self.algorithm)
+    }
+
     fn utilization(&self) -> f64 {
         self.gov.utilization() as f64
     }
@@ -108,7 +127,7 @@ impl quip_miner_core::Sampler for MetalSampler {
     }
 
     fn max_reads(&self) -> u32 {
-        DEFAULT_MAX_READS
+        streaming::max_reads(self.algorithm)
     }
 }
 

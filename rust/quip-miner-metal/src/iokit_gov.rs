@@ -171,6 +171,74 @@ fn query_iokit_gpu_utilization() -> u32 {
     }
 }
 
+/// Best-effort Apple GPU core count via IOKit, or `None` on any failure.
+///
+/// Reads the `"gpu-core-count"` integer property published on the
+/// `IOAccelerator` service (Apple Silicon). Used only to size the streaming
+/// command-buffer budget ([`crate::streaming::stream_width`]); callers fall
+/// back to a conservative default when this returns `None`, so a miss costs
+/// concurrency tuning, never correctness. Never panics — same "return nothing
+/// on any error" contract as [`query_iokit_gpu_utilization`].
+pub fn gpu_core_count() -> Option<usize> {
+    unsafe {
+        let service_name = CString::new("IOAccelerator").ok()?;
+        let matching = IOServiceMatching(service_name.as_ptr());
+        if matching.is_null() {
+            return None;
+        }
+
+        let mut iterator: io_iterator_t = 0;
+        let ret = IOServiceGetMatchingServices(
+            kIOMasterPortDefault,
+            matching as CFDictionaryRef,
+            &mut iterator,
+        );
+        if ret != 0 {
+            return None;
+        }
+
+        let mut cores: Option<usize> = None;
+        loop {
+            let service = IOIteratorNext(iterator);
+            if service == 0 {
+                break;
+            }
+            let mut props: CFMutableDictionaryRef = std::ptr::null_mut();
+            let pret = IORegistryEntryCreateCFProperties(service, &mut props, std::ptr::null(), 0);
+            IOObjectRelease(service);
+            if pret != 0 || props.is_null() {
+                continue;
+            }
+            if let Some(v) = read_int_property(props as CFDictionaryRef, "gpu-core-count") {
+                if v > 0 {
+                    cores = Some(cores.map_or(v as usize, |c| c.max(v as usize)));
+                }
+            }
+            CFRelease(props as CFTypeRef);
+        }
+        IOObjectRelease(iterator);
+        cores
+    }
+}
+
+/// Read a top-level signed-integer property from a service property dict,
+/// or `None` if the key is absent / not a `CFNumber`.
+unsafe fn read_int_property(props: CFDictionaryRef, key: &str) -> Option<i64> {
+    let k = cfstr(key)?;
+    let val = CFDictionaryGetValue(props, k as *const c_void);
+    CFRelease(k as CFTypeRef);
+    if val.is_null() || CFGetTypeID(val) != CFNumberGetTypeID() {
+        return None;
+    }
+    let mut out: i64 = 0;
+    let ok = CFNumberGetValue(
+        val as CFNumberRef,
+        kCFNumberSInt64Type,
+        &mut out as *mut i64 as *mut c_void,
+    );
+    ok.then_some(out)
+}
+
 /// Read `PerformanceStatistics -> "Device Utilization %"` from one service's
 /// property dictionary, or `None` if either key is absent / not a number.
 unsafe fn read_device_utilization(props: CFDictionaryRef) -> Option<i64> {

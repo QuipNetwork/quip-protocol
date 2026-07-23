@@ -61,8 +61,8 @@ impl MetalDevice {
             .nth(device_index)
             .ok_or(MetalError::NoDevice(device_index))?;
 
-        let sa = compile_pipeline(&device, SA_SRC, "metal_sa_sample")?;
-        let gibbs = compile_pipeline(&device, GIBBS_SRC, "metal_gibbs_sample")?;
+        let sa = compile_pipeline(&device, SA_SRC, "pure_simulated_annealing")?;
+        let gibbs = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_sampler")?;
         let queue = device.new_command_queue();
 
         Ok(Self {

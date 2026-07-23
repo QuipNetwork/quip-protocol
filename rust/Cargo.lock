@@ -3113,8 +3113,10 @@ dependencies = [
 name = "quip-miner-metal"
 version = "0.3.0"
 dependencies = [
+ "block",
  "clap",
  "core-foundation-sys",
+ "crossbeam-channel",
  "io-kit-sys",
  "metal",
  "quip-miner-core",
