@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import logging
 import queue
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator, Optional, Tuple
 
 import grpc
@@ -98,6 +100,36 @@ def run_session(
     session_hash: Optional[bytes] = None
     session_target: Optional[miner_pb2.SetTarget] = None
     pending_budget = budget
+    # Pipeline: up to queue_depth QPU submissions in flight (overlaps cloud RTT).
+    # jobs_done + pending_budget are shared with worker threads -> guard them.
+    state_lock = threading.Lock()
+    job_pool: Optional[ThreadPoolExecutor] = None
+
+    def process_job(job, s_nodes, s_edges, s_hash, s_target):
+        # Runs on a pool thread: sample (blocking on the QPU), then enqueue
+        # replies. Shared-state mutations are guarded by state_lock.
+        nonlocal jobs_done
+        replies = handle_job(
+            job,
+            sampler,
+            session_nodes=s_nodes,
+            session_edges=s_edges,
+            session_hash=s_hash,
+            session_target=s_target,
+        )
+        for reply in replies:
+            kind = reply.WhichOneof("msg")
+            with state_lock:
+                if kind == "result":
+                    jobs_done += 1
+                    meta = reply.result.meta
+                    if pending_budget is not None and meta is not None:
+                        pending_budget.record_access_time(meta.device_access_time_us)
+                if kind == "job_request" and pending_budget is not None:
+                    if not pending_budget.should_mine().should_mine:
+                        pending_budget.end_burst()
+                        continue
+            out_q.put(reply)
     exit_code = EXIT_CLEAN
 
     # tonic (Rust) rejects UDS streams whose :authority is the socket path;
@@ -154,8 +186,12 @@ def run_session(
                         cm.configure.backend_toml
                     )
                 out_q.put(miner_pb2.MinerMsg(ready=miner_pb2.Ready()))
+                depth = config.queue_depth if config else 3
+                if job_pool is None:
+                    job_pool = ThreadPoolExecutor(
+                        max_workers=max(1, depth), thread_name_prefix="dwave-job"
+                    )
                 if pending_budget is None or pending_budget.should_mine().should_mine:
-                    depth = config.queue_depth if config else 3
                     out_q.put(
                         miner_pb2.MinerMsg(
                             job_request=miner_pb2.JobRequest(credits=depth)
@@ -173,10 +209,12 @@ def run_session(
             elif which == "set_target":
                 session_target = cm.set_target
             elif which == "job":
-                if (
-                    pending_budget is not None
-                    and not pending_budget.should_mine().should_mine
-                ):
+                with state_lock:
+                    budget_ok = (
+                        pending_budget is None
+                        or pending_budget.should_mine().should_mine
+                    )
+                if not budget_ok:
                     out_q.put(
                         miner_pb2.MinerMsg(
                             reject=miner_pb2.Reject(
@@ -186,32 +224,27 @@ def run_session(
                         )
                     )
                     continue
-                replies = handle_job(
+                # Submit for concurrent sampling; the pool bounds in-flight to
+                # queue_depth (credits keep the coordinator dispatching that many).
+                args = (
                     cm.job,
-                    sampler,
-                    session_nodes=session_nodes,
-                    session_edges=session_edges,
-                    session_hash=session_hash,
-                    session_target=session_target,
+                    list(session_nodes),
+                    list(session_edges),
+                    session_hash,
+                    session_target,
                 )
-                for reply in replies:
-                    kind = reply.WhichOneof("msg")
-                    if kind == "result":
-                        jobs_done += 1
-                        meta = reply.result.meta
-                        if pending_budget is not None and meta is not None:
-                            pending_budget.record_access_time(
-                                meta.device_access_time_us
-                            )
-                    if kind == "job_request" and pending_budget is not None:
-                        if not pending_budget.should_mine().should_mine:
-                            pending_budget.end_burst()
-                            continue
-                    out_q.put(reply)
+                if job_pool is not None:
+                    job_pool.submit(process_job, *args)
+                else:
+                    process_job(*args)
             elif which == "cancel":
-                out_q.put(_status(miner_id, jobs_done, abandoned=1))
+                with state_lock:
+                    done = jobs_done
+                out_q.put(_status(miner_id, done, abandoned=1))
             elif which == "ping":
-                out_q.put(_status(miner_id, jobs_done))
+                with state_lock:
+                    done = jobs_done
+                out_q.put(_status(miner_id, done))
             elif which == "shutdown":
                 grace_ms = cm.shutdown.grace_ms or 5000
                 break
@@ -222,6 +255,10 @@ def run_session(
                 logger.info("idle timeout (%ss) — clean exit", idle_s)
                 break
 
+        # Drain in-flight submissions (they enqueue their Results) before the
+        # end-of-outbound marker, bounded by the grace window.
+        if job_pool is not None:
+            job_pool.shutdown(wait=True)
         # Signal end-of-outbound so the server can finish draining Results.
         out_q.put(_STOP)
         # Give the feeder thread a moment to flush (grace_ms).
@@ -237,6 +274,8 @@ def run_session(
         logger.exception("session failed")
         return EXIT_INTERNAL_FATAL
     finally:
+        if job_pool is not None:
+            job_pool.shutdown(wait=False, cancel_futures=True)
         try:
             out_q.put(_STOP)
         except Exception:  # noqa: BLE001
