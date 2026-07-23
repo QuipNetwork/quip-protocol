@@ -31,6 +31,7 @@ cudarc = { version = "0.19", default-features = false, features = [
 ] }
 nvml-wrapper = "0.11"
 thiserror = "2"
+tokio = { workspace = true }
 
 [dev-dependencies]
 quip-mock-coordinator = { path = "../quip-mock-coordinator" }
