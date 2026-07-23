@@ -1,4 +1,5 @@
 """Real-QPU connection must be deferred until the coordinator engages."""
+
 import pytest
 
 pytest.importorskip("numpy")  # OceanSampler imports numpy at module load

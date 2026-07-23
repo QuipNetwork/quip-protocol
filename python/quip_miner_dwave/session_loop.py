@@ -3,6 +3,7 @@
 Mirrors ``rust/quip-mock-miner`` behavior using the ``quip_proto`` Python SDK.
 Uses the synchronous gRPC client with a request queue (reliable over UDS).
 """
+
 from __future__ import annotations
 
 import logging
@@ -36,7 +37,9 @@ logger = logging.getLogger(__name__)
 _STOP = object()
 
 
-def _status(miner_id: str, jobs_done: int = 0, abandoned: int = 0) -> miner_pb2.MinerMsg:
+def _status(
+    miner_id: str, jobs_done: int = 0, abandoned: int = 0
+) -> miner_pb2.MinerMsg:
     return miner_pb2.MinerMsg(
         status=miner_pb2.Status(
             miner_id=miner_id,
@@ -148,13 +151,16 @@ def run_session(
                             jobs_done,
                             rate,
                             meta.reads if meta is not None else 0,
-                            best_energy_milli if best_energy_milli is not None else "n/a",
+                            best_energy_milli
+                            if best_energy_milli is not None
+                            else "n/a",
                         )
                 if kind == "job_request" and pending_budget is not None:
                     if not pending_budget.should_mine().should_mine:
                         pending_budget.end_burst()
                         continue
             out_q.put(reply)
+
     exit_code = EXIT_CLEAN
 
     # tonic (Rust) rejects UDS streams whose :authority is the socket path;
@@ -213,9 +219,7 @@ def run_session(
                 # doesn't recognize before consuming the ones it does.
                 warn_unknown_backend_keys(cm.configure.backend_toml)
                 if pending_budget is None and cm.configure.backend_toml:
-                    pending_budget = budget_from_backend_toml(
-                        cm.configure.backend_toml
-                    )
+                    pending_budget = budget_from_backend_toml(cm.configure.backend_toml)
                 out_q.put(miner_pb2.MinerMsg(ready=miner_pb2.Ready()))
                 depth = config.queue_depth if config else 3
                 if job_pool is None:

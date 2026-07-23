@@ -239,9 +239,7 @@ async fn handshake(
                 .await;
         }
         if let Some(target) = st.target.as_ref() {
-            let _ = tx
-                .send(Ok(coord(coord_msg::Msg::SetTarget(*target))))
-                .await;
+            let _ = tx.send(Ok(coord(coord_msg::Msg::SetTarget(*target)))).await;
         }
     }
     Some(configure)

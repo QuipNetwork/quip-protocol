@@ -149,7 +149,11 @@ impl quip_miner_core::Sampler for MetalSampler {
         let cfg: MetalConfig = toml::from_str(backend_toml).unwrap_or_default();
         warn_unknown_fields("metal", cfg.unknown.keys());
         // config over CLI (the governor holds the CLI-set values until now).
-        let ceiling = config_override("utilization", self.gov.utilization_ceiling(), cfg.utilization);
+        let ceiling = config_override(
+            "utilization",
+            self.gov.utilization_ceiling(),
+            cfg.utilization,
+        );
         let yielding = config_override("yielding", self.gov.yielding(), cfg.yielding);
         self.gov.reconfigure(ceiling, yielding);
     }

@@ -109,7 +109,11 @@ impl Sampler for CudaSampler {
 
     /// Self-feeding kernel instances: `max_sms / sms_per_nonce` (1 for SA,
     /// 4 for Gibbs), each a fully independent nonce group.
-    fn sample_stream(&self, jobs: tokio::sync::mpsc::Receiver<StreamJob>, out: tokio::sync::mpsc::Sender<StreamResult>) {
+    fn sample_stream(
+        &self,
+        jobs: tokio::sync::mpsc::Receiver<StreamJob>,
+        out: tokio::sync::mpsc::Sender<StreamResult>,
+    ) {
         streaming::run_stream(&self.device, self.algorithm, jobs, out);
     }
 
@@ -133,7 +137,11 @@ impl Sampler for CudaSampler {
         let cfg: CudaConfig = toml::from_str(backend_toml).unwrap_or_default();
         warn_unknown_fields("cuda", cfg.unknown.keys());
         // config over CLI (the governor holds the CLI-set values until now).
-        let ceiling = config_override("utilization", self.gov.utilization_ceiling(), cfg.utilization);
+        let ceiling = config_override(
+            "utilization",
+            self.gov.utilization_ceiling(),
+            cfg.utilization,
+        );
         let yielding = config_override("yielding", self.gov.yielding(), cfg.yielding);
         self.gov.reconfigure(ceiling, yielding);
     }

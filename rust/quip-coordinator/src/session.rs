@@ -6,9 +6,7 @@ use crate::router::{MinerCaps, Router};
 use crate::topology::Topology;
 use crate::validate::{beats_current, validate_result, ResolvedTopo};
 use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
-use quip_proto::v1::{
-    coord_msg, miner_msg, Configure, CoordMsg, MinerMsg, Shutdown, Welcome,
-};
+use quip_proto::v1::{coord_msg, miner_msg, Configure, CoordMsg, MinerMsg, Shutdown, Welcome};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -241,8 +239,7 @@ async fn run_session<C: ChainClient>(
                 };
                 if let Some(job) = job {
                     if let Some(ising) = job.ising.as_ref() {
-                        let validated =
-                            validate_result(ising, &result.solutions, &gates, &topo);
+                        let validated = validate_result(ising, &result.solutions, &gates, &topo);
                         {
                             let mut st = state.lock().await;
                             st.results_validated += 1;

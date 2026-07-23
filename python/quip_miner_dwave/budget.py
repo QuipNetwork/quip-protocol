@@ -5,6 +5,7 @@ wall-second and is spent by :meth:`QPUTimeManager.record_access_time`. Mining
 uses start/continue hysteresis: idle until the pool reaches
 ``min_block_budget``, then burst until the pool drains to 0.
 """
+
 from __future__ import annotations
 
 import time

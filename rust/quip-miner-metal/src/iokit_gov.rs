@@ -71,7 +71,9 @@ impl UtilGovernor {
             stop: AtomicBool::new(false),
         });
         let knobs_thread = Arc::clone(&knobs);
-        let handle = Some(thread::spawn(move || poll_loop(device_index, &knobs_thread)));
+        let handle = Some(thread::spawn(move || {
+            poll_loop(device_index, &knobs_thread)
+        }));
         Self { knobs, handle }
     }
 

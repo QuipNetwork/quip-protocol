@@ -5,6 +5,7 @@ type behaves the same: config (from the coordinator's ``Configure``) overrides
 CLI/env with a warning, and unrecognized keys warn. Credentials are not carried
 here — the dwave miner uses D-Wave's own config (dwave.conf + env).
 """
+
 from __future__ import annotations
 
 import logging
@@ -33,7 +34,9 @@ def config_override(name: str, cli: T, from_config: Optional[T]) -> T:
     return cli
 
 
-def warn_unknown_fields(backend: str, present: Iterable[str], known: Iterable[str]) -> None:
+def warn_unknown_fields(
+    backend: str, present: Iterable[str], known: Iterable[str]
+) -> None:
     """Warn once per unrecognized key. Session keys are never flagged."""
     known_all = set(known) | SESSION_KEYS
     for key in present:

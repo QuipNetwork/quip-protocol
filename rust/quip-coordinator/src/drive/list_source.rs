@@ -5,9 +5,7 @@
 use crate::chain::MiningSnapshot;
 use crate::drive::JobSource;
 use crate::producer::build_ising_job_from_nonce;
-use quip_proto::v1::{
-    ising_problem, EdgeList, IsingProblem, Job, JobKind, Provenance,
-};
+use quip_proto::v1::{ising_problem, EdgeList, IsingProblem, Job, JobKind, Provenance};
 use quip_protocol::wire::encode_i32_le;
 use serde::Deserialize;
 

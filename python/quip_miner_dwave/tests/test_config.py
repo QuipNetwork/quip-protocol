@@ -1,4 +1,5 @@
 """Tests for the uniform dwave config-override discipline."""
+
 from __future__ import annotations
 
 import logging
@@ -20,7 +21,9 @@ def test_config_override_reports_only_on_change(caplog):
 
 def test_warn_unknown_fields_filters_session_keys(caplog):
     with caplog.at_level(logging.WARNING):
-        warn_unknown_fields("dwave", ["daily_budget", "num_sweeps", "typo"], DWAVE_CONFIG_KEYS)
+        warn_unknown_fields(
+            "dwave", ["daily_budget", "num_sweeps", "typo"], DWAVE_CONFIG_KEYS
+        )
     warned = [r.message for r in caplog.records]
     assert any("unknown field 'typo' for dwave" in m for m in warned)
     # recognized + session keys are not flagged

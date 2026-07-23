@@ -57,7 +57,10 @@ pub enum TopologySpecError {
     /// An `edges` endpoint is a node id not present in `nodes`. Edges reference
     /// native node ids (possibly sparse), which the miner and consensus scorer
     /// map to dense positions — so an id just has to exist in `nodes`.
-    EdgeUnknownNode { edge_index: usize, endpoint: u32 },
+    EdgeUnknownNode {
+        edge_index: usize,
+        endpoint: u32,
+    },
 }
 
 impl std::fmt::Display for TopologySpecError {

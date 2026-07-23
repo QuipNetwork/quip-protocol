@@ -162,7 +162,11 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-type BuiltJobs = (Vec<Job>, Option<Topology>, Option<quip_proto::v1::SetTarget>);
+type BuiltJobs = (
+    Vec<Job>,
+    Option<Topology>,
+    Option<quip_proto::v1::SetTarget>,
+);
 
 /// Convert a CLI energy value to milli-units.
 #[expect(
@@ -200,8 +204,8 @@ fn build_jobs(args: &DriveArgs, deadline_ms: u64) -> Result<BuiltJobs, String> {
     let topo_path = resolve_topology_path(args)?;
     match args.source {
         DriveSourceKind::Random => {
-            let topo_path = topo_path
-                .ok_or("--source random requires --topology or --topology-preset")?;
+            let topo_path =
+                topo_path.ok_or("--source random requires --topology or --topology-preset")?;
             let text = std::fs::read_to_string(&topo_path)
                 .map_err(|e| format!("cannot read topology spec {}: {e}", topo_path.display()))?;
             let spec = parse_topology_spec(&text).map_err(|e| e.to_string())?;
@@ -219,12 +223,15 @@ fn build_jobs(args: &DriveArgs, deadline_ms: u64) -> Result<BuiltJobs, String> {
                 .ok_or("--source list requires --list <models.jsonl>")?;
             let (topology, snapshot, target) = match &topo_path {
                 Some(p) => {
-                    let text = std::fs::read_to_string(p).map_err(|e| {
-                        format!("cannot read topology spec {}: {e}", p.display())
-                    })?;
+                    let text = std::fs::read_to_string(p)
+                        .map_err(|e| format!("cannot read topology spec {}: {e}", p.display()))?;
                     let spec = parse_topology_spec(&text).map_err(|e| e.to_string())?;
                     let target = set_target_from_spec(&spec, args);
-                    (Some(spec.topology.clone()), Some(spec.to_snapshot()), Some(target))
+                    (
+                        Some(spec.topology.clone()),
+                        Some(spec.to_snapshot()),
+                        Some(target),
+                    )
                 }
                 None => (None, None, None),
             };

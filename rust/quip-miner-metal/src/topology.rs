@@ -237,8 +237,7 @@ mod tests {
             let e = t.row_ptr[i + 1] as usize;
             for &nbr in &t.col_ind[s..e] {
                 assert_ne!(
-                    color_of[i],
-                    color_of[nbr as usize],
+                    color_of[i], color_of[nbr as usize],
                     "adjacent nodes {i} and {nbr} share a color"
                 );
             }
