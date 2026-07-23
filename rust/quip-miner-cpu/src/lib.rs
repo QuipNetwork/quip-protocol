@@ -13,7 +13,7 @@ pub use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 pub use sampler_core::sample_ising;
 
 use quip_miner_core::adapt::AdaptBounds;
-use quip_miner_core::{BackendIdentity, Sampler};
+use quip_miner_core::{BackendIdentity, Sampler, StreamJob, StreamResult};
 use quip_proto::v1::RejectReason;
 
 const DEFAULT_MAX_NODES: u32 = 100_000;
@@ -68,9 +68,58 @@ impl Sampler for CpuSampler {
         Ok(sample_ising(graph, params, self.algorithm))
     }
 
-    // stream_width stays at the default 1: `sample` already parallelizes across
-    // reads with rayon, saturating all cores, so Layer-1 model concurrency would
-    // only oversubscribe. The CPU still streams via the session pump (its sampler
-    // runs on a dedicated thread); its lookahead parity gap is the coordinator
-    // feeder (Layer 2), not miner-side. See streaming-parity design.
+    /// One model per core: `sample`'s reads are sequential and cache-local, so
+    /// throughput comes from running `stream_width` models concurrently, each
+    /// pinned to a worker thread. Fanning a single model's reads across cores
+    /// bounced the shared arrays' cache lines and measured slower.
+    fn stream_width(&self) -> usize {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    }
+
+    fn sample_stream(
+        &self,
+        mut jobs: tokio::sync::mpsc::Receiver<StreamJob>,
+        out: tokio::sync::mpsc::Sender<StreamResult>,
+    ) {
+        let width = self.stream_width();
+        let algorithm = self.algorithm;
+        // MPMC hand-off: this thread (dispatcher) pulls from the async job
+        // channel; `width` worker threads each take one model at a time.
+        let (work_tx, work_rx) = crossbeam_channel::bounded::<StreamJob>(width);
+        let workers: Vec<_> = (0..width)
+            .map(|_| {
+                let work_rx = work_rx.clone();
+                let out = out.clone();
+                std::thread::spawn(move || {
+                    for j in work_rx.iter() {
+                        let t0 = std::time::Instant::now();
+                        let result = Ok(sample_ising(&j.graph, &j.params, algorithm));
+                        let device_access_time_us = t0.elapsed().as_micros() as u64;
+                        if out
+                            .blocking_send(StreamResult {
+                                job_id: j.job_id,
+                                result,
+                                device_access_time_us,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect();
+        drop(work_rx);
+        drop(out);
+
+        while let Some(j) = jobs.blocking_recv() {
+            if work_tx.send(j).is_err() {
+                break;
+            }
+        }
+        drop(work_tx); // close -> workers drain and exit
+        for w in workers {
+            let _ = w.join();
+        }
+    }
 }
