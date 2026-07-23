@@ -718,20 +718,37 @@ pub fn run_stream(device: &CudaDevice, algorithm: Algorithm, mut jobs: Receiver<
         let mut slots: Vec<SlotState> = (0..width).map(|_| SlotState::new()).collect();
 
         // Cold start: the first job is already in hand; drain whatever else
-        // is already queued (bounded wait) so the launch starts with as much
-        // concurrency as is actually available right now.
+        // shows up so the launch starts with as much concurrency as
+        // possible. `launch_self_feeding`'s grid size is fixed for the
+        // kernel's whole lifetime (no adding nonces after launch), so it's
+        // worth waiting past the first quiet moment: this keeps pulling
+        // until either `width` is reached, a hard cap elapses, or a full
+        // `idle_timeout` passes with nothing new arriving (a burst source
+        // like a coordinator dispatching its whole staged queue arrives in
+        // well under `idle_timeout`; a genuinely slow/empty source gives up
+        // after it).
         let mut cold: Vec<StreamJob> = vec![seed];
         let mut mismatch: Option<StreamJob> = None;
         let mut closed = false;
-        let cold_deadline = Instant::now() + Duration::from_millis(50);
-        while cold.len() < width && Instant::now() < cold_deadline {
+        let cold_hard_cap = Instant::now() + Duration::from_secs(3);
+        let idle_timeout = Duration::from_millis(150);
+        let mut last_arrival = Instant::now();
+        while cold.len() < width && Instant::now() < cold_hard_cap {
             match try_pull(&mut jobs, &key) {
-                Pull::Job(j) => cold.push(j),
+                Pull::Job(j) => {
+                    cold.push(j);
+                    last_arrival = Instant::now();
+                }
                 Pull::Mismatch(j) => {
                     mismatch = Some(j);
                     break;
                 }
-                Pull::Empty => std::thread::sleep(Duration::from_millis(1)),
+                Pull::Empty => {
+                    if last_arrival.elapsed() > idle_timeout {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 Pull::Closed => {
                     closed = true;
                     break;
@@ -740,6 +757,9 @@ pub fn run_stream(device: &CudaDevice, algorithm: Algorithm, mut jobs: Receiver<
         }
 
         let active_nonces = cold.len();
+        eprintln!(
+            "quip-miner-cuda: self-feeding session launching with {active_nonces}/{width} nonces active"
+        );
         for (nonce_id, job) in cold.into_iter().enumerate() {
             if sess.upload_slot(nonce_id, 0, &job.graph).is_err() {
                 send_reject(&out, job, RejectReason::Overloaded);
