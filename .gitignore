@@ -97,5 +97,5 @@ python/**/__pycache__/
 .dolt/
 *.db
 .beads-credential-key
-.beads/proxieddb/
+.beads/
 python/quip_proto/*.so
