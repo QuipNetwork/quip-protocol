@@ -35,13 +35,32 @@ pub fn max_reads(_algorithm: Algorithm) -> u32 {
     sampler::MAX_READS as u32
 }
 
-/// Problems per dispatch = GPU core count (one threadgroup per core fills the
-/// GPU). Advertised to the harness as `stream_width` so it keeps roughly a
-/// batch's worth of jobs queued.
+/// Threadgroups co-resident per GPU core. One threadgroup per problem, so
+/// `gpu_core_count` problems covers every core exactly once — but a single
+/// threadgroup does not saturate a core: SA runs only `num_reads` (64) threads
+/// there, each carrying ~5.2 KiB of thread-private state, so the core stalls on
+/// memory. Oversubscribing hides that latency.
+///
+/// Measured on an M4 Max (40 cores), full Advantage2 topology, 120 jobs at 64
+/// reads — 1x / 2x / 4x cores:
+///   SA               14.2 / 27.5 / 27.4 jobs/s  (2x = 1.93x, then saturated)
+///   Gibbs chromatic  29.4 / 36.3 / 33.6 jobs/s  (2x best, 4x regresses)
+/// `QUIP_METAL_BATCH_MULT` overrides it for GPUs where the optimum differs.
+const BATCH_CORE_MULT: usize = 2;
+
+/// Problems per dispatch: `gpu_core_count * BATCH_CORE_MULT`. Advertised
+/// (doubled) to the harness as `stream_width` so it keeps roughly a batch's
+/// worth of jobs queued while another dispatches.
 fn batch_size(_algorithm: Algorithm) -> usize {
-    crate::iokit_gov::gpu_core_count()
+    let cores = crate::iokit_gov::gpu_core_count()
         .unwrap_or(DEFAULT_GPU_CORES)
-        .max(1)
+        .max(1);
+    let mult = std::env::var("QUIP_METAL_BATCH_MULT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(BATCH_CORE_MULT)
+        .max(1);
+    cores.saturating_mul(mult).max(1)
 }
 
 /// `Sampler::stream_width`: how many models the backend keeps in flight. Two
