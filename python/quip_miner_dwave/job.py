@@ -68,6 +68,7 @@ def handle_job(
     session_nodes: Sequence[int],
     session_edges: Sequence[Tuple[int, int]],
     session_hash: Optional[bytes] = None,
+    session_target: Optional["miner_pb2.SetTarget"] = None,
 ) -> List[miner_pb2.MinerMsg]:
     """Validate and solve one job; return Result+JobRequest or Reject messages.
 
@@ -152,7 +153,14 @@ def handle_job(
         if k < len(j_vals):
             j_dict[(int(u), int(v))] = float(j_vals[k])
 
-    num_reads = int(ising.num_reads) if ising.num_reads else 1
+    # Sampling budget precedence: per-job override > SetTarget override >
+    # default. (Full energy-based adapt for the QPU path is a follow-up;
+    # see quip-asx.* — it needs the shared GSE model and QPU credits.)
+    num_reads = int(ising.num_reads)
+    if num_reads == 0 and session_target is not None and session_target.num_reads:
+        num_reads = int(session_target.num_reads)
+    if num_reads == 0:
+        num_reads = 1
     # Use job_id bytes as clamp seed when present
     nonce_seed = bytes(job_id) if job_id else None
 

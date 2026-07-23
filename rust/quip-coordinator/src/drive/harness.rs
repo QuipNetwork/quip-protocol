@@ -17,7 +17,7 @@ use crate::topology::Topology;
 use crate::validate::validate_result;
 use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
 use quip_proto::v1::{
-    coord_msg, miner_msg, Configure, CoordMsg, Job, MinerMsg, QualityGates, Reject,
+    coord_msg, miner_msg, Configure, CoordMsg, Job, MinerMsg, Reject,
     Result as JobResult, Shutdown, Welcome,
 };
 use std::collections::HashMap;
@@ -272,7 +272,7 @@ async fn handle_result(
     result: JobResult,
     run: &Arc<RunState>,
 ) {
-    let (job, topo_nodes, topo_edges) = {
+    let (job, topo_nodes, topo_edges, gates) = {
         let mut st = state.lock().await;
         st.router.ack(miner_id);
         let job = st.inflight.remove(&result.job_id);
@@ -281,17 +281,13 @@ async fn handle_result(
             .as_ref()
             .map(|t| (t.nodes.clone(), t.edge_pairs()))
             .unwrap_or_default();
-        (job, nodes, edges)
+        let gates = crate::validate::gates_from_target(st.target.as_ref());
+        (job, nodes, edges, gates)
     };
     let Some(job) = job else { return };
     let Some(ising) = job.ising.as_ref() else {
         return;
     };
-    let gates = ising.gates.unwrap_or(QualityGates {
-        min_energy_milli: i64::MAX,
-        min_diversity_milli: 0,
-        min_solutions: 0,
-    });
     let validated = validate_result(ising, &result.solutions, &gates, &topo_nodes, &topo_edges);
     let wall_ms = run.wall_ms_since_dispatch(&result.job_id);
     let device_us = result

@@ -182,3 +182,28 @@ def test_topology_hash_job_match_resolves_to_result():
     )
     assert any(m.HasField("result") for m in msgs)
     sampler.close()
+
+
+def test_set_target_num_reads_override_is_honored():
+    sampler = OceanSampler(mock=True)
+    job = miner_pb2.Job(
+        job_id=b"st",
+        kind=miner_pb2.ISING_SAMPLE,
+        deadline_ms=int(time.time() * 1000) + 60_000,
+        ising=miner_pb2.IsingProblem(
+            edges=miner_pb2.EdgeList(u=[0], v=[1]),
+            h_milli_le32=wire.encode_i32_le([1000, -1000]),
+            j_milli_le32=wire.encode_i32_le([500]),
+            num_reads=0,  # unset -> falls through to SetTarget
+        ),
+    )
+    target = miner_pb2.SetTarget(max_energy_milli=1000, min_solutions=1, num_reads=3)
+    msgs = handle_job(
+        job,
+        sampler,
+        session_nodes=[0, 1],
+        session_edges=[(0, 1)],
+        session_target=target,
+    )
+    assert any(m.HasField("result") for m in msgs)
+    sampler.close()

@@ -69,6 +69,13 @@ struct DriveArgs {
     /// JSONL model list (`--source list`).
     #[arg(long)]
     list: Option<PathBuf>,
+    /// Difficulty target energy (the adapt target, in energy units). Overrides
+    /// the spec's gate; the miner adapts its reads/sweeps from this.
+    #[arg(long)]
+    target_energy: Option<f64>,
+    /// Minimum unique solutions gate. Overrides the spec.
+    #[arg(long)]
+    min_solutions: Option<u32>,
     /// Per-job deadline, milliseconds from now.
     #[arg(long, default_value_t = 3_600_000)]
     deadline_ms: u64,
@@ -146,11 +153,27 @@ fn now_unix_ms() -> u64 {
 
 type BuiltJobs = (Vec<Job>, Option<Topology>, Option<quip_proto::v1::SetTarget>);
 
-/// Build the `SetTarget` a drive run advertises, from the spec's gates.
-fn set_target_from_spec(spec: &quip_coordinator::drive::TopologySpec) -> quip_proto::v1::SetTarget {
+/// Convert a CLI energy value to milli-units.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "CLI target energy is a bounded value; milli fits i64"
+)]
+fn energy_to_milli(e: f64) -> i64 {
+    (e * 1000.0) as i64
+}
+
+/// Build the `SetTarget` a drive run advertises, from the spec's gates, with
+/// optional CLI overrides (`--target-energy`, `--min-solutions`).
+fn set_target_from_spec(
+    spec: &quip_coordinator::drive::TopologySpec,
+    args: &DriveArgs,
+) -> quip_proto::v1::SetTarget {
+    let max_energy_milli = args
+        .target_energy
+        .map_or(spec.max_energy_milli, energy_to_milli);
     quip_proto::v1::SetTarget {
-        max_energy_milli: spec.max_energy_milli,
-        min_solutions: spec.min_solutions,
+        max_energy_milli,
+        min_solutions: args.min_solutions.unwrap_or(spec.min_solutions),
         min_diversity_milli: spec.min_diversity_milli,
         num_reads: 0,
         num_sweeps: 0,
@@ -175,7 +198,7 @@ fn build_jobs(args: &DriveArgs, deadline_ms: u64) -> Result<BuiltJobs, String> {
             let mut src =
                 RandomSource::new(&spec, miner_account, args.seed, args.count, deadline_ms);
             let jobs = drain_all(&mut src);
-            let target = set_target_from_spec(&spec);
+            let target = set_target_from_spec(&spec, args);
             Ok((jobs, Some(spec.topology), Some(target)))
         }
         DriveSourceKind::List => {
@@ -189,7 +212,7 @@ fn build_jobs(args: &DriveArgs, deadline_ms: u64) -> Result<BuiltJobs, String> {
                         format!("cannot read topology spec {}: {e}", p.display())
                     })?;
                     let spec = parse_topology_spec(&text).map_err(|e| e.to_string())?;
-                    let target = set_target_from_spec(&spec);
+                    let target = set_target_from_spec(&spec, args);
                     (Some(spec.topology.clone()), Some(spec.to_snapshot()), Some(target))
                 }
                 None => (None, None, None),
@@ -327,6 +350,8 @@ mod tests {
             count: 10,
             seed: 0,
             list: None,
+            target_energy: None,
+            min_solutions: None,
             deadline_ms: 1000,
             report: None,
         }

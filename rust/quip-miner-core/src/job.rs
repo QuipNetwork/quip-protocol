@@ -314,7 +314,6 @@ mod tests {
             num_reads: 0,
             num_sweeps: 0,
             anneal_time_us: 0,
-            gates: None,
         }
     }
 

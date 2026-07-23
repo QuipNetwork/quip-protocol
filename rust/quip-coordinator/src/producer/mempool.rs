@@ -2,7 +2,7 @@
 
 use crate::chain::mempool::JobOrder;
 use quip_proto::v1::{
-    ising_problem, EdgeList, IsingProblem, Job, JobKind, Provenance, QualityGates,
+    ising_problem, EdgeList, IsingProblem, Job, JobKind, Provenance,
 };
 use quip_protocol::wire::encode_i32_le;
 
@@ -24,11 +24,6 @@ pub fn job_order_to_job(order: &JobOrder) -> Job {
             num_reads: 0,
             num_sweeps: 0,
             anneal_time_us: 0,
-            gates: Some(QualityGates {
-                min_energy_milli: order.min_energy_milli.unwrap_or(0),
-                min_diversity_milli: order.min_diversity_milli.unwrap_or(0),
-                min_solutions: order.min_solutions.unwrap_or(0),
-            }),
         }),
         provenance: Some(Provenance {
             is_pow: false,
@@ -64,9 +59,5 @@ mod tests {
         assert_eq!(job.provenance.as_ref().unwrap().order_id, b"order-1");
         let ising = job.ising.unwrap();
         assert!(matches!(ising.graph, Some(ising_problem::Graph::Edges(_))));
-        let gates = ising.gates.unwrap();
-        assert_eq!(gates.min_energy_milli, -1000);
-        assert_eq!(gates.min_diversity_milli, 0); // defaulted
-        assert_eq!(gates.min_solutions, 1);
     }
 }

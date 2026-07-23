@@ -6,24 +6,10 @@ use crate::chain::MiningSnapshot;
 use crate::drive::JobSource;
 use crate::producer::build_ising_job_from_nonce;
 use quip_proto::v1::{
-    ising_problem, EdgeList, IsingProblem, Job, JobKind, Provenance, QualityGates,
+    ising_problem, EdgeList, IsingProblem, Job, JobKind, Provenance,
 };
 use quip_protocol::wire::encode_i32_le;
 use serde::Deserialize;
-
-#[derive(Debug, Deserialize)]
-struct GatesEntryJson {
-    #[serde(default)]
-    min_solutions: u32,
-    #[serde(default = "default_max_energy_milli")]
-    max_energy_milli: i64,
-    #[serde(default)]
-    min_diversity_milli: u32,
-}
-
-fn default_max_energy_milli() -> i64 {
-    i64::MAX
-}
 
 #[derive(Debug, Deserialize)]
 struct ListEntryJson {
@@ -35,8 +21,6 @@ struct ListEntryJson {
     j_milli: Option<Vec<i32>>,
     #[serde(default)]
     edges: Option<Vec<(u32, u32)>>,
-    #[serde(default)]
-    gates: Option<GatesEntryJson>,
     #[serde(default)]
     num_reads: Option<u32>,
 }
@@ -110,7 +94,6 @@ fn build_explicit_job(entry: &ListEntryJson, generation: u64, deadline_ms: u64) 
     let j = entry.j_milli.clone().unwrap_or_default();
     let edges = entry.edges.clone().unwrap_or_default();
     let (u, v): (Vec<u32>, Vec<u32>) = edges.into_iter().unzip();
-    let gates = entry.gates.as_ref();
     Job {
         job_id: format!("explicit-{generation}").into_bytes(),
         kind: JobKind::IsingSample as i32,
@@ -123,11 +106,6 @@ fn build_explicit_job(entry: &ListEntryJson, generation: u64, deadline_ms: u64) 
             num_reads: entry.num_reads.unwrap_or(0),
             num_sweeps: 0,
             anneal_time_us: 0,
-            gates: Some(QualityGates {
-                min_energy_milli: gates.map(|g| g.max_energy_milli).unwrap_or(i64::MAX),
-                min_diversity_milli: gates.map(|g| g.min_diversity_milli).unwrap_or(0),
-                min_solutions: gates.map(|g| g.min_solutions).unwrap_or(0),
-            }),
         }),
         provenance: Some(Provenance {
             is_pow: false,
