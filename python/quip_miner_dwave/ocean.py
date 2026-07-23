@@ -9,6 +9,7 @@ Design points carried from ``QPU/dwave_sampler.py``:
 Offline mode (``QUIP_DWAVE_MOCK=1`` or an injected sampler) uses a dimod
 sampler so unit/conformance tests never hit a real QPU.
 """
+
 from __future__ import annotations
 
 import logging
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 def credentials_present() -> bool:
     """True if a D-Wave API token is available via env or SDK config file."""
-    if os.environ.get("DWAVE_API_KEY") or os.environ.get("DWAVE_API_TOKEN"):
+    if os.environ.get("DWAVE_API_TOKEN"):
         return True
     conf = os.path.expanduser("~/.config/dwave/dwave.conf")
     if os.path.isfile(conf):
@@ -61,6 +62,7 @@ def ocean_importable() -> bool:
     try:
         import dimod  # noqa: F401
         import dwave  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -129,9 +131,7 @@ class MockSampler:
             "qpu_programming_time": 100,
             "qpu_sampling_time": elapsed_us,
         }
-        return dimod.SampleSet(
-            ss.record, ss.variables, info, ss.vartype
-        )
+        return dimod.SampleSet(ss.record, ss.variables, info, ss.vartype)
 
 
 class OceanSampler:
@@ -211,33 +211,26 @@ class OceanSampler:
 
     def _apply_native_hash(self) -> None:
         if self._live_nodes and self._live_edges is not None:
-            self._native_hash = native_topology_hash(
-                self._live_nodes, self._live_edges
-            )
+            self._native_hash = native_topology_hash(self._live_nodes, self._live_edges)
 
     def _connect_real(self, solver_name, region, token):
         from dwave.system import DWaveSampler
 
         # Comply with D-Wave's own config: DWaveSampler resolves credentials
-        # from ~/.config/dwave/dwave.conf and standard env. We only bridge the
-        # project's env names as explicit overrides when set; anything unset
-        # falls through to the SDK's native resolution.
+        # from ~/.config/dwave/dwave.conf and the canonical DWAVE_API_TOKEN /
+        # DWAVE_API_SOLVER / DWAVE_API_REGION / DWAVE_API_ENDPOINT env vars. Pass
+        # only explicit overrides a caller supplied; everything else is the SDK's.
         kwargs: Dict[str, Any] = {"request_timeout": (60, 300)}
-        solver_name = solver_name or os.environ.get("DWAVE_API_SOLVER")
-        if solver_name:
+        if solver_name is not None:
             kwargs["solver"] = solver_name
-        endpoint = region or os.environ.get("DWAVE_REGION_URL")
-        if endpoint:
-            kwargs["endpoint"] = endpoint
-        token = token or os.environ.get("DWAVE_API_KEY")
-        if token:
+        if region is not None:
+            kwargs["region"] = region
+        if token is not None:
             kwargs["token"] = token
         base = DWaveSampler(**kwargs)
         self._qpu_solver = base
         self._live_nodes = sorted(int(n) for n in base.nodelist)
-        self._live_edges = [
-            (int(u), int(v)) for u, v in base.edgelist
-        ]
+        self._live_edges = [(int(u), int(v)) for u, v in base.edgelist]
         logger.info(
             "[QPU] connected solver=%s qubits=%d",
             base.properties.get("chip_id", "?"),
@@ -279,9 +272,7 @@ class OceanSampler:
         if self._live_nodes:
             live_set = set(self._live_nodes)
             self._defective_qubits = sorted(set(nodes_l) - live_set)
-            live_edge_set = {
-                (min(u, v), max(u, v)) for u, v in self._live_edges
-            }
+            live_edge_set = {(min(u, v), max(u, v)) for u, v in self._live_edges}
             def_q = set(self._defective_qubits)
             self._defective_edges = set()
             for u, v in edges_l:
@@ -368,9 +359,7 @@ class OceanSampler:
         for row, energy in zip(ss.record.sample, ss.record.energy):
             reduced = {int(variables[i]): int(row[i]) for i in range(len(variables))}
             # ExactSolver / SA use ±1; coerce zeros just in case
-            reduced = {
-                k: (1 if v >= 0 else -1) for k, v in reduced.items()
-            }
+            reduced = {k: (1 if v >= 0 else -1) for k, v in reduced.items()}
             full, e_corr = reconstruct_sample(reduced, float(energy), defect_info)
             samples.append(full)
             energies.append(e_corr)

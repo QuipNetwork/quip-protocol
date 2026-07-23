@@ -1,4 +1,5 @@
 """CLI for ``quip-dwave-qa`` / ``python -m quip_miner_dwave``."""
+
 from __future__ import annotations
 
 import argparse
@@ -85,7 +86,7 @@ def run_check(*, force_mock: bool = False) -> int:
     if not credentials_present():
         print(
             "FAIL: no D-Wave credentials "
-            "(set DWAVE_API_KEY or configure ~/.config/dwave/dwave.conf)",
+            "(set DWAVE_API_TOKEN or configure ~/.config/dwave/dwave.conf)",
             file=sys.stderr,
         )
         return EXIT_ENV_INCOMPATIBLE
