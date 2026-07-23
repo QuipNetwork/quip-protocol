@@ -19,9 +19,7 @@
 
 use crate::metal_device::MetalDevice;
 use crate::sampler::{self, algo_max_nodes};
-use quip_miner_core::{
-    Algorithm, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamResult,
-};
+use quip_miner_core::{Algorithm, IsingGraph, SamplerResult, StreamJob, StreamResult};
 use quip_proto::v1::RejectReason;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
@@ -111,17 +109,22 @@ fn send_reject(out: &Sender<StreamResult>, job: StreamJob, reason: RejectReason)
 
 /// Pull the next non-empty, in-range job to seed a batch. Empty-graph jobs are
 /// answered inline and oversized jobs rejected without occupying a batch slot.
-/// Returns `None` when the channel closes with nothing pending.
+///
+/// `blocking` waits for a job (returns `None` only on channel close); otherwise
+/// returns `None` the moment no job is immediately queued — the overlap path
+/// uses this so it never blocks while an in-flight batch is un-harvested.
 fn next_seed(
     jobs: &mut Receiver<StreamJob>,
     out: &Sender<StreamResult>,
     pending: &mut Option<StreamJob>,
     algorithm: Algorithm,
+    blocking: bool,
 ) -> Option<StreamJob> {
     loop {
         let job = match pending.take() {
             Some(j) => j,
-            None => jobs.blocking_recv()?,
+            None if blocking => jobs.blocking_recv()?,
+            None => jobs.try_recv().ok()?,
         };
         if job.graph.num_nodes() == 0 {
             answer_empty(out, job);
@@ -180,7 +183,20 @@ fn fill_batch(
     true
 }
 
+/// One committed batch awaiting completion + harvest.
+struct InFlight {
+    encoded: sampler::EncodedBatch,
+    jobs: Vec<StreamJob>,
+}
+
 /// Drive the batched streaming loop for the lifetime of `jobs`.
+///
+/// Double-buffered: each iteration forms and **commits** the next batch (host
+/// work — collect, build buffers, enqueue) while the previous batch is still
+/// executing on the GPU, then waits on and harvests the previous batch (its GPU
+/// compute overlaps this iteration's host work + the next batch's execution).
+/// The GPU stays continuously fed; host encode + parallel scoring are hidden
+/// behind GPU compute.
 pub fn run_stream(
     device: &MetalDevice,
     algorithm: Algorithm,
@@ -190,79 +206,105 @@ pub fn run_stream(
     let cap = batch_size(algorithm);
     let mut pending: Option<StreamJob> = None;
 
-    while let Some(seed) = next_seed(&mut jobs, &out, &mut pending, algorithm) {
-        let key = BatchKey::from_job(&seed);
-        let mut batch = vec![seed];
-        let open = fill_batch(
-            &mut jobs,
-            &out,
-            &key,
-            &mut batch,
-            &mut pending,
-            cap,
-            algorithm,
-        );
+    // Prime the pipeline with the first batch (blocking for its seed).
+    let mut inflight = form_and_commit(device, algorithm, &mut jobs, &out, &mut pending, cap, true);
 
-        dispatch_batch(device, algorithm, batch, &out);
-
-        if !open && pending.is_none() {
-            break;
-        }
+    while let Some(cur) = inflight.take() {
+        // Form + commit the next batch WITHOUT blocking, so it overlaps `cur`'s
+        // GPU compute. Never block here: `cur` is still un-harvested, and its
+        // results must flow (freeing coordinator credits) before more jobs come.
+        let next = form_and_commit(device, algorithm, &mut jobs, &out, &mut pending, cap, false);
+        // Wait on `cur`, host-score (rayon), emit. Its GPU compute overlapped
+        // the `next` form above and now overlaps `next`'s execution.
+        finish_batch(cur, &out);
+        inflight = match next {
+            Some(f) => Some(f),
+            // Nothing was queued to overlap; now that `cur` freed credits, block
+            // for the next batch (or exit when the channel closes).
+            None => form_and_commit(device, algorithm, &mut jobs, &out, &mut pending, cap, true),
+        };
     }
 }
 
-/// Encode + commit + wait for one batch, then host-score and emit per job.
-fn dispatch_batch(
+/// Collect the next batch and commit it to the GPU without waiting. With
+/// `blocking`, waits for the seed (returns `None` only on channel close); the
+/// non-blocking overlap path returns `None` if no job is immediately queued or
+/// on an encode failure (the caller finishes the in-flight batch, then retries).
+fn form_and_commit(
     device: &MetalDevice,
     algorithm: Algorithm,
-    batch: Vec<StreamJob>,
+    jobs: &mut Receiver<StreamJob>,
     out: &Sender<StreamResult>,
-) {
-    use metal::MTLCommandBufferStatus;
+    pending: &mut Option<StreamJob>,
+    cap: usize,
+    blocking: bool,
+) -> Option<InFlight> {
+    let seed = next_seed(jobs, out, pending, algorithm, blocking)?;
+    let key = BatchKey::from_job(&seed);
+    let mut batch = vec![seed];
+    fill_batch(jobs, out, &key, &mut batch, pending, cap, algorithm);
 
-    let graphs: Vec<&IsingGraph> = batch.iter().map(|j| &j.graph).collect();
-    // Every job in the batch shares params by construction (BatchKey).
-    let params: &SampleParams = &batch[0].params;
-
-    let encoded = match sampler::encode_batch(device, &graphs, params, algorithm) {
-        Ok(e) => e,
+    // Scope `graphs` so its borrow of `batch` ends before `batch` moves.
+    let encoded = {
+        let graphs: Vec<&IsingGraph> = batch.iter().map(|j| &j.graph).collect();
+        sampler::encode_batch(device, &graphs, &batch[0].params, algorithm)
+    };
+    match encoded {
+        Ok(enc) => {
+            enc.cmd.commit();
+            Some(InFlight {
+                encoded: enc,
+                jobs: batch,
+            })
+        }
         Err(e) => {
             eprintln!("metal batch encode failed: {e}");
             for job in batch {
                 send_reject(out, job, RejectReason::Overloaded);
             }
-            return;
+            None
         }
-    };
+    }
+}
 
-    let t0 = Instant::now();
-    encoded.cmd.commit();
+/// Wait on a committed batch, then host-score (rayon) and emit one result per
+/// job. `device_access_time_us` is the true GPU execution time
+/// (`GPUEndTime - GPUStartTime`), not the wall clock — the wall includes this
+/// batch's overlap with host work on either side.
+fn finish_batch(inflight: InFlight, out: &Sender<StreamResult>) {
+    use metal::MTLCommandBufferStatus;
+    let InFlight { encoded, jobs } = inflight;
+
     encoded.cmd.wait_until_completed();
-    let device_access_time_us = t0.elapsed().as_micros() as u64;
+    let device_access_time_us = gpu_time_us(&encoded.cmd);
 
     if encoded.cmd.status() != MTLCommandBufferStatus::Completed {
         eprintln!(
             "metal batch command buffer did not complete: status {:?}",
             encoded.cmd.status()
         );
-        for job in batch {
+        for job in jobs {
             send_reject(out, job, RejectReason::Overloaded);
         }
         return;
     }
 
-    let per_problem = match sampler::harvest_batch(&encoded, &graphs) {
+    let per_problem = {
+        let graphs: Vec<&IsingGraph> = jobs.iter().map(|j| &j.graph).collect();
+        sampler::harvest_batch(&encoded, &graphs)
+    };
+    let per_problem = match per_problem {
         Ok(p) => p,
         Err(e) => {
             eprintln!("metal batch harvest failed: {e}");
-            for job in batch {
+            for job in jobs {
                 send_reject(out, job, RejectReason::Overloaded);
             }
             return;
         }
     };
 
-    for (job, results) in batch.into_iter().zip(per_problem) {
+    for (job, results) in jobs.into_iter().zip(per_problem) {
         let take = job.params.num_reads.max(1);
         let result = Ok(results
             .into_iter()
@@ -278,5 +320,26 @@ fn dispatch_batch(
         {
             break; // consumer gone
         }
+    }
+}
+
+/// True GPU execution time of a completed command buffer, in microseconds,
+/// from `GPUEndTime - GPUStartTime` (`CFTimeInterval` seconds). metal-rs 0.33
+/// exposes no accessor, so read the properties via `objc`. Returns 0 if the
+/// timestamps are unavailable / non-positive.
+// `unexpected_cfgs`: objc 0.2's `msg_send!` expands to a `cfg(cargo-clippy)`
+// check the compiler no longer recognizes — a macro-internal quirk, not our cfg.
+#[allow(unexpected_cfgs)]
+fn gpu_time_us(cmd: &metal::CommandBufferRef) -> u64 {
+    use objc::{msg_send, sel, sel_impl};
+    // SAFETY: `GPUStartTime`/`GPUEndTime` are `CFTimeInterval` (f64) properties
+    // on a completed `MTLCommandBuffer`; `cmd` implements `objc::Message`.
+    let (start, end): (f64, f64) =
+        unsafe { (msg_send![cmd, GPUStartTime], msg_send![cmd, GPUEndTime]) };
+    let dur = end - start;
+    if dur.is_finite() && dur > 0.0 {
+        (dur * 1_000_000.0) as u64
+    } else {
+        0
     }
 }

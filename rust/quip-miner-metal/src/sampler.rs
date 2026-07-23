@@ -338,25 +338,35 @@ fn pad_i32(v: &[i32]) -> Vec<i32> {
 /// returning one `Vec<SamplerResult>` per problem (in `graphs` order).
 ///
 /// `graphs` must be the exact slice passed to [`encode_batch`] (same order and
-/// length) so each problem's spins are scored against its own `h`/`J`.
+/// length) so each problem's spins are scored against its own `h`/`J`. The
+/// buffer read is on the caller's thread; unpack + `energy_milli` scoring runs
+/// on a rayon pool (one task per problem) — this is the bulk of the per-batch
+/// host cost, overlapped with the next batch's GPU compute by the streaming
+/// pipeline.
 #[cfg(target_os = "macos")]
 pub(crate) fn harvest_batch(
     batch: &EncodedBatch,
     graphs: &[&IsingGraph],
 ) -> Result<Vec<Vec<SamplerResult>>, SampleError> {
+    use rayon::prelude::*;
+
     debug_assert_eq!(graphs.len(), batch.num_problems);
     let count = batch.num_problems * batch.num_reads * batch.packed_size;
     let packed = read_i8_buffer(&batch.d_samples, count)?;
-    let mut out = Vec::with_capacity(batch.num_problems);
-    for (p, graph) in graphs.iter().enumerate() {
-        let mut reads = Vec::with_capacity(batch.num_reads);
-        for r in 0..batch.num_reads {
-            let start = (p * batch.num_reads + r) * batch.packed_size;
-            let spins = unpack_spins(&packed[start..start + batch.packed_size], batch.n);
-            reads.push(score_spins(&spins, graph));
-        }
-        out.push(reads);
-    }
+    let (num_reads, packed_size, n) = (batch.num_reads, batch.packed_size, batch.n);
+    let out = graphs
+        .par_iter()
+        .enumerate()
+        .map(|(p, graph)| {
+            (0..num_reads)
+                .map(|r| {
+                    let start = (p * num_reads + r) * packed_size;
+                    let spins = unpack_spins(&packed[start..start + packed_size], n);
+                    score_spins(&spins, graph)
+                })
+                .collect()
+        })
+        .collect();
     Ok(out)
 }
 

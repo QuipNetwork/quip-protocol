@@ -29,6 +29,10 @@ tokio = { workspace = true }
 metal = "0.33"
 io-kit-sys = "0.5"
 core-foundation-sys = "0.8"
+# Parallel host scoring of a batch's samples; objc for the GPUStartTime/EndTime
+# command-buffer timestamps (no accessor in metal-rs 0.33).
+rayon = "1.10"
+objc = "0.2"
 
 [dev-dependencies]
 quip-mock-coordinator = { path = "../quip-mock-coordinator" }
