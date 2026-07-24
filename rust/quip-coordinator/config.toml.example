@@ -1,0 +1,31 @@
+# Coordinator config: miner registry + launch plan.
+#
+# Each backend section becomes a spawned miner. `binary` selects the executable
+# (and thus the algorithm variant: the `-sa` default vs the `-gibbs` chromatic
+# variant); omit it to use the default. Binaries are fetched per-host by
+# tools/fetch-miners.sh from the standalone miner repos and expected on PATH or
+# by absolute path here. Unknown keys pass through to the miner as backend_toml.
+
+[miner]
+validators = ["ws://127.0.0.1:9944"]
+signer_key = "//Alice"
+
+# CPU miner. Default binary: quip-cpu-sa. Use the chromatic Gibbs variant:
+[cpu]
+binary = "quip-cpu-sa"        # or "quip-cpu-gibbs"
+queue_depth = 3
+idle_timeout_s = 300
+
+# One CUDA miner per device (amd64 only). Default binary: quip-cuda-sa.
+[cuda.0]
+device_index = 0
+binary = "quip-cuda-sa"       # or "quip-cuda-gibbs"
+
+# Apple Silicon Metal miner. Default binary: quip-metal-sa.
+# [metal]
+# binary = "quip-metal-sa"    # or "quip-metal-gibbs"
+
+# D-Wave QPU miner (pip package, entry point quip-dwave-qa). No sa/gibbs split.
+[dwave]
+binary = "quip-dwave-qa"
+daily_budget = "30s"
