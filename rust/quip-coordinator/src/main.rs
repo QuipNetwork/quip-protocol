@@ -311,7 +311,13 @@ async fn drive_main(args: DriveArgs) -> StdExitCode {
     };
     let sock = format!("/tmp/quip-coordinator-drive-{}.sock", std::process::id());
     let token = gen_session_token();
-    let overall_timeout = Duration::from_secs(30 + jobs.len() as u64 * 5);
+    // Backstop only, for a genuinely stuck miner. A job cannot legitimately
+    // run past its own deadline (the miner rejects Expired), and streaming
+    // backends run jobs concurrently, so the whole run completes within roughly
+    // one per-job deadline. Derive the ceiling from that deadline plus slack
+    // instead of an arbitrary per-job guess.
+    let overall_timeout =
+        Duration::from_millis(args.deadline_ms).saturating_add(Duration::from_secs(60));
 
     let report = run_drive(DriveManyParams {
         miner_bin: &entry.binary,
@@ -336,7 +342,7 @@ async fn drive_main(args: DriveArgs) -> StdExitCode {
         return StdExitCode::from(ExitCode::InternalFatal as u8);
     }
 
-    let agg = aggregate(&report.rows);
+    let agg = aggregate(&report.rows, report.run_wall_ms);
     print_table(&report.rows, &agg);
     if let Some(path) = &args.report {
         if let Err(e) = write_jsonl(path, &report.rows, &agg) {

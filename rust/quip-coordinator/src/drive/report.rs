@@ -27,18 +27,22 @@ pub struct Aggregate {
     pub total_jobs: usize,
     pub passed: usize,
     pub rejected: usize,
+    /// Real wall-clock span of the run (first dispatch → last result), ms.
     pub wall_ms_total: u64,
     pub throughput_per_s: f64,
 }
 
 /// Compute aggregate stats from per-job rows.
-pub fn aggregate(rows: &[JobRow]) -> Aggregate {
+/// `run_wall_ms` is the real wall-clock span of the run (first dispatch → last
+/// result). Throughput uses it — NOT the sum of per-job `wall_ms`, which
+/// overcounts the streaming backends' concurrent, overlapping jobs (e.g. 12
+/// jobs each ~3.3s that all overlap take ~3.3s of wall clock, not ~40s).
+pub fn aggregate(rows: &[JobRow], run_wall_ms: u64) -> Aggregate {
     let total_jobs = rows.len();
     let passed = rows.iter().filter(|r| r.passed).count();
     let rejected = rows.iter().filter(|r| r.rejected).count();
-    let wall_ms_total: u64 = rows.iter().map(|r| r.wall_ms).sum();
-    let throughput_per_s = if wall_ms_total > 0 {
-        total_jobs as f64 / (wall_ms_total as f64 / 1000.0)
+    let throughput_per_s = if run_wall_ms > 0 {
+        total_jobs as f64 / (run_wall_ms as f64 / 1000.0)
     } else {
         0.0
     };
@@ -46,7 +50,7 @@ pub fn aggregate(rows: &[JobRow]) -> Aggregate {
         total_jobs,
         passed,
         rejected,
-        wall_ms_total,
+        wall_ms_total: run_wall_ms,
         throughput_per_s,
     }
 }
@@ -155,17 +159,19 @@ mod tests {
             row(false, false, 20),
             row(false, true, 5),
         ];
-        let agg = aggregate(&rows);
+        // 3 jobs over a real 1.5s wall span -> 2 jobs/s (independent of the
+        // per-job wall times, which overlap for concurrent streaming jobs).
+        let agg = aggregate(&rows, 1500);
         assert_eq!(agg.total_jobs, 3);
         assert_eq!(agg.passed, 1);
         assert_eq!(agg.rejected, 1);
-        assert_eq!(agg.wall_ms_total, 35);
-        assert!(agg.throughput_per_s > 0.0);
+        assert_eq!(agg.wall_ms_total, 1500);
+        assert!((agg.throughput_per_s - 2.0).abs() < 1e-9);
     }
 
     #[test]
     fn aggregate_of_empty_rows_has_zero_throughput() {
-        let agg = aggregate(&[]);
+        let agg = aggregate(&[], 0);
         assert_eq!(agg.total_jobs, 0);
         assert_eq!(agg.throughput_per_s, 0.0);
     }
@@ -173,7 +179,7 @@ mod tests {
     #[test]
     fn jsonl_round_trips_through_serde_json() {
         let rows = vec![row(true, false, 10), row(false, true, 0)];
-        let agg = aggregate(&rows);
+        let agg = aggregate(&rows, 1000);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("report.jsonl");
         write_jsonl(&path, &rows, &agg).unwrap();

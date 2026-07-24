@@ -59,6 +59,10 @@ pub struct DriveManyReport {
     /// not per-job data.
     pub total: usize,
     pub miner_exit_code: i32,
+    /// Real wall-clock span first-dispatch → last-result (ms). Throughput is
+    /// `jobs / this`, not the sum of per-job `wall_ms` (which overcounts the
+    /// concurrent, overlapping jobs the streaming backends run).
+    pub run_wall_ms: u64,
 }
 
 fn coord(msg: coord_msg::Msg) -> CoordMsg {
@@ -93,6 +97,10 @@ fn job_is_pow(job: &Job) -> bool {
 struct RunState {
     rows: StdMutex<Vec<JobRow>>,
     dispatch_at: StdMutex<HashMap<Vec<u8>, Instant>>,
+    /// First job dispatch and last result — the real wall-clock span of the
+    /// run. Throughput is `jobs / span`; summing per-job `wall_ms` would
+    /// overcount the streaming backends' concurrent (overlapping) jobs.
+    span: StdMutex<(Option<Instant>, Option<Instant>)>,
     total: usize,
 }
 
@@ -101,15 +109,18 @@ impl RunState {
         Self {
             rows: StdMutex::new(Vec::new()),
             dispatch_at: StdMutex::new(HashMap::new()),
+            span: StdMutex::new((None, None)),
             total,
         }
     }
 
     fn note_dispatch(&self, job_id: Vec<u8>) {
-        self.dispatch_at
-            .lock()
-            .unwrap()
-            .insert(job_id, Instant::now());
+        let now = Instant::now();
+        self.dispatch_at.lock().unwrap().insert(job_id, now);
+        let mut span = self.span.lock().unwrap();
+        if span.0.is_none() {
+            span.0 = Some(now);
+        }
     }
 
     fn wall_ms_since_dispatch(&self, job_id: &[u8]) -> u64 {
@@ -123,6 +134,16 @@ impl RunState {
 
     fn record(&self, row: JobRow) {
         self.rows.lock().unwrap().push(row);
+        self.span.lock().unwrap().1 = Some(Instant::now());
+    }
+
+    /// Real wall-clock span first-dispatch → last-result, in ms.
+    fn wall_span_ms(&self) -> u64 {
+        let span = self.span.lock().unwrap();
+        match (span.0, span.1) {
+            (Some(start), Some(end)) => end.saturating_duration_since(start).as_millis() as u64,
+            _ => 0,
+        }
     }
 
     fn is_complete(&self) -> bool {
@@ -508,11 +529,13 @@ pub async fn run_drive(p: DriveManyParams<'_>) -> DriveManyReport {
 
     let st = state.lock().await;
     let handshake_ok = st.router.caps(miner_id).is_some();
+    let run_wall_ms = run.wall_span_ms();
     let rows = run.rows.lock().unwrap().clone();
     DriveManyReport {
         handshake_ok,
         rows,
         total,
         miner_exit_code: exit_code,
+        run_wall_ms,
     }
 }
