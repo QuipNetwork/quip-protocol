@@ -114,7 +114,6 @@ async fn run_session<S: Sampler>(
         std::thread::spawn(move || s.sample_stream(job_rx, res_tx))
     };
 
-    let mut config: Option<SessionConfig> = None;
     let mut grace_ms: u64 = 5000;
     let mut num_sweeps = DEFAULT_NUM_SWEEPS;
     let mut jobs_done: u64 = 0;
@@ -127,7 +126,6 @@ async fn run_session<S: Sampler>(
     let mut best_energy_milli: i64 = i64::MAX;
 
     loop {
-        let idle = config.as_ref().map(|c| c.idle_timeout_s).unwrap_or(300) as u64;
         tokio::select! {
             biased;
             // Drain completed results first so a busy sampler never backs up.
@@ -152,12 +150,17 @@ async fn run_session<S: Sampler>(
                     );
                 }
             }
-            next = tokio::time::timeout(Duration::from_secs(idle), inbound.message()) => {
-                let cm: CoordMsg = match next {
-                    Err(_) => break, // idle timeout
-                    Ok(Ok(Some(cm))) => cm,
-                    Ok(Ok(None)) => break,
-                    Ok(Err(status)) => return Err(status.into()),
+            // No wall-clock idle timeout: a miner grinding a hard nonce for
+            // minutes-to-hours legitimately receives nothing from the
+            // coordinator meanwhile — it is busy, not dead. Liveness of a
+            // truly-gone peer surfaces here as a closed stream (`Ok(None)`) or
+            // a transport error (`Err`); dead-peer detection over the network
+            // belongs to HTTP/2 keepalive, not an application quiet-period.
+            msg = inbound.message() => {
+                let cm: CoordMsg = match msg {
+                    Ok(Some(cm)) => cm,
+                    Ok(None) => break,
+                    Err(status) => return Err(status.into()),
                 };
                 match cm.msg {
                     Some(coord_msg::Msg::Welcome(w)) => {
@@ -171,13 +174,10 @@ async fn run_session<S: Sampler>(
                         // unknown fields / overrides) before mining starts.
                         sampler.apply_config(&c.backend_toml);
                         num_sweeps = num_sweeps_from_toml(&c.backend_toml);
-                        config = Some(SessionConfig::from_configure(miner_id.into(), &c));
+                        let config = SessionConfig::from_configure(miner_id.into(), &c);
                         tx.send(miner(miner_msg::Msg::Ready(Ready {}))).await?;
                         // Request enough credits to keep `width` models in flight.
-                        let depth = config
-                            .as_ref()
-                            .map_or(3, |c| c.queue_depth)
-                            .max(width as u32);
+                        let depth = config.queue_depth.max(width as u32);
                         tx.send(miner(miner_msg::Msg::JobRequest(JobRequest {
                             credits: depth,
                         })))
@@ -199,7 +199,17 @@ async fn run_session<S: Sampler>(
                             topology.as_ref(),
                             target.as_ref(),
                         ) {
-                            Prepared::Reject(msg) => tx.send(msg).await?,
+                            Prepared::Reject(msg) => {
+                                // Rejecting at prepare time is terminal for the
+                                // job, so ask for a replacement credit — same as
+                                // a completion — to keep the coordinator's
+                                // consume-on-dispatch pool from leaking a slot.
+                                tx.send(msg).await?;
+                                tx.send(miner(miner_msg::Msg::JobRequest(JobRequest {
+                                    credits: 1,
+                                })))
+                                .await?;
+                            }
                             Prepared::Sample {
                                 job,
                                 num_reads,

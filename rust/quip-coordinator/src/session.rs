@@ -230,7 +230,6 @@ async fn run_session<C: ChainClient>(
             Some(miner_msg::Msg::Result(result)) => {
                 let (job, topo, best, gates) = {
                     let mut st = state.lock().await;
-                    st.router.ack(&miner_id);
                     let job = st.inflight.remove(&result.job_id);
                     let topo = Arc::clone(&st.resolved_topo);
                     let best = st.current_best_milli;
@@ -284,10 +283,11 @@ async fn run_session<C: ChainClient>(
             }
             Some(miner_msg::Msg::Reject(rej)) => {
                 let mut st = state.lock().await;
+                // The rejecting miner grants its own replacement credit (see the
+                // miner's reject path), so the coordinator only re-routes the
+                // job to a capable miner; an unknown job_id needs nothing.
                 if let Some(job) = st.inflight.remove(&rej.job_id) {
                     st.router.on_reject(&miner_id, job, rej.reason);
-                } else {
-                    st.router.ack(&miner_id);
                 }
             }
             Some(miner_msg::Msg::Status(s)) => {
@@ -701,7 +701,6 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                     Some(miner_msg::Msg::Result(result)) => {
                         let (job, topo, best, gates) = {
                             let mut st = state.lock().await;
-                            st.router.ack(&miner_id);
                             let job = st.inflight.remove(&result.job_id);
                             let topo = Arc::clone(&st.resolved_topo);
                             let gates = crate::validate::gates_from_target(st.target.as_ref());
@@ -784,10 +783,11 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                     }
                     Some(miner_msg::Msg::Reject(rej)) => {
                         let mut st = state.lock().await;
+                        // The rejecting miner grants its own replacement credit,
+                        // so the coordinator only re-routes the job to a capable
+                        // miner; an unknown job_id needs nothing.
                         if let Some(job) = st.inflight.remove(&rej.job_id) {
                             st.router.on_reject(&miner_id, job, rej.reason);
-                        } else {
-                            st.router.ack(&miner_id);
                         }
                     }
                     Some(miner_msg::Msg::Status(s)) => {

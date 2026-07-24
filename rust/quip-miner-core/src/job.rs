@@ -319,7 +319,15 @@ pub(crate) fn finalize_result(
 ) -> Vec<MinerMsg> {
     let samples = match sr.result {
         Ok(s) => s,
-        Err(reason) => return vec![reject(sr.job_id, reason)],
+        // A reject is terminal for this job too, so replace its credit like a
+        // completion does — otherwise the coordinator's consume-on-dispatch
+        // pool leaks one slot per reject and the pipeline slowly starves.
+        Err(reason) => {
+            return vec![
+                reject(sr.job_id, reason),
+                miner(miner_msg::Msg::JobRequest(JobRequest { credits: 1 })),
+            ]
+        }
     };
     let solutions: Vec<Solution> = samples
         .into_iter()
