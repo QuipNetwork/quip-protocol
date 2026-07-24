@@ -10,7 +10,6 @@ use thiserror::Error;
 
 const SA_SRC: &str = include_str!("../kernels/sa.cu");
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.cu");
-const ENERGY_SRC: &str = include_str!("../kernels/energy.cu");
 
 /// Minimum CUDA driver version (`cuDriverGetVersion` encoding: `major*1000 +
 /// minor*10`) NVRTC needs to natively target each GPU arch. Port of
@@ -103,12 +102,10 @@ pub struct CudaDevice {
     /// `cuda_gibbs_self_feeding` — persistent kernel, `sms_per_nonce` blocks
     /// per nonce.
     pub gibbs: CudaFunction,
-    pub energy: CudaFunction,
     /// SMs on this device (`launch_self_feeding`'s `num_kernels` budget).
     pub max_sms: usize,
     _sa_mod: Arc<CudaModule>,
     _gibbs_mod: Arc<CudaModule>,
-    _energy_mod: Arc<CudaModule>,
 }
 
 impl CudaDevice {
@@ -142,20 +139,15 @@ impl CudaDevice {
 
         let sa_ptx = compile_with_fallback(SA_SRC)?;
         let gibbs_ptx = compile_with_fallback(GIBBS_SRC)?;
-        let energy_ptx = compile_with_fallback(ENERGY_SRC)?;
 
         let sa_mod = ctx.load_module(sa_ptx).map_err(CudaError::from)?;
         let gibbs_mod = ctx.load_module(gibbs_ptx).map_err(CudaError::from)?;
-        let energy_mod = ctx.load_module(energy_ptx).map_err(CudaError::from)?;
 
         let sa = sa_mod
             .load_function("cuda_sa_self_feeding")
             .map_err(CudaError::from)?;
         let gibbs = gibbs_mod
             .load_function("cuda_gibbs_self_feeding")
-            .map_err(CudaError::from)?;
-        let energy = energy_mod
-            .load_function("cuda_energy_milli")
             .map_err(CudaError::from)?;
 
         Ok(Self {
@@ -164,11 +156,9 @@ impl CudaDevice {
             stream,
             sa,
             gibbs,
-            energy,
             max_sms: max_sms.max(1),
             _sa_mod: sa_mod,
             _gibbs_mod: gibbs_mod,
-            _energy_mod: energy_mod,
         })
     }
 

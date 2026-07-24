@@ -2563,74 +2563,87 @@ class SubstrateMinerController:
             float(preview.get("submit_floor_energy", 0.0)),
             handle_id,
         )
-        submit_result = await submit_with_retry(
-            self.build_client,
-            self.pool_client,
-            self.signer,
-            result,
-            ctx,
-            tip=self.submission_config.tip_plancks,
-            max_retries=self.submission_config.max_retries,
-            retry_backoff_ms=self.submission_config.retry_backoff_ms,
-        )
-
-        if submit_result.action is SubmitRetryAction.SUCCESS:
-            await self._record_anticipatory_success(
-                ctx, key, preview, result,
-                handle_id=handle_id, receipt=submit_result.receipt,
+        try:
+            submit_result = await submit_with_retry(
+                self.build_client,
+                self.pool_client,
+                self.signer,
+                result,
+                ctx,
+                tip=self.submission_config.tip_plancks,
+                max_retries=self.submission_config.max_retries,
+                retry_backoff_ms=self.submission_config.retry_backoff_ms,
             )
-            return
-        if submit_result.action is SubmitRetryAction.RETRY:
-            # Retries exhausted this fire only. Keep the preview and clear
-            # the mid-fire mark so a later head (decay only eases further)
-            # can fire again. Do NOT abandon.
-            self._anticipatory_fired.discard(key)
-            # Retries exhausted is a failed submit, so it moves the gh-20
-            # streak counter exactly like `_handle_result`'s except-branch.
-            # Without this a miner stuck in the QUI-899 loop (fire, exhaust,
-            # repeat every tick) leaves the counter frozen at whatever the
-            # last worker-path submission set, so /api/v1/status reads
-            # healthy while nothing lands.
+
+            if submit_result.action is SubmitRetryAction.SUCCESS:
+                await self._record_anticipatory_success(
+                    ctx, key, preview, result,
+                    handle_id=handle_id, receipt=submit_result.receipt,
+                )
+                return
+            if submit_result.action is SubmitRetryAction.RETRY:
+                # Retries exhausted this fire only. Keep the preview and clear
+                # the mid-fire mark so a later head (decay only eases further)
+                # can fire again. Do NOT abandon.
+                self._anticipatory_fired.discard(key)
+                # Retries exhausted is a failed submit, so it moves the gh-20
+                # streak counter exactly like `_handle_result`'s except-branch.
+                # Without this a miner stuck in the QUI-899 loop (fire, exhaust,
+                # repeat every tick) leaves the counter frozen at whatever the
+                # last worker-path submission set, so /api/v1/status reads
+                # healthy while nothing lands.
+                self.stats.consecutive_submit_failures += 1
+                self.stats.last_submission_error = submit_result.error
+                logger.info(
+                    "anticipatory fire RETRY-exhausted for work_key 0x%s... "
+                    "(attempts=%d, error=%s); will retry on a later head",
+                    ctx.last_proof_block_hash.hex()[:16],
+                    submit_result.attempts,
+                    submit_result.error,
+                )
+                return
+            if submit_result.action is SubmitRetryAction.STOP_ROUND_STALE:
+                # Nonce bound to a round that advanced — the candidate is dead.
+                self.stats.stale_drops += 1
+                # Audit parity with _handle_result's STALE path: write a
+                # rejected_stale row (with chain-derived Sol#) so anticipatory
+                # stale drops are visible in the submission log, then evict.
+                await self._record_anticipatory_stale(
+                    ctx, result, preview, error=submit_result.error,
+                )
+                logger.info(
+                    "anticipatory fire STOP_ROUND_STALE for work_key 0x%s... "
+                    "(error=%s); discarding preview + pending state",
+                    ctx.last_proof_block_hash.hex()[:16],
+                    submit_result.error,
+                )
+                self._evict_anticipatory_state(key)
+                return
+            # STOP_FATAL — this candidate is genuinely bad; discard it and wait
+            # for a better preview to supersede it.
+            self.stats.submission_errors += 1
+            # Parity with `_handle_result`'s FATAL branch, which moves both.
             self.stats.consecutive_submit_failures += 1
             self.stats.last_submission_error = submit_result.error
-            logger.info(
-                "anticipatory fire RETRY-exhausted for work_key 0x%s... "
-                "(attempts=%d, error=%s); will retry on a later head",
-                ctx.last_proof_block_hash.hex()[:16],
-                submit_result.attempts,
-                submit_result.error,
-            )
-            return
-        if submit_result.action is SubmitRetryAction.STOP_ROUND_STALE:
-            # Nonce bound to a round that advanced — the candidate is dead.
-            self.stats.stale_drops += 1
-            # Audit parity with _handle_result's STALE path: write a
-            # rejected_stale row (with chain-derived Sol#) so anticipatory
-            # stale drops are visible in the submission log, then evict.
-            await self._record_anticipatory_stale(
-                ctx, result, preview, error=submit_result.error,
-            )
-            logger.info(
-                "anticipatory fire STOP_ROUND_STALE for work_key 0x%s... "
-                "(error=%s); discarding preview + pending state",
+            logger.warning(
+                "anticipatory fire STOP_FATAL for work_key 0x%s... (error=%s); "
+                "discarding candidate, awaiting a better preview",
                 ctx.last_proof_block_hash.hex()[:16],
                 submit_result.error,
             )
             self._evict_anticipatory_state(key)
-            return
-        # STOP_FATAL — this candidate is genuinely bad; discard it and wait
-        # for a better preview to supersede it.
-        self.stats.submission_errors += 1
-        # Parity with `_handle_result`'s FATAL branch, which moves both.
-        self.stats.consecutive_submit_failures += 1
-        self.stats.last_submission_error = submit_result.error
-        logger.warning(
-            "anticipatory fire STOP_FATAL for work_key 0x%s... (error=%s); "
-            "discarding candidate, awaiting a better preview",
-            ctx.last_proof_block_hash.hex()[:16],
-            submit_result.error,
-        )
-        self._evict_anticipatory_state(key)
+        except BaseException:
+            # submit_with_retry only raises for outcomes it can't classify
+            # itself (a programming error, or a raw CancelledError that the
+            # outer watch-timeout's wait_for failed to convert to
+            # TimeoutError). Either way the work_key must not stay wedged in
+            # `_anticipatory_fired` — a later valid solution needs to be able
+            # to re-fire/submit. Using BaseException (not Exception) is
+            # deliberate: CancelledError is the observed live trigger
+            # (quip-wql) and must be covered too. Re-raise unconditionally —
+            # this must never swallow real shutdown.
+            self._anticipatory_fired.discard(key)
+            raise
 
     async def _record_anticipatory_stale(
         self,

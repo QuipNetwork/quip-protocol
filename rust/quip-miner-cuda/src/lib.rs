@@ -20,7 +20,7 @@ pub mod streaming;
 pub mod topology;
 
 pub use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
-pub use sampler::{gpu_energy_milli, sample_ising};
+pub use sampler::sample_ising;
 
 use cuda_device::CudaDevice;
 use nvml_gov::UtilGovernor;
