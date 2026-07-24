@@ -4,7 +4,7 @@
 use quip_coordinator::config::LaunchEntry;
 use quip_coordinator::drive::{aggregate, drain_all, DriveManyParams, ListSource};
 use quip_proto::v1::Configure;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Sibling `quip-mock-miner` binary (not same package → no CARGO_BIN_EXE_*).
 fn mock_miner() -> String {
@@ -67,7 +67,6 @@ async fn drives_two_entry_list_end_to_end() {
         topology: None,
         target: None,
         jobs,
-        overall_timeout: Duration::from_secs(20),
         utilization: None,
         yielding: false,
     })

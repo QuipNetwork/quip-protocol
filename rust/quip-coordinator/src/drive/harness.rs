@@ -23,7 +23,7 @@ use quip_proto::v1::{
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
@@ -41,8 +41,6 @@ pub struct DriveManyParams<'a> {
     pub topology: Option<Topology>,
     pub target: Option<quip_proto::v1::SetTarget>,
     pub jobs: Vec<Job>,
-    /// Hard ceiling on the whole run (bounds a stuck or rejecting miner).
-    pub overall_timeout: Duration,
     /// Forwarded to the spawned miner's `--utilization` when set (GPU backends).
     pub utilization: Option<u32>,
     /// Forwarded as `--yielding` to the spawned miner (GPU backends).
@@ -514,10 +512,15 @@ pub async fn run_drive(p: DriveManyParams<'_>) -> DriveManyReport {
     }
     let mut child = cmd.spawn().expect("spawn miner");
 
-    let exit_code = match tokio::time::timeout(p.overall_timeout, child.wait()).await {
-        Ok(Ok(status)) => status.code().unwrap_or(-1),
-        Ok(Err(_)) => -1,
-        Err(_) => {
+    // No artificial time limit: the run ends when the miner has serviced every
+    // job (it exits after the session sends `Shutdown` on completion), however
+    // long that takes — mining a hard problem can legitimately run for hours.
+    // The only early stop is the operator: Ctrl-C kills the miner and reports
+    // whatever completed so far (`rows.len() < total` marks it truncated).
+    let exit_code = tokio::select! {
+        status = child.wait() => status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1),
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("drive: interrupted; stopping and reporting completed jobs");
             let _ = child.kill().await;
             let _ = child.wait().await;
             -1

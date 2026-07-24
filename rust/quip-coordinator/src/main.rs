@@ -13,7 +13,6 @@ use quip_proto::v1::{Configure, Job};
 use quip_protocol::session::ExitCode;
 use std::path::PathBuf;
 use std::process::ExitCode as StdExitCode;
-use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -311,14 +310,6 @@ async fn drive_main(args: DriveArgs) -> StdExitCode {
     };
     let sock = format!("/tmp/quip-coordinator-drive-{}.sock", std::process::id());
     let token = gen_session_token();
-    // Backstop only, for a genuinely stuck miner. A job cannot legitimately
-    // run past its own deadline (the miner rejects Expired), and streaming
-    // backends run jobs concurrently, so the whole run completes within roughly
-    // one per-job deadline. Derive the ceiling from that deadline plus slack
-    // instead of an arbitrary per-job guess.
-    let overall_timeout =
-        Duration::from_millis(args.deadline_ms).saturating_add(Duration::from_secs(60));
-
     let report = run_drive(DriveManyParams {
         miner_bin: &entry.binary,
         sock_path: &sock,
@@ -328,7 +319,6 @@ async fn drive_main(args: DriveArgs) -> StdExitCode {
         topology,
         target,
         jobs,
-        overall_timeout,
         utilization: args.utilization,
         yielding: args.yielding,
     })
