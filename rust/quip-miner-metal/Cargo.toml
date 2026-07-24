@@ -33,8 +33,13 @@ core-foundation-sys = "0.8"
 # Objective-C block passed to `MTLCommandBuffer.addCompletedHandler`.
 crossbeam-channel = "0.5.16"
 block = "0.1"
+# Config parsing for apply_config (utilization/yielding schema).
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# Parallel host scoring of a batch's samples; objc for the GPUStartTime/EndTime
+# command-buffer timestamps (no accessor in metal-rs 0.33).
+rayon = "1.10"
+objc = "0.2"
 
 [dev-dependencies]
 quip-mock-coordinator = { path = "../quip-mock-coordinator" }

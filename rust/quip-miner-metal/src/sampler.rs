@@ -5,14 +5,23 @@
 //! CSR, D-Wave incremental delta-energy SA / color-block Gibbs, bit-packed
 //! thread-local state, one thread per read. Solution energies are always
 //! scored on the host with [`quip_protocol::scoring::energy_milli`] (f64
-//! consensus) — the kernel's own int8 energy tracking only drives its internal
-//! accept/reject decisions. There is no GPU energy kernel (MSL has no `double`).
+//! consensus). There is no GPU energy kernel (MSL has no `double`).
 //!
-//! [`encode_job`] builds one job's buffers and encodes the dispatch without
-//! committing; [`harvest`] reads the bit-packed samples and host-scores them.
-//! The synchronous [`sample_ising`] commits + waits; the streaming loop
-//! ([`crate::streaming`]) commits with a completion handler and harvests on the
-//! wakeup. Both keep every Metal object on one owner thread.
+//! # Batched dispatch (throughput)
+//!
+//! The kernel maps **one threadgroup per problem, one thread per read**
+//! (`thread_id = threadgroup·num_reads + read`, `problem_id = thread_id /
+//! num_reads`). A dispatch of `P` problems is
+//! `dispatchThreadgroups(P, num_reads)` → `P` threadgroups occupy `P` GPU
+//! cores, so a batch of ≈`gpu_cores` problems fills the whole GPU and hides
+//! the kernel's thread-private memory latency. This mirrors v0.2
+//! `metal_sa.py::_dispatch_batch`. Driving `P = 1` (one problem per command
+//! buffer) leaves all but one core idle — a ~`gpu_cores`× slowdown — which is
+//! why the streaming loop batches ([`crate::streaming`]).
+//!
+//! [`encode_batch`] builds one batch's buffers and encodes the dispatch without
+//! committing; [`harvest_batch`] reads the bit-packed samples per problem. The
+//! synchronous [`sample_ising`] runs a single-problem batch and waits.
 
 use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 use thiserror::Error;
@@ -35,7 +44,8 @@ pub enum SampleError {
     Unavailable,
 }
 
-/// Largest `num_reads` a single command buffer allocates for (mirrors CUDA).
+/// Largest `num_reads` a dispatch allocates for (mirrors CUDA). Also the
+/// per-threadgroup thread count, well under `maxTotalThreadsPerThreadgroup`.
 #[cfg(target_os = "macos")]
 pub(crate) const MAX_READS: usize = 256;
 
@@ -47,8 +57,33 @@ pub(crate) const SA_MAX_NODES: usize = 4593;
 #[cfg(target_os = "macos")]
 pub(crate) const GIBBS_MAX_NODES: usize = 4800;
 
+/// Whether Gibbs uses the chromatic (node-parallel) kernel — the default.
+///
+/// `block_gibbs_parallel` puts one threadgroup per *sample* and lets its
+/// threads split each color's nodes over `threadgroup`-shared state, exploiting
+/// the chromatic independence of a sweep. `block_gibbs_sampler` instead runs
+/// one thread per read and walks all N nodes serially. Measured on an M4 Max
+/// over the full Advantage2 topology (4577 nodes): 36.5 vs 13.2 jobs/s — 2.75x
+/// — at equal solution quality (mean best energy within 0.01%, same diversity).
+///
+/// v0.2 shipped the sequential kernel as its default (`parallel=False`), so it
+/// has more field exposure; `QUIP_METAL_GIBBS_SEQUENTIAL=1` forces it as an
+/// escape hatch. SA is unaffected — its incremental delta-energy chain is
+/// inherently serial, so it has no node-parallel variant.
 #[cfg(target_os = "macos")]
-fn algo_max_nodes(algorithm: Algorithm) -> usize {
+fn gibbs_node_parallel() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("QUIP_METAL_GIBBS_SEQUENTIAL").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn algo_max_nodes(algorithm: Algorithm) -> usize {
     match algorithm {
         Algorithm::Sa => SA_MAX_NODES,
         Algorithm::Gibbs => GIBBS_MAX_NODES,
@@ -99,16 +134,16 @@ fn unpack_spins(packed: &[i8], n: usize) -> Vec<i8> {
     spins
 }
 
-/// One encoded-but-uncommitted job: the command buffer plus the metadata and
-/// device buffers needed to harvest it. Input/scratch buffers are held in
-/// `_keep` so they outlive the GPU execution (the command buffer references
-/// them; freeing them early would be a use-after-free on the GPU).
+/// One encoded-but-uncommitted batch of `num_problems` problems sharing a
+/// topology, plus the metadata and device buffers needed to harvest it.
+/// Input/scratch buffers are held in `_keep` so they outlive the GPU execution.
 #[cfg(target_os = "macos")]
-pub(crate) struct EncodedJob {
+pub(crate) struct EncodedBatch {
     pub(crate) cmd: metal::CommandBuffer,
     d_samples: metal::Buffer,
     n: usize,
     num_reads: usize,
+    num_problems: usize,
     packed_size: usize,
     _keep: Vec<metal::Buffer>,
 }
@@ -131,21 +166,35 @@ fn set_bytes_u32(enc: &metal::ComputeCommandEncoderRef, index: u64, val: u32) {
     );
 }
 
-/// Build one job's device buffers and encode its dispatch. Does **not** commit.
-///
-/// Caller must handle the empty graph (`N == 0`) before calling — this always
-/// dispatches a kernel. `num_reads` is clamped to [`MAX_READS`]; with
-/// `num_problems = 1` the launch runs `num_reads` threads, one per read.
+/// Tile a slice `times` times into one contiguous `Vec`.
 #[cfg(target_os = "macos")]
-pub(crate) fn encode_job(
+fn tile_i32(src: &[i32], times: usize) -> Vec<i32> {
+    let mut out = Vec::with_capacity(src.len() * times);
+    for _ in 0..times {
+        out.extend_from_slice(src);
+    }
+    out
+}
+
+/// Build one batch's device buffers and encode its dispatch. Does **not** commit.
+///
+/// `graphs` must be non-empty and share a topology (same `N` and `edges`) — the
+/// caller ([`crate::streaming`]) guarantees this by batch key; the topology is
+/// built from `graphs[0]`. `params` (reads, sweeps, beta) is shared across the
+/// batch, matching v0.2 (`compute_beta_schedule(h[0], J[0], ...)`). Dispatches
+/// `dispatchThreadgroups(num_problems, num_reads)`.
+#[cfg(target_os = "macos")]
+pub(crate) fn encode_batch(
     device: &crate::metal_device::MetalDevice,
-    graph: &IsingGraph,
+    graphs: &[&IsingGraph],
     params: &SampleParams,
     algorithm: Algorithm,
-) -> Result<EncodedJob, SampleError> {
+) -> Result<EncodedBatch, SampleError> {
     use metal::{MTLSize, NSUInteger};
 
-    let n = graph.num_nodes();
+    let num_problems = graphs.len();
+    debug_assert!(num_problems >= 1, "encode_batch needs at least one graph");
+    let n = graphs[0].num_nodes();
     let cap = algo_max_nodes(algorithm);
     if n > cap {
         // Defense in depth: the harness rejects N > max_nodes (identity const)
@@ -157,11 +206,11 @@ pub(crate) fn encode_job(
     }
 
     let num_reads = params.num_reads.clamp(1, MAX_READS);
-    let num_threads = num_reads; // num_problems = 1
+    let num_threads = num_problems * num_reads;
     let packed_size = n.div_ceil(8).max(1);
 
     let (beta, sweeps_per) = build_beta_schedule(
-        graph,
+        graphs[0],
         params.num_sweeps,
         params.sweeps_per_beta,
         params.beta_range,
@@ -169,37 +218,51 @@ pub(crate) fn encode_job(
     let num_betas = beta.len() as i32;
     let base_seed = (params.seed as u32).wrapping_add(1);
 
-    let topo = SelfFeedingTopology::build(graph);
-    let (j_csr, h_i8) = fill_h_j(&topo, graph);
+    let topo = SelfFeedingTopology::build(graphs[0]);
+    let nnz_alloc = topo.nnz.max(1);
+    let rp_len = topo.row_ptr.len().max(1);
 
-    // Non-empty device buffers for row_ptr (N+1) and h (N); pad col/J when the
-    // graph has no edges so the device pointers stay non-null.
-    let row_ptr = if topo.row_ptr.is_empty() {
+    // Shared CSR structure, tiled per problem; per-problem J / h values.
+    let base_row = if topo.row_ptr.is_empty() {
         vec![0i32]
     } else {
         topo.row_ptr.clone()
     };
-    let (col_ind, j_vals) = if topo.nnz == 0 {
-        (vec![0i32], vec![0i8])
+    let base_col = if topo.nnz == 0 {
+        vec![0i32]
     } else {
-        (topo.col_ind.clone(), j_csr)
+        topo.col_ind.clone()
     };
-    // Single problem: offsets into the concatenated CSR both start at 0.
-    let row_offsets = [0i32, row_ptr.len() as i32];
-    let col_offsets = [0i32, col_ind.len() as i32];
+    let all_row_ptr = tile_i32(&base_row, num_problems);
+    let all_col_ind = tile_i32(&base_col, num_problems);
+    let mut all_j = vec![0i8; num_problems * nnz_alloc];
+    let mut all_h = vec![0i8; num_problems * n];
+    for (p, graph) in graphs.iter().enumerate() {
+        let (j_csr, h_i8) = fill_h_j(&topo, graph);
+        // `j_csr` has length `topo.nnz`; pad region is the trailing slot when
+        // nnz == 0. `h_i8` has length N.
+        all_j[p * nnz_alloc..p * nnz_alloc + j_csr.len()].copy_from_slice(&j_csr);
+        all_h[p * n..p * n + h_i8.len()].copy_from_slice(&h_i8);
+    }
+    let row_ptr_offsets: Vec<i32> = (0..=num_problems).map(|p| (p * rp_len) as i32).collect();
+    let col_ind_offsets: Vec<i32> = (0..=num_problems).map(|p| (p * nnz_alloc) as i32).collect();
 
-    let d_row = device.new_buffer_from_slice(&row_ptr);
-    let d_col = device.new_buffer_from_slice(&col_ind);
-    let d_j = device.new_buffer_from_slice(&j_vals);
-    let d_h = device.new_buffer_from_slice(&h_i8);
-    let d_row_off = device.new_buffer_from_slice(&row_offsets);
-    let d_col_off = device.new_buffer_from_slice(&col_offsets);
+    let d_row = device.new_buffer_from_slice(&all_row_ptr);
+    let d_col = device.new_buffer_from_slice(&all_col_ind);
+    let d_j = device.new_buffer_from_slice(&all_j);
+    let d_h = device.new_buffer_from_slice(&all_h);
+    let d_row_off = device.new_buffer_from_slice(&row_ptr_offsets);
+    let d_col_off = device.new_buffer_from_slice(&col_ind_offsets);
     let d_beta = device.new_buffer_from_slice(&beta);
     let d_samples = device.new_zeroed_buffer((num_threads * packed_size) as u64);
     let d_energies = device.new_zeroed_buffer((num_threads * 4) as u64); // i32
 
+    // Chromatic Gibbs uses a different pipeline but the *same* buffer layout —
+    // only the dispatch geometry below differs.
+    let node_parallel = matches!(algorithm, Algorithm::Gibbs) && gibbs_node_parallel();
     let pipeline = match algorithm {
         Algorithm::Sa => &device.sa,
+        Algorithm::Gibbs if node_parallel => &device.gibbs_parallel,
         Algorithm::Gibbs => &device.gibbs,
     };
 
@@ -221,7 +284,7 @@ pub(crate) fn encode_job(
     encoder.set_buffer(10, Some(&d_samples), 0);
     encoder.set_buffer(11, Some(&d_energies), 0);
     set_bytes_i32(encoder, 12, num_threads as i32);
-    set_bytes_i32(encoder, 13, 1); // num_problems
+    set_bytes_i32(encoder, 13, num_problems as i32);
     set_bytes_i32(encoder, 14, num_reads as i32);
     encoder.set_buffer(15, Some(&d_h), 0);
 
@@ -247,6 +310,8 @@ pub(crate) fn encode_job(
             keep.extend([d_pstate, d_pdelta, d_prng, d_penergy]);
         }
         Algorithm::Gibbs => {
+            // Color blocks are shared across the batch (same topology → same
+            // coloring); the kernel indexes them globally, not per problem.
             let starts = pad_i32(&topo.colors.starts);
             let counts = pad_i32(&topo.colors.counts);
             let nodes = pad_i32(&topo.colors.nodes);
@@ -262,11 +327,22 @@ pub(crate) fn encode_job(
         }
     }
 
-    // Uniform threadgroups so `thread_id = tg * tgw + tp` is exact; the kernel
-    // guards `thread_id >= num_threads` for the last partial group.
-    let max_tg = pipeline.max_total_threads_per_threadgroup();
-    let tgw = (num_threads as u64).clamp(1, max_tg.min(256));
-    let groups = (num_threads as u64).div_ceil(tgw);
+    // Sequential kernels: one threadgroup per problem, `num_reads` threads (one
+    // per read) each — `problem_id = thread_id / num_reads` = the threadgroup
+    // index, so a model maps to a core and its reads are the threads inside.
+    //
+    // Chromatic Gibbs: one threadgroup per *sample* (`sample_id =
+    // problem*num_reads + read`), and its threads split each color's nodes.
+    // The group is capped at 256 by the kernel's `threadgroup int
+    // partial_energies[256]` reduction array.
+    let (groups, threads_per_group) = if node_parallel {
+        let t = 256
+            .min(pipeline.max_total_threads_per_threadgroup() as usize)
+            .max(1);
+        (num_threads, t) // num_threads == num_problems * num_reads == samples
+    } else {
+        (num_problems, num_reads)
+    };
     encoder.dispatch_thread_groups(
         MTLSize {
             width: groups as NSUInteger,
@@ -274,18 +350,19 @@ pub(crate) fn encode_job(
             depth: 1,
         },
         MTLSize {
-            width: tgw as NSUInteger,
+            width: threads_per_group as NSUInteger,
             height: 1,
             depth: 1,
         },
     );
     encoder.end_encoding();
 
-    Ok(EncodedJob {
+    Ok(EncodedBatch {
         cmd,
         d_samples,
         n,
         num_reads,
+        num_problems,
         packed_size,
         _keep: keep,
     })
@@ -300,26 +377,45 @@ fn pad_i32(v: &[i32]) -> Vec<i32> {
     }
 }
 
-/// Read a completed job's bit-packed samples and host-score each read.
+/// Read a completed batch's bit-packed samples and host-score each read,
+/// returning one `Vec<SamplerResult>` per problem (in `graphs` order).
+///
+/// `graphs` must be the exact slice passed to [`encode_batch`] (same order and
+/// length) so each problem's spins are scored against its own `h`/`J`. The
+/// buffer read is on the caller's thread; unpack + `energy_milli` scoring runs
+/// on a rayon pool (one task per problem) — this is the bulk of the per-batch
+/// host cost, overlapped with the next batch's GPU compute by the streaming
+/// pipeline.
 #[cfg(target_os = "macos")]
-pub(crate) fn harvest(
-    job: &EncodedJob,
-    graph: &IsingGraph,
-) -> Result<Vec<SamplerResult>, SampleError> {
-    let count = job.num_reads * job.packed_size;
-    let packed = read_i8_buffer(&job.d_samples, count)?;
-    let mut out = Vec::with_capacity(job.num_reads);
-    for r in 0..job.num_reads {
-        let start = r * job.packed_size;
-        let spins = unpack_spins(&packed[start..start + job.packed_size], job.n);
-        out.push(score_spins(&spins, graph));
-    }
+pub(crate) fn harvest_batch(
+    batch: &EncodedBatch,
+    graphs: &[&IsingGraph],
+) -> Result<Vec<Vec<SamplerResult>>, SampleError> {
+    use rayon::prelude::*;
+
+    debug_assert_eq!(graphs.len(), batch.num_problems);
+    let count = batch.num_problems * batch.num_reads * batch.packed_size;
+    let packed = read_i8_buffer(&batch.d_samples, count)?;
+    let (num_reads, packed_size, n) = (batch.num_reads, batch.packed_size, batch.n);
+    let out = graphs
+        .par_iter()
+        .enumerate()
+        .map(|(p, graph)| {
+            (0..num_reads)
+                .map(|r| {
+                    let start = (p * num_reads + r) * packed_size;
+                    let spins = unpack_spins(&packed[start..start + packed_size], n);
+                    score_spins(&spins, graph)
+                })
+                .collect()
+        })
+        .collect();
     Ok(out)
 }
 
 /// Run `num_reads` independent anneals on the GPU for one explicit problem
-/// (synchronous single-job path; used by [`crate::MetalSampler::sample`] and
-/// the golden-parity tests).
+/// (synchronous single-problem batch; used by [`crate::MetalSampler::sample`]
+/// and the golden-parity tests).
 #[cfg(target_os = "macos")]
 pub fn sample_ising(
     device: &crate::metal_device::MetalDevice,
@@ -340,21 +436,22 @@ pub fn sample_ising(
             .collect());
     }
 
-    let job = encode_job(device, graph, params, algorithm)?;
-    job.cmd.commit();
-    job.cmd.wait_until_completed();
+    let batch = encode_batch(device, &[graph], params, algorithm)?;
+    batch.cmd.commit();
+    batch.cmd.wait_until_completed();
 
     // A GPU-side failure (device reset, kernel fault, timeout) leaves d_samples
     // in its allocated-zero state; without this check the unpack would turn
     // those zeros into an all-`+1` config and score it as a real solution.
-    if job.cmd.status() != MTLCommandBufferStatus::Completed {
+    if batch.cmd.status() != MTLCommandBufferStatus::Completed {
         return Err(SampleError::Driver(format!(
             "metal command buffer did not complete: status {:?}",
-            job.cmd.status()
+            batch.cmd.status()
         )));
     }
 
-    harvest(&job, graph)
+    let mut per_problem = harvest_batch(&batch, &[graph])?;
+    Ok(per_problem.remove(0))
 }
 
 #[cfg(target_os = "macos")]

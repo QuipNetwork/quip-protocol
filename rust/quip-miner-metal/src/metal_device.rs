@@ -43,6 +43,10 @@ pub struct MetalDevice {
     pub queue: metal::CommandQueue,
     pub sa: ComputePipelineState,
     pub gibbs: ComputePipelineState,
+    /// Chromatic (node-parallel) Gibbs: one threadgroup per sample, threads
+    /// split the nodes of each color, `threadgroup`-shared state. Same buffer
+    /// layout as `gibbs`, different dispatch geometry.
+    pub gibbs_parallel: ComputePipelineState,
 }
 
 impl MetalDevice {
@@ -63,6 +67,7 @@ impl MetalDevice {
 
         let sa = compile_pipeline(&device, SA_SRC, "pure_simulated_annealing")?;
         let gibbs = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_sampler")?;
+        let gibbs_parallel = compile_pipeline(&device, GIBBS_SRC, "block_gibbs_parallel")?;
         let queue = device.new_command_queue();
 
         Ok(Self {
@@ -71,6 +76,7 @@ impl MetalDevice {
             queue,
             sa,
             gibbs,
+            gibbs_parallel,
         })
     }
 
