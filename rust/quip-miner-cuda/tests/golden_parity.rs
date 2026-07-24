@@ -8,6 +8,7 @@ use quip_miner_cuda::{Algorithm, IsingGraph, SampleParams};
 use quip_protocol::scoring::energy_milli;
 use quip_protocol::wire::{decode_spins, encode_spins};
 use serde_json::Value;
+use serial_test::serial;
 use std::fs;
 use std::sync::OnceLock;
 
@@ -33,6 +34,7 @@ fn device() -> &'static CudaDevice {
 
 /// Golden Ising cases: run the energy kernel on the GPU and compare bit-exact.
 #[test]
+#[serial]
 fn gpu_energy_kernel_matches_golden_vectors() {
     if !cuda_available() {
         eprintln!("SKIP gpu_energy_kernel_matches_golden_vectors: no usable CUDA device");
@@ -111,6 +113,7 @@ fn truncation_matches_golden() {
 
 /// Live SA/Gibbs sample: every returned energy equals consensus scoring.
 #[test]
+#[serial]
 fn live_sample_energies_match_energy_milli() {
     if !cuda_available() {
         eprintln!("SKIP live_sample_energies_match_energy_milli: no usable CUDA device");
@@ -152,6 +155,7 @@ fn live_sample_energies_match_energy_milli() {
 
 /// Positive-sign convention pin via GPU energy kernel.
 #[test]
+#[serial]
 fn positive_sign_convention_on_gpu() {
     if !cuda_available() {
         eprintln!("SKIP positive_sign_convention_on_gpu: no usable CUDA device");
@@ -170,6 +174,7 @@ fn positive_sign_convention_on_gpu() {
 
 /// SA finds ferro ground state (sanity that the kernel actually anneals).
 #[test]
+#[serial]
 fn sa_finds_ground_state_on_ferro() {
     if !cuda_available() {
         eprintln!("SKIP sa_finds_ground_state_on_ferro: no usable CUDA device");

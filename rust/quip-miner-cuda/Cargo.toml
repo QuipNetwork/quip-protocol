@@ -38,4 +38,5 @@ toml = "0.8"
 [dev-dependencies]
 quip-mock-coordinator = { path = "../quip-mock-coordinator" }
 serde_json = "1"
+serial_test = "3.5"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process"] }

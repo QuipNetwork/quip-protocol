@@ -2,12 +2,14 @@
 
 use quip_mock_coordinator::driver::drive_miner;
 use quip_proto::v1::RejectReason;
+use serial_test::serial;
 use std::process::Command;
 
 mod common;
 use common::{cuda_available, ensure_built, profile_bin};
 
 #[tokio::test]
+#[serial]
 async fn quip_cuda_sa_passes_conformance() {
     if !cuda_available() {
         eprintln!("SKIP quip_cuda_sa_passes_conformance: no usable CUDA device");
@@ -64,6 +66,7 @@ async fn quip_cuda_sa_passes_conformance() {
 }
 
 #[tokio::test]
+#[serial]
 async fn quip_cuda_gibbs_passes_conformance() {
     if !cuda_available() {
         eprintln!("SKIP quip_cuda_gibbs_passes_conformance: no usable CUDA device");
@@ -96,6 +99,7 @@ async fn quip_cuda_gibbs_passes_conformance() {
 }
 
 #[test]
+#[serial]
 fn capabilities_and_version_and_check() {
     ensure_built(&["quip-cuda-sa", "quip-cuda-gibbs"]);
     // --capabilities and --version are headless (no CUDA); --check needs a GPU.
