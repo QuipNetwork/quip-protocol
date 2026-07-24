@@ -1,11 +1,15 @@
 """CLI surface tests."""
 
+import signal
+
+import pytest
+
 from quip_miner_dwave import (
     EXIT_CLEAN,
     EXIT_CONFIG_INVALID,
     EXIT_ENV_INCOMPATIBLE,
 )
-from quip_miner_dwave.cli import main, run_check
+from quip_miner_dwave.cli import install_sigterm_handler, main, run_check
 
 
 def test_version(capsys):
@@ -43,3 +47,43 @@ def test_check_no_creds_fails(monkeypatch):
         "quip_miner_dwave.cli.ocean_importable", lambda: True
     )
     assert run_check(force_mock=False) == EXIT_ENV_INCOMPATIBLE
+
+
+class _FakeSampler:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def test_sigterm_handler_closes_sampler_and_exits_clean():
+    """SIGTERM must close the sampler and request a clean exit code, matching
+    the v0.2 ``_cleanup_handler`` behavior (quip-w5p.8b)."""
+    original = signal.getsignal(signal.SIGTERM)
+    sampler = _FakeSampler()
+    try:
+        install_sigterm_handler(sampler)
+        handler = signal.getsignal(signal.SIGTERM)
+        assert handler is not original
+        with pytest.raises(SystemExit) as exc_info:
+            handler(signal.SIGTERM, None)
+        assert exc_info.value.code == EXIT_CLEAN
+        assert sampler.closed
+    finally:
+        signal.signal(signal.SIGTERM, original)
+
+
+def test_sigterm_handler_is_idempotent():
+    """A second delivery (or re-entrant signal) must not raise/close twice."""
+    original = signal.getsignal(signal.SIGTERM)
+    sampler = _FakeSampler()
+    try:
+        install_sigterm_handler(sampler)
+        handler = signal.getsignal(signal.SIGTERM)
+        with pytest.raises(SystemExit):
+            handler(signal.SIGTERM, None)
+        # Second delivery: already triggered, must return quietly (no raise).
+        handler(signal.SIGTERM, None)
+    finally:
+        signal.signal(signal.SIGTERM, original)

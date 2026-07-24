@@ -3066,6 +3066,7 @@ name = "quip-miner-core"
 version = "0.3.0"
 dependencies = [
  "clap",
+ "getrandom 0.2.17",
  "hyper-util",
  "prost",
  "quip-mock-coordinator",

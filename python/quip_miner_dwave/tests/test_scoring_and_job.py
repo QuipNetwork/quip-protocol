@@ -1,10 +1,11 @@
 """Consensus scoring + job reject paths (offline mock sampler)."""
 import time
+from typing import Dict, Optional, Tuple
 
 from quip_proto import miner_pb2, scoring, wire
 
 from quip_miner_dwave.job import handle_job
-from quip_miner_dwave.ocean import OceanSampler
+from quip_miner_dwave.ocean import OceanSampler, SampleResult
 
 
 def test_energy_milli_matches_golden_shape():
@@ -207,3 +208,87 @@ def test_set_target_num_reads_override_is_honored():
     )
     assert any(m.HasField("result") for m in msgs)
     sampler.close()
+
+
+class _RecordingSampler:
+    """Duck-typed stand-in for OceanSampler that records ``sample()`` kwargs.
+
+    Avoids exercising the real dimod/D-Wave path — only checks that job.py
+    resolves and forwards ``anneal_time_us`` correctly (quip-w5p.3).
+    """
+
+    def __init__(self):
+        self.calls: list = []
+
+    def sample(
+        self,
+        h: Dict[int, float],
+        j: Dict[Tuple[int, int], float],
+        *,
+        num_reads: int = 1,
+        anneal_time_us: Optional[int] = None,
+        nonce_seed: Optional[bytes] = None,
+        label: str = "",
+    ) -> SampleResult:
+        self.calls.append({"num_reads": num_reads, "anneal_time_us": anneal_time_us})
+        return SampleResult(
+            samples=[{0: 1, 1: -1}],
+            energies=[0.0],
+            device_access_time_us=1,
+            num_reads=1,
+            extra={},
+        )
+
+    def close(self) -> None:
+        pass
+
+
+def _make_job(job_id: bytes, *, anneal_time_us: int = 0) -> "miner_pb2.Job":
+    return miner_pb2.Job(
+        job_id=job_id,
+        kind=miner_pb2.ISING_SAMPLE,
+        deadline_ms=int(time.time() * 1000) + 60_000,
+        ising=miner_pb2.IsingProblem(
+            edges=miner_pb2.EdgeList(u=[0], v=[1]),
+            h_milli_le32=wire.encode_i32_le([1000, -1000]),
+            j_milli_le32=wire.encode_i32_le([500]),
+            num_reads=1,
+            anneal_time_us=anneal_time_us,
+        ),
+    )
+
+
+def test_anneal_time_us_unset_passes_none_to_sampler():
+    sampler = _RecordingSampler()
+    job = _make_job(b"anneal-unset")
+    handle_job(job, sampler, session_nodes=[0, 1], session_edges=[(0, 1)])
+    assert sampler.calls[0]["anneal_time_us"] is None
+
+
+def test_anneal_time_us_per_job_override_is_honored():
+    sampler = _RecordingSampler()
+    job = _make_job(b"anneal-job", anneal_time_us=250)
+    target = miner_pb2.SetTarget(anneal_time_us=999)
+    handle_job(
+        job,
+        sampler,
+        session_nodes=[0, 1],
+        session_edges=[(0, 1)],
+        session_target=target,
+    )
+    # Per-job override wins over SetTarget.
+    assert sampler.calls[0]["anneal_time_us"] == 250
+
+
+def test_anneal_time_us_session_target_fallback_is_honored():
+    sampler = _RecordingSampler()
+    job = _make_job(b"anneal-target")  # unset -> falls through to SetTarget
+    target = miner_pb2.SetTarget(anneal_time_us=777)
+    handle_job(
+        job,
+        sampler,
+        session_nodes=[0, 1],
+        session_edges=[(0, 1)],
+        session_target=target,
+    )
+    assert sampler.calls[0]["anneal_time_us"] == 777

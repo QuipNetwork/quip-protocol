@@ -80,6 +80,7 @@ async fn run_session<S: Sampler>(
     miner_id: &str,
     id: &BackendIdentity,
     sampler: Arc<S>,
+    sweeps_per_beta: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Resolve token before any network I/O so a missing QUIP_SESSION_TOKEN
     // always maps to exit 77 (never InternalFatal from a connect failure).
@@ -194,6 +195,7 @@ async fn run_session<S: Sampler>(
                             &*sampler,
                             id,
                             num_sweeps,
+                            sweeps_per_beta,
                             topology.as_ref(),
                             target.as_ref(),
                         ) {
@@ -323,7 +325,13 @@ pub fn run<S: Sampler>(
         }
     };
 
-    match rt.block_on(run_session(&uri, &miner_id, &id, Arc::new(sampler))) {
+    match rt.block_on(run_session(
+        &uri,
+        &miner_id,
+        &id,
+        Arc::new(sampler),
+        common.sweeps_per_beta,
+    )) {
         Ok(()) => StdExitCode::SUCCESS,
         Err(e) => map_err_to_exit(e, id.backend),
     }

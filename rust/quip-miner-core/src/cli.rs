@@ -25,4 +25,9 @@ pub struct CommonArgs {
     /// Log level (accepted for compatibility; stderr is the default sink).
     #[arg(long, default_value = "info")]
     pub log_level: String,
+    /// Sweeps per beta rung in the annealing schedule (>= 1). Overrides the
+    /// default of 1 without going through the coordinator; e.g. raise it to
+    /// converge Gibbs further. A miner-local setting for now (not on the wire).
+    #[arg(long)]
+    pub sweeps_per_beta: Option<usize>,
 }

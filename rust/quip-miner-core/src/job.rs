@@ -86,11 +86,27 @@ fn pick_param(job: u32, target: u32, adapt: Option<u32>, fallback: u32) -> u32 {
 
 pub(crate) const DEFAULT_NUM_SWEEPS: usize = 64;
 
+// v0.2 parity: the Python GPU miners ran Gibbs at 2x the SA sweep budget
+// (`GIBBS_SWEEP_MULTIPLIER` in GPU/cuda_miner.py, GPU/metal_miner.py) because
+// Gibbs converges slower per sweep than SA. The v0.3 adapt path resolves an
+// algorithm-agnostic `num_sweeps`, so this gate restores that parity for all
+// backends (cpu/cuda/metal) sharing this code path.
+const GIBBS_SWEEP_MULTIPLIER: u32 = 2;
+
 pub(crate) fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Fresh per-job seed from OS entropy. Two jobs issued in the same
+/// millisecond must not sample identically, which a wall-clock-derived seed
+/// would cause (miner-core is shared by cpu/cuda/metal).
+fn os_seed() -> u64 {
+    let mut bytes = [0u8; 8];
+    getrandom::getrandom(&mut bytes).expect("os rng");
+    u64::from_le_bytes(bytes)
 }
 
 pub(crate) fn miner(msg: miner_msg::Msg) -> MinerMsg {
@@ -219,6 +235,7 @@ pub(crate) fn prepare_job<S: Sampler>(
     sampler: &S,
     id: &BackendIdentity,
     default_sweeps: usize,
+    sweeps_per_beta: Option<usize>,
     cache: Option<&TopologyCache>,
     target: Option<&SessionTarget>,
 ) -> Prepared {
@@ -262,6 +279,11 @@ pub(crate) fn prepare_job<S: Sampler>(
         adapt.map(|a| a.num_sweeps),
         default_sweeps as u32,
     );
+    let num_sweeps = if id.algorithm == "gibbs" {
+        num_sweeps.saturating_mul(GIBBS_SWEEP_MULTIPLIER)
+    } else {
+        num_sweeps
+    };
 
     if num_reads > sampler.max_reads() {
         return Prepared::Reject(reject(job_id, RejectReason::TooLarge));
@@ -270,7 +292,8 @@ pub(crate) fn prepare_job<S: Sampler>(
     let params = SampleParams {
         num_reads: num_reads as usize,
         num_sweeps: num_sweeps as usize,
-        seed: now_unix_ms(),
+        seed: os_seed(),
+        sweeps_per_beta: sweeps_per_beta.unwrap_or(1),
         ..Default::default()
     };
     Prepared::Sample {
@@ -328,8 +351,66 @@ pub(crate) fn finalize_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapt::AdaptBounds;
+    use crate::ising::{IsingGraph, SamplerResult};
     use quip_proto::v1::{ising_problem::Graph, EdgeList, Topology};
     use quip_protocol::wire::encode_i32_le;
+
+    struct StubSampler;
+
+    impl crate::Sampler for StubSampler {
+        fn sample(
+            &self,
+            _graph: &IsingGraph,
+            _params: &SampleParams,
+        ) -> Result<Vec<SamplerResult>, RejectReason> {
+            Ok(vec![])
+        }
+    }
+
+    const TEST_ADAPT: AdaptBounds = AdaptBounds {
+        min_sweeps: 1,
+        max_sweeps: u32::MAX,
+        min_reads: 1,
+        max_reads: u32::MAX,
+        reads_solution_min_factor: 1,
+        reads_solution_max_factor: 1,
+        reads_solution_floor_factor: 0,
+    };
+
+    fn identity(algorithm: &'static str) -> BackendIdentity {
+        BackendIdentity {
+            backend: "test",
+            algorithm,
+            max_nodes: 100_000,
+            max_edges: 1_000_000,
+            adapt: TEST_ADAPT,
+        }
+    }
+
+    /// A minimal valid `IsingSample` job with inline edges (no topology cache
+    /// needed) and `num_sweeps` left unset (0), so `prepare_job` falls back to
+    /// `default_sweeps`.
+    fn edges_job(job_id: u8) -> Job {
+        Job {
+            job_id: vec![job_id],
+            kind: JobKind::IsingSample as i32,
+            generation: 0,
+            deadline_ms: now_unix_ms() + 60_000,
+            ising: Some(IsingProblem {
+                graph: Some(Graph::Edges(EdgeList {
+                    u: vec![0],
+                    v: vec![1],
+                })),
+                h_milli_le32: encode_i32_le(&[1000, 1000]),
+                j_milli_le32: encode_i32_le(&[1000]),
+                num_reads: 0,
+                num_sweeps: 0,
+                anneal_time_us: 0,
+            }),
+            provenance: None,
+        }
+    }
 
     fn hash_job(hash: Vec<u8>, h_milli: &[i32], j_milli: &[i32]) -> IsingProblem {
         IsingProblem {
@@ -447,5 +528,89 @@ mod tests {
         let ising = hash_job(vec![7; 32], &[1000, 1000], &[1000]);
         let err = parse_ising(&ising, 100_000, 1_000_000, Some(&cache)).unwrap_err();
         assert_eq!(err, RejectReason::Malformed);
+    }
+
+    #[test]
+    fn gibbs_job_resolves_2x_the_sweeps_of_the_same_sa_job() {
+        let sampler = StubSampler;
+        let default_sweeps = 64;
+
+        let sa_id = identity("sa");
+        let Prepared::Sample {
+            num_sweeps: sa_sweeps,
+            ..
+        } = prepare_job(
+            edges_job(1),
+            &sampler,
+            &sa_id,
+            default_sweeps,
+            None,
+            None,
+            None,
+        )
+        else {
+            panic!("expected Sample");
+        };
+
+        let gibbs_id = identity("gibbs");
+        let Prepared::Sample {
+            num_sweeps: gibbs_sweeps,
+            ..
+        } = prepare_job(
+            edges_job(2),
+            &sampler,
+            &gibbs_id,
+            default_sweeps,
+            None,
+            None,
+            None,
+        )
+        else {
+            panic!("expected Sample");
+        };
+
+        assert_eq!(sa_sweeps, default_sweeps as u32);
+        assert_eq!(gibbs_sweeps, sa_sweeps * GIBBS_SWEEP_MULTIPLIER);
+    }
+
+    #[test]
+    fn back_to_back_jobs_get_different_os_entropy_seeds() {
+        let sampler = StubSampler;
+        let id = identity("sa");
+
+        let Prepared::Sample { job: job1, .. } =
+            prepare_job(edges_job(1), &sampler, &id, 64, None, None, None)
+        else {
+            panic!("expected Sample");
+        };
+        let Prepared::Sample { job: job2, .. } =
+            prepare_job(edges_job(2), &sampler, &id, 64, None, None, None)
+        else {
+            panic!("expected Sample");
+        };
+
+        assert_ne!(job1.params.seed, job2.params.seed);
+    }
+
+    #[test]
+    fn sweeps_per_beta_flag_flows_into_sample_params() {
+        let sampler = StubSampler;
+        let id = identity("sa");
+
+        // The miner-local CLI value threads through to SampleParams.
+        let Prepared::Sample { job, .. } =
+            prepare_job(edges_job(1), &sampler, &id, 64, Some(3), None, None)
+        else {
+            panic!("expected Sample");
+        };
+        assert_eq!(job.params.sweeps_per_beta, 3);
+
+        // Unset falls back to the default of 1.
+        let Prepared::Sample { job, .. } =
+            prepare_job(edges_job(2), &sampler, &id, 64, None, None, None)
+        else {
+            panic!("expected Sample");
+        };
+        assert_eq!(job.params.sweeps_per_beta, 1);
     }
 }

@@ -297,12 +297,25 @@ class OceanSampler:
             except Exception:  # noqa: BLE001 — best-effort
                 pass
 
-    def _submit_sync(self, h, j, num_reads: int, label: str):
+    def _submit_sync(
+        self,
+        h,
+        j,
+        num_reads: int,
+        label: str,
+        anneal_time_us: Optional[int] = None,
+    ):
         """Run on a pool thread: build/submit only; do NOT touch .sampleset."""
         kwargs: Dict[str, Any] = {
             "num_reads": num_reads,
             "label": label,
         }
+        # D-Wave's SAPI parameter is `annealing_time`, in microseconds — the
+        # same unit as the proto's `anneal_time_us`, so no conversion needed.
+        # Only set when the caller supplied an explicit override; otherwise
+        # leave it out so the QPU's hardware-default anneal applies.
+        if anneal_time_us:
+            kwargs["annealing_time"] = anneal_time_us
         # Prefer sample_ising; mock ExactSolver also supports it.
         sample_fn = getattr(self.sampler, "sample_ising", None)
         if not callable(sample_fn):
@@ -329,6 +342,7 @@ class OceanSampler:
         j: Dict[Tuple[int, int], float],
         *,
         num_reads: int = 1,
+        anneal_time_us: Optional[int] = None,
         nonce_seed: Optional[bytes] = None,
         label: str = "quip-dwave-qa",
     ) -> SampleResult:
@@ -336,6 +350,9 @@ class OceanSampler:
 
         Submit work runs on the thread pool; sampleset decode runs here after
         the future completes (v0.2 lesson: never decode on the submit path).
+        ``anneal_time_us`` (microseconds) maps directly to D-Wave's
+        ``annealing_time`` SAPI parameter; ``None``/``0`` leaves it unset so
+        the QPU's hardware-default anneal applies.
         """
         h_eff, j_eff, defect_info = prepare_problem(
             h,
@@ -346,7 +363,12 @@ class OceanSampler:
         )
         # Thread-pooled submit
         fut = self._submit_pool.submit(
-            self._submit_sync, h_eff, j_eff, max(1, int(num_reads)), label
+            self._submit_sync,
+            h_eff,
+            j_eff,
+            max(1, int(num_reads)),
+            label,
+            anneal_time_us,
         )
         raw = fut.result()
         # Decode off the submit path
