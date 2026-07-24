@@ -106,7 +106,13 @@ async fn run_session<S: Sampler>(
     // Streaming sampler on a blocking thread: it pulls StreamJobs and emits
     // StreamResults in completion order, keeping `stream_width` models in flight.
     let width = sampler.stream_width().max(1);
-    let cap = width.max(8);
+    // Prefetch a full extra batch beyond the active set: the backend keeps each
+    // stream lane's NEXT slot pre-loaded so a completed slot rotates into a
+    // ready one with no idle gap while it is downloaded and refilled (the
+    // 3-slot pipeline in quip-miner-cuda). Without this look-ahead the lane
+    // stalls every cycle waiting for the next job to arrive over the wire.
+    let prefetch = width.saturating_mul(2);
+    let cap = prefetch.max(8);
     let (job_tx, job_rx) = mpsc::channel::<StreamJob>(cap);
     let (res_tx, mut res_rx) = mpsc::channel::<StreamResult>(cap);
     let sampler_thread = {
@@ -176,8 +182,10 @@ async fn run_session<S: Sampler>(
                         num_sweeps = num_sweeps_from_toml(&c.backend_toml);
                         let config = SessionConfig::from_configure(miner_id.into(), &c);
                         tx.send(miner(miner_msg::Msg::Ready(Ready {}))).await?;
-                        // Request enough credits to keep `width` models in flight.
-                        let depth = config.queue_depth.max(width as u32);
+                        // Request enough credits to keep the prefetch buffer
+                        // full (active + next per lane), so the backend always
+                        // has a NEXT slot to rotate into.
+                        let depth = config.queue_depth.max(prefetch as u32);
                         tx.send(miner(miner_msg::Msg::JobRequest(JobRequest {
                             credits: depth,
                         })))
