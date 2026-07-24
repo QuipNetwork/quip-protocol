@@ -161,6 +161,15 @@ def handle_job(
         num_reads = int(session_target.num_reads)
     if num_reads == 0:
         num_reads = 1
+    # Same precedence for anneal_time_us: per-job override > SetTarget
+    # override > unset (0 = let the QPU use its hardware-default anneal).
+    anneal_time_us = int(ising.anneal_time_us)
+    if (
+        anneal_time_us == 0
+        and session_target is not None
+        and session_target.anneal_time_us
+    ):
+        anneal_time_us = int(session_target.anneal_time_us)
     # Use job_id bytes as clamp seed when present
     nonce_seed = bytes(job_id) if job_id else None
 
@@ -168,6 +177,7 @@ def handle_job(
         h_dict,
         j_dict,
         num_reads=num_reads,
+        anneal_time_us=anneal_time_us or None,
         nonce_seed=nonce_seed,
         label=f"quip-{job_id.hex()[:8] if job_id else 'job'}",
     )

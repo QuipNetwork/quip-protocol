@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import sys
+import threading
 
 from quip_miner_dwave import (
     ALGORITHM,
@@ -94,6 +96,41 @@ def run_check(*, force_mock: bool = False) -> int:
     return EXIT_CLEAN
 
 
+def install_sigterm_handler(sampler: OceanSampler) -> None:
+    """Register a SIGTERM handler that closes ``sampler`` before exiting.
+
+    A default-disposition SIGTERM (``kill``, orchestrator shutdown) tears
+    down the interpreter without unwinding the stack, so it skips
+    ``session_loop.run_session``'s normal-exit ``finally`` block and leaks
+    the D-Wave cloud client/session until its own idle timeout. Mirrors
+    ``QPU/dwave_miner.py``'s ``_cleanup_handler``: close the sampler, then
+    raise ``SystemExit`` so ``main``'s existing ``except SystemExit`` path
+    (and, if the signal lands while a session is running, ``run_session``'s
+    ``finally``) still gets a chance to unwind normally.
+
+    ``signal.signal`` only accepts a handler on the main thread; installing
+    from any other thread would raise, so this is a no-op there.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    triggered = threading.Event()
+
+    def handler(signum, frame):  # noqa: ARG001 - required signal handler signature
+        if triggered.is_set():
+            return
+        triggered.set()
+        log = logging.getLogger(__name__)
+        log.info("SIGTERM received; closing D-Wave sampler")
+        try:
+            sampler.close()
+        except Exception:  # noqa: BLE001 - best-effort cleanup before exit
+            log.exception("sampler.close() failed during SIGTERM shutdown")
+        raise SystemExit(EXIT_CLEAN)
+
+    signal.signal(signal.SIGTERM, handler)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(
@@ -123,6 +160,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001
         logging.getLogger(__name__).exception("sampler init failed: %s", exc)
         return EXIT_ENV_INCOMPATIBLE
+
+    install_sigterm_handler(sampler)
 
     try:
         return run_session_sync(

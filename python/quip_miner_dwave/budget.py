@@ -188,12 +188,23 @@ class QPUTimeManager:
     def get_stats(self, now: Optional[float] = None) -> Dict[str, Any]:
         now = now if now is not None else time.time()
         self._accrue(now)
+        # Reuses should_mine()'s hysteresis evaluation for seconds_until_can_mine
+        # (note: should_mine() also refreshes self._burst_active as a side
+        # effect, consistent with the pool/state already accrued to `now`).
+        estimate = self.should_mine(now)
         return {
             "pool_seconds": self._pool_us / 1_000_000,
             "burst_active": self._burst_active,
             "daily_budget_seconds": self.config.daily_budget_seconds,
             "min_block_budget_seconds": self.config.min_block_budget_seconds,
             "cumulative_used_seconds": self.cumulative_used_us / 1_000_000,
+            "ema_estimate_seconds": (
+                self.ema_estimate_us / 1_000_000
+                if self.ema_estimate_us is not None
+                else None
+            ),
+            "estimated_block_time_seconds": self.estimate_next_block_time() / 1_000_000,
+            "seconds_until_can_mine": estimate.seconds_until_can_mine,
         }
 
 
