@@ -20,7 +20,9 @@ use crate::sampler::SampleError;
 use crate::topology::{fill_h_j, SelfFeedingTopology};
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use quip_miner_core::beta::{default_ising_beta_range, geometric_beta_schedule};
-use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamResult};
+use quip_miner_core::{
+    Algorithm, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamResult,
+};
 use quip_proto::v1::RejectReason;
 use quip_protocol::scoring::energy_milli;
 use std::sync::Arc;
@@ -222,7 +224,8 @@ impl<'a> SelfFeedingSession<'a> {
         let d_h = stream_compute.alloc_zeros::<i8>(total_slots * n.max(1))?;
         let d_samples =
             stream_compute.alloc_zeros::<i8>(total_slots * reads_per_nonce * max_packed_size)?;
-        let d_energies = stream_compute.alloc_zeros::<i32>((total_slots * reads_per_nonce).max(1))?;
+        let d_energies =
+            stream_compute.alloc_zeros::<i32>((total_slots * reads_per_nonce).max(1))?;
         let d_ctrl = stream_compute.alloc_zeros::<i32>(num_nonces * CTRL_STRIDE)?;
         let d_beta = stream_compute.alloc_zeros::<f32>(max_num_betas.max(1))?;
 
@@ -236,8 +239,16 @@ impl<'a> SelfFeedingSession<'a> {
             Algorithm::Gibbs => {
                 let starts = tile_i32(&topology.colors.starts, num_nonces);
                 let counts = tile_i32(&topology.colors.counts, num_nonces);
-                let starts = if starts.is_empty() { vec![0i32] } else { starts };
-                let counts = if counts.is_empty() { vec![0i32] } else { counts };
+                let starts = if starts.is_empty() {
+                    vec![0i32]
+                } else {
+                    starts
+                };
+                let counts = if counts.is_empty() {
+                    vec![0i32]
+                } else {
+                    counts
+                };
                 let nodes = if topology.colors.nodes.is_empty() {
                     vec![0i32]
                 } else {
@@ -291,7 +302,12 @@ impl<'a> SelfFeedingSession<'a> {
     /// Upload one job's `h`/`J` into `(nonce_id, slot_id)` and mark it READY.
     /// The job's graph must already be known compatible with `self.topology`
     /// (same `N`/edges) — checked by the caller via [`SessionKey`].
-    fn upload_slot(&mut self, nonce_id: usize, slot_id: usize, graph: &IsingGraph) -> Result<(), SampleError> {
+    fn upload_slot(
+        &mut self,
+        nonce_id: usize,
+        slot_id: usize,
+        graph: &IsingGraph,
+    ) -> Result<(), SampleError> {
         let slot_idx = nonce_id * SLOTS_PER_NONCE + slot_id;
         let nnz = self.topology.nnz;
         let n = self.topology.n;
@@ -322,7 +338,9 @@ impl<'a> SelfFeedingSession<'a> {
         let zeros = vec![0i8; sample_len];
         self.stream_transfer.memcpy_htod(
             &zeros,
-            &mut self.d_samples.slice_mut(sample_start..sample_start + sample_len),
+            &mut self
+                .d_samples
+                .slice_mut(sample_start..sample_start + sample_len),
         )?;
 
         let ctrl_offset = nonce_id * CTRL_STRIDE + slot_id;
@@ -338,9 +356,11 @@ impl<'a> SelfFeedingSession<'a> {
         let slot_idx = nonce_id * SLOTS_PER_NONCE + slot_id;
         let sample_start = slot_idx * self.reads_per_nonce * self.max_packed_size;
         let sample_len = self.reads_per_nonce * self.max_packed_size;
-        let packed: Vec<i8> = self
-            .stream_transfer
-            .clone_dtoh(&self.d_samples.slice(sample_start..sample_start + sample_len))?;
+        let packed: Vec<i8> = self.stream_transfer.clone_dtoh(
+            &self
+                .d_samples
+                .slice(sample_start..sample_start + sample_len),
+        )?;
         let n = self.topology.n;
         Ok((0..self.reads_per_nonce)
             .map(|r| {
@@ -354,7 +374,13 @@ impl<'a> SelfFeedingSession<'a> {
         Ok(self.stream_transfer.clone_dtoh(&self.d_ctrl)?)
     }
 
-    fn launch(&mut self, active_nonces: usize, num_betas: i32, sweeps_per_beta: i32, seed: u32) -> Result<(), SampleError> {
+    fn launch(
+        &mut self,
+        active_nonces: usize,
+        num_betas: i32,
+        sweeps_per_beta: i32,
+        seed: u32,
+    ) -> Result<(), SampleError> {
         self.active_nonces = active_nonces;
         let limits = algo_limits(self.algorithm);
         let num_blocks = (active_nonces * limits.sms_per_nonce) as u32;
@@ -531,12 +557,17 @@ pub fn sample_one(
 
     let limits = algo_limits(algorithm);
     let reads_per_nonce = params.num_reads.max(1).min(limits.max_reads);
-    let (beta, sweeps_per_beta) =
-        build_beta_schedule(graph, params.num_sweeps, params.sweeps_per_beta, params.beta_range);
+    let (beta, sweeps_per_beta) = build_beta_schedule(
+        graph,
+        params.num_sweeps,
+        params.sweeps_per_beta,
+        params.beta_range,
+    );
     let num_betas = beta.len() as i32;
     let topology = SelfFeedingTopology::build(graph);
 
-    let mut sess = SelfFeedingSession::build(device, algorithm, topology, 1, reads_per_nonce, beta.len())?;
+    let mut sess =
+        SelfFeedingSession::build(device, algorithm, topology, 1, reads_per_nonce, beta.len())?;
     sess.upload_beta_schedule(&beta)?;
     sess.upload_slot(0, 0, graph)?;
     let seed = (params.seed as u32).wrapping_add(1);
@@ -659,7 +690,12 @@ fn send_reject(out: &Sender<StreamResult>, job: StreamJob, reason: RejectReason)
 /// to [`stream_width`] models in flight across one (or, on a topology/param
 /// change, successive) persistent kernel launches, emitting results in
 /// completion order.
-pub fn run_stream(device: &CudaDevice, algorithm: Algorithm, mut jobs: Receiver<StreamJob>, out: Sender<StreamResult>) {
+pub fn run_stream(
+    device: &CudaDevice,
+    algorithm: Algorithm,
+    mut jobs: Receiver<StreamJob>,
+    out: Sender<StreamResult>,
+) {
     let width = stream_width(device, algorithm);
     let limits = algo_limits(algorithm);
     let mut pending_seed: Option<StreamJob> = match jobs.blocking_recv() {
@@ -699,16 +735,22 @@ pub fn run_stream(device: &CudaDevice, algorithm: Algorithm, mut jobs: Receiver<
         let num_betas = beta.len() as i32;
         let topology = SelfFeedingTopology::build(&seed.graph);
 
-        let mut sess =
-            match SelfFeedingSession::build(device, algorithm, topology, width, reads_per_nonce, beta.len()) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("cuda streaming session build failed: {e}");
-                    send_reject(&out, seed, RejectReason::Overloaded);
-                    pending_seed = jobs.blocking_recv();
-                    continue 'session;
-                }
-            };
+        let mut sess = match SelfFeedingSession::build(
+            device,
+            algorithm,
+            topology,
+            width,
+            reads_per_nonce,
+            beta.len(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cuda streaming session build failed: {e}");
+                send_reject(&out, seed, RejectReason::Overloaded);
+                pending_seed = jobs.blocking_recv();
+                continue 'session;
+            }
+        };
         if sess.upload_beta_schedule(&beta).is_err() {
             send_reject(&out, seed, RejectReason::Overloaded);
             pending_seed = jobs.blocking_recv();
@@ -768,7 +810,10 @@ pub fn run_stream(device: &CudaDevice, algorithm: Algorithm, mut jobs: Receiver<
             slots[nonce_id].assign_active(0, job);
         }
         let seed_val = (Instant::now().elapsed().as_nanos() as u32) ^ 0x9E3779B9;
-        if sess.launch(active_nonces, num_betas, sweeps_per_beta as i32, seed_val).is_err() {
+        if sess
+            .launch(active_nonces, num_betas, sweeps_per_beta as i32, seed_val)
+            .is_err()
+        {
             // Every cold-start job already handed off; nothing more to reject
             // here beyond what upload_slot rejected above.
             pending_seed = if closed { None } else { jobs.blocking_recv() };
@@ -843,7 +888,9 @@ pub fn run_stream(device: &CudaDevice, algorithm: Algorithm, mut jobs: Receiver<
                     continue;
                 };
                 found = true;
-                let reads = sess.download_slot(nonce_id, active_slot).unwrap_or_default();
+                let reads = sess
+                    .download_slot(nonce_id, active_slot)
+                    .unwrap_or_default();
                 let device_access_time_us = slot
                     .active_started
                     .map(|t| t.elapsed().as_micros() as u64)

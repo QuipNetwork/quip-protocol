@@ -73,6 +73,11 @@ conformance:
   image: python:3.11
   tags: [linux, amd64]
   before_script:
+    # quip-proto's build script (prost/tonic) needs protoc; python:3.11 has none.
+    - apt-get update && apt-get install -y --no-install-recommends protobuf-compiler
+    # maturin develop requires an active virtualenv; the base image has none.
+    - python -m venv .venv
+    - . .venv/bin/activate
     - pip install -e ".[dev]" grpcio-tools numpy blake3 maturin
     # quip_proto's scoring/wire are a PyO3 extension; build it before tests
     # import it. python:3.11 has no Rust toolchain, so install one first.

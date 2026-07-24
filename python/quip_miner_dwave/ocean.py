@@ -9,6 +9,7 @@ Design points carried from ``QPU/dwave_sampler.py``:
 Offline mode (``QUIP_DWAVE_MOCK=1`` or an injected sampler) uses a dimod
 sampler so unit/conformance tests never hit a real QPU.
 """
+
 from __future__ import annotations
 
 import logging
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 def credentials_present() -> bool:
     """True if a D-Wave API token is available via env or SDK config file."""
-    if os.environ.get("DWAVE_API_KEY") or os.environ.get("DWAVE_API_TOKEN"):
+    if os.environ.get("DWAVE_API_TOKEN"):
         return True
     conf = os.path.expanduser("~/.config/dwave/dwave.conf")
     if os.path.isfile(conf):
@@ -61,6 +62,7 @@ def ocean_importable() -> bool:
     try:
         import dimod  # noqa: F401
         import dwave  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -129,9 +131,7 @@ class MockSampler:
             "qpu_programming_time": 100,
             "qpu_sampling_time": elapsed_us,
         }
-        return dimod.SampleSet(
-            ss.record, ss.variables, info, ss.vartype
-        )
+        return dimod.SampleSet(ss.record, ss.variables, info, ss.vartype)
 
 
 class OceanSampler:
@@ -165,31 +165,61 @@ class OceanSampler:
         self._native_hash: Optional[bytes] = None
         self._is_mock = False
         self._qpu_solver = None
+        self._connected = False
+        # Connection overrides; unset values fall through to D-Wave's native
+        # config resolution (dwave.conf + standard env) in `_connect_real`.
+        self._solver_name = solver_name
+        self._region = region
+        self._token = token
 
         use_mock = mock if mock is not None else mock_mode_enabled()
         if sampler is not None:
             self.sampler = sampler
             self._is_mock = use_mock or isinstance(sampler, MockSampler)
+            self._connected = True
+            self._apply_native_hash()
         elif use_mock:
             self.sampler = MockSampler(backend=mock_backend())
             self._is_mock = True
+            self._connected = True
             logger.info(
                 "[QPU] mock sampler active (QUIP_DWAVE_MOCK, backend=%s)",
                 mock_backend(),
             )
+            self._apply_native_hash()
         else:
-            self.sampler = self._connect_real(solver_name, region, token)
-            self._is_mock = False
-            self._detect_defects()
+            # Real QPU: do NOT contact D-Wave here. The connection is deferred
+            # until the coordinator engages us (Configure calls ensure_connected)
+            # or another mode forces it (--check), so an idle or unconnected
+            # miner never opens a QPU session.
+            self.sampler = None
+            logger.info("[QPU] real sampler deferred until Configure")
 
+    def ensure_connected(self) -> None:
+        """Connect to the real QPU if not already (idempotent).
+
+        Mock and injected samplers are ready at construction; a real sampler
+        connects here — invoked when the coordinator sends Configure, or eagerly
+        by --check. Safe to call repeatedly.
+        """
+        if self._connected:
+            return
+        self.sampler = self._connect_real(self._solver_name, self._region, self._token)
+        self._detect_defects()
+        self._connected = True
+        self._apply_native_hash()
+
+    def _apply_native_hash(self) -> None:
         if self._live_nodes and self._live_edges is not None:
-            self._native_hash = native_topology_hash(
-                self._live_nodes, self._live_edges
-            )
+            self._native_hash = native_topology_hash(self._live_nodes, self._live_edges)
 
     def _connect_real(self, solver_name, region, token):
         from dwave.system import DWaveSampler
 
+        # Comply with D-Wave's own config: DWaveSampler resolves credentials
+        # from ~/.config/dwave/dwave.conf and the canonical DWAVE_API_TOKEN /
+        # DWAVE_API_SOLVER / DWAVE_API_REGION / DWAVE_API_ENDPOINT env vars. Pass
+        # only explicit overrides a caller supplied; everything else is the SDK's.
         kwargs: Dict[str, Any] = {"request_timeout": (60, 300)}
         if solver_name is not None:
             kwargs["solver"] = solver_name
@@ -197,14 +227,10 @@ class OceanSampler:
             kwargs["region"] = region
         if token is not None:
             kwargs["token"] = token
-        elif os.environ.get("DWAVE_API_KEY"):
-            kwargs["token"] = os.environ["DWAVE_API_KEY"]
         base = DWaveSampler(**kwargs)
         self._qpu_solver = base
         self._live_nodes = sorted(int(n) for n in base.nodelist)
-        self._live_edges = [
-            (int(u), int(v)) for u, v in base.edgelist
-        ]
+        self._live_edges = [(int(u), int(v)) for u, v in base.edgelist]
         logger.info(
             "[QPU] connected solver=%s qubits=%d",
             base.properties.get("chip_id", "?"),
@@ -246,9 +272,7 @@ class OceanSampler:
         if self._live_nodes:
             live_set = set(self._live_nodes)
             self._defective_qubits = sorted(set(nodes_l) - live_set)
-            live_edge_set = {
-                (min(u, v), max(u, v)) for u, v in self._live_edges
-            }
+            live_edge_set = {(min(u, v), max(u, v)) for u, v in self._live_edges}
             def_q = set(self._defective_qubits)
             self._defective_edges = set()
             for u, v in edges_l:
@@ -335,9 +359,7 @@ class OceanSampler:
         for row, energy in zip(ss.record.sample, ss.record.energy):
             reduced = {int(variables[i]): int(row[i]) for i in range(len(variables))}
             # ExactSolver / SA use ±1; coerce zeros just in case
-            reduced = {
-                k: (1 if v >= 0 else -1) for k, v in reduced.items()
-            }
+            reduced = {k: (1 if v >= 0 else -1) for k, v in reduced.items()}
             full, e_corr = reconstruct_sample(reduced, float(energy), defect_info)
             samples.append(full)
             energies.append(e_corr)

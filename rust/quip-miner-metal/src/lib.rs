@@ -78,6 +78,20 @@ pub struct MetalSampler {
     algorithm: Algorithm,
 }
 
+/// Metal backend config, parsed from the verbatim `config.toml` subsection in
+/// `Configure.backend_toml`. Unrecognized keys land in `unknown`;
+/// `warn_unknown_fields` filters session-level keys (e.g. `num_sweeps`).
+#[cfg(target_os = "macos")]
+#[derive(serde::Deserialize, Default)]
+struct MetalConfig {
+    /// GPU utilization ceiling 1–100 (governor throttle threshold when yielding).
+    utilization: Option<u32>,
+    /// Yield the GPU to siblings when util exceeds the ceiling.
+    yielding: Option<bool>,
+    #[serde(flatten)]
+    unknown: std::collections::BTreeMap<String, toml::Value>,
+}
+
 #[cfg(target_os = "macos")]
 impl MetalSampler {
     pub fn new(
@@ -128,6 +142,20 @@ impl quip_miner_core::Sampler for MetalSampler {
 
     fn max_reads(&self) -> u32 {
         streaming::max_reads(self.algorithm)
+    }
+
+    fn apply_config(&self, backend_toml: &str) {
+        use quip_miner_core::config::{config_override, warn_unknown_fields};
+        let cfg: MetalConfig = toml::from_str(backend_toml).unwrap_or_default();
+        warn_unknown_fields("metal", cfg.unknown.keys());
+        // config over CLI (the governor holds the CLI-set values until now).
+        let ceiling = config_override(
+            "utilization",
+            self.gov.utilization_ceiling(),
+            cfg.utilization,
+        );
+        let yielding = config_override("yielding", self.gov.yielding(), cfg.yielding);
+        self.gov.reconfigure(ceiling, yielding);
     }
 }
 

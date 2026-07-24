@@ -9,6 +9,7 @@
 pub mod adapt;
 pub mod beta;
 pub mod cli;
+pub mod config;
 pub mod csr;
 pub mod ising;
 mod job;
@@ -102,6 +103,15 @@ pub trait Sampler: Send + Sync + 'static {
     fn max_reads(&self) -> u32 {
         u32::MAX
     }
+
+    /// Apply this backend's configuration from `Configure.backend_toml` — the
+    /// verbatim `config.toml` subsection the coordinator forwards. Called once
+    /// when `Configure` arrives, before any job. Each backend parses against its
+    /// own schema, applies recognized fields (config overrides CLI, see
+    /// [`config::config_override`]), and warns on unknown fields
+    /// ([`config::warn_unknown_fields`]). Default: no configurable settings (the
+    /// CPU miner's shape).
+    fn apply_config(&self, _backend_toml: &str) {}
 }
 
 #[cfg(test)]

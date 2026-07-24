@@ -3104,17 +3104,21 @@ dependencies = [
  "quip-mock-coordinator",
  "quip-proto",
  "quip-protocol",
+ "serde",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "toml",
 ]
 
 [[package]]
 name = "quip-miner-metal"
 version = "0.3.0"
 dependencies = [
+ "block",
  "clap",
  "core-foundation-sys",
+ "crossbeam-channel",
  "io-kit-sys",
  "metal",
  "objc",
@@ -3123,9 +3127,11 @@ dependencies = [
  "quip-proto",
  "quip-protocol",
  "rayon",
+ "serde",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "toml",
 ]
 
 [[package]]

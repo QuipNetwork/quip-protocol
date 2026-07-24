@@ -10,12 +10,12 @@ use crate::job::{
     TopologyCache, DEFAULT_NUM_SWEEPS,
 };
 use crate::{Sampler, StreamJob, StreamResult};
-use std::collections::HashMap;
-use std::sync::Arc;
 use quip_proto::v1::miner_service_client::MinerServiceClient;
 use quip_proto::v1::{coord_msg, miner_msg, CoordMsg, JobKind, JobRequest, MinerMsg, Ready};
 use quip_protocol::session::{build_hello, ExitCode, SessionConfig, SessionError};
+use std::collections::HashMap;
 use std::process::ExitCode as StdExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -60,7 +60,11 @@ fn log_progress(
     best_energy_milli: i64,
 ) {
     let secs = elapsed.as_secs_f64();
-    let rate = if secs > 0.0 { jobs_done as f64 / secs } else { 0.0 };
+    let rate = if secs > 0.0 {
+        jobs_done as f64 / secs
+    } else {
+        0.0
+    };
     let best = if best_energy_milli == i64::MAX {
         "n/a".to_owned()
     } else {
@@ -158,6 +162,10 @@ async fn run_session<S: Sampler>(
                         }
                     }
                     Some(coord_msg::Msg::Configure(c)) => {
+                        // Hand the verbatim config subsection to the backend to
+                        // parse against its own schema (overrides CLI, warns on
+                        // unknown fields / overrides) before mining starts.
+                        sampler.apply_config(&c.backend_toml);
                         num_sweeps = num_sweeps_from_toml(&c.backend_toml);
                         config = Some(SessionConfig::from_configure(miner_id.into(), &c));
                         tx.send(miner(miner_msg::Msg::Ready(Ready {}))).await?;

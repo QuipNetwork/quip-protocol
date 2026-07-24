@@ -24,8 +24,7 @@ fn expected_solution_energy(num_nodes: usize, num_edges: usize, c: f64, h_values
     let h_contribution = if h_values.len() == 1 && h_values[0] == 0.0 {
         0.0
     } else {
-        let nonzero =
-            h_values.iter().filter(|&&v| v != 0.0).count() as f64 / h_values.len() as f64;
+        let nonzero = h_values.iter().filter(|&&v| v != 0.0).count() as f64 / h_values.len() as f64;
         -c * ALPHA * nonzero * n / avg_degree.sqrt()
     };
     j_contribution + h_contribution
@@ -57,7 +56,10 @@ pub fn energy_to_difficulty(
     let h_values: &[f64] = if allowed_h_milli.is_empty() {
         &DEFAULT_H
     } else {
-        h_owned = allowed_h_milli.iter().map(|&v| f64::from(v) / 1000.0).collect();
+        h_owned = allowed_h_milli
+            .iter()
+            .map(|&v| f64::from(v) / 1000.0)
+            .collect();
         &h_owned
     };
 
@@ -211,8 +213,16 @@ mod tests {
                 .map(|v| v.as_i64().unwrap() as i32)
                 .collect();
             let got = adapt_params(target, min_sol, n, m, &h, &CPU_SA);
-            assert_eq!(got.num_reads, c["num_reads"].as_u64().unwrap() as u32, "reads {c}");
-            assert_eq!(got.num_sweeps, c["num_sweeps"].as_u64().unwrap() as u32, "sweeps {c}");
+            assert_eq!(
+                got.num_reads,
+                c["num_reads"].as_u64().unwrap() as u32,
+                "reads {c}"
+            );
+            assert_eq!(
+                got.num_sweeps,
+                c["num_sweeps"].as_u64().unwrap() as u32,
+                "sweeps {c}"
+            );
         }
     }
 

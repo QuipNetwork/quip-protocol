@@ -5,11 +5,48 @@ wall-second and is spent by :meth:`QPUTimeManager.record_access_time`. Mining
 uses start/continue hysteresis: idle until the pool reaches
 ``min_block_budget``, then burst until the pool drains to 0.
 """
+
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
+
+from quip_miner_dwave.config import warn_unknown_fields
+
+# Config keys the dwave backend recognizes in Configure.backend_toml. Anything
+# else (outside SESSION_KEYS) is a typo and gets warned about, uniform with the
+# Rust backends' unknown-field handling. Connection credentials (token/solver/
+# region) are NOT here: they come from D-Wave's own config (dwave.conf + env),
+# not the coordinator.
+DWAVE_CONFIG_KEYS = frozenset(
+    {
+        "daily_budget",
+        "daily_budget_seconds",
+        "min_block_budget",
+        "min_block_budget_seconds",
+        "budget_cap",
+        "budget_cap_seconds",
+        "anneal_time_us",
+        "num_reads",
+    }
+)
+
+
+def warn_unknown_backend_keys(toml_text: str) -> None:
+    """Parse ``Configure.backend_toml`` and warn on keys outside the dwave
+    schema, matching the Rust backends' unknown-field warnings."""
+    if not toml_text or not toml_text.strip():
+        return
+    try:
+        try:
+            import tomllib
+        except ImportError:  # pragma: no cover - py3.10
+            import tomli as tomllib  # type: ignore
+        data = tomllib.loads(toml_text)
+    except Exception:
+        return
+    warn_unknown_fields("dwave", data.keys(), DWAVE_CONFIG_KEYS)
 
 
 def parse_duration(duration_str: str) -> float:

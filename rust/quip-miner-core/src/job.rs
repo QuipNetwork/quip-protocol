@@ -3,9 +3,9 @@
 
 use crate::adapt::adapt_params;
 use crate::ising::{IsingGraph, SampleParams};
-use crate::{StreamJob, StreamResult};
 use crate::session::BackendIdentity;
 use crate::Sampler;
+use crate::{StreamJob, StreamResult};
 use quip_proto::v1::{
     ising_problem, miner_msg, IsingProblem, Job, JobKind, JobRequest, MinerMsg, Reject,
     RejectReason, Result as JobResult, SamplerMeta, Solution, Status, Topology,

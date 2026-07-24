@@ -1,9 +1,7 @@
 //! Convert mempool `JobOrder`s to wire `Job`s with inline `EdgeList`.
 
 use crate::chain::mempool::JobOrder;
-use quip_proto::v1::{
-    ising_problem, EdgeList, IsingProblem, Job, JobKind, Provenance,
-};
+use quip_proto::v1::{ising_problem, EdgeList, IsingProblem, Job, JobKind, Provenance};
 use quip_protocol::wire::encode_i32_le;
 
 /// Convert a mempool order into an `ISING_SAMPLE` job with inline edges.
