@@ -79,6 +79,10 @@ struct DriveArgs {
     /// Useful for the dwave/QPU path, which does not adapt yet.
     #[arg(long)]
     num_reads: Option<u32>,
+    /// Pin num_sweeps via the SetTarget override (bypasses adapt). Pairs with
+    /// `--num-reads` for controlled, matched-condition throughput/parity runs.
+    #[arg(long)]
+    num_sweeps: Option<u32>,
     /// Per-job deadline, milliseconds from now.
     #[arg(long, default_value_t = 3_600_000)]
     deadline_ms: u64,
@@ -190,7 +194,7 @@ fn set_target_from_spec(
         min_solutions: args.min_solutions.unwrap_or(spec.min_solutions),
         min_diversity_milli: spec.min_diversity_milli,
         num_reads: args.num_reads.unwrap_or(0),
-        num_sweeps: 0,
+        num_sweeps: args.num_sweeps.unwrap_or(0),
         anneal_time_us: 0,
     }
 }
@@ -369,6 +373,7 @@ mod tests {
             target_energy: None,
             min_solutions: None,
             num_reads: None,
+            num_sweeps: None,
             deadline_ms: 1000,
             report: None,
             utilization: None,
