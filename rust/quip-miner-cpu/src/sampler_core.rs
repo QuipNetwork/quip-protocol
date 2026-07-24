@@ -20,37 +20,76 @@ use quip_protocol::scoring::energy_milli;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
-/// Per-variable neighbor lists for O(degree) local fields.
+/// Per-variable neighbor lists in CSR layout for O(degree) local fields.
+///
+/// A flat CSR (`nbr_start` offsets into contiguous `nbr_node`/`nbr_coup`)
+/// keeps each variable's neighbors cache-local in the annealing hot loop,
+/// unlike a `Vec<Vec<_>>` whose rows are scattered heap allocations.
 ///
 /// Built from the base [`IsingGraph`] with the same defensive posture as
 /// `energy_milli`: edges out of range for `h.len()` are skipped, and couplings
 /// shorter than the edge list are treated as 0.
 struct CpuGraph {
     h: Vec<f64>,
-    /// `neighbors[var]` = `(neighbor, coupling)` pairs.
-    neighbors: Vec<Vec<(usize, f64)>>,
+    /// CSR row offsets, length `n + 1`.
+    nbr_start: Vec<u32>,
+    /// Flattened neighbor node ids.
+    nbr_node: Vec<u32>,
+    /// Flattened couplings, parallel to `nbr_node`.
+    nbr_coup: Vec<f64>,
 }
 
 impl CpuGraph {
     fn from_base(g: &IsingGraph) -> Self {
         let n = g.h.len();
-        let mut neighbors = vec![Vec::new(); n];
+        let mut deg = vec![0u32; n];
+        for &(u, v) in &g.edges {
+            if u >= n || v >= n {
+                continue;
+            }
+            deg[u] += 1;
+            deg[v] += 1;
+        }
+        let mut nbr_start = vec![0u32; n + 1];
+        for i in 0..n {
+            nbr_start[i + 1] = nbr_start[i] + deg[i];
+        }
+        let total = nbr_start[n] as usize;
+        let mut nbr_node = vec![0u32; total];
+        let mut nbr_coup = vec![0.0f64; total];
+        let mut cursor: Vec<u32> = nbr_start[..n].to_vec();
         for (k, &(u, v)) in g.edges.iter().enumerate() {
             if u >= n || v >= n {
                 continue;
             }
             let coup = g.j.get(k).copied().unwrap_or(0.0);
-            neighbors[u].push((v, coup));
-            neighbors[v].push((u, coup));
+            let pu = cursor[u] as usize;
+            nbr_node[pu] = v as u32;
+            nbr_coup[pu] = coup;
+            cursor[u] += 1;
+            let pv = cursor[v] as usize;
+            nbr_node[pv] = u as u32;
+            nbr_coup[pv] = coup;
+            cursor[v] += 1;
         }
         Self {
             h: g.h.clone(),
-            neighbors,
+            nbr_start,
+            nbr_node,
+            nbr_coup,
         }
     }
 
     fn num_nodes(&self) -> usize {
         self.h.len()
+    }
+
+    /// `(neighbor_ids, couplings)` slices for `var`.
+    #[inline]
+    fn neighbors(&self, var: usize) -> (&[u32], &[f64]) {
+        let s = self.nbr_start[var] as usize;
+        let e = self.nbr_start[var + 1] as usize;
+        (&self.nbr_node[s..e], &self.nbr_coup[s..e])
     }
 }
 
@@ -72,19 +111,25 @@ fn spin_sign(s: i8) -> f64 {
     }
 }
 
-/// Local field `h_i + Σ_j J_ij s_j`.
+/// Local field `h_i + Σ_j J_ij s_j` (full recompute; used once to seed the
+/// incremental `heff` cache).
 fn effective_field(var: usize, spins: &[i8], graph: &CpuGraph) -> f64 {
-    let mut heff = graph.h.get(var).copied().unwrap_or(0.0);
-    for &(nbr, jij) in &graph.neighbors[var] {
-        heff += jij * spin_sign(spins[nbr]);
+    let mut heff = graph.h[var];
+    let (nodes, coups) = graph.neighbors(var);
+    for i in 0..nodes.len() {
+        heff += coups[i] * spin_sign(spins[nodes[i] as usize]);
     }
     heff
 }
 
-/// ΔE for flipping spin `var` (positive-sign Ising convention).
-fn flip_energy(var: usize, spins: &[i8], graph: &CpuGraph) -> f64 {
-    let s = spin_sign(spins[var]);
-    -2.0 * s * effective_field(var, spins, graph)
+/// Propagate a spin change at `var` (sign delta `ds`) into its neighbors' cached
+/// effective fields. `var`'s own field is unaffected (it excludes its own spin).
+#[inline]
+fn apply_field_delta(graph: &CpuGraph, heff: &mut [f64], var: usize, ds: f64) {
+    let (nodes, coups) = graph.neighbors(var);
+    for i in 0..nodes.len() {
+        heff[nodes[i] as usize] += coups[i] * ds;
+    }
 }
 
 fn random_spins(n: usize, rng: &mut SmallRng) -> Vec<i8> {
@@ -126,19 +171,40 @@ fn anneal_one_read(
         return spins;
     }
 
-    for &beta in beta_schedule {
-        for _ in 0..sweeps_per_beta {
-            for var in 0..n {
-                match algorithm {
-                    Algorithm::Sa => {
-                        let delta = flip_energy(var, &spins, graph);
+    // Incremental effective-field cache: `heff[var]` stays equal to
+    // `effective_field(var, spins)` across the whole anneal. Seeded once
+    // (O(edges)); each accepted flip updates only its neighbors (O(degree)),
+    // so a sweep costs O(n + accepts·degree) instead of O(n·degree) every
+    // time. ΔE and the Gibbs conditional both read the cache in O(1). The
+    // accept/reject RNG stream is unchanged (ΔE is identical), so results are
+    // bit-for-bit the same as the recompute-every-flip version.
+    let mut heff: Vec<f64> = (0..n).map(|v| effective_field(v, &spins, graph)).collect();
+
+    match algorithm {
+        Algorithm::Sa => {
+            for &beta in beta_schedule {
+                for _ in 0..sweeps_per_beta {
+                    for var in 0..n {
+                        let s = spin_sign(spins[var]);
+                        let delta = -2.0 * s * heff[var];
                         if metropolis_accept(delta, beta, rng) {
                             spins[var] = -spins[var];
+                            apply_field_delta(graph, &mut heff, var, -2.0 * s);
                         }
                     }
-                    Algorithm::Gibbs => {
-                        let heff = effective_field(var, &spins, graph);
-                        spins[var] = gibbs_sample_spin(heff, beta, rng);
+                }
+            }
+        }
+        Algorithm::Gibbs => {
+            for &beta in beta_schedule {
+                for _ in 0..sweeps_per_beta {
+                    for var in 0..n {
+                        let new = gibbs_sample_spin(heff[var], beta, rng);
+                        if new != spins[var] {
+                            let ds = spin_sign(new) - spin_sign(spins[var]);
+                            spins[var] = new;
+                            apply_field_delta(graph, &mut heff, var, ds);
+                        }
                     }
                 }
             }
