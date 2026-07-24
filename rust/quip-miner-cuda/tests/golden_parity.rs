@@ -1,9 +1,10 @@
-//! Consensus: GPU energy kernel + host energy_milli match golden vectors.
+//! Consensus parity: host `energy_milli` matches golden vectors, and live GPU
+//! samples score bit-exactly to consensus `energy_milli`.
 //!
-//! Requires a CUDA device. Run with `cargo test -p quip-miner-cuda`.
+//! Sampling tests require a CUDA device. Run with `cargo test -p quip-miner-cuda`.
 
 use quip_miner_cuda::cuda_device::CudaDevice;
-use quip_miner_cuda::sampler::{gpu_energy_milli, sample_ising};
+use quip_miner_cuda::sampler::sample_ising;
 use quip_miner_cuda::{Algorithm, IsingGraph, SampleParams};
 use quip_protocol::scoring::energy_milli;
 use quip_protocol::wire::{decode_spins, encode_spins};
@@ -32,15 +33,11 @@ fn device() -> &'static CudaDevice {
     })
 }
 
-/// Golden Ising cases: run the energy kernel on the GPU and compare bit-exact.
+/// Golden Ising cases: host consensus scorer matches the golden energy, and a
+/// wire round-trip preserves it. No GPU needed (the sampler always scores
+/// host-side with `energy_milli` for consensus).
 #[test]
-#[serial]
-fn gpu_energy_kernel_matches_golden_vectors() {
-    if !cuda_available() {
-        eprintln!("SKIP gpu_energy_kernel_matches_golden_vectors: no usable CUDA device");
-        return;
-    }
-    let dev = device();
+fn host_energy_matches_golden_vectors() {
     for case in golden()["energy"].as_array().unwrap() {
         let spins: Vec<i8> = case["spins"]
             .as_array()
@@ -73,29 +70,16 @@ fn gpu_energy_kernel_matches_golden_vectors() {
             .collect();
 
         let expected = case["energy_milli"].as_i64().unwrap();
-
-        // Host consensus scorer.
         assert_eq!(
             energy_milli(&spins, &h, &j, &edges),
             expected,
             "host energy_milli mismatch"
         );
 
-        // GPU energy kernel on the golden spins / problem.
-        let gpu_e = gpu_energy_milli(dev, &spins, &h, &j, &edges).expect("gpu energy");
-        assert_eq!(
-            gpu_e, expected,
-            "GPU energy kernel must match golden energy_milli bit-exactly"
-        );
-
         // Wire round-trip must preserve scoring.
         let bytes = encode_spins(&spins);
         let decoded = decode_spins(&bytes).unwrap();
         assert_eq!(energy_milli(&decoded, &h, &j, &edges), expected);
-        assert_eq!(
-            gpu_energy_milli(dev, &decoded, &h, &j, &edges).unwrap(),
-            expected
-        );
     }
 }
 
@@ -145,31 +129,8 @@ fn live_sample_energies_match_energy_milli() {
             assert!(r.spins.iter().all(|&s| s == 1 || s == -1));
             let bytes = encode_spins(&r.spins);
             assert_eq!(decode_spins(&bytes).unwrap(), r.spins);
-
-            // GPU energy kernel agrees with host for each sample.
-            let gpu_e = gpu_energy_milli(dev, &r.spins, &graph.h, &graph.j, &graph.edges).unwrap();
-            assert_eq!(gpu_e, expected, "GPU energy vs host for {algo:?}");
         }
     }
-}
-
-/// Positive-sign convention pin via GPU energy kernel.
-#[test]
-#[serial]
-fn positive_sign_convention_on_gpu() {
-    if !cuda_available() {
-        eprintln!("SKIP positive_sign_convention_on_gpu: no usable CUDA device");
-        return;
-    }
-    let dev = device();
-    // spins [+1,-1]; h=[1.0, -0.5]; edge (0,1) J=2.0
-    // E = 1 + 0.5 - 2.0 = -0.5 → -500 milli
-    let spins = vec![1i8, -1i8];
-    let h = vec![1.0, -0.5];
-    let j = vec![2.0];
-    let edges = vec![(0usize, 1usize)];
-    assert_eq!(energy_milli(&spins, &h, &j, &edges), -500);
-    assert_eq!(gpu_energy_milli(dev, &spins, &h, &j, &edges).unwrap(), -500);
 }
 
 /// SA finds ferro ground state (sanity that the kernel actually anneals).
