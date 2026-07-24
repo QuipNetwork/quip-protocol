@@ -296,13 +296,11 @@ async fn dispatch_jobs(
 /// never a data copy.
 async fn handle_result(
     state: &Arc<Mutex<CoordinatorState>>,
-    miner_id: &str,
     result: JobResult,
     run: &Arc<RunState>,
 ) {
     let (job, topo, gates) = {
         let mut st = state.lock().await;
-        st.router.ack(miner_id);
         let job = st.inflight.remove(&result.job_id);
         let topo = Arc::clone(&st.resolved_topo);
         let gates = crate::validate::gates_from_target(st.target.as_ref());
@@ -343,15 +341,9 @@ async fn handle_result(
 
 /// Record a `Reject` as a failing row (see module docs for the no-reroute
 /// deviation) and ack the router so its credit bookkeeping stays consistent.
-async fn handle_reject(
-    state: &Arc<Mutex<CoordinatorState>>,
-    miner_id: &str,
-    rej: Reject,
-    run: &Arc<RunState>,
-) {
+async fn handle_reject(state: &Arc<Mutex<CoordinatorState>>, rej: Reject, run: &Arc<RunState>) {
     let is_pow = {
         let mut st = state.lock().await;
-        st.router.ack(miner_id);
         st.inflight
             .remove(&rej.job_id)
             .map(|j| job_is_pow(&j))
@@ -400,9 +392,8 @@ async fn handle_message(
             let state = Arc::clone(state);
             let run = Arc::clone(run);
             let tx = tx.clone();
-            let miner_id = miner_id.to_string();
             drop(tokio::spawn(async move {
-                handle_result(&state, &miner_id, result, &run).await;
+                handle_result(&state, result, &run).await;
                 if run.is_complete() {
                     let _ = tx.send(Ok(shutdown_msg())).await;
                 }
@@ -410,7 +401,7 @@ async fn handle_message(
             true
         }
         Some(miner_msg::Msg::Reject(rej)) => {
-            handle_reject(state, miner_id, rej, run).await;
+            handle_reject(state, rej, run).await;
             true
         }
         Some(miner_msg::Msg::Fatal(_)) => {

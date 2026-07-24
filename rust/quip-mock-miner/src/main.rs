@@ -162,6 +162,18 @@ fn reject(job_id: Vec<u8>, reason: RejectReason) -> MinerMsg {
     }))
 }
 
+/// A reject plus a `JobRequest` for one replacement credit. A reject is
+/// terminal for the job just like a completion, so it must refund a credit to
+/// the coordinator's consume-on-dispatch pool — otherwise every reject leaks a
+/// slot and the pipeline starves. Mirrors the `Result` + `JobRequest` pair on
+/// the success path.
+fn reject_and_replace(job_id: Vec<u8>, reason: RejectReason) -> Vec<MinerMsg> {
+    vec![
+        reject(job_id, reason),
+        miner(miner_msg::Msg::JobRequest(JobRequest { credits: 1 })),
+    ]
+}
+
 /// Validate a job and produce the reply(s): a `Reject` on bad input, otherwise a
 /// `Result` (all-+1 spins) followed by a `JobRequest` for one more credit.
 fn handle_job(job: Job, topo: Option<&SessionTopo>) -> Vec<MinerMsg> {
@@ -169,7 +181,7 @@ fn handle_job(job: Job, topo: Option<&SessionTopo>) -> Vec<MinerMsg> {
 
     // UNSUPPORTED_KIND: only ISING_SAMPLE is implemented by this reference miner.
     if job.kind != JobKind::IsingSample as i32 {
-        return vec![reject(job_id, RejectReason::UnsupportedKind)];
+        return reject_and_replace(job_id, RejectReason::UnsupportedKind);
     }
 
     let ising = job.ising.unwrap_or_default();
@@ -177,24 +189,24 @@ fn handle_job(job: Job, topo: Option<&SessionTopo>) -> Vec<MinerMsg> {
     // MALFORMED: h field is not a valid i32-LE array (length not a multiple of 4).
     let h = match decode_milli_f64(&ising.h_milli_le32) {
         Ok(h) => h,
-        Err(_) => return vec![reject(job_id, RejectReason::Malformed)],
+        Err(_) => return reject_and_replace(job_id, RejectReason::Malformed),
     };
 
     // MALFORMED: j field must also be a valid i32-LE array (mirror h handling).
     let j = match decode_milli_f64(&ising.j_milli_le32) {
         Ok(j) => j,
-        Err(_) => return vec![reject(job_id, RejectReason::Malformed)],
+        Err(_) => return reject_and_replace(job_id, RejectReason::Malformed),
     };
 
     // EXPIRED: the deadline has already passed.
     // deadline_ms == 0 means "no deadline" (only mempool/chain jobs carry one).
     if job.deadline_ms != 0 && job.deadline_ms < now_unix_ms() {
-        return vec![reject(job_id, RejectReason::Expired)];
+        return reject_and_replace(job_id, RejectReason::Expired);
     }
 
     let edges = match resolve_edges(&ising, topo) {
         Ok(e) => e,
-        Err(reason) => return vec![reject(job_id, reason)],
+        Err(reason) => return reject_and_replace(job_id, reason),
     };
     let n = h.len();
 
@@ -202,7 +214,7 @@ fn handle_job(job: Job, topo: Option<&SessionTopo>) -> Vec<MinerMsg> {
     // quip-miner-core::parse_ising, which rejects out-of-bounds inline edges
     // instead of silently skipping them during scoring).
     if edges.iter().any(|&(u, v)| u >= n || v >= n) {
-        return vec![reject(job_id, RejectReason::Malformed)];
+        return reject_and_replace(job_id, RejectReason::Malformed);
     }
 
     let spins = vec![1i8; n];

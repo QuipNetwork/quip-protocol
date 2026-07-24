@@ -17,10 +17,14 @@ pub struct MinerCaps {
 struct MinerQueue {
     caps: MinerCaps,
     staged: VecDeque<Job>,
-    /// Credits granted by the miner via `JobRequest` (cumulative capacity).
+    /// Consumable credit pool: each `JobRequest` adds credits, each dispatch
+    /// spends one. The miner grants `width` up front and one per terminal
+    /// event (Result or Reject), so dispatch stays 1:1 with completion and
+    /// in-flight is bounded — never a cumulative ceiling that ack also frees
+    /// (that double-count let in-flight grow without bound and deadlocked the
+    /// miner's channels). In-flight itself is tracked by the coordinator's
+    /// `inflight` map, so the router needs no separate outstanding counter.
     granted_credits: u32,
-    /// Jobs dispatched and not yet acked by Result/Reject.
-    outstanding: u32,
     unsupported_kinds: HashSet<i32>,
 }
 
@@ -45,7 +49,6 @@ impl Router {
                 caps,
                 staged: VecDeque::new(),
                 granted_credits: 0,
-                outstanding: 0,
                 unsupported_kinds: HashSet::new(),
             },
         );
@@ -83,27 +86,20 @@ impl Router {
         }
     }
 
-    /// Pop the next staged job if credits allow (`outstanding < granted`).
+    /// Pop the next staged job, spending one credit. Returns `None` when the
+    /// miner has no credits left or nothing is staged.
     pub fn next_job(&mut self, miner_id: &str) -> Option<Job> {
         let q = self.miners.get_mut(miner_id)?;
-        if q.outstanding >= q.granted_credits {
+        if q.granted_credits == 0 {
             return None;
         }
         let job = q.staged.pop_front()?;
-        q.outstanding += 1;
+        q.granted_credits -= 1;
         Some(job)
-    }
-
-    /// Decrement outstanding on Result/Reject.
-    pub fn ack(&mut self, miner_id: &str) {
-        if let Some(q) = self.miners.get_mut(miner_id) {
-            q.outstanding = q.outstanding.saturating_sub(1);
-        }
     }
 
     /// Handle a miner reject: mark unsupported kinds, re-route when possible.
     pub fn on_reject(&mut self, miner_id: &str, job: Job, reason: i32) {
-        self.ack(miner_id);
         if reason == RejectReason::UnsupportedKind as i32 {
             if let Some(q) = self.miners.get_mut(miner_id) {
                 q.unsupported_kinds.insert(job.kind);
@@ -125,7 +121,6 @@ impl Router {
     /// Return all outstanding + staged jobs for a miner (e.g. on crash re-queue).
     pub fn reclaim(&mut self, miner_id: &str) -> Vec<Job> {
         if let Some(q) = self.miners.get_mut(miner_id) {
-            q.outstanding = 0;
             q.granted_credits = 0;
             return q.staged.drain(..).collect();
         }
@@ -226,19 +221,18 @@ mod tests {
     }
 
     #[test]
-    fn next_job_respects_credits() {
+    fn next_job_consumes_credits() {
         let mut r = Router::new();
         r.register_miner("cpu-0", caps_ising());
         r.route(make_job(1, JobKind::IsingSample));
         r.route(make_job(2, JobKind::IsingSample));
         assert!(r.next_job("cpu-0").is_none()); // no credits
         r.grant_credits("cpu-0", 1);
-        assert!(r.next_job("cpu-0").is_some());
-        assert!(r.next_job("cpu-0").is_none()); // outstanding == granted
-        r.ack("cpu-0");
-        // still only 1 credit total, already used once → still None until re-grant
-        // Actually: outstanding=0, granted=1, staged has 1 → should yield
-        assert!(r.next_job("cpu-0").is_some());
+        assert!(r.next_job("cpu-0").is_some()); // spends the one credit
+        assert!(r.next_job("cpu-0").is_none()); // pool empty — a completion is
+                                                // what refills it, not dispatch
+        r.grant_credits("cpu-0", 1); // miner grants one per terminal event
+        assert!(r.next_job("cpu-0").is_some()); // dispatches the replacement
     }
 
     #[test]
