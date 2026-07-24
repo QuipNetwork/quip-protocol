@@ -13,7 +13,6 @@ use quip_proto::v1::{Configure, Job};
 use quip_protocol::session::ExitCode;
 use std::path::PathBuf;
 use std::process::ExitCode as StdExitCode;
-use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -80,8 +79,13 @@ struct DriveArgs {
     /// Useful for the dwave/QPU path, which does not adapt yet.
     #[arg(long)]
     num_reads: Option<u32>,
-    /// Per-job deadline, milliseconds from now.
-    #[arg(long, default_value_t = 3_600_000)]
+    /// Pin num_sweeps via the SetTarget override (bypasses adapt). Pairs with
+    /// `--num-reads` for controlled, matched-condition throughput/parity runs.
+    #[arg(long)]
+    num_sweeps: Option<u32>,
+    /// Per-job deadline, milliseconds from now. 0 = no deadline (the default);
+    /// a deadline is only meaningful for real mempool/chain jobs.
+    #[arg(long, default_value_t = 0)]
     deadline_ms: u64,
     /// Optional path to write a per-job + aggregate JSONL report.
     #[arg(long)]
@@ -191,7 +195,7 @@ fn set_target_from_spec(
         min_solutions: args.min_solutions.unwrap_or(spec.min_solutions),
         min_diversity_milli: spec.min_diversity_milli,
         num_reads: args.num_reads.unwrap_or(0),
-        num_sweeps: 0,
+        num_sweeps: args.num_sweeps.unwrap_or(0),
         anneal_time_us: 0,
     }
 }
@@ -289,7 +293,13 @@ fn run_drive_cli(args: DriveArgs) -> StdExitCode {
 }
 
 async fn drive_main(args: DriveArgs) -> StdExitCode {
-    let deadline_ms = now_unix_ms() + args.deadline_ms;
+    // 0 => no deadline (the sentinel the miner honors); otherwise an absolute
+    // wall-clock deadline `now + args.deadline_ms`.
+    let deadline_ms = if args.deadline_ms == 0 {
+        0
+    } else {
+        now_unix_ms() + args.deadline_ms
+    };
     let (jobs, topology, target) = match build_jobs(&args, deadline_ms) {
         Ok(v) => v,
         Err(msg) => {
@@ -311,8 +321,6 @@ async fn drive_main(args: DriveArgs) -> StdExitCode {
     };
     let sock = format!("/tmp/quip-coordinator-drive-{}.sock", std::process::id());
     let token = gen_session_token();
-    let overall_timeout = Duration::from_secs(30 + jobs.len() as u64 * 5);
-
     let report = run_drive(DriveManyParams {
         miner_bin: &entry.binary,
         sock_path: &sock,
@@ -322,7 +330,6 @@ async fn drive_main(args: DriveArgs) -> StdExitCode {
         topology,
         target,
         jobs,
-        overall_timeout,
         utilization: args.utilization,
         yielding: args.yielding,
     })
@@ -336,7 +343,7 @@ async fn drive_main(args: DriveArgs) -> StdExitCode {
         return StdExitCode::from(ExitCode::InternalFatal as u8);
     }
 
-    let agg = aggregate(&report.rows);
+    let agg = aggregate(&report.rows, report.run_wall_ms);
     print_table(&report.rows, &agg);
     if let Some(path) = &args.report {
         if let Err(e) = write_jsonl(path, &report.rows, &agg) {
@@ -373,6 +380,7 @@ mod tests {
             target_energy: None,
             min_solutions: None,
             num_reads: None,
+            num_sweeps: None,
             deadline_ms: 1000,
             report: None,
             utilization: None,

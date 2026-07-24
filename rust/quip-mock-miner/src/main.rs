@@ -187,7 +187,8 @@ fn handle_job(job: Job, topo: Option<&SessionTopo>) -> Vec<MinerMsg> {
     };
 
     // EXPIRED: the deadline has already passed.
-    if job.deadline_ms < now_unix_ms() {
+    // deadline_ms == 0 means "no deadline" (only mempool/chain jobs carry one).
+    if job.deadline_ms != 0 && job.deadline_ms < now_unix_ms() {
         return vec![reject(job_id, RejectReason::Expired)];
     }
 

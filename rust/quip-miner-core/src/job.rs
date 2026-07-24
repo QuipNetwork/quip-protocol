@@ -244,7 +244,8 @@ pub(crate) fn prepare_job<S: Sampler>(
     if job.kind != JobKind::IsingSample as i32 {
         return Prepared::Reject(reject(job_id, RejectReason::UnsupportedKind));
     }
-    if job.deadline_ms < now_unix_ms() {
+    // deadline_ms == 0 means "no deadline" (only mempool/chain jobs carry one).
+    if job.deadline_ms != 0 && job.deadline_ms < now_unix_ms() {
         return Prepared::Reject(reject(job_id, RejectReason::Expired));
     }
     let ising = match job.ising {
