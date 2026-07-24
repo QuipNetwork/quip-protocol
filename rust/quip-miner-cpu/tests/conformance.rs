@@ -48,24 +48,24 @@ async fn quip_cpu_sa_passes_conformance() {
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
     assert!(report.handshake_ok, "SA handshake failed");
     assert_eq!(
-        report.result_job_ids.len(),
+        report.result_job_ids().len(),
         3,
         "expected 3 job results (job-1, job-2, job-hash)"
     );
     assert!(
-        report.result_job_ids.iter().any(|id| id == b"job-1"),
+        report.result_job_ids().iter().any(|id| id == b"job-1"),
         "missing result for job-1: {:?}",
-        report.result_job_ids
+        report.result_job_ids()
     );
     assert!(
-        report.result_job_ids.iter().any(|id| id == b"job-2"),
+        report.result_job_ids().iter().any(|id| id == b"job-2"),
         "missing result for job-2: {:?}",
-        report.result_job_ids
+        report.result_job_ids()
     );
     assert!(
-        report.result_job_ids.iter().any(|id| id == b"job-hash"),
+        report.result_job_ids().iter().any(|id| id == b"job-hash"),
         "missing result for topology-hash job-hash: {:?}",
-        report.result_job_ids
+        report.result_job_ids()
     );
     assert!(
         report.has_reject(b"job-bad-h", RejectReason::Malformed),
@@ -100,13 +100,13 @@ async fn quip_cpu_gibbs_passes_conformance() {
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
     assert!(report.handshake_ok, "Gibbs handshake failed");
     assert_eq!(
-        report.result_job_ids.len(),
+        report.result_job_ids().len(),
         3,
         "expected 3 job results (job-1, job-2, job-hash)"
     );
-    assert!(report.result_job_ids.iter().any(|id| id == b"job-1"));
-    assert!(report.result_job_ids.iter().any(|id| id == b"job-2"));
-    assert!(report.result_job_ids.iter().any(|id| id == b"job-hash"));
+    assert!(report.result_job_ids().iter().any(|id| id == b"job-1"));
+    assert!(report.result_job_ids().iter().any(|id| id == b"job-2"));
+    assert!(report.result_job_ids().iter().any(|id| id == b"job-hash"));
     assert!(report.has_reject(b"job-bad-h", RejectReason::Malformed));
     assert!(report.has_reject(b"job-gate", RejectReason::UnsupportedKind));
     assert!(report.has_reject(b"job-old", RejectReason::Expired));

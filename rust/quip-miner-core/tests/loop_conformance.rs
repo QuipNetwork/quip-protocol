@@ -46,19 +46,19 @@ async fn mock_sampler_passes_loop_conformance() {
         "miner never requested credits"
     );
     assert!(
-        report.result_job_ids.iter().any(|id| id == b"job-1"),
+        report.result_job_ids().iter().any(|id| id == b"job-1"),
         "missing result for job-1: {:?}",
-        report.result_job_ids
+        report.result_job_ids()
     );
     assert!(
-        report.result_job_ids.iter().any(|id| id == b"job-2"),
+        report.result_job_ids().iter().any(|id| id == b"job-2"),
         "missing result for job-2: {:?}",
-        report.result_job_ids
+        report.result_job_ids()
     );
     assert!(
-        report.result_job_ids.iter().any(|id| id == b"job-hash"),
+        report.result_job_ids().iter().any(|id| id == b"job-hash"),
         "missing result for topology-hash job-hash (cache/resolve regression): {:?}",
-        report.result_job_ids
+        report.result_job_ids()
     );
     assert!(
         report.has_reject(b"job-bad-h", RejectReason::Malformed),
@@ -92,9 +92,9 @@ async fn capped_sampler_rejects_too_large() {
         report.rejects
     );
     assert!(
-        report.result_job_ids.is_empty(),
+        report.result_job_ids().is_empty(),
         "capped sampler must not produce results: {:?}",
-        report.result_job_ids
+        report.result_job_ids()
     );
     assert_eq!(report.exit_code, 0, "clean shutdown expected");
 }

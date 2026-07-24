@@ -22,6 +22,16 @@ pub struct ObservedReject {
     pub reason: i32,
 }
 
+/// A `Result` observed during the scripted session: its job_id, the
+/// `energy_milli` of every returned solution (order preserved), and whether
+/// `SamplerMeta` was attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedResult {
+    pub job_id: Vec<u8>,
+    pub solution_energies_milli: Vec<i64>,
+    pub meta_present: bool,
+}
+
 /// Outcome of driving one miner through the conformance session.
 #[derive(Debug, Clone)]
 pub struct DriverReport {
@@ -30,32 +40,51 @@ pub struct DriverReport {
     pub ready_received: bool,
     /// Credits advertised on each `JobRequest` (must be non-empty for pass).
     pub job_request_credits: Vec<u32>,
-    /// `job_id` of every `Result` received (order preserved).
-    pub result_job_ids: Vec<Vec<u8>>,
+    /// Every `Result` received (order preserved).
+    pub results: Vec<ObservedResult>,
     /// Every `Reject`, bound to its `job_id` (not just the reason code).
     pub rejects: Vec<ObservedReject>,
     /// True when a `Status` arrived after `Cancel` (cancel acknowledgement).
     pub cancel_acked: bool,
+    /// `(exit_code, reason)` from a `Fatal`, if the miner sent one.
+    pub fatal: Option<(i32, String)>,
     pub exit_code: i32,
 }
 
 impl DriverReport {
+    /// Job ids of the observed results, in arrival order. Convenience over
+    /// [`results`](Self::results) for callers that only correlate job ids.
+    #[must_use]
+    pub fn result_job_ids(&self) -> Vec<Vec<u8>> {
+        self.results.iter().map(|r| r.job_id.clone()).collect()
+    }
+
     /// Full conformance verdict — every axis the harness grades.
     pub fn is_conformant(&self) -> bool {
         self.handshake_ok
             && self.ready_received
             && !self.job_request_credits.is_empty()
             && self.job_request_credits.iter().all(|&c| c > 0)
-            && self.result_job_ids.len() == 3
-            && self.result_job_ids.iter().any(|id| id == b"job-1")
-            && self.result_job_ids.iter().any(|id| id == b"job-2")
-            && self.result_job_ids.iter().any(|id| id == b"job-hash")
+            && self.results_conformant()
             && self.has_reject(b"job-bad-h", RejectReason::Malformed)
             && self.has_reject(b"job-bad-j", RejectReason::Malformed)
             && self.has_reject(b"job-gate", RejectReason::UnsupportedKind)
             && self.has_reject(b"job-old", RejectReason::Expired)
             && self.cancel_acked
             && self.exit_code == 0
+    }
+
+    /// Exactly the three expected Results, each carrying at least one solution
+    /// (with its energy) and a `SamplerMeta`.
+    fn results_conformant(&self) -> bool {
+        self.results.len() == 3
+            && self.results.iter().any(|r| r.job_id == b"job-1")
+            && self.results.iter().any(|r| r.job_id == b"job-2")
+            && self.results.iter().any(|r| r.job_id == b"job-hash")
+            && self
+                .results
+                .iter()
+                .all(|r| !r.solution_energies_milli.is_empty() && r.meta_present)
     }
 
     pub fn has_reject(&self, job_id: &[u8], reason: RejectReason) -> bool {
@@ -71,13 +100,25 @@ struct SessionOutcome {
     handshake_ok: bool,
     ready_received: bool,
     job_request_credits: Vec<u32>,
-    result_job_ids: Vec<Vec<u8>>,
+    results: Vec<ObservedResult>,
     rejects: Vec<ObservedReject>,
     cancel_acked: bool,
+    fatal: Option<(i32, String)>,
+}
+
+/// Which scripted session `MockCoordinator` plays against a connecting miner.
+#[derive(Debug, Clone, Copy)]
+enum ScriptKind {
+    /// The full conformance walk: handshake, jobs, rejects, cancel, shutdown.
+    Full,
+    /// Send a `Welcome` with an unsupported `protocol_version` and observe how
+    /// the miner rejects it (expected: `Fatal` + exit `ConfigInvalid`).
+    BadWelcome,
 }
 
 struct MockCoordinator {
     outcome_tx: Mutex<Option<oneshot::Sender<SessionOutcome>>>,
+    script: ScriptKind,
 }
 
 #[tonic::async_trait]
@@ -91,9 +132,13 @@ impl MinerService for MockCoordinator {
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel::<Result<CoordMsg, Status>>(64);
         let outcome_tx = self.outcome_tx.lock().await.take();
+        let script = self.script;
 
         tokio::spawn(async move {
-            let outcome = run_script(&mut inbound, &tx).await;
+            let outcome = match script {
+                ScriptKind::Full => run_script(&mut inbound, &tx).await,
+                ScriptKind::BadWelcome => run_script_bad_welcome(&mut inbound, &tx).await,
+            };
             if let Some(otx) = outcome_tx {
                 let _ = otx.send(outcome);
             }
@@ -170,6 +215,46 @@ fn job_kind(job_id: &[u8], deadline_ms: u64, kind: JobKind, ising: IsingProblem)
     }
 }
 
+/// Read the first inbound message, which must be a valid `Hello`. Returns
+/// `false` (without touching `outcome.handshake_ok`) if the stream ended or
+/// the first message was something else.
+async fn read_hello(inbound: &mut Streaming<MinerMsg>, outcome: &mut SessionOutcome) -> bool {
+    match inbound.message().await {
+        Ok(Some(MinerMsg {
+            msg: Some(miner_msg::Msg::Hello(h)),
+        })) => {
+            outcome.handshake_ok = h.session_token == "test-token" && h.protocol_version == 1;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Drain the miner's replies until it closes the stream, folding each message
+/// into `outcome`.
+async fn drain_replies(inbound: &mut Streaming<MinerMsg>, outcome: &mut SessionOutcome) {
+    while let Ok(Some(MinerMsg { msg: Some(m) })) = inbound.message().await {
+        match m {
+            miner_msg::Msg::Ready(_) => outcome.ready_received = true,
+            miner_msg::Msg::JobRequest(jr) => outcome.job_request_credits.push(jr.credits),
+            miner_msg::Msg::Result(r) => outcome.results.push(ObservedResult {
+                job_id: r.job_id,
+                solution_energies_milli: r.solutions.iter().map(|s| s.energy_milli).collect(),
+                meta_present: r.meta.is_some(),
+            }),
+            miner_msg::Msg::Reject(r) => outcome.rejects.push(ObservedReject {
+                job_id: r.job_id,
+                reason: r.reason,
+            }),
+            // This script only emits Status as the Cancel acknowledgement
+            // (no Ping), so any Status counts as the cancel ack.
+            miner_msg::Msg::Status(_) => outcome.cancel_acked = true,
+            miner_msg::Msg::Fatal(f) => outcome.fatal = Some((f.exit_code as i32, f.reason)),
+            _ => {}
+        }
+    }
+}
+
 /// Drive the full scripted CoordMsg sequence and collect the miner's replies.
 async fn run_script(
     inbound: &mut Streaming<MinerMsg>,
@@ -178,13 +263,8 @@ async fn run_script(
     let mut outcome = SessionOutcome::default();
 
     // 1. First inbound message must be a valid Hello.
-    match inbound.message().await {
-        Ok(Some(MinerMsg {
-            msg: Some(miner_msg::Msg::Hello(h)),
-        })) => {
-            outcome.handshake_ok = h.session_token == "test-token" && h.protocol_version == 1;
-        }
-        _ => return outcome,
+    if !read_hello(inbound, &mut outcome).await {
+        return outcome;
     }
 
     // 2. Handshake response + topology.
@@ -303,31 +383,44 @@ async fn run_script(
         .await;
 
     // Drain the miner's replies until it closes the stream.
-    while let Ok(Some(MinerMsg { msg: Some(m) })) = inbound.message().await {
-        match m {
-            miner_msg::Msg::Ready(_) => outcome.ready_received = true,
-            miner_msg::Msg::JobRequest(jr) => outcome.job_request_credits.push(jr.credits),
-            miner_msg::Msg::Result(r) => outcome.result_job_ids.push(r.job_id),
-            miner_msg::Msg::Reject(r) => outcome.rejects.push(ObservedReject {
-                job_id: r.job_id,
-                reason: r.reason,
-            }),
-            // This script only emits Status as the Cancel acknowledgement
-            // (no Ping), so any Status counts as the cancel ack.
-            miner_msg::Msg::Status(_) => outcome.cancel_acked = true,
-            _ => {}
-        }
-    }
+    drain_replies(inbound, &mut outcome).await;
 
     outcome
 }
 
+/// Handshake, then send a `Welcome` advertising an unsupported protocol
+/// version. A conformant miner rejects this cleanly: it emits `Fatal` and
+/// disconnects instead of proceeding to `Configure`.
+async fn run_script_bad_welcome(
+    inbound: &mut Streaming<MinerMsg>,
+    tx: &mpsc::Sender<Result<CoordMsg, Status>>,
+) -> SessionOutcome {
+    let mut outcome = SessionOutcome::default();
+
+    if !read_hello(inbound, &mut outcome).await {
+        return outcome;
+    }
+
+    if tx
+        .send(Ok(coord(coord_msg::Msg::Welcome(Welcome {
+            protocol_version: 2,
+        }))))
+        .await
+        .is_err()
+    {
+        return outcome;
+    }
+
+    drain_replies(inbound, &mut outcome).await;
+    outcome
+}
+
 /// Bind a UDS mock coordinator, spawn `bin_path` as a miner client against it,
-/// run the scripted conformance session, and report what was observed.
+/// run the given scripted session, and report what was observed.
 ///
 /// `socket` is a `unix://<path>` URI; the same value is passed to the miner via
 /// `--quip-coordinator`.
-pub async fn drive_miner(bin_path: &str, socket: &str) -> DriverReport {
+async fn drive_miner_with_script(bin_path: &str, socket: &str, script: ScriptKind) -> DriverReport {
     let path = socket.strip_prefix("unix://").unwrap_or(socket).to_string();
     let _ = std::fs::remove_file(&path);
     let uds = UnixListener::bind(&path).expect("bind unix socket");
@@ -336,6 +429,7 @@ pub async fn drive_miner(bin_path: &str, socket: &str) -> DriverReport {
     let (otx, orx) = oneshot::channel::<SessionOutcome>();
     let svc = MockCoordinator {
         outcome_tx: Mutex::new(Some(otx)),
+        script,
     };
     let server = tokio::spawn(async move {
         Server::builder()
@@ -378,11 +472,24 @@ pub async fn drive_miner(bin_path: &str, socket: &str) -> DriverReport {
         handshake_ok: outcome.handshake_ok,
         ready_received: outcome.ready_received,
         job_request_credits: outcome.job_request_credits,
-        result_job_ids: outcome.result_job_ids,
+        results: outcome.results,
         rejects: outcome.rejects,
         cancel_acked: outcome.cancel_acked,
+        fatal: outcome.fatal,
         exit_code,
     }
+}
+
+/// Run the full conformance walk against `bin_path`.
+pub async fn drive_miner(bin_path: &str, socket: &str) -> DriverReport {
+    drive_miner_with_script(bin_path, socket, ScriptKind::Full).await
+}
+
+/// Send a `Welcome` with an unsupported `protocol_version` and observe how
+/// `bin_path` rejects it. A conformant miner exits `ConfigInvalid` (64) and
+/// sends a `Fatal` before disconnecting.
+pub async fn drive_miner_bad_welcome(bin_path: &str, socket: &str) -> DriverReport {
+    drive_miner_with_script(bin_path, socket, ScriptKind::BadWelcome).await
 }
 
 #[cfg(test)]
@@ -394,9 +501,10 @@ mod tests {
             handshake_ok: true,
             ready_received: false,
             job_request_credits: vec![],
-            result_job_ids: vec![],
+            results: vec![],
             rejects: vec![],
             cancel_acked: false,
+            fatal: None,
             exit_code: 0,
         }
     }
@@ -423,5 +531,64 @@ mod tests {
         assert!(r.has_reject(b"job-bad-h", RejectReason::Malformed));
         assert!(!r.has_reject(b"job-old", RejectReason::Malformed));
         assert!(!r.has_reject(b"job-bad-h", RejectReason::Expired));
+    }
+
+    fn full_results() -> Vec<ObservedResult> {
+        vec![
+            ObservedResult {
+                job_id: b"job-1".to_vec(),
+                solution_energies_milli: vec![-500],
+                meta_present: true,
+            },
+            ObservedResult {
+                job_id: b"job-2".to_vec(),
+                solution_energies_milli: vec![-500],
+                meta_present: true,
+            },
+            ObservedResult {
+                job_id: b"job-hash".to_vec(),
+                solution_energies_milli: vec![-500],
+                meta_present: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn results_require_solutions_and_meta() {
+        let mut r = bare_report();
+        r.results = full_results();
+        assert!(
+            r.results_conformant(),
+            "3 results with energy+meta must pass"
+        );
+
+        // Empty solutions on one Result -> fails, even though meta is present.
+        let mut empty_solutions = full_results();
+        empty_solutions[0].solution_energies_milli.clear();
+        let mut r_empty = bare_report();
+        r_empty.results = empty_solutions;
+        assert!(
+            !r_empty.results_conformant(),
+            "empty solutions must fail conformance"
+        );
+
+        // Missing meta on one Result -> fails, even though solutions are present.
+        let mut missing_meta = full_results();
+        missing_meta[1].meta_present = false;
+        let mut r_meta = bare_report();
+        r_meta.results = missing_meta;
+        assert!(
+            !r_meta.results_conformant(),
+            "missing SamplerMeta must fail conformance"
+        );
+
+        // The documented failing example: no solutions and no meta at all.
+        let mut r_bare_result = bare_report();
+        r_bare_result.results = vec![ObservedResult {
+            job_id: b"job-1".to_vec(),
+            solution_energies_milli: vec![],
+            meta_present: false,
+        }];
+        assert!(!r_bare_result.results_conformant());
     }
 }

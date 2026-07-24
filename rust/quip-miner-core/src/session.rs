@@ -81,6 +81,10 @@ async fn run_session<S: Sampler>(
     id: &BackendIdentity,
     sampler: Arc<S>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve token before any network I/O so a missing QUIP_SESSION_TOKEN
+    // always maps to exit 77 (never InternalFatal from a connect failure).
+    let hello = build_hello(miner_id, id.backend, id.algorithm, &[JobKind::IsingSample])?;
+
     let path = uri.strip_prefix("unix://").unwrap_or(uri).to_string();
     let channel = Endpoint::try_from("http://[::]:50051")? // dummy authority for UDS
         .connect_with_connector(tower::service_fn(move |_: Uri| {
@@ -94,7 +98,6 @@ async fn run_session<S: Sampler>(
     let mut client = MinerServiceClient::new(channel);
 
     let (tx, rx) = mpsc::channel::<MinerMsg>(16);
-    let hello = build_hello(miner_id, id.backend, id.algorithm, &[JobKind::IsingSample])?;
     tx.send(miner(miner_msg::Msg::Hello(hello))).await?;
 
     let mut inbound = client.session(ReceiverStream::new(rx)).await?.into_inner();
@@ -246,18 +249,22 @@ async fn run_session<S: Sampler>(
 }
 
 fn map_err_to_exit(err: Box<dyn std::error::Error>, backend: &str) -> StdExitCode {
-    if let Some(se) = err.downcast_ref::<SessionError>() {
-        return match se {
-            SessionError::MissingToken => StdExitCode::from(ExitCode::TokenRejected as u8),
-            SessionError::BadWelcome(_) => StdExitCode::from(ExitCode::InternalFatal as u8),
-        };
-    }
+    // Prefer the canonical `SessionError -> ExitCode` mapping (quip-protocol)
+    // over a hand-rolled match, so real miners exit the same code as the mock
+    // reference (e.g. BadWelcome -> ConfigInvalid/64, not InternalFatal/70).
+    let err = match err.downcast::<SessionError>() {
+        Ok(se) => return StdExitCode::from(ExitCode::from(*se) as u8),
+        Err(err) => err,
+    };
+    // Type-erased fallback: the error crossed a boundary that lost the
+    // concrete `SessionError` (e.g. tonic::Status::into()). Recover only the
+    // two documented exit codes we can identify from the message.
     let msg = err.to_string();
     if msg.contains("QUIP_SESSION_TOKEN") || msg.contains("session token") {
         return StdExitCode::from(ExitCode::TokenRejected as u8);
     }
     if msg.contains("unexpected protocol version") {
-        return StdExitCode::from(ExitCode::InternalFatal as u8);
+        return StdExitCode::from(ExitCode::ConfigInvalid as u8);
     }
     eprintln!("quip-miner-{backend} fatal: {err}");
     StdExitCode::from(ExitCode::InternalFatal as u8)

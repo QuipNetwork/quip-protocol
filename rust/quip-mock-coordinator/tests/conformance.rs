@@ -1,4 +1,4 @@
-use quip_mock_coordinator::driver::drive_miner;
+use quip_mock_coordinator::driver::{drive_miner, drive_miner_bad_welcome};
 use quip_proto::v1::RejectReason;
 
 /// Path to the sibling `quip-mock-miner` binary.
@@ -31,18 +31,23 @@ fn miner_bin() -> String {
     p.to_string_lossy().into_owned()
 }
 
-#[tokio::test]
-async fn mock_miner_passes_conformance() {
-    let miner = miner_bin();
-    let socket = format!(
-        "/tmp/quip-conf-{}-{}.sock",
+/// A unique `unix://` socket path for one test's mock coordinator.
+fn unique_socket(label: &str) -> String {
+    format!(
+        "unix:///tmp/quip-conf-{label}-{}-{}.sock",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
-    );
-    let report = drive_miner(&miner, &format!("unix://{socket}")).await;
+    )
+}
+
+#[tokio::test]
+async fn mock_miner_passes_conformance() {
+    let miner = miner_bin();
+    let socket = unique_socket("full");
+    let report = drive_miner(&miner, &socket).await;
 
     assert!(report.handshake_ok, "handshake failed: {report:?}");
     assert!(
@@ -58,22 +63,34 @@ async fn mock_miner_passes_conformance() {
         "JobRequest credits must be > 0: {report:?}"
     );
     assert_eq!(
-        report.result_job_ids.len(),
+        report.results.len(),
         3,
         "expected 3 Results (job-1, job-2, job-hash): {report:?}"
     );
     assert!(
-        report.result_job_ids.iter().any(|id| id == b"job-1"),
+        report.results.iter().any(|r| r.job_id == b"job-1"),
         "missing Result for job-1: {report:?}"
     );
     assert!(
-        report.result_job_ids.iter().any(|id| id == b"job-2"),
+        report.results.iter().any(|r| r.job_id == b"job-2"),
         "missing Result for job-2: {report:?}"
     );
     assert!(
-        report.result_job_ids.iter().any(|id| id == b"job-hash"),
+        report.results.iter().any(|r| r.job_id == b"job-hash"),
         "missing Result for topology-hash job-hash: {report:?}"
     );
+    for r in &report.results {
+        assert!(
+            !r.solution_energies_milli.is_empty(),
+            "Result for job {:?} has no solutions (no energy_milli): {report:?}",
+            r.job_id
+        );
+        assert!(
+            r.meta_present,
+            "Result for job {:?} is missing SamplerMeta: {report:?}",
+            r.job_id
+        );
+    }
     assert!(
         report.has_reject(b"job-bad-h", RejectReason::Malformed),
         "missing per-job_id Reject MALFORMED for job-bad-h: {report:?}"
@@ -98,5 +115,43 @@ async fn mock_miner_passes_conformance() {
     assert!(
         report.is_conformant(),
         "full DriverReport must pass: {report:?}"
+    );
+}
+
+/// A conformant miner must reject an unsupported `Welcome.protocol_version`
+/// cleanly: emit `Fatal` (exit_code=ConfigInvalid=64) and exit with that same
+/// code, rather than proceeding to `Configure`.
+#[tokio::test]
+async fn mock_miner_rejects_bad_welcome() {
+    let miner = miner_bin();
+    let socket = unique_socket("bad-welcome");
+    let report = drive_miner_bad_welcome(&miner, &socket).await;
+
+    assert!(report.handshake_ok, "handshake failed: {report:?}");
+    assert_eq!(
+        report.exit_code, 64,
+        "expected ConfigInvalid (64) exit on bad Welcome: {report:?}"
+    );
+    let (fatal_code, fatal_reason) = report
+        .fatal
+        .as_ref()
+        .unwrap_or_else(|| panic!("miner must send Fatal on bad Welcome: {report:?}"));
+    assert_eq!(
+        *fatal_code, 64,
+        "Fatal.exit_code must match ConfigInvalid: {report:?}"
+    );
+    assert!(
+        !fatal_reason.is_empty(),
+        "Fatal.reason must explain the rejection: {report:?}"
+    );
+    // A miner that got this far must not have proceeded into the normal
+    // job-handling flow.
+    assert!(
+        !report.ready_received,
+        "miner must not send Ready after a rejected Welcome: {report:?}"
+    );
+    assert!(
+        report.results.is_empty(),
+        "miner must not process jobs after a rejected Welcome: {report:?}"
     );
 }

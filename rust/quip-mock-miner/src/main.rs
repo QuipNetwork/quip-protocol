@@ -2,7 +2,8 @@ use clap::Parser;
 use quip_proto::v1::miner_service_client::MinerServiceClient;
 use quip_proto::v1::{
     coord_msg, ising_problem, miner_msg, CoordMsg, Fatal, IsingProblem, Job, JobKind, JobRequest,
-    MinerMsg, Ready, Reject, RejectReason, Result as JobResult, Solution, Status, Topology,
+    MinerMsg, Ready, Reject, RejectReason, Result as JobResult, SamplerMeta, Solution, Status,
+    Topology,
 };
 use quip_protocol::scoring::energy_milli;
 use quip_protocol::session::{build_hello, check_welcome, ExitCode, SessionConfig, SessionError};
@@ -195,6 +196,14 @@ fn handle_job(job: Job, topo: Option<&SessionTopo>) -> Vec<MinerMsg> {
         Err(reason) => return vec![reject(job_id, reason)],
     };
     let n = h.len();
+
+    // MALFORMED: an edge endpoint indexes past the node count (mirrors
+    // quip-miner-core::parse_ising, which rejects out-of-bounds inline edges
+    // instead of silently skipping them during scoring).
+    if edges.iter().any(|&(u, v)| u >= n || v >= n) {
+        return vec![reject(job_id, RejectReason::Malformed)];
+    }
+
     let spins = vec![1i8; n];
     let energy = energy_milli(&spins, &h, &j, &edges);
     let result = JobResult {
@@ -203,7 +212,14 @@ fn handle_job(job: Job, topo: Option<&SessionTopo>) -> Vec<MinerMsg> {
             spins_bytes: vec![0x01u8; n],
             energy_milli: energy,
         }],
-        meta: None,
+        // The reference miner produces a single trivial read with no annealing;
+        // report that faithfully so results carry SamplerMeta like real miners.
+        meta: Some(SamplerMeta {
+            reads: 1,
+            sweeps: 0,
+            device_access_time_us: 0,
+            ..Default::default()
+        }),
     };
     vec![
         miner(miner_msg::Msg::Result(result)),
@@ -393,6 +409,31 @@ mod tests {
                 _ => b"",
             },
             b"bad-j"
+        );
+    }
+
+    #[test]
+    fn out_of_bounds_edge_rejects_malformed() {
+        // h has 2 nodes (indices 0, 1); the inline edge references node 2,
+        // which is out of bounds and must be rejected rather than silently
+        // skipped during scoring.
+        let mut job = sample_job(b"oob-edge", JobKind::IsingSample, encode_i32_le(&[500]));
+        job.ising.as_mut().unwrap().graph =
+            Some(ising_problem::Graph::Edges(quip_proto::v1::EdgeList {
+                u: vec![0],
+                v: vec![2],
+            }));
+        let msgs = handle_job(job, None);
+        assert_eq!(
+            first_reject_reason(&msgs),
+            Some(RejectReason::Malformed as i32)
+        );
+        assert_eq!(
+            match &msgs[0].msg {
+                Some(miner_msg::Msg::Reject(r)) => r.job_id.as_slice(),
+                _ => b"",
+            },
+            b"oob-edge"
         );
     }
 }
