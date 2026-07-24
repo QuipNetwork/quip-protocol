@@ -265,6 +265,23 @@ impl<'a> SelfFeedingSession<'a> {
             }
         };
 
+        // Every device buffer above is zero-initialized by an `alloc_zeros`
+        // memset enqueued on `stream_compute`. Per-slot `h`/`J`/ctrl uploads
+        // (`upload_slot`) and the beta-schedule upload (`upload_beta_schedule`)
+        // run on `stream_transfer`, and this device has event tracking disabled
+        // (see `CudaDevice::open`), so the two streams are unordered. A memset
+        // that lands *after* its buffer's upload silently re-zeros it — most
+        // visibly the tiny, fast beta upload, whose memset sits behind the large
+        // `d_samples`/`d_delta_energy` memsets and so lands late, leaving the
+        // kernel to anneal against an all-zero beta schedule (no annealing at
+        // all -> garbage energies that scale with how long the memset queue runs
+        // vs. the upload). Draining `stream_compute` here guarantees all
+        // zero-init completes before any upload can race with it. From this
+        // point on the intended byte-range racing between the persistent kernel
+        // and slot traffic is arbitrated by the volatile ctrl protocol as
+        // documented; only this one-time initialization needed ordering.
+        stream_compute.synchronize()?;
+
         Ok(Self {
             device,
             algorithm,
