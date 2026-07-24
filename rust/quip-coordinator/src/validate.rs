@@ -12,7 +12,7 @@ use quantum_validation::{calculate_diversity, select_diverse, MilliValue};
 use quip_proto::v1::{ising_problem, IsingProblem, QualityGates, Solution};
 use quip_protocol::wire::decode_i32_le;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Validated {
@@ -87,6 +87,26 @@ fn byte_spin(b: u8) -> Option<i64> {
         0x01 => Some(1),
         0xFF => Some(-1),
         _ => None,
+    }
+}
+
+/// Canonical form of a spin row for dedup: a solution `s` and its global flip
+/// `-s` map to one key by forcing the first spin to `+1`.
+///
+/// The protocol's notion of solution *uniqueness* is flip-invariant by design:
+/// consensus `symmetric_hamming` scores `s` and `-s` as distance 0, so they are
+/// never "diverse" from each other and must count once. This mirrors the v0.2
+/// reference (`shared/quantum_proof_of_work.py` `_unique_rows`, which negates
+/// each row whose anchor spin is `-1`). Note this is *not* about energy: at
+/// `h != 0` the field term flips sign under `s -> -s`, so `E(-s) != E(s)` and
+/// twin pairs that are both energy-valid are vanishingly rare — canonicalization
+/// is a near-no-op there. It bites at `h = 0` (parity_shared), where flip-
+/// symmetric ground states genuinely appear and would otherwise double-count.
+fn canonicalize_spins(spins: &[i8]) -> Vec<i8> {
+    if spins.first() == Some(&-1) {
+        spins.iter().map(|&s| -s).collect()
+    } else {
+        spins.to_vec()
     }
 }
 
@@ -166,15 +186,31 @@ pub fn validate_result(
         .enumerate()
         .filter_map(|(i, &e)| (e < gates.min_energy_milli).then_some(i))
         .collect();
-    let n_valid = energy_valid_indices.len() as u32;
 
-    let (best_energy_milli, diversity_milli) = if energy_valid_indices.is_empty() {
+    // Dedup before counting/diversity: exact duplicates and Z2-flip twins
+    // (a solution and its global spin flip) are the same physical state and
+    // must not be double counted or inflate the diversity score — most
+    // visible at h=0 (parity_shared), where flip-symmetric ground states are
+    // common. Sequential (not rayon): this is a cheap post-filter over the
+    // already-scored valid indices, not the scoring loop. Keeps the first
+    // occurrence, so it stays deterministic given the fixed solution order.
+    let mut seen_canonical: HashSet<Vec<i8>> = HashSet::new();
+    let unique_valid_indices: Vec<usize> = energy_valid_indices
+        .into_iter()
+        .filter(|&i| {
+            let spins = bytemuck::cast_slice::<u8, i8>(byte_rows[i]);
+            seen_canonical.insert(canonicalize_spins(spins))
+        })
+        .collect();
+    let n_valid = unique_valid_indices.len() as u32;
+
+    let (best_energy_milli, diversity_milli) = if unique_valid_indices.is_empty() {
         (i64::MAX, 0u32)
     } else {
         // Diversity reads the valid spin vectors as `&[i8]` reinterpreted from
         // their wire bytes (0x01/0xFF -> +1/-1) — a zero-copy view, sound
         // because every byte was validated during scoring.
-        let energy_valid: Vec<&[i8]> = energy_valid_indices
+        let energy_valid: Vec<&[i8]> = unique_valid_indices
             .iter()
             .map(|&i| bytemuck::cast_slice::<u8, i8>(byte_rows[i]))
             .collect();
@@ -185,7 +221,7 @@ pub fn validate_result(
         let diversity = calculate_diversity(&selected_spins).unwrap_or(0);
         let best = selected
             .iter()
-            .map(|&i| energies[energy_valid_indices[i]])
+            .map(|&i| energies[unique_valid_indices[i]])
             .min()
             .unwrap_or(i64::MAX);
         (best, diversity)
@@ -370,5 +406,94 @@ mod tests {
         assert_eq!(v.n_valid, 2);
         assert_eq!(v.diversity_milli, 500);
         assert!(v.accepted);
+    }
+
+    #[test]
+    fn dedup_collapses_exact_duplicate_solutions() {
+        let problem = IsingProblem {
+            graph: None,
+            h_milli_le32: encode_i32_le(&[0, 0]),
+            j_milli_le32: vec![],
+            num_reads: 2,
+            num_sweeps: 0,
+            anneal_time_us: 0,
+        };
+        let sols = [
+            Solution {
+                spins_bytes: encode_spins(&[1, -1]),
+                energy_milli: 0,
+            },
+            Solution {
+                spins_bytes: encode_spins(&[1, -1]),
+                energy_milli: 0,
+            },
+        ];
+        let gates = QualityGates {
+            min_energy_milli: 1, // 0 < 1 → both energy-valid
+            min_diversity_milli: 0,
+            min_solutions: 1,
+        };
+        let v = validate_result(&problem, &sols, &gates, &ResolvedTopo::default());
+        assert_eq!(v.n_valid, 1);
+    }
+
+    #[test]
+    fn dedup_collapses_z2_flip_twin_at_h_zero() {
+        // h = 0: a solution and its global flip are energy-equal and are the
+        // same physical state, so they must collapse to one.
+        let problem = IsingProblem {
+            graph: None,
+            h_milli_le32: encode_i32_le(&[0, 0, 0]),
+            j_milli_le32: vec![],
+            num_reads: 2,
+            num_sweeps: 0,
+            anneal_time_us: 0,
+        };
+        let sols = [
+            Solution {
+                spins_bytes: encode_spins(&[1, -1, 1]),
+                energy_milli: 0,
+            },
+            Solution {
+                spins_bytes: encode_spins(&[-1, 1, -1]),
+                energy_milli: 0,
+            },
+        ];
+        let gates = QualityGates {
+            min_energy_milli: 1,
+            min_diversity_milli: 0,
+            min_solutions: 1,
+        };
+        let v = validate_result(&problem, &sols, &gates, &ResolvedTopo::default());
+        assert_eq!(v.n_valid, 1);
+    }
+
+    #[test]
+    fn dedup_does_not_collapse_genuinely_distinct_solutions() {
+        let problem = IsingProblem {
+            graph: None,
+            h_milli_le32: encode_i32_le(&[0, 0]),
+            j_milli_le32: vec![],
+            num_reads: 2,
+            num_sweeps: 0,
+            anneal_time_us: 0,
+        };
+        let sols = [
+            Solution {
+                spins_bytes: encode_spins(&[1, 1]),
+                energy_milli: 0,
+            },
+            Solution {
+                spins_bytes: encode_spins(&[1, -1]),
+                energy_milli: 0,
+            },
+        ];
+        let gates = QualityGates {
+            min_energy_milli: 1,
+            min_diversity_milli: 0,
+            min_solutions: 2,
+        };
+        let v = validate_result(&problem, &sols, &gates, &ResolvedTopo::default());
+        assert_eq!(v.n_valid, 2);
     }
 }
