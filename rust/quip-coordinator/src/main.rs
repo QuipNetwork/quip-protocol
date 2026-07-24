@@ -83,8 +83,9 @@ struct DriveArgs {
     /// `--num-reads` for controlled, matched-condition throughput/parity runs.
     #[arg(long)]
     num_sweeps: Option<u32>,
-    /// Per-job deadline, milliseconds from now.
-    #[arg(long, default_value_t = 3_600_000)]
+    /// Per-job deadline, milliseconds from now. 0 = no deadline (the default);
+    /// a deadline is only meaningful for real mempool/chain jobs.
+    #[arg(long, default_value_t = 0)]
     deadline_ms: u64,
     /// Optional path to write a per-job + aggregate JSONL report.
     #[arg(long)]
@@ -292,7 +293,13 @@ fn run_drive_cli(args: DriveArgs) -> StdExitCode {
 }
 
 async fn drive_main(args: DriveArgs) -> StdExitCode {
-    let deadline_ms = now_unix_ms() + args.deadline_ms;
+    // 0 => no deadline (the sentinel the miner honors); otherwise an absolute
+    // wall-clock deadline `now + args.deadline_ms`.
+    let deadline_ms = if args.deadline_ms == 0 {
+        0
+    } else {
+        now_unix_ms() + args.deadline_ms
+    };
     let (jobs, topology, target) = match build_jobs(&args, deadline_ms) {
         Ok(v) => v,
         Err(msg) => {
