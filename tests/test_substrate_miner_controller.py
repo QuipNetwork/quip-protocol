@@ -1740,6 +1740,35 @@ async def test_anticipatory_retry_keeps_preview_for_next_head(monkeypatch):
     assert key not in controller._anticipatory_fired  # mid-fire mark cleared
 
 
+async def test_anticipatory_fire_clears_mark_on_cancelled_error(monkeypatch):
+    """quip-wql: if ``submit_with_retry`` raises instead of returning a typed
+    ``SubmitRetryAction`` (e.g. a raw ``CancelledError`` that the outer
+    watch-timeout's ``wait_for`` failed to convert to ``TimeoutError``), the
+    mid-fire mark must still be cleared from ``_anticipatory_fired`` so a
+    later solution for this work_key isn't dropped forever by
+    ``_should_drop_result``. The exception itself must still propagate
+    (never swallowed — that would hide a real shutdown cancel)."""
+    controller = _bare_controller()
+    _stub_predictor_inputs(controller)
+    ctx = _ctx_at_block(b"\xaa" * 32, 19)
+    _store_preview_entry(controller, ctx)
+    from substrate.miner_controller import _work_key
+    key = _work_key(ctx)
+    preview = controller._latest_preview[key]
+
+    async def fake_submit_with_retry(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        "substrate.miner_controller.submit_with_retry", fake_submit_with_retry
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await controller._fire_preview(ctx, key, preview, 20)
+
+    assert key not in controller._anticipatory_fired  # mid-fire mark cleared
+
+
 async def test_anticipatory_round_stale_discards_preview(monkeypatch):
     """STOP_ROUND_STALE means the nonce is dead — discard the preview and
     any pending anticipatory state."""
