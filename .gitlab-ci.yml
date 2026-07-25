@@ -89,16 +89,14 @@ conformance:
 # Bundle: from-source quip-coordinator + released CPU/CUDA miner binaries +
 # D-Wave Python miner. Manual on branches (heavy build), automatic on tags.
 # ---------------------------------------------------------------------------
-# NOTE: kaniko (no docker daemon) builds reliably on the shared runners, but is
-# single-arch (amd64). arm64 for quip-miner needs a separate arm64 runner — a
-# follow-up; for now both images are amd64.
+# Kaniko (no daemon — the runners don't allow privileged dind) on tesla-docker
+# (arm64, no GPU firmware mount, so kaniko's rootfs unpack works). Native arm64;
+# TARGETARCH is passed explicitly since kaniko doesn't set it. amd64 + the CUDA
+# image need an amd64 non-GPU runner — a follow-up.
 .image_base:
   stage: build
-  # Steer off the GPU host runner (its /lib/firmware bind-mount breaks kaniko's
-  # rootfs unpack) onto the same linux/amd64 runner the test jobs use.
-  tags: [linux, amd64]
+  tags: [arm64, docker]
   image:
-    # -debug carries a busybox shell for the before_script; the plain image has none.
     name: gcr.io/kaniko-project/executor:v1.23.2-debug
     entrypoint: [""]
   before_script:
@@ -115,21 +113,9 @@ image-quip-miner:
   script:
     - |
       TAG="${CI_COMMIT_TAG:-v0.3.0}"
-      DEST="--destination $CI_REGISTRY_IMAGE/v0.3/quip-miner:${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
-      [ -n "$CI_COMMIT_TAG" ] && DEST="$DEST --destination $CI_REGISTRY_IMAGE/v0.3/quip-miner:latest"
+      DEST="--destination $CI_REGISTRY_IMAGE/v0.3/quip-miner:${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}-arm64"
+      [ -n "$CI_COMMIT_TAG" ] && DEST="$DEST --destination $CI_REGISTRY_IMAGE/v0.3/quip-miner:latest-arm64"
       [ -z "$CI_COMMIT_TAG" ] && DEST="--no-push"
-      /kaniko/executor --ignore-path=/lib/firmware --context "$CI_PROJECT_DIR" --dockerfile docker/Dockerfile.quip-miner \
-        --build-arg "MINERS_TAG=$TAG" \
+      /kaniko/executor --context "$CI_PROJECT_DIR" --dockerfile docker/Dockerfile.quip-miner \
+        --build-arg "MINERS_TAG=$TAG" --build-arg "TARGETARCH=arm64" \
         --build-arg "QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/v0.3/quip-miner:$TAG" $DEST
-
-image-quip-miner-cuda:
-  extends: .image_base
-  script:
-    - |
-      TAG="${CI_COMMIT_TAG:-v0.3.0}"
-      DEST="--destination $CI_REGISTRY_IMAGE/v0.3/quip-miner-cuda:${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
-      [ -n "$CI_COMMIT_TAG" ] && DEST="$DEST --destination $CI_REGISTRY_IMAGE/v0.3/quip-miner-cuda:latest"
-      [ -z "$CI_COMMIT_TAG" ] && DEST="--no-push"
-      /kaniko/executor --ignore-path=/lib/firmware --context "$CI_PROJECT_DIR" --dockerfile docker/Dockerfile.quip-miner-cuda \
-        --build-arg "MINERS_TAG=$TAG" \
-        --build-arg "QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/v0.3/quip-miner-cuda:$TAG" $DEST
