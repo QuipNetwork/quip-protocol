@@ -89,7 +89,8 @@ conformance:
     - . "$HOME/.cargo/env"
     - (cd python && maturin develop)
   script:
-    - python conformance/gen_golden_vectors.py --stdout | diff - conformance/golden_vectors.json
+    # Golden vectors are frozen and validated through quip_proto (test_pyo3_parity);
+    # the Python regeneration drift guard was retired with the v0.2 shared/ stack.
     # Proto↔stub drift guard: regenerate Python *_pb2 stubs from the normative
     # .proto and fail if the checked-in copies are stale (mirrors golden drift).
     - |
