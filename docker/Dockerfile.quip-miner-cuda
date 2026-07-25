@@ -38,7 +38,11 @@ ENV QUIP_DOCKER_IMAGE=${QUIP_DOCKER_IMAGE} \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tini gosu curl ca-certificates python3 \
     && rm -rf /var/lib/apt/lists/*
-RUN groupadd --system --gid 1000 quip \
+# ubuntu:24.04 (the nvidia/cuda base) ships a default ubuntu:ubuntu at 1000:1000;
+# drop it so quip can own UID/GID 1000, consistent with the non-CUDA image.
+RUN userdel --remove ubuntu 2>/dev/null || true; \
+    groupdel ubuntu 2>/dev/null || true; \
+    groupadd --system --gid 1000 quip \
     && useradd --system --uid 1000 --gid 1000 --home /home/quip \
        --create-home --shell /usr/sbin/nologin quip
 
