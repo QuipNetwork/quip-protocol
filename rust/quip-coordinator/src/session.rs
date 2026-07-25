@@ -43,6 +43,15 @@ pub struct CoordinatorState {
     pub router: Router,
     /// job_id → Job, for validation context.
     pub inflight: HashMap<Vec<u8>, quip_proto::v1::Job>,
+    /// job_id → owning miner_id, so a crashed miner's in-flight jobs can be
+    /// isolated and re-routed. Maintained on the production path via
+    /// [`CoordinatorState::dispatch_inflight`]/[`CoordinatorState::complete_inflight`];
+    /// the drive harness leaves it empty (it never crash-requeues).
+    pub inflight_owner: HashMap<Vec<u8>, String>,
+    /// Live per-miner outbound channels, so the supervisor can push an in-band
+    /// `Shutdown`/cancel to a running session. Registered on handshake success,
+    /// removed when the session ends.
+    pub outbound: HashMap<String, mpsc::Sender<Result<CoordMsg, Status>>>,
     pub current_best_milli: Option<i64>,
     pub results_validated: u64,
     pub last_abandoned_generation: u64,
@@ -58,6 +67,8 @@ impl CoordinatorState {
             target: None,
             router: Router::new(),
             inflight: HashMap::new(),
+            inflight_owner: HashMap::new(),
+            outbound: HashMap::new(),
             current_best_milli: None,
             results_validated: 0,
             last_abandoned_generation: 0,
@@ -75,6 +86,56 @@ impl CoordinatorState {
                 .unwrap_or_default(),
         );
         self.topology = topology;
+    }
+
+    /// Record a dispatched job as in-flight, attributing it to `miner_id`.
+    pub fn dispatch_inflight(&mut self, miner_id: &str, job: quip_proto::v1::Job) {
+        self.inflight_owner
+            .insert(job.job_id.clone(), miner_id.to_string());
+        self.inflight.insert(job.job_id.clone(), job);
+    }
+
+    /// Clear an in-flight job on a terminal event (Result/Reject); returns the
+    /// job for validation context.
+    pub fn complete_inflight(&mut self, job_id: &[u8]) -> Option<quip_proto::v1::Job> {
+        let _ = self.inflight_owner.remove(job_id);
+        self.inflight.remove(job_id)
+    }
+
+    /// Reclaim every job a miner owned — its in-flight jobs plus its staged
+    /// queue — so they can be re-routed after a crash. Also drops its outbound
+    /// channel.
+    pub fn reclaim_miner(&mut self, miner_id: &str) -> Vec<quip_proto::v1::Job> {
+        let owned: Vec<Vec<u8>> = self
+            .inflight_owner
+            .iter()
+            .filter(|(_, m)| m.as_str() == miner_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut jobs = Vec::with_capacity(owned.len());
+        for id in owned {
+            let _ = self.inflight_owner.remove(&id);
+            if let Some(job) = self.inflight.remove(&id) {
+                jobs.push(job);
+            }
+        }
+        jobs.extend(self.router.reclaim(miner_id));
+        let _ = self.outbound.remove(miner_id);
+        jobs
+    }
+
+    /// Register a live session's outbound channel for supervisor-initiated sends.
+    pub fn register_outbound(
+        &mut self,
+        miner_id: &str,
+        tx: mpsc::Sender<Result<CoordMsg, Status>>,
+    ) {
+        let _ = self.outbound.insert(miner_id.to_string(), tx);
+    }
+
+    /// Drop a session's outbound channel when it ends.
+    pub fn deregister_outbound(&mut self, miner_id: &str) {
+        let _ = self.outbound.remove(miner_id);
     }
 }
 
@@ -195,8 +256,12 @@ async fn run_session<C: ChainClient>(
         }
     }
 
+    // Register this session's outbound channel so the supervisor can push an
+    // in-band Shutdown/cancel while it runs; dropped when the loop exits.
+    state.lock().await.register_outbound(&miner_id, tx.clone());
+
     // 3. Message loop
-    loop {
+    'session: loop {
         let msg = match inbound.message().await {
             Ok(Some(m)) => m,
             Ok(None) => break,
@@ -211,9 +276,9 @@ async fn run_session<C: ChainClient>(
                 let mut st = state.lock().await;
                 st.router.grant_credits(&miner_id, credits);
                 while let Some(job) = st.router.next_job(&miner_id) {
-                    st.inflight.insert(job.job_id.clone(), job.clone());
+                    st.dispatch_inflight(&miner_id, job.clone());
                     if tx.send(Ok(coord(coord_msg::Msg::Job(job)))).await.is_err() {
-                        return;
+                        break 'session;
                     }
                 }
             }
@@ -221,16 +286,16 @@ async fn run_session<C: ChainClient>(
                 let mut st = state.lock().await;
                 st.router.grant_credits(&miner_id, req.credits);
                 while let Some(job) = st.router.next_job(&miner_id) {
-                    st.inflight.insert(job.job_id.clone(), job.clone());
+                    st.dispatch_inflight(&miner_id, job.clone());
                     if tx.send(Ok(coord(coord_msg::Msg::Job(job)))).await.is_err() {
-                        return;
+                        break 'session;
                     }
                 }
             }
             Some(miner_msg::Msg::Result(result)) => {
                 let (job, topo, best, gates) = {
                     let mut st = state.lock().await;
-                    let job = st.inflight.remove(&result.job_id);
+                    let job = st.complete_inflight(&result.job_id);
                     let topo = Arc::clone(&st.resolved_topo);
                     let best = st.current_best_milli;
                     let gates = crate::validate::gates_from_target(st.target.as_ref());
@@ -286,7 +351,7 @@ async fn run_session<C: ChainClient>(
                 // The rejecting miner grants its own replacement credit (see the
                 // miner's reject path), so the coordinator only re-routes the
                 // job to a capable miner; an unknown job_id needs nothing.
-                if let Some(job) = st.inflight.remove(&rej.job_id) {
+                if let Some(job) = st.complete_inflight(&rej.job_id) {
                     st.router.on_reject(&miner_id, job, rej.reason);
                 }
             }
@@ -299,6 +364,8 @@ async fn run_session<C: ChainClient>(
             Some(miner_msg::Msg::Fatal(_)) | Some(miner_msg::Msg::Hello(_)) | None => {}
         }
     }
+
+    state.lock().await.deregister_outbound(&miner_id);
 }
 
 /// Push a cancel for generations `<= max_generation` to a live session channel.
@@ -808,4 +875,77 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
 /// Issue a Shutdown on an outbound channel (for supervisor).
 pub fn shutdown_msg(grace_ms: u32) -> CoordMsg {
     coord(coord_msg::Msg::Shutdown(Shutdown { grace_ms }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::router::MinerCaps;
+    use quip_proto::v1::{IsingProblem, Job, JobKind, Provenance};
+
+    fn job(id: &[u8]) -> Job {
+        Job {
+            job_id: id.to_vec(),
+            kind: JobKind::IsingSample as i32,
+            generation: 1,
+            deadline_ms: 0,
+            ising: Some(IsingProblem {
+                graph: None,
+                h_milli_le32: vec![0; 8], // 2 nodes
+                j_milli_le32: vec![0; 4], // 1 edge
+                num_reads: 0,
+                num_sweeps: 0,
+                anneal_time_us: 0,
+            }),
+            provenance: Some(Provenance {
+                is_pow: true,
+                order_id: vec![],
+            }),
+        }
+    }
+
+    fn caps() -> MinerCaps {
+        MinerCaps {
+            backend: "mock".into(),
+            algorithm: "sa".into(),
+            supported_kinds: vec![JobKind::IsingSample as i32],
+            max_nodes: 0, // unlimited
+            max_edges: 0,
+        }
+    }
+
+    #[test]
+    fn reclaim_miner_returns_inflight_plus_staged_and_isolates_by_owner() {
+        let mut st = CoordinatorState::new();
+        st.router.register_miner("cpu-0", caps());
+        st.router.register_miner("cpu-1", caps());
+
+        // cpu-0 owns two in-flight jobs; cpu-1 owns one.
+        st.dispatch_inflight("cpu-0", job(b"a"));
+        st.dispatch_inflight("cpu-0", job(b"b"));
+        st.dispatch_inflight("cpu-1", job(b"c"));
+        // One job staged on cpu-0 (route picks the first capable miner, cpu-0).
+        assert_eq!(st.router.route(job(b"d")).as_deref(), Some("cpu-0"));
+
+        let mut reclaimed = st.reclaim_miner("cpu-0");
+        reclaimed.sort_by(|x, y| x.job_id.cmp(&y.job_id));
+        let ids: Vec<&[u8]> = reclaimed.iter().map(|j| j.job_id.as_slice()).collect();
+        assert_eq!(ids, vec![&b"a"[..], &b"b"[..], &b"d"[..]]);
+
+        // cpu-0's in-flight is cleared from both maps; cpu-1's is untouched.
+        assert!(!st.inflight.contains_key(&b"a"[..]));
+        assert!(!st.inflight_owner.contains_key(&b"a"[..]));
+        assert!(st.inflight.contains_key(&b"c"[..]));
+        assert_eq!(st.router.staged_len("cpu-0"), 0);
+    }
+
+    #[test]
+    fn outbound_register_and_deregister() {
+        let mut st = CoordinatorState::new();
+        let (tx, _rx) = mpsc::channel::<Result<CoordMsg, Status>>(1);
+        st.register_outbound("cpu-0", tx);
+        assert!(st.outbound.contains_key("cpu-0"));
+        st.deregister_outbound("cpu-0");
+        assert!(!st.outbound.contains_key("cpu-0"));
+    }
 }

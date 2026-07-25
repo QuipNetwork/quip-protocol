@@ -7,12 +7,16 @@ use quip_coordinator::drive::{
     aggregate, drain_all, parse_topology_spec, print_table, run_drive, write_jsonl,
     DriveManyParams, ListSource, RandomSource,
 };
-use quip_coordinator::session::gen_session_token;
+use quip_coordinator::runtime::{run_runtime, RuntimeParams};
+use quip_coordinator::session::{gen_session_token, CoordinatorState};
+use quip_coordinator::supervisor::BackoffPolicy;
 use quip_coordinator::topology::Topology;
 use quip_proto::v1::{Configure, Job};
 use quip_protocol::session::ExitCode;
 use std::path::PathBuf;
 use std::process::ExitCode as StdExitCode;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -130,19 +134,6 @@ fn run_config_path(config: Option<PathBuf>) -> StdExitCode {
         }
     };
 
-    // Real chain is wired (RPC + hybrid sign). Full producers/session loop
-    // still needs a live node; config-load path validates wiring only.
-    // Integration is covered by tests/e2e.rs with FakeChain.
-    let _chain = RealChainClient::new(cfg.validators.clone(), cfg.signer_key.clone());
-    let _tokens: Vec<String> = cfg.launch.iter().map(|_| gen_session_token()).collect();
-
-    eprintln!(
-        "quip-coordinator: config ok ({} miners); chain client ready (needs live node for RPC)",
-        cfg.launch.len()
-    );
-
-    // Block until SIGINT/SIGTERM for a realistic process shape when used under
-    // a process supervisor; tests use --config /nonexistent and never reach here.
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -150,12 +141,56 @@ fn run_config_path(config: Option<PathBuf>) -> StdExitCode {
             return StdExitCode::from(ExitCode::InternalFatal as u8);
         }
     };
-    rt.block_on(async {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-        }
+
+    let chain = Arc::new(RealChainClient::new(
+        cfg.validators.clone(),
+        cfg.signer_key.clone(),
+    ));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    let params = RuntimeParams {
+        sock_path: format!("/tmp/quip-coordinator-{}.sock", std::process::id()),
+        grace_ms: 2000,
+        backoff: BackoffPolicy::default(),
+    };
+    eprintln!(
+        "quip-coordinator: serving {} miner(s) on {}",
+        cfg.launch.len(),
+        params.sock_path
+    );
+
+    let result = rt.block_on(async move {
+        run_runtime(cfg.launch, chain, state, params, shutdown_signal()).await
     });
-    StdExitCode::from(ExitCode::Clean as u8)
+    match result {
+        Ok(()) => StdExitCode::from(ExitCode::Clean as u8),
+        Err(e) => {
+            eprintln!("error: runtime: {e}");
+            StdExitCode::from(ExitCode::InternalFatal as u8)
+        }
+    }
+}
+
+/// Resolve when the process receives SIGINT or SIGTERM (SIGINT-only off-unix).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn now_unix_ms() -> u64 {
