@@ -87,21 +87,26 @@ conformance:
 # ---------------------------------------------------------------------------
 # v0.3 container images (separate v0.3/ namespace; see the stages note).
 # Bundle: from-source quip-coordinator + released CPU/CUDA miner binaries +
-# D-Wave Python miner. Manual on branches (heavy build), automatic on tags.
+# D-Wave Python miner. Manual on branches (build-only, no push), automatic on
+# tags (build + push :<tag> and :latest). amd64 only.
 # ---------------------------------------------------------------------------
-# Kaniko (no daemon — the runners don't allow privileged dind) on tesla-docker
-# (arm64, no GPU firmware mount, so kaniko's rootfs unpack works). Native arm64;
-# TARGETARCH is passed explicitly since kaniko doesn't set it. amd64 + the CUDA
-# image need an amd64 non-GPU runner — a follow-up.
+# buildah, not kaniko: the only linux/amd64 docker runner (finney) bind-mounts
+# the host's /lib/firmware/nvidia into every job. kaniko unpacks the base image
+# over its own `/`, so it can't turn /lib into the merged-usr symlink while that
+# mount is busy (EBUSY, un-fixable with --ignore-path). buildah builds in its
+# own vfs storage and never touches /lib; STORAGE_DRIVER=vfs +
+# BUILDAH_ISOLATION=chroot let it run unprivileged (no daemon, no /dev/fuse).
+# NOTE: pin `quay.io/buildah/stable` to a digest once this is validated green.
 .image_base:
   stage: build
-  tags: [arm64, docker]
-  image:
-    name: gcr.io/kaniko-project/executor:v1.23.2-debug
-    entrypoint: [""]
+  tags: [linux, amd64]
+  image: quay.io/buildah/stable:latest
+  variables:
+    STORAGE_DRIVER: vfs
+    BUILDAH_ISOLATION: chroot
+    BUILDAH_FORMAT: docker
   before_script:
-    - mkdir -p /kaniko/.docker
-    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' \"$CI_REGISTRY_USER\" \"$CI_REGISTRY_PASSWORD\" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    - buildah login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
   rules:
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH
@@ -113,9 +118,29 @@ image-quip-miner:
   script:
     - |
       TAG="${CI_COMMIT_TAG:-v0.3.0}"
-      DEST="--destination $CI_REGISTRY_IMAGE/v0.3/quip-miner:${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}-arm64"
-      [ -n "$CI_COMMIT_TAG" ] && DEST="$DEST --destination $CI_REGISTRY_IMAGE/v0.3/quip-miner:latest-arm64"
-      [ -z "$CI_COMMIT_TAG" ] && DEST="--no-push"
-      /kaniko/executor --context "$CI_PROJECT_DIR" --dockerfile docker/Dockerfile.quip-miner \
-        --build-arg "MINERS_TAG=$TAG" --build-arg "TARGETARCH=arm64" \
-        --build-arg "QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/v0.3/quip-miner:$TAG" $DEST
+      IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner"
+      REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+      buildah build --file docker/Dockerfile.quip-miner --tag "$IMAGE:$REF" \
+        --build-arg "MINERS_TAG=$TAG" --build-arg "TARGETARCH=amd64" \
+        --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" "$CI_PROJECT_DIR"
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        buildah push "$IMAGE:$REF"
+        buildah tag "$IMAGE:$REF" "$IMAGE:latest"
+        buildah push "$IMAGE:latest"
+      fi
+
+image-quip-miner-cuda:
+  extends: .image_base
+  script:
+    - |
+      TAG="${CI_COMMIT_TAG:-v0.3.0}"
+      IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner-cuda"
+      REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+      buildah build --file docker/Dockerfile.quip-miner-cuda --tag "$IMAGE:$REF" \
+        --build-arg "MINERS_TAG=$TAG" \
+        --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" "$CI_PROJECT_DIR"
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        buildah push "$IMAGE:$REF"
+        buildah tag "$IMAGE:$REF" "$IMAGE:latest"
+        buildah push "$IMAGE:latest"
+      fi
