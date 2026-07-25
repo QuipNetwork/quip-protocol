@@ -88,25 +88,26 @@ conformance:
 # v0.3 container images (separate v0.3/ namespace; see the stages note).
 # Bundle: from-source quip-coordinator + released CPU/CUDA miner binaries +
 # D-Wave Python miner. Manual on branches (build-only, no push), automatic on
-# tags (build + push :<tag> and :latest). amd64 only.
+# tags (build + push :<tag> and :latest).
 # ---------------------------------------------------------------------------
-# buildah, not kaniko: the only linux/amd64 docker runner (finney) bind-mounts
-# the host's /lib/firmware/nvidia into every job. kaniko unpacks the base image
-# over its own `/`, so it can't turn /lib into the merged-usr symlink while that
-# mount is busy (EBUSY, un-fixable with --ignore-path). buildah builds in its
-# own vfs storage and never touches /lib; STORAGE_DRIVER=vfs +
-# BUILDAH_ISOLATION=chroot let it run unprivileged (no daemon, no /dev/fuse).
-# NOTE: pin `quay.io/buildah/stable` to a digest once this is validated green.
+# Built on the macOS runners via `docker buildx` (real Linux VM + QEMU). finney
+# (the only linux/amd64 docker runner) can't build images: kaniko dies on its
+# GPU /lib/firmware bind-mount, and buildah's user namespace is seccomp-blocked
+# on the unprivileged executor. The Macs run Docker with a proper Linux VM, so
+# the linux images build there alongside the native bundle. quip-miner is
+# multi-arch (buildx sets TARGETARCH per platform: amd64 native on the amd64
+# Mac, arm64 emulated); quip-miner-cuda is amd64-only (nvidia/cuda base).
+# These are shell-executor jobs: no `image:`; the commands hit the Mac's daemon.
 .image_base:
   stage: build
-  tags: [linux, amd64]
-  image: quay.io/buildah/stable:latest
-  variables:
-    STORAGE_DRIVER: vfs
-    BUILDAH_ISOLATION: chroot
-    BUILDAH_FORMAT: docker
+  tags: [macos, amd64]
   before_script:
-    - buildah login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    # buildx needs the docker-container driver for multi-platform builds; the
+    # builder + QEMU binfmt persist on the shell runner, so create idempotently.
+    - docker buildx inspect quip >/dev/null 2>&1 || docker buildx create --name quip --driver docker-container
+    - docker buildx use quip
+    - docker run --privileged --rm tonistiigi/binfmt --install arm64,amd64 || true
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
   rules:
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH
@@ -120,14 +121,14 @@ image-quip-miner:
       TAG="${CI_COMMIT_TAG:-v0.3.0}"
       IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner"
       REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
-      buildah build --file docker/Dockerfile.quip-miner --tag "$IMAGE:$REF" \
-        --build-arg "MINERS_TAG=$TAG" --build-arg "TARGETARCH=amd64" \
-        --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" "$CI_PROJECT_DIR"
-      if [ -n "$CI_COMMIT_TAG" ]; then
-        buildah push "$IMAGE:$REF"
-        buildah tag "$IMAGE:$REF" "$IMAGE:latest"
-        buildah push "$IMAGE:latest"
-      fi
+      TAGS="--tag $IMAGE:$REF"; PUSH=""
+      if [ -n "$CI_COMMIT_TAG" ]; then TAGS="$TAGS --tag $IMAGE:latest"; PUSH="--push"; fi
+      # No --build-arg TARGETARCH: buildx sets it per --platform automatically.
+      docker buildx build --platform linux/amd64,linux/arm64 \
+        --file docker/Dockerfile.quip-miner $TAGS \
+        --build-arg "MINERS_TAG=$TAG" \
+        --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" \
+        $PUSH "$CI_PROJECT_DIR"
 
 image-quip-miner-cuda:
   extends: .image_base
@@ -136,11 +137,10 @@ image-quip-miner-cuda:
       TAG="${CI_COMMIT_TAG:-v0.3.0}"
       IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner-cuda"
       REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
-      buildah build --file docker/Dockerfile.quip-miner-cuda --tag "$IMAGE:$REF" \
+      TAGS="--tag $IMAGE:$REF"; PUSH=""
+      if [ -n "$CI_COMMIT_TAG" ]; then TAGS="$TAGS --tag $IMAGE:latest"; PUSH="--push"; fi
+      docker buildx build --platform linux/amd64 \
+        --file docker/Dockerfile.quip-miner-cuda $TAGS \
         --build-arg "MINERS_TAG=$TAG" \
-        --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" "$CI_PROJECT_DIR"
-      if [ -n "$CI_COMMIT_TAG" ]; then
-        buildah push "$IMAGE:$REF"
-        buildah tag "$IMAGE:$REF" "$IMAGE:latest"
-        buildah push "$IMAGE:latest"
-      fi
+        --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" \
+        $PUSH "$CI_PROJECT_DIR"
