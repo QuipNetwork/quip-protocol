@@ -6,6 +6,7 @@ pub mod config;
 pub mod drive;
 pub mod producer;
 pub mod router;
+pub mod runtime;
 pub mod session;
 pub mod supervisor;
 pub mod topology;
