@@ -6,10 +6,10 @@ members = [
     "quip-mock-miner",
     "quip-mock-coordinator",
     "quip-coordinator",
+    # quip-miner-core is the shared sampler crate the standalone miner repos
+    # git-dep; keep it here as the source of truth. The miner binaries
+    # themselves now live in quip.network/quip-miner-{cpu,cuda,metal}.
     "quip-miner-core",
-    "quip-miner-metal",
-    "quip-miner-cpu",
-    "quip-miner-cuda",
 ]
 # quip-protocol-py is a PyO3 extension built by maturin (needs a Python
 # interpreter); keep it out of the plain `cargo build --workspace` gate.
