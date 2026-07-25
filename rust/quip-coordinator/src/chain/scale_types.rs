@@ -16,6 +16,15 @@ pub struct DifficultyConfig {
     pub min_diversity_milli: u32,
 }
 
+/// Per-topology curve override (matches pallet `CurveC`): per-mille c-triple
+/// stored under `TopologyCurveC[topology_hash]`. Field order is the pallet's.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct CurveCScale {
+    pub easy_milli: u32,
+    pub knee_milli: u32,
+    pub hard_milli: u32,
+}
+
 /// Runtime-API mining snapshot (matches pallet `MiningSnapshot`).
 ///
 /// Note: no `block_number` field — callers fetch the header separately.

@@ -18,6 +18,21 @@ pub const DECAY_RATE_MILLI: i64 = 25;
 /// unit in milli).
 pub const MIN_ENERGY_DELTA_MILLI: i64 = 1000;
 
+// The pallet exposes these as constants/defaults, not via any runtime API, so
+// (per the independent-reads path) the coordinator mirrors them. They match
+// quip-protocol-rs @ v0.2 `QuantumPow`; a chain retune must be echoed here.
+/// Blocks per decay epoch (`QuantumPow::EpochLength`).
+pub const EPOCH_LENGTH_BLOCKS: u64 = 100;
+/// Default curve calibration c-triple (per-mille: 700 == 0.70), from the
+/// `CurveC{Easy,Knee,Hard}Milli` constants. A topology may override these via
+/// `TopologyCurveC` storage, probed separately.
+pub const DEFAULT_C_EASY_MILLI: u32 = 700;
+pub const DEFAULT_C_KNEE_MILLI: u32 = 725;
+pub const DEFAULT_C_HARD_MILLI: u32 = 750;
+/// Default base difficulty `max_energy_milli` when `Difficulties[hash]` is unset
+/// (`DifficultyConfig::default()` on chain: `{5, -1_200_000, 200}`).
+pub const DEFAULT_BASE_MAX_ENERGY_MILLI: i64 = -1_200_000;
+
 /// GSE-estimate bounds for the decay curve (all negative). `ease_step` only
 /// references `min_milli`/`max_milli`; `knee_milli` is retained for parity with
 /// the chain curve and the (separate) curve-construction path.
