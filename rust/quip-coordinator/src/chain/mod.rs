@@ -13,7 +13,7 @@ pub mod submit;
 pub use fake::FakeChain;
 pub use mempool::JobOrder;
 pub use real::RealChainClient;
-pub use snapshot::{head_state_key, MiningSnapshot};
+pub use snapshot::{head_state_key, DecayParams, MiningSnapshot};
 pub use submit::{classify_receipt, Proof, SubmitAction};
 
 use async_trait::async_trait;

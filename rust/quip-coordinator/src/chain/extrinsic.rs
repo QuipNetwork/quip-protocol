@@ -183,6 +183,36 @@ pub fn job_orders_storage_key(order_id: u64) -> Vec<u8> {
     key
 }
 
+/// `QuantumPow` Blake2_128Concat storage-map key for a 32-byte topology hash
+/// (`H256` encodes as its raw 32 bytes, no length prefix).
+fn quantum_pow_map_key(item: &[u8], topology_hash: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(16 + 16 + 16 + 32);
+    key.extend_from_slice(&twox128(b"QuantumPow"));
+    key.extend_from_slice(&twox128(item));
+    key.extend_from_slice(&blake2_128(topology_hash));
+    key.extend_from_slice(topology_hash);
+    key
+}
+
+/// `QuantumPow::Difficulties[topology_hash]` — base (un-decayed) `DifficultyConfig`.
+pub fn difficulties_storage_key(topology_hash: &[u8; 32]) -> Vec<u8> {
+    quantum_pow_map_key(b"Difficulties", topology_hash)
+}
+
+/// `QuantumPow::TopologyCurveC[topology_hash]` — per-topology c-triple override.
+pub fn topology_curve_c_storage_key(topology_hash: &[u8; 32]) -> Vec<u8> {
+    quantum_pow_map_key(b"TopologyCurveC", topology_hash)
+}
+
+/// `QuantumPow::LastProofBlock` — plain `StorageValue` (block number of the last
+/// winning proof).
+pub fn last_proof_block_storage_key() -> Vec<u8> {
+    let mut key = Vec::with_capacity(32);
+    key.extend_from_slice(&twox128(b"QuantumPow"));
+    key.extend_from_slice(&twox128(b"LastProofBlock"));
+    key
+}
+
 fn twox128(data: &[u8]) -> [u8; 16] {
     use std::hash::Hasher;
     use twox_hash::XxHash64;
