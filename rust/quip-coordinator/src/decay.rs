@@ -117,6 +117,82 @@ pub fn step_for_energy(schedule: &[i64], floor_energy_milli: i64) -> Option<usiz
     (i < schedule.len()).then_some(i)
 }
 
+/// One unit == this many milli (a value of 1000 milli is magnitude 1.0).
+const MILLI_SCALE: f64 = 1000.0;
+/// Field-term weight in the GSE estimate (`quantum_validation` `DEFAULT_H_ALPHA`).
+const DEFAULT_H_ALPHA: f64 = 0.88;
+
+/// Mean |value| of a discrete allowed-value set on the unit scale (1.0 ==
+/// `MILLI_SCALE` milli), under uniform sampling. Mirrors
+/// `quantum_validation::energy::mean_abs_unit` for the `AllowedValueSet` variant
+/// (the coordinator's snapshot carries allowed values as a discrete milli set).
+/// An empty set contributes nothing.
+fn mean_abs_unit(allowed_milli: &[i32]) -> f64 {
+    if allowed_milli.is_empty() {
+        return 0.0;
+    }
+    let sum_abs: i64 = allowed_milli.iter().map(|&v| i64::from(v).abs()).sum();
+    sum_abs as f64 / (allowed_milli.len() as f64 * MILLI_SCALE)
+}
+
+/// Expected ground-state-energy estimate (milli) for a topology + calibration
+/// constant `c`, given its field/coupling value sets. Port of
+/// `quantum_validation::expected_gse_for_specs`; must match the chain to the
+/// milli or the whole `EnergyCurve` (and decay trajectory) drifts. Zero nodes or
+/// edges yields 0 (matches the pallet guard).
+pub fn expected_gse_milli(
+    num_nodes: u64,
+    num_edges: u64,
+    c: f64,
+    allowed_h_milli: &[i32],
+    allowed_j_milli: &[i32],
+) -> i64 {
+    if num_nodes == 0 || num_edges == 0 {
+        return 0;
+    }
+    let h_mean_abs = mean_abs_unit(allowed_h_milli);
+    let j_mean_abs = mean_abs_unit(allowed_j_milli);
+    let n = num_nodes as f64;
+    let m = num_edges as f64;
+    let avg_degree = (2.0 * m) / n;
+    let sqrt_avg_degree = avg_degree.sqrt();
+    let j_contribution = -c * j_mean_abs * sqrt_avg_degree * n;
+    let h_contribution = -c * DEFAULT_H_ALPHA * h_mean_abs * n / sqrt_avg_degree;
+    ((j_contribution + h_contribution) * MILLI_SCALE).round() as i64
+}
+
+impl EnergyCurve {
+    /// Build the decay curve from a topology and the chain's calibration
+    /// c-triple (stored scaled milli: `700` == `0.70`). `min`/`knee`/`max` are
+    /// the GSE estimates at `c_hard`/`c_knee`/`c_easy`; since a larger `c` is
+    /// more negative, `min_milli < knee_milli < max_milli` for any legitimate
+    /// input. Mirrors `EnergyCurve::from_topology` in `difficulty.rs`.
+    pub fn from_topology(
+        num_nodes: u64,
+        num_edges: u64,
+        c_easy_milli: u32,
+        c_knee_milli: u32,
+        c_hard_milli: u32,
+        allowed_h_milli: &[i32],
+        allowed_j_milli: &[i32],
+    ) -> Self {
+        let gse = |c_milli: u32| {
+            expected_gse_milli(
+                num_nodes,
+                num_edges,
+                f64::from(c_milli) / MILLI_SCALE,
+                allowed_h_milli,
+                allowed_j_milli,
+            )
+        };
+        Self {
+            min_milli: gse(c_hard_milli),
+            knee_milli: gse(c_knee_milli),
+            max_milli: gse(c_easy_milli),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +279,38 @@ mod tests {
         );
         // No curve → base regardless of elapsed.
         assert_eq!(current_max_energy(125, -50_000, 100, 10, None), -50_000);
+    }
+
+    #[test]
+    fn expected_gse_matches_golden_zero_field() {
+        // Zero-field h drops the h term; legacy J {-1000,1000} has unit mean 1.0.
+        // (1024, 2048): avg_degree 4, sqrt 2, j = -0.75*1*2*1024 = -1536 → milli.
+        assert_eq!(
+            expected_gse_milli(1024, 2048, 0.75, &[0], &[-1000, 1000]),
+            -1_536_000
+        );
+    }
+
+    #[test]
+    fn expected_gse_zero_nodes_or_edges_is_zero() {
+        assert_eq!(expected_gse_milli(0, 2048, 0.75, &[0], &[-1000, 1000]), 0);
+        assert_eq!(expected_gse_milli(1024, 0, 0.75, &[0], &[-1000, 1000]), 0);
+    }
+
+    #[test]
+    fn from_topology_orders_bounds_hard_lt_knee_lt_easy() {
+        let c = EnergyCurve::from_topology(
+            1024,
+            2048,
+            700,
+            750,
+            800,
+            &[-1000, 0, 1000],
+            &[-1000, 1000],
+        );
+        // A larger c is more negative: hard (800) < knee (750) < easy (700).
+        assert!(c.min_milli < c.knee_milli);
+        assert!(c.knee_milli < c.max_milli);
+        assert!(c.max_milli < 0);
     }
 }
