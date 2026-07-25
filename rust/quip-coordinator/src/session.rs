@@ -52,6 +52,10 @@ pub struct CoordinatorState {
     /// `Shutdown`/cancel to a running session. Registered on handshake success,
     /// removed when the session ends.
     pub outbound: HashMap<String, mpsc::Sender<Result<CoordMsg, Status>>>,
+    /// job_id (nonce) → the 32-byte salt it was derived from, so the winning
+    /// Proof carries the salt live submit requires. Recorded when the feeder
+    /// stages a job, consumed on its Result, cleared on reseed.
+    pub salts: HashMap<Vec<u8>, [u8; 32]>,
     pub current_best_milli: Option<i64>,
     pub results_validated: u64,
     pub last_abandoned_generation: u64,
@@ -69,6 +73,7 @@ impl CoordinatorState {
             inflight: HashMap::new(),
             inflight_owner: HashMap::new(),
             outbound: HashMap::new(),
+            salts: HashMap::new(),
             current_best_milli: None,
             results_validated: 0,
             last_abandoned_generation: 0,
@@ -86,6 +91,21 @@ impl CoordinatorState {
                 .unwrap_or_default(),
         );
         self.topology = topology;
+    }
+
+    /// Remember the salt a staged job was derived from (feeder path).
+    pub fn record_salt(&mut self, job_id: &[u8], salt: [u8; 32]) {
+        let _ = self.salts.insert(job_id.to_vec(), salt);
+    }
+
+    /// Consume the salt for a completed job, for its Proof.
+    pub fn take_salt(&mut self, job_id: &[u8]) -> Option<[u8; 32]> {
+        self.salts.remove(job_id)
+    }
+
+    /// Drop all remembered salts on reseed — the prior generation is cancelled.
+    pub fn clear_salts(&mut self) {
+        self.salts.clear();
     }
 
     /// Record a dispatched job as in-flight, attributing it to `miner_id`.
@@ -293,13 +313,14 @@ async fn run_session<C: ChainClient>(
                 }
             }
             Some(miner_msg::Msg::Result(result)) => {
-                let (job, topo, best, gates) = {
+                let (job, salt, topo, best, gates) = {
                     let mut st = state.lock().await;
                     let job = st.complete_inflight(&result.job_id);
+                    let salt = st.take_salt(&result.job_id);
                     let topo = Arc::clone(&st.resolved_topo);
                     let best = st.current_best_milli;
                     let gates = crate::validate::gates_from_target(st.target.as_ref());
-                    (job, topo, best, gates)
+                    (job, salt, topo, best, gates)
                 };
                 if let Some(job) = job {
                     if let Some(ising) = job.ising.as_ref() {
@@ -322,11 +343,10 @@ async fn run_session<C: ChainClient>(
                                     .map(|p| p.order_id.clone())
                                     .unwrap_or_default(),
                                 generation: job.generation,
-                                // Salt is chosen when the PoW job is derived;
-                                // session does not yet thread it through the
-                                // Job message. Live RealChainClient submit
-                                // requires proof.salt == 32 bytes.
-                                salt: vec![],
+                                // Salt is chosen by the feeder when the PoW job
+                                // is derived and remembered by job_id; the live
+                                // RealChainClient submit requires 32 bytes.
+                                salt: salt.map(|s| s.to_vec()).unwrap_or_default(),
                                 device_access_time_us: result
                                     .meta
                                     .as_ref()
