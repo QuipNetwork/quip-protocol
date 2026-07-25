@@ -2,103 +2,34 @@
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
+# The v0.2 Python miner stack (CPU/ GPU/ QPU/ shared/ substrate/ quip_cli.py)
+# was removed in the v0.3 cutover: the miners live in their own repos
+# (quip.network/quip-miner-*) and the coordinator + chain integration are Rust
+# (rust/). This root package now only pins the Python dev/conformance
+# dependencies; the v0.3 SDK is python/quip_proto (built by maturin).
 [project]
 name = "quip-protocol"
-version = "0.2.1rc54"
-description = "Quantum mining stack (Substrate-integrated successor to the legacy quip-protocol P2P node)"
+version = "0.3.0"
+description = "quip.network v0.3 workspace: Rust crates (rust/) + quip_proto SDK (python/). Python dev/conformance deps only."
 readme = "README.md"
 requires-python = ">=3.10"
-# Base dependencies required for all modes
 dependencies = [
-    "dwave-ocean-sdk>=9.0.0,<10",
-    "numpy>=1.24.0",
-    "python-dotenv>=1.0.0",
-    "aiohttp>=3.9.0",
-    "click>=8.1.7",
-    "blake3>=1.0.5",
-    "substrate-interface>=1.7.4",
-    "scalecodec>=1.2",
-    # Phase 7: hybrid sr25519+ML-DSA-44 signing. `dilithium-py` is pure
-    # Python (deterministic seed-based keygen for ML-DSA-44). The legacy
-    # `oqs-python` binding to liboqs is faster but doesn't expose seeded
-    # keygen and isn't on PyPI under a stable name — keep dilithium-py as
-    # the canonical path until ML-DSA signing rate becomes a bottleneck.
-    "dilithium-py>=1.0",
-    # tomllib joined stdlib in 3.11 — fall back to the upstream package on 3.10.
-    "tomli>=2.0.1; python_version < '3.11'",
-    # v0.3 quip_proto gRPC stubs + runtime (python/quip, python/quip_proto).
     "grpcio>=1.60.0",
     "protobuf>=4.25.0",
+    "numpy>=1.24.0",
+    "blake3>=1.0.5",
 ]
 
 [project.optional-dependencies]
-# CPU mode - lightweight, no GPU dependencies
-cpu = []
+dev = ["pytest>=8.0,<9", "pytest-asyncio>=0.23.0"]
 
-# Performance optimizations for networking (optional)
-fast = [
-    "pyzmq>=25.0.0",
-    "uvloop>=0.19.0; sys_platform != 'win32'",
-]
-
-# CUDA mode - NVIDIA GPU support (matches PyTorch CUDA 12)
-cuda = [
-    "cupy-cuda12x>=13.0.0",
-    "nvidia-ml-py>=12.0.0",
-]
-
-# Metal mode - Apple Silicon GPU support
-metal = [
-    "pyobjc-framework-Metal",
-    "pyobjc-framework-MetalPerformanceShaders",
-]
-
-# Full installation with all GPU backends + visualization
-full = [
-    "torch>=2.0.0",
-    "torchvision>=0.15.0",
-    "torchaudio>=2.0.0",
-    "cupy-cuda12x>=13.0.0; sys_platform == 'linux' or sys_platform == 'win32'",
-    "nvidia-ml-py>=12.0.0; sys_platform == 'linux' or sys_platform == 'win32'",
-    "pyobjc-framework-Metal; sys_platform == 'darwin'",
-    "pyobjc-framework-MetalPerformanceShaders; sys_platform == 'darwin'",
-    "matplotlib>=3.6.0",
-    "pandas>=2.0.0",
-    "seaborn>=0.12.0",
-    "acme>=2.0.0",
-    "josepy>=1.13.0",
-]
-
-dev = [
-    "pytest>=8.0,<9",
-    "pytest-asyncio>=0.23.0",
-]
-
-[project.scripts]
-quip-miner = "quip_cli:miner_main"
-
+# No packages: the SDK (quip_proto + quip.v1 stubs) is installed via
+# `maturin develop` from python/; nothing here is importable on its own.
 [tool.setuptools]
-py-modules = ["quip_cli"]
+py-modules = []
 
 [tool.setuptools.packages.find]
-# Root packages are the v0.2 miner stack; python/ holds the v0.3 quip_proto
-# SDK (quip.v1 stubs + quip_proto helpers). Both must install via `pip install .`.
-where = [".", "python"]
-include = [
-    "shared*",
-    "substrate*",
-    "dwave_topologies*",
-    "CPU*",
-    "GPU*",
-    "QPU*",
-    "quip*",
-    # quip_proto is built by maturin (PyO3 extension), not setuptools.
-]
-
-[tool.setuptools.package-data]
-dwave_topologies = ["topologies/*.json.gz", "embeddings/*.json.gz"]
-GPU = ["*.cu", "*.metal"]
-"*" = ["genesis_block.json"]
+include = []
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
