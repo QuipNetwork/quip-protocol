@@ -1,6 +1,7 @@
 //! quip-coordinator binary: CLI, runtime wiring, graceful shutdown.
 
 use clap::{Parser, Subcommand, ValueEnum};
+use quip_coordinator::chain::extrinsic::{load_hybrid_pair, miner_identity_bytes};
 use quip_coordinator::chain::RealChainClient;
 use quip_coordinator::config::{parse_config, LaunchEntry};
 use quip_coordinator::drive::{
@@ -147,10 +148,24 @@ fn run_config_path(config: Option<PathBuf>) -> StdExitCode {
         cfg.signer_key.clone(),
     ));
     let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    // Canonical miner account (blake2_256(SCALE(account))) seeds PoW nonce
+    // derivation. A live mining coordinator needs its signer key; without a
+    // usable one, warn and fall back to a zero account — it still serves and
+    // feeds, but its proofs won't verify on-chain.
+    let miner_account = match load_hybrid_pair(&cfg.signer_key) {
+        Ok(pair) => miner_identity_bytes(&pair),
+        Err(e) => {
+            eprintln!("warning: no usable signer key ({e}); PoW proofs will not verify on-chain");
+            [0u8; 32]
+        }
+    };
     let params = RuntimeParams {
         sock_path: format!("/tmp/quip-coordinator-{}.sock", std::process::id()),
         grace_ms: 2000,
         backoff: BackoffPolicy::default(),
+        miner_account,
+        buffer_depth: 8,
+        poll_interval_ms: 1000,
     };
     eprintln!(
         "quip-coordinator: serving {} miner(s) on {}",

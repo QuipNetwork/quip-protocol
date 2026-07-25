@@ -137,6 +137,30 @@ impl Router {
             .map(|q| q.staged.len())
             .unwrap_or(0)
     }
+
+    /// Registered miner ids, sorted for deterministic iteration (the feeder
+    /// walks them to top each up to buffer depth).
+    pub fn miner_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.miners.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Stage `job` directly on `miner_id` if it is registered and capable —
+    /// the feeder tops up a specific miner rather than first-fit `route`. Returns
+    /// whether the job was staged.
+    pub fn stage_on(&mut self, miner_id: &str, job: Job) -> bool {
+        let n_nodes = job_node_count(&job);
+        let n_edges = job_edge_count(&job);
+        let kind = job.kind;
+        if let Some(q) = self.miners.get_mut(miner_id) {
+            if capable(q, kind, n_nodes, n_edges) {
+                q.staged.push_back(job);
+                return true;
+            }
+        }
+        false
+    }
 }
 
 fn capable(q: &MinerQueue, kind: i32, n_nodes: u32, n_edges: u32) -> bool {
@@ -263,6 +287,30 @@ mod tests {
             gens.push(j.generation);
         }
         assert_eq!(gens, vec![0, 6]);
+    }
+
+    #[test]
+    fn miner_ids_are_sorted() {
+        let mut r = Router::new();
+        r.register_miner("cpu-1", caps_ising());
+        r.register_miner("cpu-0", caps_ising());
+        assert_eq!(
+            r.miner_ids(),
+            vec!["cpu-0".to_string(), "cpu-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn stage_on_targets_specific_capable_miner() {
+        let mut r = Router::new();
+        r.register_miner("cpu-0", caps_ising());
+        r.register_miner("cpu-1", caps_ising());
+        // Directly stage on cpu-1 (first-fit `route` would have picked cpu-0).
+        assert!(r.stage_on("cpu-1", make_job(1, JobKind::IsingSample)));
+        assert_eq!(r.staged_len("cpu-0"), 0);
+        assert_eq!(r.staged_len("cpu-1"), 1);
+        // Unknown miner → not staged.
+        assert!(!r.stage_on("nope", make_job(2, JobKind::IsingSample)));
     }
 
     #[test]
