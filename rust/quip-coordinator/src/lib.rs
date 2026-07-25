@@ -3,6 +3,7 @@
 
 pub mod chain;
 pub mod config;
+pub mod decay;
 pub mod drive;
 pub mod producer;
 pub mod router;
