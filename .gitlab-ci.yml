@@ -3,12 +3,14 @@
 
 stages:
   - test
+  - build
 
-# NOTE (v0.3 cutover): the v0.2 image + binary build/release jobs (build-cpu-*,
-# build-cuda, manifest-cpu, package-macos-arm64, release-binaries, check-version)
-# were removed — they built the deleted Python monolith. New v0.3 images will
-# fetch the released miner binaries under a separate namespace once the
-# coordinator's production runtime is wired (beads quip-6ha/4kn/agm); see rxg.5.
+# NOTE (v0.3 cutover): the v0.2 image/binary jobs were removed (they built the
+# deleted Python monolith). The v0.3 images below live under a SEPARATE
+# namespace (v0.3/) so they never touch the v0.2 :latest/:v0.2 tags that
+# quip-node-manager tracks — the full cutover of those tags is deferred. Images
+# bundle the released miner binaries + a from-source coordinator; the
+# coordinator's production runtime is still being wired (quip-6ha/4kn/agm).
 
 # ---------------------------------------------------------------------------
 # Tests (branches only — main/tags skip straight to build)
@@ -81,3 +83,57 @@ conformance:
     - if: $CI_COMMIT_BRANCH == "main"
       when: never
     - if: $CI_COMMIT_BRANCH
+
+# ---------------------------------------------------------------------------
+# v0.3 container images (separate v0.3/ namespace; see the stages note).
+# Bundle: from-source quip-coordinator + released CPU/CUDA miner binaries +
+# D-Wave Python miner. Manual on branches (heavy build), automatic on tags.
+# ---------------------------------------------------------------------------
+.image_base:
+  stage: build
+  image: docker:27
+  services: [docker:27-dind]
+  before_script:
+    - docker buildx create --use --name quipci --driver docker-container --bootstrap 2>/dev/null || docker buildx use quipci
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
+      when: manual
+      allow_failure: true
+
+image-quip-miner:
+  extends: .image_base
+  variables:
+    IMG: $CI_REGISTRY_IMAGE/v0.3/quip-miner
+  script:
+    - |
+      TAG="${CI_COMMIT_TAG:-v0.3.0}"
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        docker buildx build --platform linux/amd64,linux/arm64 \
+          -f docker/Dockerfile.quip-miner --build-arg MINERS_TAG="$TAG" \
+          --build-arg QUIP_DOCKER_IMAGE="$IMG:$CI_COMMIT_TAG" \
+          -t "$IMG:$CI_COMMIT_TAG" -t "$IMG:latest" --push .
+      else
+        docker buildx build --platform linux/amd64 \
+          -f docker/Dockerfile.quip-miner --build-arg MINERS_TAG="$TAG" \
+          -t "$IMG:$CI_COMMIT_SHORT_SHA" .
+      fi
+
+image-quip-miner-cuda:
+  extends: .image_base
+  variables:
+    IMG: $CI_REGISTRY_IMAGE/v0.3/quip-miner-cuda
+  script:
+    - |
+      TAG="${CI_COMMIT_TAG:-v0.3.0}"
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        docker buildx build --platform linux/amd64 \
+          -f docker/Dockerfile.quip-miner-cuda --build-arg MINERS_TAG="$TAG" \
+          --build-arg QUIP_DOCKER_IMAGE="$IMG:$CI_COMMIT_TAG" \
+          -t "$IMG:$CI_COMMIT_TAG" -t "$IMG:latest" --push .
+      else
+        docker buildx build --platform linux/amd64 \
+          -f docker/Dockerfile.quip-miner-cuda --build-arg MINERS_TAG="$TAG" \
+          -t "$IMG:$CI_COMMIT_SHORT_SHA" .
+      fi

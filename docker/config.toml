@@ -1,0 +1,23 @@
+# quip-coordinator config for the v0.3 container image.
+#
+# Copied to /data/config.toml on first run; after that /data/config.toml is the
+# source of truth (edit + restart). The coordinator connects to a chain via
+# [miner].validators, then supervises the miner processes declared below —
+# each backend section maps to a downloaded binary (see the image's
+# /usr/local/bin). `binary` selects the sa vs chromatic-gibbs variant.
+
+[miner]
+# Ordered chain endpoints; live-rotated on disconnect.
+validators = ["ws://quip-validator:9944", "ws://127.0.0.1:9944"]
+# Hybrid sr25519 + ML-DSA-44 signer. Provide via a mounted keystore/secret.
+signer_key = ""
+
+# CPU miner (bundled: quip-cpu-sa, quip-cpu-gibbs).
+[cpu]
+binary = "quip-cpu-sa"   # or "quip-cpu-gibbs"
+
+# D-Wave QPU miner (bundled Python entry point quip-dwave-qa). Needs a Leap
+# token (DWAVE_API_TOKEN) for real hardware; omit the section to disable.
+# [dwave]
+# binary = "quip-dwave-qa"
+# daily_budget = "30s"
