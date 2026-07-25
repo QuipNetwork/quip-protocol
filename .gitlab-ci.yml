@@ -169,3 +169,22 @@ image-quip-miner-cuda:
         --file docker/Dockerfile.quip-miner-cuda $TAGS \
         --build-arg "MINERS_TAG=$TAG" --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" \
         $OUT "$CI_PROJECT_DIR"
+
+# TEMPORARY diagnostic: does finney expose a Docker daemon we can build against
+# (docker-outside-of-docker)? If `docker info` + the trivial build succeed,
+# finney can build amd64 images with plain `docker build`. Remove after we know.
+probe-finney:
+  stage: build
+  tags: [linux, amd64]
+  image: docker:27-cli
+  script:
+    - 'echo "== id =="; id || true'
+    - 'echo "== socket =="; ls -la /var/run/docker.sock 2>&1 || echo "NO SOCKET"'
+    - 'echo "== docker version =="; docker version 2>&1 || echo "VERSION FAILED"'
+    - 'echo "== docker info =="; docker info 2>&1 | head -15 || echo "INFO FAILED"'
+    - 'echo "== buildx =="; docker buildx version 2>&1 || echo "NO BUILDX"'
+    - 'echo "== trivial build =="; printf "FROM alpine\nRUN echo hi\n" > Dockerfile.probe; docker build -f Dockerfile.probe -t probe:test . 2>&1 | tail -15 || echo "BUILD FAILED"'
+  rules:
+    - if: $CI_COMMIT_BRANCH
+      when: manual
+      allow_failure: true
