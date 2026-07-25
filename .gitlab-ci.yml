@@ -87,104 +87,128 @@ conformance:
 # ---------------------------------------------------------------------------
 # v0.3 container images (separate v0.3/ namespace; see the stages note).
 # Bundle: from-source quip-coordinator + released CPU/CUDA miner binaries +
-# D-Wave Python miner. Manual on branches (build-only, no push), automatic on
-# tags (build + push :<tag> and :latest).
+# D-Wave Python miner. Built the org-standard way (see quip-protocol-rs's
+# quip-network-node): kaniko, one job per native architecture, stitched by
+# manifest-tool. Build-only on branches (--no-push, manual), build + push on tags.
 # ---------------------------------------------------------------------------
-# Native per-arch on the macOS runners (docker buildx, real Linux VM), no
-# emulation: linux/amd64 on the amd64 Mac, linux/arm64 on the arm64 Mac, then a
-# manifest stitches them into one multi-arch tag. finney can't build images
-# (kaniko dies on its GPU /lib/firmware mount; buildah's user namespace is
-# seccomp-blocked on the unprivileged executor), so the amd64 Mac is our amd64
-# builder. Shell-executor jobs: no `image:`; commands hit the Mac's daemon.
-.image_base:
+# The `docker` tag is load-bearing: it pins these to *container* executors that
+# honour `image:` and can run kaniko. amd64 -> the Linux Docker boxes
+# (finney/lovelace/watch); arm64 -> the arm64 docker-executor on an Apple-Silicon
+# Mac (tesla-docker). The bare arch tags alone would hit the macOS *shell*
+# runners, which ignore `image:` and can't run kaniko.
+#
+# amd64 /lib workaround: the amd64 boxes are NVIDIA GPU hosts whose runtime
+# bind-mounts host firmware into /lib, so kaniko can't rewrite /lib into the
+# base image's merged-usr symlink (EBUSY). Ignore /lib entirely, then re-shim
+# the multilib triplet dir so each RUN still resolves its ELF interpreter (the
+# shim dangles until kaniko unpacks the rootfs; it never reaches the image).
+# NOT applied on arm64: no firmware mount, and the aarch64 ELF interpreter lives
+# directly in /lib, so ignoring /lib would break every RUN.
+.kaniko-image:
   stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  timeout: 90m
   before_script:
-    # Per-job docker auth in a throwaway config dir. The shared Mac's default
-    # config uses the osxkeychain cred store, and concurrent `docker login`s
-    # collide on it ("item already exists in keychain"). A local config.json
-    # with no credsStore keeps creds out of the keychain.
-    - export DOCKER_CONFIG="$CI_PROJECT_DIR/.docker"
-    - mkdir -p "$DOCKER_CONFIG" && printf '{}' > "$DOCKER_CONFIG/config.json"
-    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - if [ -n "$KANIKO_LIB_IGNORE" ]; then mkdir -p /lib && ln -sfn /usr/lib/$TRIPLET /lib/$TRIPLET; fi
+    - mkdir -p /kaniko/.docker
+    - |
+      printf '{"auths":{"%s":{"auth":"%s"}}}\n' \
+        "$CI_REGISTRY" \
+        "$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')" \
+        > /kaniko/.docker/config.json
   rules:
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH
       when: manual
       allow_failure: true
 
-# quip-miner: native per-arch, combined into a multi-arch manifest on tags.
-# buildx sets TARGETARCH from --platform, so the Dockerfile picks the right
-# CPU binaries. Branch = build + --load (validate); tag = --push per-arch tags.
+# quip-miner: one native kaniko build per arch, each pushing an arch-suffixed
+# tag; the manifest job stitches them. Branch = --no-push (validate).
 image-quip-miner-amd64:
-  extends: .image_base
-  tags: [macos, amd64]
+  extends: .kaniko-image
+  tags: [docker, amd64]
+  variables:
+    TRIPLET: x86_64-linux-gnu
+    KANIKO_LIB_IGNORE: "--ignore-path=/lib"
   script:
     - |
       TAG="${CI_COMMIT_TAG:-v0.3.0}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner"
       REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
-      OUT="--load"; [ -n "$CI_COMMIT_TAG" ] && OUT="--push"
-      docker buildx build --platform linux/amd64 \
-        --file docker/Dockerfile.quip-miner --tag "$IMAGE:$REF-amd64" \
-        --build-arg "MINERS_TAG=$TAG" --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" \
-        $OUT "$CI_PROJECT_DIR"
+      DEST="--destination $IMAGE:$REF-amd64"; [ -z "$CI_COMMIT_TAG" ] && DEST="--no-push"
+      /kaniko/executor \
+        --context "$CI_PROJECT_DIR" \
+        --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile.quip-miner" \
+        --build-arg "MINERS_TAG=$TAG" \
+        --build-arg "TARGETARCH=amd64" \
+        --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" \
+        $KANIKO_LIB_IGNORE \
+        $DEST
 
 image-quip-miner-arm64:
-  extends: .image_base
-  tags: [macos, arm64]
+  extends: .kaniko-image
+  tags: [docker, arm64]
+  # The arm64 runner is a docker-executor on an Apple-Silicon Mac; a cold
+  # coordinator + D-Wave venv compile can run long, and kaniko's default
+  # compressed-caching OOMs that VM while snapshotting — disable it.
+  timeout: 180m
+  variables:
+    KANIKO_EXTRA: "--compressed-caching=false"
   script:
     - |
       TAG="${CI_COMMIT_TAG:-v0.3.0}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner"
       REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
-      OUT="--load"; [ -n "$CI_COMMIT_TAG" ] && OUT="--push"
-      docker buildx build --platform linux/arm64 \
-        --file docker/Dockerfile.quip-miner --tag "$IMAGE:$REF-arm64" \
-        --build-arg "MINERS_TAG=$TAG" --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" \
-        $OUT "$CI_PROJECT_DIR"
+      DEST="--destination $IMAGE:$REF-arm64"; [ -z "$CI_COMMIT_TAG" ] && DEST="--no-push"
+      /kaniko/executor \
+        --context "$CI_PROJECT_DIR" \
+        --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile.quip-miner" \
+        --build-arg "MINERS_TAG=$TAG" \
+        --build-arg "TARGETARCH=arm64" \
+        --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" \
+        $KANIKO_EXTRA \
+        $DEST
 
-# Stitch the per-arch images into one multi-arch tag. Tags only (needs the
-# per-arch images pushed); combines into :<tag> and :latest.
+# Stitch the per-arch images into the consumer-facing multi-arch tag (+ :latest).
+# Tags only (needs the per-arch images pushed). manifest-tool substitutes ARCH.
 image-quip-miner-manifest:
-  extends: .image_base
-  tags: [macos, amd64]
+  stage: build
+  image:
+    name: mplatform/manifest-tool:alpine
+    entrypoint: [""]
+  tags: [docker, amd64]
   needs: [image-quip-miner-amd64, image-quip-miner-arm64]
   rules:
     - if: $CI_COMMIT_TAG
   script:
     - |
       IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner"; REF="$CI_COMMIT_TAG"
-      docker buildx imagetools create --tag "$IMAGE:$REF" --tag "$IMAGE:latest" \
-        "$IMAGE:$REF-amd64" "$IMAGE:$REF-arm64"
+      manifest-tool \
+        --username "$CI_REGISTRY_USER" --password "$CI_REGISTRY_PASSWORD" \
+        push from-args \
+        --platforms linux/amd64,linux/arm64 \
+        --template "$IMAGE:$REF-ARCH" \
+        --target "$IMAGE:$REF" \
+        --tags "latest"
 
-# quip-miner-cuda: amd64-only (nvidia/cuda base), native on the amd64 Mac.
+# quip-miner-cuda: amd64-only (nvidia/cuda base), single kaniko job on finney.
 image-quip-miner-cuda:
-  extends: .image_base
-  tags: [macos, amd64]
+  extends: .kaniko-image
+  tags: [docker, amd64]
+  variables:
+    TRIPLET: x86_64-linux-gnu
+    KANIKO_LIB_IGNORE: "--ignore-path=/lib"
   script:
     - |
       TAG="${CI_COMMIT_TAG:-v0.3.0}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner-cuda"
       REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
-      TAGS="--tag $IMAGE:$REF"; OUT="--load"
-      if [ -n "$CI_COMMIT_TAG" ]; then TAGS="$TAGS --tag $IMAGE:latest"; OUT="--push"; fi
-      docker buildx build --platform linux/amd64 \
-        --file docker/Dockerfile.quip-miner-cuda $TAGS \
-        --build-arg "MINERS_TAG=$TAG" --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" \
-        $OUT "$CI_PROJECT_DIR"
-
-# TEMPORARY diagnostic: does finney expose a Docker daemon we can build against
-# (docker-outside-of-docker)? If `docker info` + the trivial build succeed,
-# finney can build amd64 images with plain `docker build`. Remove after we know.
-probe-finney:
-  stage: build
-  tags: [linux, amd64]
-  image: docker:27-cli
-  script:
-    - 'echo "== id =="; id || true'
-    - 'echo "== socket =="; ls -la /var/run/docker.sock 2>&1 || echo "NO SOCKET"'
-    - 'echo "== docker version =="; docker version 2>&1 || echo "VERSION FAILED"'
-    - 'echo "== docker info =="; docker info 2>&1 | head -15 || echo "INFO FAILED"'
-    - 'echo "== buildx =="; docker buildx version 2>&1 || echo "NO BUILDX"'
-    - 'echo "== trivial build =="; printf "FROM alpine\nRUN echo hi\n" > Dockerfile.probe; docker build -f Dockerfile.probe -t probe:test . 2>&1 | tail -15 || echo "BUILD FAILED"'
-  rules:
-    - if: $CI_COMMIT_BRANCH
-      when: manual
-      allow_failure: true
+      DEST="--destination $IMAGE:$REF"
+      [ -n "$CI_COMMIT_TAG" ] && DEST="$DEST --destination $IMAGE:latest"
+      [ -z "$CI_COMMIT_TAG" ] && DEST="--no-push"
+      /kaniko/executor \
+        --context "$CI_PROJECT_DIR" \
+        --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile.quip-miner-cuda" \
+        --build-arg "MINERS_TAG=$TAG" \
+        --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" \
+        $KANIKO_LIB_IGNORE \
+        $DEST
