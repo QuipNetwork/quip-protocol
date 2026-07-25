@@ -1,0 +1,64 @@
+# quip-miner (v0.3) — coordinator + CPU + D-Wave miners.
+# Multi-arch (linux/amd64, linux/arm64) via buildx; TARGETARCH selects the
+# released CPU binaries. The coordinator is built from source; the CPU miner
+# binaries are downloaded from their release; the D-Wave miner is a Python
+# package (builds quip_proto from source until it is on PyPI).
+
+# --- builder: quip-coordinator (Rust) + quip-dwave-qa venv (Python) ---
+FROM python:3.12-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        protobuf-compiler build-essential curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /src
+COPY rust/ rust/
+COPY proto/ proto/
+RUN cargo build --release -p quip-coordinator --manifest-path rust/Cargo.toml
+
+# D-Wave miner into an isolated venv (pulls + builds quip_proto via maturin).
+ARG MINERS_TAG=v0.3.0
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir \
+       "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git@${MINERS_TAG}"
+
+# --- runtime ---
+FROM python:3.12-slim-bookworm
+
+LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-protocol"
+LABEL description="quip-miner v0.3 — coordinator + CPU + D-Wave"
+
+ARG TARGETARCH
+ARG MINERS_TAG=v0.3.0
+ARG QUIP_DOCKER_IMAGE=""
+ENV QUIP_DOCKER_IMAGE=${QUIP_DOCKER_IMAGE} \
+    PATH="/opt/venv/bin:/usr/local/bin:${PATH}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tini gosu curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN groupadd --system --gid 1000 quip \
+    && useradd --system --uid 1000 --gid 1000 --home /home/quip \
+       --create-home --shell /usr/sbin/nologin quip
+
+# Coordinator binary + D-Wave venv from the builder.
+COPY --from=builder /src/rust/target/release/quip-coordinator /usr/local/bin/quip-coordinator
+COPY --from=builder /opt/venv /opt/venv
+
+# Released CPU miner binaries for this arch.
+RUN base="https://gitlab.com/api/v4/projects/quip.network%2Fquip-miner-cpu/packages/generic/quip-miner-cpu/${MINERS_TAG}" \
+    && for b in quip-cpu-sa quip-cpu-gibbs; do \
+         curl --fail --location --silent --show-error \
+              "${base}/${b}-${TARGETARCH}" -o "/usr/local/bin/${b}" \
+         && chmod +x "/usr/local/bin/${b}"; \
+       done
+
+WORKDIR /app
+COPY docker/config.toml /app/config.toml
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+VOLUME ["/data"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
