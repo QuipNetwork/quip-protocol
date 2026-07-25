@@ -89,13 +89,21 @@ conformance:
 # Bundle: from-source quip-coordinator + released CPU/CUDA miner binaries +
 # D-Wave Python miner. Manual on branches (heavy build), automatic on tags.
 # ---------------------------------------------------------------------------
+# NOTE: kaniko (no docker daemon) builds reliably on the shared runners, but is
+# single-arch (amd64). arm64 for quip-miner needs a separate arm64 runner — a
+# follow-up; for now both images are amd64.
 .image_base:
   stage: build
-  image: docker:27
-  services: [docker:27-dind]
+  # Steer off the GPU host runner (its /lib/firmware bind-mount breaks kaniko's
+  # rootfs unpack) onto the same linux/amd64 runner the test jobs use.
+  tags: [linux, amd64]
+  image:
+    # -debug carries a busybox shell for the before_script; the plain image has none.
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
   before_script:
-    - docker buildx create --use --name quipci --driver docker-container --bootstrap 2>/dev/null || docker buildx use quipci
-    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' \"$CI_REGISTRY_USER\" \"$CI_REGISTRY_PASSWORD\" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
   rules:
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH
@@ -104,36 +112,24 @@ conformance:
 
 image-quip-miner:
   extends: .image_base
-  variables:
-    IMG: $CI_REGISTRY_IMAGE/v0.3/quip-miner
   script:
     - |
       TAG="${CI_COMMIT_TAG:-v0.3.0}"
-      if [ -n "$CI_COMMIT_TAG" ]; then
-        docker buildx build --platform linux/amd64,linux/arm64 \
-          -f docker/Dockerfile.quip-miner --build-arg MINERS_TAG="$TAG" \
-          --build-arg QUIP_DOCKER_IMAGE="$IMG:$CI_COMMIT_TAG" \
-          -t "$IMG:$CI_COMMIT_TAG" -t "$IMG:latest" --push .
-      else
-        docker buildx build --platform linux/amd64 \
-          -f docker/Dockerfile.quip-miner --build-arg MINERS_TAG="$TAG" \
-          -t "$IMG:$CI_COMMIT_SHORT_SHA" .
-      fi
+      DEST="--destination $CI_REGISTRY_IMAGE/v0.3/quip-miner:${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+      [ -n "$CI_COMMIT_TAG" ] && DEST="$DEST --destination $CI_REGISTRY_IMAGE/v0.3/quip-miner:latest"
+      [ -z "$CI_COMMIT_TAG" ] && DEST="--no-push"
+      /kaniko/executor --ignore-path=/lib/firmware --context "$CI_PROJECT_DIR" --dockerfile docker/Dockerfile.quip-miner \
+        --build-arg "MINERS_TAG=$TAG" \
+        --build-arg "QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/v0.3/quip-miner:$TAG" $DEST
 
 image-quip-miner-cuda:
   extends: .image_base
-  variables:
-    IMG: $CI_REGISTRY_IMAGE/v0.3/quip-miner-cuda
   script:
     - |
       TAG="${CI_COMMIT_TAG:-v0.3.0}"
-      if [ -n "$CI_COMMIT_TAG" ]; then
-        docker buildx build --platform linux/amd64 \
-          -f docker/Dockerfile.quip-miner-cuda --build-arg MINERS_TAG="$TAG" \
-          --build-arg QUIP_DOCKER_IMAGE="$IMG:$CI_COMMIT_TAG" \
-          -t "$IMG:$CI_COMMIT_TAG" -t "$IMG:latest" --push .
-      else
-        docker buildx build --platform linux/amd64 \
-          -f docker/Dockerfile.quip-miner-cuda --build-arg MINERS_TAG="$TAG" \
-          -t "$IMG:$CI_COMMIT_SHORT_SHA" .
-      fi
+      DEST="--destination $CI_REGISTRY_IMAGE/v0.3/quip-miner-cuda:${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+      [ -n "$CI_COMMIT_TAG" ] && DEST="$DEST --destination $CI_REGISTRY_IMAGE/v0.3/quip-miner-cuda:latest"
+      [ -z "$CI_COMMIT_TAG" ] && DEST="--no-push"
+      /kaniko/executor --ignore-path=/lib/firmware --context "$CI_PROJECT_DIR" --dockerfile docker/Dockerfile.quip-miner-cuda \
+        --build-arg "MINERS_TAG=$TAG" \
+        --build-arg "QUIP_DOCKER_IMAGE=$CI_REGISTRY_IMAGE/v0.3/quip-miner-cuda:$TAG" $DEST
