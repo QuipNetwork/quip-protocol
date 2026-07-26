@@ -10,6 +10,7 @@ default-members = [
     "crates/quip-proto",
     "crates/quip-protocol",
     "crates/quip-miner-core",
+    "crates/quip-miner-exec",
     "crates/quip-coordinator",
     "crates/quip-mock-coordinator",
     "crates/quip-mock-miner",

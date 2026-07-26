@@ -22,6 +22,7 @@ import higher ones.
 | `quip-proto` | Generated protocol types and gRPC service (from `proto/`) | — |
 | `quip-protocol` | Consensus primitives: `wire`, `session`, `scoring`, `derive`, `chacha8` | `quip-proto` |
 | `quip-miner-core` | Shared miner harness: `Sampler` trait, session client, adaptive params | `quip-proto`, `quip-protocol` |
+| `quip-miner-exec` | Generic external-solver miner: JSON model + exec over the session protocol | `quip-miner-core`, `quip-proto` |
 | `quip-coordinator` | The `quip-coordinator` binary: chain access, feeder, router, supervisor | `quip-proto`, `quip-protocol` |
 | `quip-protocol-py` | PyO3 extension exposing consensus primitives to Python (`quip_proto._core`) | `quip-protocol` |
 | `quip-mock-coordinator` | Scripted coordinator test double (package `ln`) | `quip-proto`, `quip-protocol` |
@@ -85,17 +86,17 @@ client loop. The crate is library-only, with no binary of its own.
 
 The CPU, CUDA, and Metal miners are native binaries in their own repositories
 that call `run`. The D-Wave miner is Python, built on the PyO3 primitives in
-`quip-protocol-py`. Two parts of the target design differ from the source:
+`quip-protocol-py`. For a backend that's a standalone executable rather than a
+Rust `Sampler`, `quip-miner-exec` is the plug-in point: it serializes each job
+to a JSON model, execs a configured external solver (by file or stdin), and
+parses the solver's JSON solutions back over the same session protocol. One part
+of the target design still differs from the source:
 
 - The random and file job sources (the driver for benchmarking without a chain)
   live coordinator-side under `drive/` (`drive/random_source.rs`,
   `drive/list_source.rs`, `drive/harness.rs`), reached through the `drive`
   subcommand. They generate jobs, so the coordinator is their natural home, and
   the miner stays a pure solver.
-- The wrapper binary that shells out to a generic external solver with a model
-  file doesn't exist yet. It's the one unbuilt piece of the target design. If
-  a future backend is a standalone executable rather than a Rust `Sampler`, this
-  is where it plugs in.
 
 ### 5. Miners are isolated solvers
 
