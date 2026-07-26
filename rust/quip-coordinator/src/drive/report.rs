@@ -17,6 +17,11 @@ pub struct JobRow {
     pub passed: bool,
     pub device_access_time_us: u64,
     pub wall_ms: u64,
+    /// Resolved `num_reads`/`num_sweeps` the miner actually ran (from
+    /// `SamplerMeta`). Zero on rejected rows. For matched-condition parity
+    /// runs these show what each backend's adapt envelope settled on.
+    pub reads: u32,
+    pub sweeps: u32,
     /// True if the miner rejected the job outright (no `Result` returned).
     pub rejected: bool,
 }
@@ -85,6 +90,28 @@ pub fn print_table(rows: &[JobRow], agg: &Aggregate) {
         "--- {} jobs, {} passed, {} rejected, {:.2} jobs/s ---",
         agg.total_jobs, agg.passed, agg.rejected, agg.throughput_per_s
     );
+    if let Some(p) = effective_params(rows) {
+        println!("--- effective reads {}, sweeps {} ---", p.0, p.1);
+    }
+}
+
+/// Effective reads/sweeps across non-rejected rows, each as `"N"` when uniform
+/// or `"lo..hi"` when the run diverged. `None` if no job produced a result.
+/// A matched-condition adapt run reports one value per field per backend.
+fn effective_params(rows: &[JobRow]) -> Option<(String, String)> {
+    let mut reads = rows.iter().filter(|r| !r.rejected).map(|r| r.reads);
+    let mut sweeps = rows.iter().filter(|r| !r.rejected).map(|r| r.sweeps);
+    let (r0, s0) = (reads.next()?, sweeps.next()?);
+    let (r_lo, r_hi) = reads.fold((r0, r0), |(lo, hi), v| (lo.min(v), hi.max(v)));
+    let (s_lo, s_hi) = sweeps.fold((s0, s0), |(lo, hi), v| (lo.min(v), hi.max(v)));
+    let render = |lo: u32, hi: u32| {
+        if lo == hi {
+            lo.to_string()
+        } else {
+            format!("{lo}..{hi}")
+        }
+    };
+    Some((render(r_lo, r_hi), render(s_lo, s_hi)))
 }
 
 fn truncate_hex(s: &str) -> String {
@@ -109,6 +136,8 @@ fn row_to_json(r: &JobRow) -> serde_json::Value {
         "passed": r.passed,
         "rejected": r.rejected,
         "device_access_time_us": r.device_access_time_us,
+        "reads": r.reads,
+        "sweeps": r.sweeps,
         "wall_ms": r.wall_ms,
     })
 }
@@ -147,6 +176,8 @@ mod tests {
             diversity_milli: 200,
             passed,
             device_access_time_us: 100,
+            reads: 64,
+            sweeps: 256,
             wall_ms,
             rejected,
         }

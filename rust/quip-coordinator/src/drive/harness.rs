@@ -82,6 +82,8 @@ fn failing_row(job_id: Vec<u8>, is_pow: bool, wall_ms: u64) -> JobRow {
         diversity_milli: 0,
         passed: false,
         device_access_time_us: 0,
+        reads: 0,
+        sweeps: 0,
         wall_ms,
         rejected: true,
     }
@@ -312,11 +314,11 @@ async fn handle_result(
     let job_id = result.job_id;
     let solutions = result.solutions;
     let n_solutions = solutions.len();
-    let device_us = result
+    let (device_us, reads, sweeps) = result
         .meta
         .as_ref()
-        .map(|m| m.device_access_time_us)
-        .unwrap_or(0);
+        .map(|m| (m.device_access_time_us, m.reads, m.sweeps))
+        .unwrap_or((0, 0, 0));
     let validated = match tokio::task::spawn_blocking(move || {
         validate_result(&ising, &solutions, &gates, &topo)
     })
@@ -334,6 +336,8 @@ async fn handle_result(
         diversity_milli: validated.diversity_milli,
         passed: validated.accepted,
         device_access_time_us: device_us,
+        reads,
+        sweeps,
         wall_ms,
         rejected: false,
     });
