@@ -236,7 +236,7 @@ mod tests {
         let mut s = stash_with(vec![-50_000, -48_000, -46_000], 100, 10, 4);
         s.insert(cand(1, -49_000)); // viable at block 110
         s.insert(cand(2, -47_000)); // viable at block 120
-        // Before block 110: nothing due.
+                                    // Before block 110: nothing due.
         assert!(s.due_at(109).is_none());
         // At 110: candidate 1 due.
         assert_eq!(s.due_at(110).map(|c| c.job_id[0]), Some(1));

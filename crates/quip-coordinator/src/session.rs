@@ -29,6 +29,9 @@ pub(crate) fn coord(msg: coord_msg::Msg) -> CoordMsg {
     CoordMsg { msg: Some(msg) }
 }
 
+/// How many top candidates the win-time stash retains per generation.
+const WIN_STASH_K: usize = 8;
+
 /// Shared coordinator runtime state for one or more miner sessions.
 pub struct CoordinatorState {
     pub expected_tokens: HashMap<String, String>,
@@ -64,6 +67,11 @@ pub struct CoordinatorState {
     /// Current chain quantum-block id, refreshed by the feeder on reseed; keys
     /// the per-qblock attempt logs.
     pub qblock_id: Option<u64>,
+    /// Win-time stash of the most-viable sub-threshold candidates for the
+    /// current generation, armed with the decay projection on reseed.
+    pub stash: crate::stash::WinStash,
+    /// Block-interval/lag tracker for current-block estimation.
+    pub timing: crate::timing::TimingTracker,
 }
 
 impl CoordinatorState {
@@ -84,6 +92,8 @@ impl CoordinatorState {
             last_abandoned_generation: 0,
             attempt_tx: None,
             qblock_id: None,
+            stash: crate::stash::WinStash::new(WIN_STASH_K),
+            timing: crate::timing::TimingTracker::with_defaults(),
         }
     }
 
