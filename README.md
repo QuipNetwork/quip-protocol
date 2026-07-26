@@ -62,6 +62,48 @@ pytest conformance/
 
 See `AGENTS.md` for the full command set and `COORDINATOR.md` for the run model.
 
+## Testing
+
+The workspace tests run offline by default:
+
+```bash
+cargo test --workspace --exclude quip-protocol-py
+```
+
+### Live devnet integration tests
+
+`crates/quip-coordinator/tests/devnet_submit.rs` drives the real chain client
+against a running node. The tests are `#[ignore]`d and gated on the
+`QUIP_DEVNET` environment variable, so the default `cargo test` run stays
+offline. Three milestones:
+
+- **M1 — snapshot read:** decode a live `MiningSnapshot` (runtime API +
+  SCALE).
+- **M2 — proof submit:** register `//Alice`, solve the PoW Ising locally, and
+  submit a `QuantumPow.submit_proof` extrinsic; assert on-chain acceptance.
+- **M3 — mempool decode:** propose a `QuantumComputeMempool` job order, then
+  confirm `fetch_mempool_orders` discovers its `order_id` from the head-block
+  `JobProposed` event, storage-reads `JobOrders(order_id)`, and builds a Job.
+
+Start a local devnet from the chain repo
+([quip-protocol-rs](https://gitlab.com/quip.network/quip-protocol-rs)) with
+`make local-3-node` or `docker compose up`. Both publish node RPC on
+`ws://127.0.0.1:9944`. Then run:
+
+```bash
+QUIP_DEVNET=ws://127.0.0.1:9944 \
+  cargo test -p quip-coordinator --test devnet_submit -- --ignored --nocapture
+```
+
+Two constraints:
+
+- **Use a loopback URL** (`ws://127.0.0.1:…`) or `wss://`. subxt rejects plain
+  `ws://` to a non-loopback host as insecure. To reach a remote node, tunnel
+  its RPC port to localhost first.
+- **M3 needs an existing open order** to use as a proposal template. A bare
+  devnet starts with an empty mempool; run M3 against a devnet that already has
+  at least one open order.
+
 ## What changed from v0.2
 
 In v0.2 this repository was a single Python mining stack that attached to the

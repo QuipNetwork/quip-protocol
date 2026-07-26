@@ -22,7 +22,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use parity_scale_codec::Decode;
+use parity_scale_codec::{Decode, Encode};
 use serde_json::{json, Value};
 
 use quantum_validation::{
@@ -30,12 +30,12 @@ use quantum_validation::{
     MilliValue,
 };
 use quip_coordinator::chain::extrinsic::{
-    build_hybrid_signed_extrinsic, hex_decode, hex_encode, miner_identity_bytes,
-    SignedExtensionContext,
+    build_hybrid_signed_extrinsic, hex_decode, hex_encode, job_orders_storage_key,
+    miner_identity_bytes, SignedExtensionContext,
 };
-use quip_coordinator::chain::scale_types::MiningSnapshotScale;
+use quip_coordinator::chain::scale_types::{JobOrderScale, MiningSnapshotScale, OrderStatus};
 use quip_coordinator::chain::submit::SubmitAction;
-use quip_coordinator::chain::{ChainClient, RealChainClient};
+use quip_coordinator::chain::{ChainClient, JobOrder, RealChainClient};
 use quip_proto::v1::Solution;
 use quip_protocol::wire::encode_spins;
 use quip_transaction_crypto::{account_id_from_public, HybridPair};
@@ -581,4 +581,157 @@ async fn devnet_submit_proof_end_to_end() {
             );
         }
     }
+}
+
+// ----------------------------------------------------------------------------
+// Milestone 3: mempool JobProposed decode (quip-0j6)
+// ----------------------------------------------------------------------------
+
+/// `QuantumComputeMempool` pallet + `propose_job` call indices (runtime
+/// `construct_runtime`: pallet_index 9, call_index 3).
+const MEMPOOL_PALLET: u8 = 9;
+const PROPOSE_JOB_CALL: u8 = 3;
+
+/// Storage key for the plain `QuantumComputeMempool.NextOrderId` value.
+fn next_order_id_key() -> Vec<u8> {
+    let mut k = Vec::new();
+    k.extend_from_slice(&twox128(b"QuantumComputeMempool"));
+    k.extend_from_slice(&twox128(b"NextOrderId"));
+    k
+}
+
+async fn read_next_order_id(url: &str) -> u64 {
+    match get_storage(url, &next_order_id_key(), None).await {
+        Some(b) => u64::decode(&mut &b[..]).unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// Re-encode a `propose_job(...)` call from a decoded on-chain order. The call
+/// args are a subset of the stored `JobOrder` fields with byte-identical nested
+/// types, so a live order is a pallet-valid template (topology, reward floor,
+/// and deadline/block-wait ceilings already passed when it was accepted).
+fn encode_propose_job_call(src: &JobOrderScale) -> Vec<u8> {
+    let mut out = vec![MEMPOOL_PALLET, PROPOSE_JOB_CALL];
+    out.extend(src.spec_id.encode());
+    out.extend(src.ising_params.encode());
+    out.extend(src.reward.encode());
+    out.extend(src.mode.encode());
+    out.extend(src.resolution.encode());
+    out.extend(src.timing.deadline_blocks.encode());
+    out.extend(src.timing.block_wait.encode());
+    out.extend(src.delivery.encode());
+    out
+}
+
+/// End-to-end: propose a job order, then confirm the coordinator's
+/// `fetch_mempool_orders` discovers its `order_id` from the head-block
+/// `JobProposed` event, storage-reads `JobOrders(oid)`, and builds a `JobOrder`.
+#[tokio::test]
+#[ignore = "requires a live devnet; set QUIP_DEVNET=ws://host:port"]
+async fn devnet_mempool_job_proposed_end_to_end() {
+    let Ok(url) = std::env::var("QUIP_DEVNET") else {
+        eprintln!("QUIP_DEVNET unset; skipping live devnet mempool test");
+        return;
+    };
+
+    let alice = HybridPair::from_string("//Alice", None).expect("//Alice");
+    let alice_acct = account_id_from_public(&alice.public());
+    let alice_bytes: [u8; 32] = *AsRef::<[u8; 32]>::as_ref(&alice_acct);
+    let client = RealChainClient::new(vec![url.clone()], "//Alice".to_string());
+
+    // Find an existing open order to use as a byte-valid propose_job template.
+    let next_id = read_next_order_id(&url).await;
+    assert!(
+        next_id > 0,
+        "devnet has no orders to template from (NextOrderId=0)"
+    );
+    let mut template = None;
+    for oid in 0..next_id {
+        let Some(bytes) = get_storage(&url, &job_orders_storage_key(oid), None).await else {
+            continue;
+        };
+        let Ok(order) = JobOrderScale::decode(&mut &bytes[..]) else {
+            continue;
+        };
+        if order.status == OrderStatus::Opened {
+            println!(
+                "  template: order #{oid} decoded (nodes={} edges={} status=Opened)",
+                order.ising_params.nodes.len(),
+                order.ising_params.edges.len()
+            );
+            template = Some(order);
+            break;
+        }
+    }
+    let template = template.expect("no open order found to template from");
+
+    // Build + sign propose_job as //Alice; the assigned order_id is the current
+    // NextOrderId (chain is otherwise idle, so no competing proposer takes it).
+    let expected_oid = read_next_order_id(&url).await;
+    let nonce = account_nonce(&url, &alice_bytes).await;
+    let ctx = fetch_ext_ctx(&url, nonce).await;
+    let call = encode_propose_job_call(&template);
+    let ext = build_hybrid_signed_extrinsic(&alice, &call, &ctx);
+    let tx = rpc_try(
+        &url,
+        "author_submitExtrinsic",
+        vec![json!(hex_encode(&ext))],
+    )
+    .await;
+    let tx = tx.expect("author_submitExtrinsic accepted propose_job");
+    println!(
+        "  propose_job injected (expected order_id={expected_oid}), tx {}",
+        tx.as_str().unwrap_or("?")
+    );
+
+    // Poll the coordinator's real read path: fetch_mempool_orders discovers
+    // order ids from JobProposed events at head, then storage-reads each. The
+    // event is only visible while the inclusion block is head (~6s), so poll
+    // fast enough to land inside that window.
+    let want_id_le = expected_oid.to_le_bytes().to_vec();
+    let mut found: Option<JobOrder> = None;
+    for _ in 0..60 {
+        match client.fetch_mempool_orders(alice_bytes).await {
+            Ok(orders) => {
+                if let Some(o) = orders.into_iter().find(|o| o.order_id == want_id_le) {
+                    found = Some(o);
+                    break;
+                }
+            }
+            Err(e) => eprintln!("  fetch_mempool_orders err (retrying): {e}"),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Secondary confirmation the order actually landed (clearer failure than a
+    // bare timeout if the extrinsic was rejected in-block).
+    let after = read_next_order_id(&url).await;
+    assert!(
+        after > expected_oid,
+        "propose_job did not create an order: NextOrderId stayed at {expected_oid}"
+    );
+
+    let order = found.unwrap_or_else(|| {
+        panic!("fetch_mempool_orders never surfaced order #{expected_oid} at head within timeout")
+    });
+
+    // The built Job must match the proposed Ising template end-to-end.
+    assert_eq!(order.order_id, want_id_le, "order_id mismatch");
+    assert_eq!(order.nodes, template.ising_params.nodes, "nodes mismatch");
+    assert_eq!(order.edges, template.ising_params.edges, "edges mismatch");
+    assert_eq!(
+        order.h_milli, template.ising_params.h_values,
+        "h_values mismatch"
+    );
+    assert_eq!(
+        order.j_milli, template.ising_params.j_values,
+        "j_values mismatch"
+    );
+    println!(
+        "M3 PASS: propose_job -> JobProposed(order_id={expected_oid}) discovered at head; \
+         JobOrders storage decoded + Job built (nodes={} edges={})",
+        order.nodes.len(),
+        order.edges.len()
+    );
 }
