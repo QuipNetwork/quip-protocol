@@ -29,6 +29,27 @@ pub(crate) fn coord(msg: coord_msg::Msg) -> CoordMsg {
     CoordMsg { msg: Some(msg) }
 }
 
+/// Info-log one miner liveness transition. Stale-round logs carry the
+/// coordinator's current qblock for operators.
+fn log_liveness(miner_id: &str, qblock: Option<u64>, event: &crate::liveness::LivenessEvent) {
+    use crate::liveness::LivenessEvent;
+    match event {
+        LivenessEvent::EnteredPaused { reason } => tracing::info!(
+            miner = %miner_id,
+            reason = reason.as_deref().unwrap_or("unspecified"),
+            "miner paused"
+        ),
+        LivenessEvent::Resumed => tracing::info!(miner = %miner_id, "miner resumed mining"),
+        LivenessEvent::StaleRound { reported, current } => tracing::info!(
+            miner = %miner_id,
+            reported_generation = reported,
+            current_generation = current,
+            qblock = qblock.unwrap_or(0),
+            "miner reports mining a stale round"
+        ),
+    }
+}
+
 /// How many top candidates the win-time stash retains per generation.
 const WIN_STASH_K: usize = 8;
 
@@ -73,6 +94,12 @@ pub struct CoordinatorState {
     pub stash: crate::stash::WinStash,
     /// Block-interval/lag tracker for current-block estimation.
     pub timing: crate::timing::TimingTracker,
+    /// Feeder's current round; set on reseed. Compared against a miner's
+    /// self-reported generation to detect stale-round mining.
+    pub generation: u64,
+    /// Per-miner last-known self-reported liveness (mining/paused + round),
+    /// updated from ping-reply `Status` messages.
+    pub miner_liveness: HashMap<String, crate::liveness::MinerLiveness>,
 }
 
 impl CoordinatorState {
@@ -95,6 +122,8 @@ impl CoordinatorState {
             qblock_id: None,
             stash: crate::stash::WinStash::new(WIN_STASH_K),
             timing: crate::timing::TimingTracker::with_defaults(),
+            generation: 0,
+            miner_liveness: HashMap::new(),
         }
     }
 
@@ -292,6 +321,11 @@ async fn run_session<C: ChainClient>(
                 .send(Ok(coord(coord_msg::Msg::Topology(topo.to_proto()))))
                 .await;
         }
+        // Push the current difficulty so a miner joining mid-generation tracks
+        // it immediately, rather than waiting for the next reseed broadcast.
+        if let Some(target) = st.target {
+            let _ = tx.send(Ok(coord(coord_msg::Msg::SetTarget(target)))).await;
+        }
     }
 
     // Register this session's outbound channel so the supervisor can push an
@@ -462,6 +496,19 @@ async fn run_session<C: ChainClient>(
                 let mut st = state.lock().await;
                 if s.abandoned_generation > 0 {
                     st.last_abandoned_generation = s.abandoned_generation;
+                }
+                let prev = st
+                    .miner_liveness
+                    .get(&miner_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let (next, events) =
+                    crate::liveness::evaluate_status(&prev, &s.sampler_stats, st.generation);
+                let _ = st.miner_liveness.insert(miner_id.clone(), next);
+                let qblock = st.qblock_id;
+                drop(st);
+                for ev in &events {
+                    log_liveness(&miner_id, qblock, ev);
                 }
             }
             Some(miner_msg::Msg::Fatal(_)) | Some(miner_msg::Msg::Hello(_)) | None => {}

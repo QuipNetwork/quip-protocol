@@ -12,7 +12,7 @@ use quip_coordinator::supervisor::BackoffPolicy;
 use quip_proto::v1::{Configure, JobKind};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 /// Build + resolve the sibling `quip-mock-miner` binary (not the same package,
 /// so no `CARGO_BIN_EXE_*`).
@@ -265,6 +265,58 @@ async fn feeder_grows_window_for_drainer_and_holds_floor_for_idle() {
         state.lock().await.router.staged_len("cpu-idle"),
         FLOOR,
         "idle miner should stay pinned at the buffer_depth floor"
+    );
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+}
+
+#[tokio::test]
+async fn feeder_broadcasts_set_target_once_per_difficulty() {
+    use quip_proto::v1::{coord_msg, CoordMsg};
+
+    let chain = Arc::new(FakeChain::new(ising_snapshot(), None));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    let (tx, mut rx) = mpsc::channel::<Result<CoordMsg, tonic::Status>>(16);
+    state.lock().await.register_outbound("cpu-0", tx);
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        FeederParams {
+            miner_account: [0u8; 32],
+            buffer_depth: 4,
+            poll_interval: Duration::from_millis(50),
+        },
+        stop_rx,
+    ));
+
+    // First poll pushes the current difficulty to the live miner.
+    let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("no SetTarget within 2s")
+        .expect("outbound channel closed")
+        .expect("status error");
+    let snap = ising_snapshot();
+    assert!(
+        matches!(&msg.msg, Some(coord_msg::Msg::SetTarget(_))),
+        "first outbound message should be SetTarget"
+    );
+    if let Some(coord_msg::Msg::SetTarget(t)) = msg.msg {
+        assert_eq!(t.max_energy_milli, snap.max_energy_milli);
+        assert_eq!(t.min_solutions, snap.min_solutions);
+        assert_eq!(t.min_diversity_milli, snap.min_diversity_milli);
+    }
+
+    // Unchanged difficulty across further polls must not re-broadcast.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+        "unchanged difficulty must not re-broadcast SetTarget"
     );
 
     let _ = stop_tx.send(true);

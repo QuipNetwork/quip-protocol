@@ -10,11 +10,11 @@ use crate::chain::{ChainClient, MiningSnapshot};
 use crate::config::LaunchEntry;
 use crate::decay::{build_decay_schedule, EnergyCurve};
 use crate::producer::derive_pow_job;
-use crate::session::{CoordinatorService, CoordinatorState};
+use crate::session::{coord, CoordinatorService, CoordinatorState};
 use crate::supervisor::{supervise_miner, BackoffPolicy};
 use crate::topology::Topology;
 use quip_proto::v1::miner_service_server::MinerServiceServer;
-use quip_proto::v1::SetTarget;
+use quip_proto::v1::{coord_msg, SetTarget};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
@@ -116,6 +116,19 @@ fn target_from_snapshot(snap: &MiningSnapshot) -> SetTarget {
     }
 }
 
+/// Broadcast `target` to every live miner off-lock: clone the outbound senders
+/// under the state lock, drop it, then await the sends so the fan-out never
+/// holds the state lock across I/O.
+async fn broadcast_set_target(state: &Arc<Mutex<CoordinatorState>>, target: SetTarget) {
+    let senders: Vec<_> = {
+        let st = state.lock().await;
+        st.outbound.values().cloned().collect()
+    };
+    for tx in senders {
+        let _ = tx.send(Ok(coord(coord_msg::Msg::SetTarget(target)))).await;
+    }
+}
+
 /// A unique 32-byte salt from a monotonic counter: distinct salts derive
 /// distinct nonces (job ids), so each attempt is a fresh PoW draw.
 fn salt_from_counter(ctr: u64) -> [u8; 32] {
@@ -144,6 +157,8 @@ pub async fn feeder_loop<C: ChainClient>(
     let start = std::time::Instant::now();
     // Per-miner smoothed jobs-consumed-per-poll, driving the adaptive window.
     let mut consumption_ema: HashMap<String, f64> = HashMap::new();
+    // Last difficulty triple broadcast to miners, so we only re-push on change.
+    let mut last_broadcast: Option<(i64, u32, u32)> = None;
 
     loop {
         let snap = match chain
@@ -206,11 +221,25 @@ pub async fn feeder_loop<C: ChainClient>(
                 let mut st = state.lock().await;
                 st.set_topology(Some(topo));
                 st.target = Some(target_from_snapshot(snap));
+                st.generation = generation;
                 st.qblock_id = qblock_id;
                 st.stash
                     .reset(generation, schedule, last_proof_block, epoch_length);
                 st.router.cancel(generation - 1); // drop the prior generation
                 st.clear_salts();
+            }
+
+            // Push the refreshed difficulty to live miners when it changed, so
+            // they adapt their sampling budget as the chain difficulty moves.
+            let target = target_from_snapshot(snap);
+            let key = (
+                target.max_energy_milli,
+                target.min_solutions,
+                target.min_diversity_milli,
+            );
+            if last_broadcast != Some(key) {
+                broadcast_set_target(&state, target).await;
+                last_broadcast = Some(key);
             }
 
             // Top every registered miner up to its adaptive window with fresh
@@ -384,6 +413,15 @@ where
         },
         stop_rx.clone(),
     ));
+
+    // Periodic liveness ping: miners' Status replies surface paused/stale
+    // transitions, logged by the session Status handler.
+    const LIVENESS_PING_INTERVAL: Duration = Duration::from_secs(15);
+    let liveness = tokio::spawn(crate::liveness::liveness_loop(
+        Arc::clone(&state),
+        LIVENESS_PING_INTERVAL,
+        stop_rx.clone(),
+    ));
     drop(stop_rx);
 
     // Run until asked to stop.
@@ -393,6 +431,7 @@ where
     // server so in-flight Shutdown/kill completes.
     let _ = stop_tx.send(true);
     let _ = feeder.await;
+    let _ = liveness.await;
     for h in supervisors {
         let _ = h.await;
     }

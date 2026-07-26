@@ -7,6 +7,7 @@ pub mod config;
 pub mod dashboard;
 pub mod decay;
 pub mod drive;
+pub mod liveness;
 pub mod producer;
 pub mod router;
 pub mod runtime;
