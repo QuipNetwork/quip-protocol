@@ -164,7 +164,10 @@ fn run_config_path(config: Option<PathBuf>) -> StdExitCode {
         grace_ms: 2000,
         backoff: BackoffPolicy::default(),
         miner_account,
-        buffer_depth: 8,
+        // Generous floor: keep every miner well-fed from the first poll, before
+        // its drain-rate EMA ramps. The adaptive window grows above this for
+        // fast, many-core backends; slow ones simply sit at the floor.
+        buffer_depth: 256,
         poll_interval_ms: 1000,
     };
     eprintln!(

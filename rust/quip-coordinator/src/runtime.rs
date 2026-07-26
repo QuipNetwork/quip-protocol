@@ -14,6 +14,7 @@ use crate::supervisor::{supervise_miner, BackoffPolicy};
 use crate::topology::Topology;
 use quip_proto::v1::miner_service_server::MinerServiceServer;
 use quip_proto::v1::SetTarget;
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
@@ -34,7 +35,9 @@ pub struct RuntimeParams {
     /// Canonical miner account (`blake2_256(SCALE(account))`) seeding nonce
     /// derivation for PoW jobs.
     pub miner_account: [u8; 32],
-    /// Feeder buffer depth: staged jobs kept per miner (0 disables feeding).
+    /// Floor for the adaptive staging window: minimum staged jobs per miner
+    /// (0 disables feeding). The window grows above this with each miner's
+    /// observed drain rate; there is no ceiling. See [`feeder_loop`].
     pub buffer_depth: usize,
     /// How often the feeder polls the chain head and tops up buffers.
     pub poll_interval_ms: u64,
@@ -43,8 +46,28 @@ pub struct RuntimeParams {
 /// Inputs to the feeder loop.
 pub struct FeederParams {
     pub miner_account: [u8; 32],
+    /// Floor for the adaptive staging window: the minimum staged jobs kept per
+    /// miner (0 disables feeding). The window grows above this from the miner's
+    /// observed drain rate — see [`feeder_loop`] — with no ceiling.
     pub buffer_depth: usize,
     pub poll_interval: Duration,
+}
+
+/// EMA smoothing for the per-miner consumption signal. Lower reacts slower but
+/// steadier; 0.3 favors stability over reactivity for a ~1s poll, so a single
+/// slow or fast poll doesn't swing the window.
+const CONSUMPTION_EMA_ALPHA: f64 = 0.3;
+
+/// Staging headroom over smoothed consumption: keep ~2 poll-intervals of drain
+/// staged so a fast miner never idles waiting for the next top-up.
+const WINDOW_HEADROOM: f64 = 2.0;
+
+/// Adaptive staging depth for one miner from its smoothed drain rate. The
+/// `buffer_depth` floor keeps a small reserve for idle/slow miners; there is no
+/// ceiling, so a many-core miner grows as deep as it drains. `ema` is anchored
+/// to real completions, so depth self-bounds to ~headroom × actual throughput.
+fn adaptive_depth(ema: f64, floor: usize) -> usize {
+    floor.max((ema * WINDOW_HEADROOM).ceil() as usize)
 }
 
 /// Difficulty gates advertised to miners, from the snapshot.
@@ -83,6 +106,8 @@ pub async fn feeder_loop<C: ChainClient>(
     let mut current_head: Option<[u8; 32]> = None;
     let mut generation: u64 = 0;
     let mut salt_ctr: u64 = 0;
+    // Per-miner smoothed jobs-consumed-per-poll, driving the adaptive window.
+    let mut consumption_ema: HashMap<String, f64> = HashMap::new();
 
     loop {
         let snap = match chain
@@ -117,10 +142,24 @@ pub async fn feeder_loop<C: ChainClient>(
                 st.clear_salts();
             }
 
-            // Top every registered miner up to buffer depth with fresh jobs.
+            // Top every registered miner up to its adaptive window with fresh
+            // jobs. The window tracks each miner's drain rate: sample the
+            // jobs-consumed counter (read-and-reset), smooth it, and size the
+            // staged reserve to ~headroom poll-intervals of that rate.
             let mut st = state.lock().await;
             for id in st.router.miner_ids() {
-                while st.router.staged_len(&id) < params.buffer_depth {
+                let consumed = f64::from(st.router.take_consumed(&id));
+                let ema = match consumption_ema.get(&id) {
+                    Some(&prev) => {
+                        CONSUMPTION_EMA_ALPHA * consumed + (1.0 - CONSUMPTION_EMA_ALPHA) * prev
+                    }
+                    // First sample seeds the EMA directly so a fast miner reaches
+                    // full depth in one poll instead of ramping over several.
+                    None => consumed,
+                };
+                let _ = consumption_ema.insert(id.clone(), ema);
+                let depth = adaptive_depth(ema, params.buffer_depth);
+                while st.router.staged_len(&id) < depth {
                     salt_ctr = salt_ctr.saturating_add(1);
                     let salt = salt_from_counter(salt_ctr);
                     let job = derive_pow_job(snap, params.miner_account, salt, generation, 0);
@@ -224,4 +263,33 @@ where
     server.abort();
     let _ = std::fs::remove_file(&params.sock_path);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{adaptive_depth, WINDOW_HEADROOM};
+
+    #[test]
+    fn adaptive_depth_holds_floor_when_idle() {
+        // No consumption -> stay at the floor, never below it.
+        assert_eq!(adaptive_depth(0.0, 8), 8);
+        assert_eq!(adaptive_depth(0.0, 0), 0);
+    }
+
+    #[test]
+    fn adaptive_depth_grows_with_consumption_no_ceiling() {
+        // depth = ceil(ema * headroom), floor when that is smaller.
+        assert_eq!(adaptive_depth(10.0, 8), (10.0 * WINDOW_HEADROOM) as usize);
+        // A many-core miner grows far past the floor — no upper cap.
+        assert_eq!(adaptive_depth(250.0, 8), 500);
+    }
+
+    #[test]
+    fn adaptive_depth_ceils_fractional_ema_and_respects_floor() {
+        // 2.5 * 2.0 = 5.0 exactly.
+        assert_eq!(adaptive_depth(2.5, 2), 5);
+        // Fractional below the floor rounds up but the floor still wins:
+        // 0.4 * 2.0 = 0.8 -> ceil 1, floor 4 -> 4.
+        assert_eq!(adaptive_depth(0.4, 4), 4);
+    }
 }

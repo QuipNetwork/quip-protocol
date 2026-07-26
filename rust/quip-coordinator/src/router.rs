@@ -25,6 +25,10 @@ struct MinerQueue {
     /// miner's channels). In-flight itself is tracked by the coordinator's
     /// `inflight` map, so the router needs no separate outstanding counter.
     granted_credits: u32,
+    /// Jobs dispatched (drained from `staged`) since the last `take_consumed`.
+    /// The feeder reads-and-resets this each poll to size the adaptive staging
+    /// window from the miner's observed drain rate (see `feeder_loop`).
+    consumed_since_poll: u32,
     unsupported_kinds: HashSet<i32>,
 }
 
@@ -49,6 +53,7 @@ impl Router {
                 caps,
                 staged: VecDeque::new(),
                 granted_credits: 0,
+                consumed_since_poll: 0,
                 unsupported_kinds: HashSet::new(),
             },
         );
@@ -95,7 +100,17 @@ impl Router {
         }
         let job = q.staged.pop_front()?;
         q.granted_credits -= 1;
+        q.consumed_since_poll = q.consumed_since_poll.saturating_add(1);
         Some(job)
+    }
+
+    /// Read and reset the jobs-consumed counter for `miner_id` — the feeder's
+    /// per-poll drain sample. Returns 0 for an unknown miner or an idle poll.
+    pub fn take_consumed(&mut self, miner_id: &str) -> u32 {
+        self.miners
+            .get_mut(miner_id)
+            .map(|q| std::mem::take(&mut q.consumed_since_poll))
+            .unwrap_or(0)
     }
 
     /// Handle a miner reject: mark unsupported kinds, re-route when possible.
@@ -268,6 +283,20 @@ mod tests {
         r.grant_credits("cpu-0", 1);
         assert!(r.next_job("cpu-0").is_some());
         assert!(r.next_job("cpu-0").is_none());
+    }
+
+    #[test]
+    fn take_consumed_counts_dispatches_then_resets() {
+        let mut r = Router::new();
+        r.register_miner("cpu-0", caps_ising());
+        r.route(make_job(1, JobKind::IsingSample));
+        r.route(make_job(2, JobKind::IsingSample));
+        r.grant_credits("cpu-0", 2);
+        assert!(r.next_job("cpu-0").is_some());
+        assert!(r.next_job("cpu-0").is_some());
+        assert_eq!(r.take_consumed("cpu-0"), 2); // two dispatched this interval
+        assert_eq!(r.take_consumed("cpu-0"), 0); // reset after read
+        assert_eq!(r.take_consumed("unknown"), 0); // unknown miner
     }
 
     #[test]

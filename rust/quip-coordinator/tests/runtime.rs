@@ -205,3 +205,70 @@ async fn feeder_tops_up_to_buffer_depth_records_salts_and_sets_target() {
         .expect("feeder did not stop")
         .expect("feeder task panicked");
 }
+
+#[tokio::test]
+async fn feeder_grows_window_for_drainer_and_holds_floor_for_idle() {
+    let chain = Arc::new(FakeChain::new(ising_snapshot(), None));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    {
+        let mut st = state.lock().await;
+        st.router.register_miner("cpu-fast", ising_caps());
+        st.router.register_miner("cpu-idle", ising_caps());
+    }
+
+    // Floor of 2; the fast miner drains a fixed ~8/interval so its adaptive
+    // window converges to ~2x that (headroom), well above the floor. The idle
+    // miner never consumes, so it stays pinned at the floor.
+    const FLOOR: usize = 2;
+    const DRAIN_RATE: usize = 8;
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        FeederParams {
+            miner_account: [0u8; 32],
+            buffer_depth: FLOOR,
+            poll_interval: Duration::from_millis(30),
+        },
+        stop_rx,
+    ));
+
+    // Simulate a fixed-throughput miner: each interval, grant credits and pull
+    // up to DRAIN_RATE staged jobs (min with what's available, so an unramped
+    // buffer can't force runaway growth). Watch the window climb past the floor.
+    let mut grew = false;
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        {
+            let mut st = state.lock().await;
+            st.router.grant_credits("cpu-fast", DRAIN_RATE as u32);
+            for _ in 0..DRAIN_RATE {
+                if st.router.next_job("cpu-fast").is_none() {
+                    break;
+                }
+            }
+        }
+        if state.lock().await.router.staged_len("cpu-fast") >= DRAIN_RATE {
+            grew = true;
+            break;
+        }
+    }
+    assert!(
+        grew,
+        "adaptive window never grew to the drain rate under sustained consumption"
+    );
+
+    // The idle miner consumed nothing, so its window is still the floor.
+    assert_eq!(
+        state.lock().await.router.staged_len("cpu-idle"),
+        FLOOR,
+        "idle miner should stay pinned at the buffer_depth floor"
+    );
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+}
