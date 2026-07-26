@@ -271,8 +271,11 @@ pub async fn supervise_miner(
 
         let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
 
-        // Crash: return this miner's in-flight + staged jobs to the router.
-        if code != 0 {
+        // Self-exit (crash or clean): return this miner's in-flight + staged
+        // jobs to the router. A clean exit (code 0) can still leave in-flight
+        // jobs — the Shutdown drain has a grace timeout — so reclaim regardless
+        // of code, or `inflight` leaks and any mempool order is silently lost.
+        {
             let mut st = state.lock().await;
             let jobs = st.reclaim_miner(&entry.miner_id);
             for job in jobs {
