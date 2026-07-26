@@ -29,6 +29,9 @@ pub(crate) fn coord(msg: coord_msg::Msg) -> CoordMsg {
     CoordMsg { msg: Some(msg) }
 }
 
+/// How many top candidates the win-time stash retains per generation.
+const WIN_STASH_K: usize = 8;
+
 /// Shared coordinator runtime state for one or more miner sessions.
 pub struct CoordinatorState {
     pub expected_tokens: HashMap<String, String>,
@@ -59,11 +62,17 @@ pub struct CoordinatorState {
     pub current_best_milli: Option<i64>,
     pub results_validated: u64,
     pub last_abandoned_generation: u64,
-    /// Sink for mining-attempt records (dashboard). `None` disables recording.
-    pub attempt_tx: Option<std::sync::mpsc::Sender<crate::attempt::AttemptRecord>>,
+    /// Sink for mining-attempt records + summaries (dashboard). `None` disables
+    /// recording.
+    pub attempt_tx: Option<std::sync::mpsc::Sender<crate::attempt::WriterMsg>>,
     /// Current chain quantum-block id, refreshed by the feeder on reseed; keys
     /// the per-qblock attempt logs.
     pub qblock_id: Option<u64>,
+    /// Win-time stash of the most-viable sub-threshold candidates for the
+    /// current generation, armed with the decay projection on reseed.
+    pub stash: crate::stash::WinStash,
+    /// Block-interval/lag tracker for current-block estimation.
+    pub timing: crate::timing::TimingTracker,
 }
 
 impl CoordinatorState {
@@ -84,6 +93,8 @@ impl CoordinatorState {
             last_abandoned_generation: 0,
             attempt_tx: None,
             qblock_id: None,
+            stash: crate::stash::WinStash::new(WIN_STASH_K),
+            timing: crate::timing::TimingTracker::with_defaults(),
         }
     }
 
@@ -368,26 +379,71 @@ async fn run_session<C: ChainClient>(
                                 submitted = true;
                             }
                         }
-                        // Record every solved model for the dashboard, then count it.
+                        // Record the attempt; stash sub-threshold candidates so
+                        // the easing difficulty can still win them; refresh the
+                        // per-qblock summary when the stash or a submit changed.
                         {
                             let mut st = state.lock().await;
                             st.results_validated += 1;
                             let qblock_id = st.qblock_id;
-                            if let Some(tx) = st.attempt_tx.as_ref() {
-                                let device_us = result
-                                    .meta
+                            let device_us = result
+                                .meta
+                                .as_ref()
+                                .map(|m| m.device_access_time_us)
+                                .unwrap_or(0);
+
+                            // A solution below the current threshold is submitted
+                            // immediately (above); one not yet viable is stashed
+                            // if the projection says the decay will clear it.
+                            let mut stash_changed = false;
+                            if !validated.accepted {
+                                let is_pow =
+                                    job.provenance.as_ref().map(|p| p.is_pow).unwrap_or(false);
+                                let order_id = job
+                                    .provenance
                                     .as_ref()
-                                    .map(|m| m.device_access_time_us)
-                                    .unwrap_or(0);
-                                let _ = tx.send(crate::attempt::AttemptRecord::new(
+                                    .map(|p| p.order_id.clone())
+                                    .unwrap_or_default();
+                                stash_changed = st.stash.insert(crate::stash::Candidate {
+                                    job_id: result.job_id.clone(),
+                                    salt,
+                                    generation: job.generation,
+                                    best_energy_milli: validated.best_energy_milli,
+                                    diversity_milli: validated.diversity_milli,
+                                    n_valid: validated.n_valid,
+                                    solutions: result.solutions.clone(),
+                                    is_pow,
+                                    order_id,
+                                    device_access_time_us: device_us,
+                                    submitted: false,
+                                });
+                            }
+
+                            let attempt = crate::attempt::AttemptRecord::new(
+                                qblock_id,
+                                &miner_id,
+                                &result.job_id,
+                                &job,
+                                &validated,
+                                submitted,
+                                device_us,
+                            );
+                            let summary = (stash_changed || submitted).then(|| {
+                                crate::attempt::summary_body(
                                     qblock_id,
-                                    &miner_id,
-                                    &result.job_id,
-                                    &job,
-                                    &validated,
-                                    submitted,
-                                    device_us,
-                                ));
+                                    st.current_best_milli,
+                                    st.results_validated,
+                                    st.stash.summary(),
+                                )
+                            });
+                            if let Some(tx) = st.attempt_tx.as_ref() {
+                                let _ = tx.send(crate::attempt::WriterMsg::Attempt(attempt));
+                                if let Some(body) = summary {
+                                    let _ = tx.send(crate::attempt::WriterMsg::Summary {
+                                        qblock_id,
+                                        body,
+                                    });
+                                }
                             }
                         }
                     }

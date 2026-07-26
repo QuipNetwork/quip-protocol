@@ -11,6 +11,7 @@ pub mod producer;
 pub mod router;
 pub mod runtime;
 pub mod session;
+pub mod stash;
 pub mod supervisor;
 pub mod timing;
 pub mod topology;

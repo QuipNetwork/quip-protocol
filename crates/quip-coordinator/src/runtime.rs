@@ -8,6 +8,7 @@
 
 use crate::chain::{ChainClient, MiningSnapshot};
 use crate::config::LaunchEntry;
+use crate::decay::{build_decay_schedule, EnergyCurve};
 use crate::producer::derive_pow_job;
 use crate::session::{CoordinatorService, CoordinatorState};
 use crate::supervisor::{supervise_miner, BackoffPolicy};
@@ -64,6 +65,10 @@ const CONSUMPTION_EMA_ALPHA: f64 = 0.3;
 /// Staging headroom over smoothed consumption: keep ~2 poll-intervals of drain
 /// staged so a fast miner never idles waiting for the next top-up.
 const WINDOW_HEADROOM: f64 = 2.0;
+
+/// How many decay steps (epochs) ahead the win-time stash projects viability.
+/// A candidate needing more than this to clear is dropped as too far out.
+const DECAY_HORIZON_STEPS: usize = 256;
 
 /// Adaptive staging depth for one miner from its smoothed drain rate. The
 /// `buffer_depth` floor keeps a small reserve for idle/slow miners. `ema` is
@@ -135,6 +140,8 @@ pub async fn feeder_loop<C: ChainClient>(
     let mut current_head: Option<[u8; 32]> = None;
     let mut generation: u64 = 0;
     let mut salt_ctr: u64 = 0;
+    // Monotonic anchor for block-time estimation (win-time submission).
+    let start = std::time::Instant::now();
     // Per-miner smoothed jobs-consumed-per-poll, driving the adaptive window.
     let mut consumption_ema: HashMap<String, f64> = HashMap::new();
 
@@ -164,13 +171,44 @@ pub async fn feeder_loop<C: ChainClient>(
                     &snap.allowed_j_milli,
                     &snap.allowed_spin_milli,
                 );
-                // Refresh the chain qblock id for the attempt logs (best-effort;
-                // fetched before locking so we never await under the state lock).
+                // Refresh the chain qblock id + decay-projection inputs for the
+                // attempt logs and win-time stash (best-effort; fetched before
+                // locking so we never await under the state lock).
                 let qblock_id = chain.fetch_latest_qblock_id().await.ok().flatten();
+                let decay = match <[u8; 32]>::try_from(snap.topology_hash.as_slice()) {
+                    Ok(h) => chain.fetch_decay_params(h).await.ok().flatten(),
+                    Err(_) => None,
+                };
+                // Project the per-generation decay schedule for the stash.
+                let (schedule, last_proof_block, epoch_length) = match &decay {
+                    Some(dp) => {
+                        let curve = EnergyCurve::from_topology(
+                            snap.nodes.len() as u64,
+                            snap.edges.len() as u64,
+                            dp.c_easy_milli,
+                            dp.c_knee_milli,
+                            dp.c_hard_milli,
+                            &snap.allowed_h_milli,
+                            &snap.allowed_j_milli,
+                        );
+                        (
+                            build_decay_schedule(
+                                dp.base_max_energy_milli,
+                                Some(&curve),
+                                DECAY_HORIZON_STEPS,
+                            ),
+                            dp.last_proof_block,
+                            dp.epoch_length,
+                        )
+                    }
+                    None => (Vec::new(), 0, 0),
+                };
                 let mut st = state.lock().await;
                 st.set_topology(Some(topo));
                 st.target = Some(target_from_snapshot(snap));
                 st.qblock_id = qblock_id;
+                st.stash
+                    .reset(generation, schedule, last_proof_block, epoch_length);
                 st.router.cancel(generation - 1); // drop the prior generation
                 st.clear_salts();
             }
@@ -205,6 +243,56 @@ pub async fn feeder_loop<C: ChainClient>(
                         st.record_salt(&job_id, salt);
                     } else {
                         break; // not capable for this shape — stop topping up
+                    }
+                }
+            }
+
+            // Win-time submission: observe the head for block estimation, pick
+            // the best stashed candidate whose projected viability block has
+            // arrived (and still improves on the current best), then submit it
+            // off-lock. `mark_submitted` + the `beats_current` guard keep this
+            // from double-submitting or regressing what the session path sent.
+            let now_mono = start.elapsed().as_secs_f64();
+            let now_wall = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            st.timing
+                .observe_head(snap.block_number, now_wall, now_mono, now_wall);
+            let current_block = st
+                .timing
+                .estimate_block(now_mono)
+                .unwrap_or(snap.block_number);
+            let best = st.current_best_milli;
+            let due = st.stash.due_improving(current_block, best).cloned();
+            drop(st);
+
+            if let Some(cand) = due {
+                let proof = crate::chain::Proof {
+                    job_id: cand.job_id.clone(),
+                    best_energy_milli: cand.best_energy_milli,
+                    diversity_milli: cand.diversity_milli,
+                    n_valid: cand.n_valid,
+                    solutions: cand.solutions.clone(),
+                    is_pow: cand.is_pow,
+                    order_id: cand.order_id.clone(),
+                    generation: cand.generation,
+                    salt: cand.salt.map(|s| s.to_vec()).unwrap_or_default(),
+                    device_access_time_us: cand.device_access_time_us,
+                };
+                if let Ok(crate::chain::SubmitAction::Success) = chain.submit_proof(&proof).await {
+                    let mut st = state.lock().await;
+                    st.stash.mark_submitted(&cand.job_id);
+                    st.current_best_milli = Some(cand.best_energy_milli);
+                    let qblock_id = st.qblock_id;
+                    let body = crate::attempt::summary_body(
+                        qblock_id,
+                        st.current_best_milli,
+                        st.results_validated,
+                        st.stash.summary(),
+                    );
+                    if let Some(tx) = st.attempt_tx.as_ref() {
+                        let _ = tx.send(crate::attempt::WriterMsg::Summary { qblock_id, body });
                     }
                 }
             }

@@ -74,14 +74,55 @@ impl AttemptRecord {
             device_access_time_us,
         }
     }
+}
 
-    /// Directory segment: the qblock id, or `pending` before the chain assigns
-    /// one.
-    fn qblock_dir(&self) -> String {
-        self.qblock_id
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "pending".to_string())
-    }
+/// Per-qblock summary written to `attempts.json`: aggregate counts + the
+/// win-time stash annotations (most-viable candidates + projected blocks).
+#[derive(Debug, Clone, Serialize)]
+pub struct QblockSummary {
+    pub qblock_id: Option<u64>,
+    pub updated_ts_ms: u64,
+    pub current_best_milli: Option<i64>,
+    pub results_validated: u64,
+    pub stash: crate::stash::StashSummary,
+}
+
+/// Serialize a qblock summary for `attempts.json` (empty string on the
+/// impossible serialize error, so the caller never has to handle it).
+pub fn summary_body(
+    qblock_id: Option<u64>,
+    current_best_milli: Option<i64>,
+    results_validated: u64,
+    stash: crate::stash::StashSummary,
+) -> String {
+    let s = QblockSummary {
+        qblock_id,
+        updated_ts_ms: now_ms(),
+        current_best_milli,
+        results_validated,
+        stash,
+    };
+    serde_json::to_string(&s).unwrap_or_default()
+}
+
+/// Directory segment for a qblock: its id, or `pending` before the chain
+/// assigns one (e.g. drive mode).
+fn qblock_dir_name(qblock_id: Option<u64>) -> String {
+    qblock_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "pending".to_string())
+}
+
+/// A message to the single writer thread: either one attempt line, or a
+/// rewrite of a qblock's `attempts.json` summary.
+pub enum WriterMsg {
+    /// Append one attempt to `<qblock>/attempts.jsonl`.
+    Attempt(AttemptRecord),
+    /// Overwrite `<qblock>/attempts.json` with `body` (a serialized summary).
+    Summary {
+        qblock_id: Option<u64>,
+        body: String,
+    },
 }
 
 fn now_ms() -> u64 {
@@ -102,7 +143,7 @@ fn hex(bytes: &[u8]) -> String {
 /// Append one record as a JSON line to `<data_dir>/<qblock_id>/attempts.jsonl`,
 /// creating the per-qblock directory on first write.
 pub fn append_record(data_dir: &Path, rec: &AttemptRecord) -> std::io::Result<()> {
-    let dir = data_dir.join(rec.qblock_dir());
+    let dir = data_dir.join(qblock_dir_name(rec.qblock_id));
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("attempts.jsonl");
     let mut f = std::fs::OpenOptions::new()
@@ -113,14 +154,27 @@ pub fn append_record(data_dir: &Path, rec: &AttemptRecord) -> std::io::Result<()
     writeln!(f, "{line}")
 }
 
+/// Overwrite `<data_dir>/<qblock_id>/attempts.json` with the summary `body`.
+pub fn write_summary(data_dir: &Path, qblock_id: Option<u64>, body: &str) -> std::io::Result<()> {
+    let dir = data_dir.join(qblock_dir_name(qblock_id));
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("attempts.json"), body)
+}
+
 /// Spawn the single writer thread and return the sender the sessions push to.
 /// Blocking file I/O runs on this dedicated thread, off the async runtime.
-pub fn spawn_writer(data_dir: PathBuf) -> mpsc::Sender<AttemptRecord> {
-    let (tx, rx) = mpsc::channel::<AttemptRecord>();
+pub fn spawn_writer(data_dir: PathBuf) -> mpsc::Sender<WriterMsg> {
+    let (tx, rx) = mpsc::channel::<WriterMsg>();
     std::thread::spawn(move || {
-        while let Ok(rec) = rx.recv() {
-            if let Err(e) = append_record(&data_dir, &rec) {
-                tracing::warn!(qblock = ?rec.qblock_id, "attempt-log write failed: {e}");
+        while let Ok(msg) = rx.recv() {
+            let res = match msg {
+                WriterMsg::Attempt(rec) => append_record(&data_dir, &rec),
+                WriterMsg::Summary { qblock_id, body } => {
+                    write_summary(&data_dir, qblock_id, &body)
+                }
+            };
+            if let Err(e) = res {
+                tracing::warn!("attempt-log write failed: {e}");
             }
         }
     });
