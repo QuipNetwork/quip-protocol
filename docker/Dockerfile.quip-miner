@@ -47,13 +47,12 @@ RUN groupadd --system --gid 1000 quip \
 COPY --from=builder /src/rust/target/release/quip-coordinator /usr/local/bin/quip-coordinator
 COPY --from=builder /opt/venv /opt/venv
 
-# Released CPU miner binaries for this arch.
-RUN base="https://gitlab.com/api/v4/projects/quip.network%2Fquip-miner-cpu/packages/generic/quip-miner-cpu/${MINERS_TAG}" \
-    && for b in quip-cpu-sa quip-cpu-gibbs; do \
-         curl --fail --location --silent --show-error \
-              "${base}/${b}-${TARGETARCH}" -o "/usr/local/bin/${b}" \
-         && chmod +x "/usr/local/bin/${b}"; \
-       done
+# Released CPU miner binaries for this arch, via the shared fetch-miners.sh —
+# single source of truth (the native/host install runs the same script). The
+# script derives arch from `uname` (correct on the per-arch kaniko runners).
+COPY rust/quip-coordinator/tools/fetch-miners.sh /usr/local/bin/fetch-miners.sh
+RUN TARGETARCH="${TARGETARCH}" MINERS_TAG="${MINERS_TAG}" MINER_SET=cpu \
+    bash /usr/local/bin/fetch-miners.sh /usr/local/bin
 
 WORKDIR /app
 COPY docker/config.toml /app/config.toml

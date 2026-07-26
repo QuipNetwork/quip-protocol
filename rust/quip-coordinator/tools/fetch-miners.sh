@@ -1,56 +1,131 @@
 #!/usr/bin/env bash
-# Fetch the miner binaries this host needs from the standalone miner repos'
-# GitLab package registries, into a local bin dir the coordinator's config.toml
-# points at. Miners now live in their own repos and publish per-platform
-# binaries as Release/package assets; the coordinator no longer builds them.
+# Fetch the miner binaries a host (or image) needs from the standalone miner
+# repos' GitLab package registries, into a local bin dir the coordinator's
+# config.toml points at. Miners now live in their own repos and publish
+# per-platform binaries as generic-package assets; the coordinator no longer
+# builds them.
 #
-# Usage: fetch-miners.sh [DEST_DIR]   (default: ./miners)
-# Env:   MINERS_TAG  (default: v0.3.0) — the release tag to pull from.
+# Single source of truth: the container images (docker/Dockerfile.quip-miner*)
+# and the native/host install both call this script instead of duplicating the
+# fetch logic.
 #
-# NOTE: this is inert until the miner repos have cut releases at MINERS_TAG.
+# Usage: fetch-miners.sh [DEST_DIR]        (default: ./miners)
+# Env:
+#   MINERS_TAG  release tag to pull (default: v0.3.0).
+#   MINER_SET   which miners to fetch:
+#                 auto      (default) derive from this host's OS/arch —
+#                           Linux -> cpu (+cuda if amd64, optional);
+#                           Darwin/arm64 -> metal + cpu.
+#                 cpu       cpu miners only (any arch).
+#                 cpu-cuda  cpu + cuda miners (cuda required; amd64 only).
+#   DRY_RUN     if set, print the assets that would be fetched and exit 0
+#               without downloading (used by the CI verify job).
+#   TARGETARCH  explicit target arch (amd64|arm64) for docker builds; defaults
+#               to `uname -m` for the native/host install.
+#
+# Assets are published as "<name>-<arch>" but saved locally as "<name>" (no
+# arch suffix) to match config.toml's `binary = "quip-cpu-sa"` references.
+#
+# NOTE: a real (non-DRY_RUN) run is inert until the miner repos have cut
+# releases at MINERS_TAG.
 set -euo pipefail
 
 DEST="${1:-./miners}"
 TAG="${MINERS_TAG:-v0.3.0}"
+MINER_SET="${MINER_SET:-auto}"
 API="https://gitlab.com/api/v4"
 GROUP="quip.network"
 
-os="$(uname -s)"; machine="$(uname -m)"
-case "$machine" in
-  x86_64|amd64) arch=amd64 ;;
-  arm64|aarch64) arch=arm64 ;;
-  *) echo "unsupported arch: $machine" >&2; exit 1 ;;
+# Arch: honor an explicit TARGETARCH (the docker cross-arch build signal the CI
+# passes per image) so a build is never mis-detected; fall back to `uname -m`
+# for the native/host install.
+raw_arch="${TARGETARCH:-$(uname -m)}"
+case "$raw_arch" in
+  x86_64 | amd64) arch=amd64 ;;
+  arm64 | aarch64) arch=arm64 ;;
+  *)
+    echo "unsupported arch: $raw_arch" >&2
+    exit 1
+    ;;
 esac
+os="$(uname -s)"
 
 mkdir -p "$DEST"
 
-# proj: URL-encoded "group/repo"; assets: space-separated asset base names.
+# fetch PROJ NAME...  — download "<NAME>-<arch>" from PROJ's generic package
+# registry, saving it as "<NAME>" (arch suffix stripped) in DEST. PROJ is the
+# URL-encoded "group/repo". DRY_RUN prints the plan and skips the download.
 fetch() {
-  local proj="$1"; shift
+  local proj="$1"
+  shift
+  local name asset url
   for name in "$@"; do
-    local url="${API}/projects/${proj}/packages/generic/${proj##*%2F}/${TAG}/${name}"
-    echo "fetch $name <- $url"
-    curl --fail --location --silent --output "${DEST}/${name}" "$url"
+    asset="${name}-${arch}"
+    url="${API}/projects/${proj}/packages/generic/${proj##*%2F}/${TAG}/${asset}"
+    if [ -n "${DRY_RUN:-}" ]; then
+      echo "would fetch: ${asset} -> ${DEST}/${name}  <- ${url}"
+      continue
+    fi
+    echo "fetch ${asset} -> ${DEST}/${name}"
+    curl --fail --location --silent --show-error --output "${DEST}/${name}" "$url"
     chmod +x "${DEST}/${name}" || true
   done
 }
 
-case "$os" in
-  Linux)
-    # quip-miner-cpu ships amd64+arm64; quip-miner-cuda amd64-only.
-    fetch "quip.network%2Fquip-miner-cpu" "quip-cpu-sa-${arch}" "quip-cpu-gibbs-${arch}"
-    if [ "$arch" = amd64 ]; then
-      fetch "quip.network%2Fquip-miner-cuda" "quip-cuda-sa-amd64" "quip-cuda-gibbs-amd64" || \
-        echo "note: cuda binaries optional (no GPU host)"
-    fi
+# Decide which backends this run wants.
+want_cpu=false
+want_cuda=false
+want_metal=false
+cuda_required=false
+case "$MINER_SET" in
+  cpu) want_cpu=true ;;
+  cpu-cuda)
+    want_cpu=true
+    want_cuda=true
+    cuda_required=true
     ;;
-  Darwin)
-    # Apple Silicon: metal + cpu.
-    fetch "quip.network%2Fquip-miner-metal" "quip-metal-sa-arm64" "quip-metal-gibbs-arm64"
-    fetch "quip.network%2Fquip-miner-cpu" "quip-cpu-sa-arm64" "quip-cpu-gibbs-arm64"
+  auto)
+    case "$os" in
+      Linux)
+        want_cpu=true
+        [ "$arch" = amd64 ] && want_cuda=true
+        ;;
+      Darwin)
+        want_metal=true
+        want_cpu=true
+        ;;
+      *)
+        echo "unsupported OS: $os" >&2
+        exit 1
+        ;;
+    esac
     ;;
-  *) echo "unsupported OS: $os" >&2; exit 1 ;;
+  *)
+    echo "unknown MINER_SET '$MINER_SET' (want: auto|cpu|cpu-cuda)" >&2
+    exit 1
+    ;;
 esac
+
+if [ "$want_metal" = true ]; then
+  fetch "quip.network%2Fquip-miner-metal" "quip-metal-sa" "quip-metal-gibbs"
+fi
+if [ "$want_cpu" = true ]; then
+  fetch "quip.network%2Fquip-miner-cpu" "quip-cpu-sa" "quip-cpu-gibbs"
+fi
+if [ "$want_cuda" = true ]; then
+  if [ "$arch" != amd64 ]; then
+    echo "cuda miners are amd64-only; skipping on ${arch}" >&2
+    if [ "$cuda_required" = true ]; then
+      echo "MINER_SET=cpu-cuda requires amd64" >&2
+      exit 1
+    fi
+  elif [ "$cuda_required" = true ]; then
+    fetch "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs"
+  else
+    fetch "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs" ||
+      echo "note: cuda binaries optional (no GPU host)"
+  fi
+fi
 
 # The dwave miner is a Python wheel, not a native binary:
 echo "dwave: pip install 'quip-miner-dwave @ git+https://gitlab.com/${GROUP}/quip-miner-dwave.git@${TAG}'"

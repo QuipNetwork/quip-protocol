@@ -49,17 +49,12 @@ RUN userdel --remove ubuntu 2>/dev/null || true; \
 COPY --from=builder /src/rust/target/release/quip-coordinator /usr/local/bin/quip-coordinator
 COPY --from=builder /opt/venv /opt/venv
 
-# Released CPU + CUDA miner binaries (amd64 only for this image). Each spec is
-# "<registry-base> <binary>"; split on whitespace (a ':' separator would clash
-# with the https:// in the URL). The published asset is <binary>-amd64.
-RUN cpu="https://gitlab.com/api/v4/projects/quip.network%2Fquip-miner-cpu/packages/generic/quip-miner-cpu/${MINERS_TAG}" \
-    && cuda="https://gitlab.com/api/v4/projects/quip.network%2Fquip-miner-cuda/packages/generic/quip-miner-cuda/${MINERS_TAG}" \
-    && for spec in "${cpu} quip-cpu-sa" "${cpu} quip-cpu-gibbs" \
-                   "${cuda} quip-cuda-sa" "${cuda} quip-cuda-gibbs"; do \
-         set -- $spec; base="$1"; name="$2"; \
-         curl --fail --location --silent --show-error "${base}/${name}-amd64" -o "/usr/local/bin/${name}" \
-         && chmod +x "/usr/local/bin/${name}"; \
-       done
+# Released CPU + CUDA miner binaries (amd64 only for this image), via the shared
+# fetch-miners.sh — single source of truth. MINER_SET=cpu-cuda requires the cuda
+# assets (fails the build if missing), unlike the optional cuda in `auto` mode.
+COPY rust/quip-coordinator/tools/fetch-miners.sh /usr/local/bin/fetch-miners.sh
+RUN TARGETARCH=amd64 MINERS_TAG="${MINERS_TAG}" MINER_SET=cpu-cuda \
+    bash /usr/local/bin/fetch-miners.sh /usr/local/bin
 
 WORKDIR /app
 COPY docker/config.toml /app/config.toml
