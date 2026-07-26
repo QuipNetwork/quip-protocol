@@ -60,7 +60,7 @@ struct DriveArgs {
     #[arg(long)]
     topology: Option<PathBuf>,
     /// Built-in topology by name (`advantage2-system1`, `smoke`), resolved to a
-    /// committed fixture under `tools/drive/`. Mutually exclusive with
+    /// committed fixture under `fixtures/drive/`. Mutually exclusive with
     /// `--topology`.
     #[arg(long)]
     topology_preset: Option<String>,
@@ -322,15 +322,15 @@ fn resolve_topology_path(args: &DriveArgs) -> Result<Option<PathBuf>, String> {
     }
 }
 
-/// Map a preset name to its committed fixture under `tools/drive/`, resolved
-/// relative to the source tree. Rejects names outside `[A-Za-z0-9-]` so a preset
+/// Map a preset name to its committed fixture under `fixtures/drive/`, resolved
+/// relative to the crate. Rejects names outside `[A-Za-z0-9-]` so a preset
 /// can never escape the fixture directory.
 fn preset_path(name: &str) -> Result<PathBuf, String> {
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(format!("invalid topology preset name: {name:?}"));
     }
     Ok(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tools/drive")
+        .join("fixtures/drive")
         .join(format!("{name}.spec.json")))
 }
 
@@ -453,7 +453,7 @@ mod tests {
     fn random_defaults_to_advantage2_preset() {
         let a = drive_args(DriveSourceKind::Random);
         let p = resolve_topology_path(&a).unwrap().unwrap();
-        assert!(p.ends_with("tools/drive/advantage2-system1.spec.json"));
+        assert!(p.ends_with("fixtures/drive/advantage2-system1.spec.json"));
     }
 
     #[test]
@@ -467,7 +467,7 @@ mod tests {
         let mut a = drive_args(DriveSourceKind::Random);
         a.topology_preset = Some("smoke".into());
         let p = resolve_topology_path(&a).unwrap().unwrap();
-        assert!(p.ends_with("tools/drive/smoke.spec.json"));
+        assert!(p.ends_with("fixtures/drive/smoke.spec.json"));
     }
 
     #[test]
