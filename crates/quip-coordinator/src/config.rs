@@ -23,6 +23,17 @@ pub struct CoordinatorConfig {
     pub validators: Vec<String>,
     pub signer_key: String,
     pub launch: Vec<LaunchEntry>,
+    /// Optional mining-attempt dashboard (`[dashboard]` section). `None`
+    /// disables recording + the REST endpoint.
+    pub dashboard: Option<DashboardConfig>,
+}
+
+/// `[dashboard]` config: where to serve the attempt logs and where they live.
+pub struct DashboardConfig {
+    /// HTTP listen address, e.g. `127.0.0.1:9090`.
+    pub listen: String,
+    /// Root directory for `<qblock_id>/attempts.jsonl` files.
+    pub data_dir: String,
 }
 
 pub struct LaunchEntry {
@@ -129,10 +140,23 @@ pub fn parse_config(toml_text: &str) -> Result<CoordinatorConfig, ConfigError> {
     {
         launch.push(entry("qpu-0", "dwave", t));
     }
+    let dashboard = root
+        .get("dashboard")
+        .and_then(|v| v.as_table())
+        .and_then(|t| {
+            let listen = t.get("listen").and_then(|v| v.as_str())?;
+            let data_dir = t.get("data_dir").and_then(|v| v.as_str())?;
+            Some(DashboardConfig {
+                listen: listen.to_string(),
+                data_dir: data_dir.to_string(),
+            })
+        });
+
     Ok(CoordinatorConfig {
         validators,
         signer_key,
         launch,
+        dashboard,
     })
 }
 
@@ -192,5 +216,26 @@ daily_budget = "30s"
         let c = parse_config(SAMPLE).unwrap();
         let dwave = c.launch.iter().find(|e| e.miner_id == "qpu-0").unwrap();
         assert_eq!(dwave.binary, "quip-dwave-qa");
+    }
+
+    #[test]
+    fn dashboard_section_parsed_when_present() {
+        let c = parse_config(SAMPLE).unwrap();
+        assert!(c.dashboard.is_none());
+
+        let with = format!(
+            "{SAMPLE}\n[dashboard]\nlisten = \"127.0.0.1:9090\"\ndata_dir = \"/data/attempts\"\n"
+        );
+        let d = parse_config(&with).unwrap().dashboard.unwrap();
+        assert_eq!(d.listen, "127.0.0.1:9090");
+        assert_eq!(d.data_dir, "/data/attempts");
+    }
+
+    #[test]
+    fn dashboard_ignored_when_missing_keys() {
+        // A [dashboard] section missing a required key disables it rather than
+        // erroring, so a partial config still boots.
+        let partial = format!("{SAMPLE}\n[dashboard]\nlisten = \"127.0.0.1:9090\"\n");
+        assert!(parse_config(&partial).unwrap().dashboard.is_none());
     }
 }

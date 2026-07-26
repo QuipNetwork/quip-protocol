@@ -59,6 +59,11 @@ pub struct CoordinatorState {
     pub current_best_milli: Option<i64>,
     pub results_validated: u64,
     pub last_abandoned_generation: u64,
+    /// Sink for mining-attempt records (dashboard). `None` disables recording.
+    pub attempt_tx: Option<std::sync::mpsc::Sender<crate::attempt::AttemptRecord>>,
+    /// Current chain quantum-block id, refreshed by the feeder on reseed; keys
+    /// the per-qblock attempt logs.
+    pub qblock_id: Option<u64>,
 }
 
 impl CoordinatorState {
@@ -77,6 +82,8 @@ impl CoordinatorState {
             current_best_milli: None,
             results_validated: 0,
             last_abandoned_generation: 0,
+            attempt_tx: None,
+            qblock_id: None,
         }
     }
 
@@ -325,10 +332,7 @@ async fn run_session<C: ChainClient>(
                 if let Some(job) = job {
                     if let Some(ising) = job.ising.as_ref() {
                         let validated = validate_result(ising, &result.solutions, &gates, &topo);
-                        {
-                            let mut st = state.lock().await;
-                            st.results_validated += 1;
-                        }
+                        let mut submitted = false;
                         if validated.accepted && beats_current(validated.best_energy_milli, best) {
                             let proof = Proof {
                                 job_id: result.job_id.clone(),
@@ -361,6 +365,29 @@ async fn run_session<C: ChainClient>(
                                 if let Some(n) = submit_notify.lock().await.take() {
                                     let _ = n.send(());
                                 }
+                                submitted = true;
+                            }
+                        }
+                        // Record every solved model for the dashboard, then count it.
+                        {
+                            let mut st = state.lock().await;
+                            st.results_validated += 1;
+                            let qblock_id = st.qblock_id;
+                            if let Some(tx) = st.attempt_tx.as_ref() {
+                                let device_us = result
+                                    .meta
+                                    .as_ref()
+                                    .map(|m| m.device_access_time_us)
+                                    .unwrap_or(0);
+                                let _ = tx.send(crate::attempt::AttemptRecord::new(
+                                    qblock_id,
+                                    &miner_id,
+                                    &result.job_id,
+                                    &job,
+                                    &validated,
+                                    submitted,
+                                    device_us,
+                                ));
                             }
                         }
                     }

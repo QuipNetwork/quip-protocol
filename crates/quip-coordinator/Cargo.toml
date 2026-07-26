@@ -44,10 +44,13 @@ tokio = { workspace = true, features = [
     "sync",
     "time",
     "signal",
+    "fs",
 ] }
 tokio-stream = { version = "0.1", features = ["net"] }
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs"] }
 toml = "0.8"
 blake3 = "1"
 getrandom = "0.2"

@@ -81,6 +81,7 @@ async fn runtime_serves_supervises_and_shuts_down_clean() {
         miner_account: [0u8; 32],
         buffer_depth: 0,
         poll_interval_ms: 200,
+        dashboard: None,
     };
     let (trigger_tx, trigger_rx) = oneshot::channel::<()>();
 

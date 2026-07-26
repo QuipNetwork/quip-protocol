@@ -11,6 +11,8 @@ pub struct FakeChain {
     pub submitted: Mutex<Vec<Proof>>,
     /// Optional scripted submit result (default Success).
     submit_result: Mutex<Result<SubmitAction, ChainError>>,
+    /// Scripted `latest_qblock_id` (default `None`).
+    qblock_id: Mutex<Option<u64>>,
 }
 
 impl FakeChain {
@@ -20,7 +22,12 @@ impl FakeChain {
             orders: Mutex::new(order.into_iter().collect()),
             submitted: Mutex::new(Vec::new()),
             submit_result: Mutex::new(Ok(SubmitAction::Success)),
+            qblock_id: Mutex::new(None),
         }
+    }
+
+    pub fn set_qblock_id(&self, id: Option<u64>) {
+        *self.qblock_id.lock().unwrap() = id;
     }
 
     pub fn set_snapshot(&self, snap: Option<MiningSnapshot>) {
@@ -68,5 +75,9 @@ impl ChainClient for FakeChain {
             Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
             Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),
         }
+    }
+
+    async fn fetch_latest_qblock_id(&self) -> Result<Option<u64>, ChainError> {
+        Ok(*self.qblock_id.lock().unwrap())
     }
 }
