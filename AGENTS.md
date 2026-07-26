@@ -4,6 +4,8 @@ Cross-tool instructions for AI coding assistants (Claude Code, Codex, Cursor, Ge
 
 QuIP v0.3 is a Rust workspace. The coordinator owns chain access and work routing; it spawns and supervises the miner subprocesses that do the sampling. The miner binaries ship from their own repos. A small PyO3 extension exposes the consensus primitives to Python.
 
+For deeper detail, see the companion guides: `COORDINATOR.md` covers how the coordinator works, `MINER.md` covers the shared miner harness, and `NEWMINER.md` covers adding a new miner.
+
 ## Repository layout
 
 - `crates/` — the Cargo workspace (root manifest: `Cargo.toml`):
