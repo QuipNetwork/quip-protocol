@@ -12,13 +12,13 @@
 use crate::config::LaunchEntry;
 use crate::drive::report::JobRow;
 use crate::router::MinerCaps;
-use crate::session::CoordinatorState;
+use crate::session::{coord, shutdown_msg, CoordinatorState};
 use crate::topology::Topology;
 use crate::validate::validate_result;
 use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
 use quip_proto::v1::{
     coord_msg, miner_msg, Configure, CoordMsg, Job, MinerMsg, Reject, Result as JobResult,
-    Shutdown, Welcome,
+    Welcome,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -61,14 +61,6 @@ pub struct DriveManyReport {
     /// `jobs / this`, not the sum of per-job `wall_ms` (which overcounts the
     /// concurrent, overlapping jobs the streaming backends run).
     pub run_wall_ms: u64,
-}
-
-fn coord(msg: coord_msg::Msg) -> CoordMsg {
-    CoordMsg { msg: Some(msg) }
-}
-
-fn shutdown_msg() -> CoordMsg {
-    coord(coord_msg::Msg::Shutdown(Shutdown { grace_ms: 500 }))
 }
 
 /// A failing `JobRow` for a job that produced no valid `Result` — rejected,
@@ -399,7 +391,7 @@ async fn handle_message(
             drop(tokio::spawn(async move {
                 handle_result(&state, result, &run).await;
                 if run.is_complete() {
-                    let _ = tx.send(Ok(shutdown_msg())).await;
+                    let _ = tx.send(Ok(shutdown_msg(500))).await;
                 }
             }));
             true
@@ -430,7 +422,7 @@ async fn run_drive_session(
     // Nothing left to run — either no jobs, or every job was unroutable and
     // already reconciled during handshake. Shut down without waiting for Ready.
     if run.total == 0 || run.is_complete() {
-        let _ = tx.send(Ok(shutdown_msg())).await;
+        let _ = tx.send(Ok(shutdown_msg(500))).await;
         return;
     }
     let seed_credits = configure.queue_depth.max(1);
@@ -444,7 +436,7 @@ async fn run_drive_session(
             break;
         }
         if run.is_complete() {
-            let _ = tx.send(Ok(shutdown_msg())).await;
+            let _ = tx.send(Ok(shutdown_msg(500))).await;
             break;
         }
     }

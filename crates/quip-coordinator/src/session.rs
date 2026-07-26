@@ -25,7 +25,7 @@ pub fn gen_session_token() -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn coord(msg: coord_msg::Msg) -> CoordMsg {
+pub(crate) fn coord(msg: coord_msg::Msg) -> CoordMsg {
     CoordMsg { msg: Some(msg) }
 }
 
