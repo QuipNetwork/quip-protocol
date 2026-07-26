@@ -260,6 +260,19 @@ fn debug_assert_energies_match(
     use quantum_validation::energy_of_solution;
     use quip_protocol::wire::decode_spins;
 
+    // `energy_of_solution` resolves every edge endpoint by a linear scan of
+    // `nodes` (`position_of_node`), so this golden re-check costs
+    // O(edges * nodes) per solution. That is a cheap sanity net on small
+    // problems but pathological on large topologies — a 4577-node Advantage2
+    // graph is ~20 billion unoptimized ops per result, which stalls a debug
+    // `drive` run indefinitely (quip-w5p.14). Skip it past a modest size; the
+    // release path never runs it at all, and small-problem coverage still
+    // catches an `energy_in_place` divergence (the formula is size-invariant).
+    const MAX_GOLDEN_EDGE_NODE_PRODUCT: usize = 1_000_000;
+    if edges_pos.len().saturating_mul(h_milli.len()) > MAX_GOLDEN_EDGE_NODE_PRODUCT {
+        return;
+    }
+
     let nodes: Vec<u32> = (0..h_milli.len())
         .map(|i| u32::try_from(i).unwrap_or(u32::MAX))
         .collect();
@@ -321,6 +334,53 @@ mod tests {
         assert!(!beats_current(-500, Some(-500))); // strict <
         assert!(!beats_current(-499, Some(-500)));
         assert!(beats_current(-1, None));
+    }
+
+    /// Regression for quip-w5p.14: a large topology must not stall the debug
+    /// golden re-check. `energy_of_solution` resolves edges by a linear
+    /// `position_of_node` scan (O(edges*nodes) per solution); un-capped, this
+    /// test hangs for minutes in a debug build. The size cap in
+    /// `debug_assert_energies_match` skips it, so `validate_result` returns fast.
+    #[test]
+    fn large_topology_does_not_stall_debug_golden_check() {
+        let n = 5000usize;
+        let m = 30_000usize; // edges*nodes = 150M, far above the 1M cap
+        let h: Vec<i32> = (0..n).map(|i| ((i % 3) as i32 - 1) * 1000).collect();
+        let mut u = Vec::with_capacity(m);
+        let mut v = Vec::with_capacity(m);
+        let mut j = Vec::with_capacity(m);
+        for k in 0..m {
+            u.push((k % n) as u32);
+            v.push(((k * 7 + 1) % n) as u32);
+            j.push(if k % 2 == 0 { 1000 } else { -1000 });
+        }
+        let problem = IsingProblem {
+            graph: Some(ising_problem::Graph::Edges(quip_proto::v1::EdgeList {
+                u,
+                v,
+            })),
+            h_milli_le32: encode_i32_le(&h),
+            j_milli_le32: encode_i32_le(&j),
+            num_reads: 0,
+            num_sweeps: 0,
+            anneal_time_us: 0,
+        };
+        let spins: Vec<i8> = (0..n).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect();
+        let sols: Vec<Solution> = (0..4)
+            .map(|_| Solution {
+                spins_bytes: encode_spins(&spins),
+                energy_milli: 0,
+            })
+            .collect();
+        let gates = QualityGates {
+            min_energy_milli: i64::MAX, // accept all
+            min_diversity_milli: 0,
+            min_solutions: 0,
+        };
+        let vd = validate_result(&problem, &sols, &gates, &ResolvedTopo::default());
+        // Four identical solutions dedup (Z2-canonical) to one unique valid row;
+        // the point is that this returned at all.
+        assert_eq!(vd.n_valid, 1);
     }
 
     #[test]
