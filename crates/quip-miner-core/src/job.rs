@@ -5,7 +5,7 @@ use crate::adapt::adapt_params;
 use crate::ising::{IsingGraph, SampleParams};
 use crate::session::BackendIdentity;
 use crate::Sampler;
-use crate::{StreamJob, StreamResult};
+use crate::{StreamJob, StreamOutcome, StreamResult};
 use quip_proto::v1::{
     ising_problem, miner_msg, IsingProblem, Job, JobKind, JobRequest, MinerMsg, Reject,
     RejectReason, Result as JobResult, SamplerMeta, Solution, Status, Topology,
@@ -240,6 +240,9 @@ pub(crate) fn prepare_job<S: Sampler>(
     target: Option<&SessionTarget>,
 ) -> Prepared {
     let job_id = job.job_id.clone();
+    // Capture before `job.ising` is moved out below; threads into StreamJob so
+    // the sampler knows what a Cancel invalidates.
+    let generation = job.generation;
 
     if job.kind != JobKind::IsingSample as i32 {
         return Prepared::Reject(reject(job_id, RejectReason::UnsupportedKind));
@@ -302,31 +305,40 @@ pub(crate) fn prepare_job<S: Sampler>(
             job_id,
             graph,
             params,
+            generation,
         },
         num_reads,
         num_sweeps,
     }
 }
 
-/// Turn a completed [`StreamResult`] into a `Result` + `JobRequest` (or a
-/// `Reject` if the sampler errored). `num_reads`/`num_sweeps` are the resolved
-/// values from [`prepare_job`], echoed into `SamplerMeta`.
+/// Turn a [`StreamResult`] into the reply(s): a `Result` on completion, a
+/// `Reject` on sampler error, or nothing upstream when the job's generation was
+/// cancelled. Every path refunds one credit (`JobRequest{1}`) so the
+/// coordinator's consume-on-dispatch pool never leaks a slot. `num_reads`/
+/// `num_sweeps` are the resolved values from [`prepare_job`], echoed into
+/// `SamplerMeta`.
 pub(crate) fn finalize_result(
     sr: StreamResult,
     num_reads: u32,
     num_sweeps: u32,
     jobs_done: &mut u64,
 ) -> Vec<MinerMsg> {
-    let samples = match sr.result {
-        Ok(s) => s,
+    let samples = match sr.outcome {
+        StreamOutcome::Completed(Ok(s)) => s,
         // A reject is terminal for this job too, so replace its credit like a
         // completion does — otherwise the coordinator's consume-on-dispatch
         // pool leaks one slot per reject and the pipeline slowly starves.
-        Err(reason) => {
+        StreamOutcome::Completed(Err(reason)) => {
             return vec![
                 reject(sr.job_id, reason),
                 miner(miner_msg::Msg::JobRequest(JobRequest { credits: 1 })),
             ]
+        }
+        // Generation abandoned on reseed: the coordinator has moved on, so send
+        // no stale Result/Reject — only refund the credit to keep pipeline depth.
+        StreamOutcome::Cancelled => {
+            return vec![miner(miner_msg::Msg::JobRequest(JobRequest { credits: 1 }))]
         }
     };
     let solutions: Vec<Solution> = samples

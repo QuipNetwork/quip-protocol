@@ -9,7 +9,7 @@ use crate::job::{
     finalize_result, miner, num_sweeps_from_toml, prepare_job, status_msg, Prepared, SessionTarget,
     TopologyCache, DEFAULT_NUM_SWEEPS,
 };
-use crate::{Sampler, StreamJob, StreamResult};
+use crate::{CancelGuard, Sampler, StreamJob, StreamOutcome, StreamResult};
 use quip_proto::v1::miner_service_client::MinerServiceClient;
 use quip_proto::v1::{coord_msg, miner_msg, CoordMsg, JobKind, JobRequest, MinerMsg, Ready};
 use quip_protocol::session::{build_hello, ExitCode, SessionConfig, SessionError};
@@ -115,9 +115,14 @@ async fn run_session<S: Sampler>(
     let cap = prefetch.max(8);
     let (job_tx, job_rx) = mpsc::channel::<StreamJob>(cap);
     let (res_tx, mut res_rx) = mpsc::channel::<StreamResult>(cap);
+    // Control-plane cancellation watermark: bumped here on `Cancel`, read by the
+    // sampler thread to skip/abort jobs from generations the coordinator
+    // abandoned on reseed.
+    let cancel = CancelGuard::default();
     let sampler_thread = {
         let s = Arc::clone(&sampler);
-        std::thread::spawn(move || s.sample_stream(job_rx, res_tx))
+        let cancel = cancel.clone();
+        std::thread::spawn(move || s.sample_stream(job_rx, res_tx, cancel))
     };
 
     let mut grace_ms: u64 = 5000;
@@ -137,7 +142,10 @@ async fn run_session<S: Sampler>(
             // Drain completed results first so a busy sampler never backs up.
             Some(sr) = res_rx.recv() => {
                 let (reads, sweeps) = pending.remove(&sr.job_id).unwrap_or((0, 0));
-                if let Ok(samples) = &sr.result {
+                // A Cancelled job neither advances progress nor updates best
+                // energy; finalize_result just refunds its credit.
+                let completed = matches!(sr.outcome, StreamOutcome::Completed(_));
+                if let StreamOutcome::Completed(Ok(samples)) = &sr.outcome {
                     if let Some(e) = samples.iter().map(|r| r.energy_milli).min() {
                         best_energy_milli = best_energy_milli.min(e);
                     }
@@ -145,7 +153,7 @@ async fn run_session<S: Sampler>(
                 for reply in finalize_result(sr, reads, sweeps, &mut jobs_done) {
                     tx.send(reply).await?;
                 }
-                if jobs_done > 0 && jobs_done.is_multiple_of(PROGRESS_LOG_INTERVAL) {
+                if completed && jobs_done > 0 && jobs_done.is_multiple_of(PROGRESS_LOG_INTERVAL) {
                     log_progress(
                         id.backend,
                         jobs_done,
@@ -230,7 +238,12 @@ async fn run_session<S: Sampler>(
                             }
                         }
                     }
-                    Some(coord_msg::Msg::Cancel(_)) => {
+                    Some(coord_msg::Msg::Cancel(c)) => {
+                        // Abandon every generation at/below the watermark; the
+                        // sampler skips buffered stale jobs at dequeue and (in
+                        // backends that override sample_stream) aborts the
+                        // in-flight one at its next checkpoint.
+                        cancel.cancel_through(c.max_generation);
                         tx.send(status_msg(miner_id, jobs_done, sampler.utilization()))
                             .await?;
                     }

@@ -197,7 +197,7 @@ fn job(job_id: &[u8], deadline_ms: u64, ising: IsingProblem) -> Job {
     Job {
         job_id: job_id.to_vec(),
         kind: JobKind::IsingSample as i32,
-        generation: 1,
+        generation: 2,
         deadline_ms,
         ising: Some(ising),
         provenance: None,
@@ -208,7 +208,7 @@ fn job_kind(job_id: &[u8], deadline_ms: u64, kind: JobKind, ising: IsingProblem)
     Job {
         job_id: job_id.to_vec(),
         kind: kind as i32,
-        generation: 1,
+        generation: 2,
         deadline_ms,
         ising: Some(ising),
         provenance: None,
@@ -326,7 +326,11 @@ async fn run_script(
         )))))
         .await;
 
-    // 4. Cancel (no buffered work here; miner reports via Status).
+    // 4. Cancel the prior round (generation 1): the current jobs are
+    // generation 2, so nothing in flight is abandoned — this exercises the
+    // cancel-ack Status path without racing the results above. (Skipping of a
+    // job whose own generation is cancelled is covered white-box by
+    // quip-miner-core's sample_stream unit test.)
     let _ = tx
         .send(Ok(coord(coord_msg::Msg::Cancel(quip_proto::v1::Cancel {
             max_generation: 1,
