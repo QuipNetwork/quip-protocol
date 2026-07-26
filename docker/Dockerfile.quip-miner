@@ -14,9 +14,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --pr
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /src
-COPY rust/ rust/
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ crates/
 COPY proto/ proto/
-RUN cargo build --release -p quip-coordinator --manifest-path rust/Cargo.toml
+RUN cargo build --release -p quip-coordinator
 
 # D-Wave miner into an isolated venv (pulls + builds quip_proto via maturin).
 ARG MINERS_TAG=v0.3.0
@@ -44,13 +45,13 @@ RUN groupadd --system --gid 1000 quip \
        --create-home --shell /usr/sbin/nologin quip
 
 # Coordinator binary + D-Wave venv from the builder.
-COPY --from=builder /src/rust/target/release/quip-coordinator /usr/local/bin/quip-coordinator
+COPY --from=builder /src/target/release/quip-coordinator /usr/local/bin/quip-coordinator
 COPY --from=builder /opt/venv /opt/venv
 
 # Released CPU miner binaries for this arch, via the shared fetch-miners.sh —
 # single source of truth (the native/host install runs the same script). The
 # script derives arch from `uname` (correct on the per-arch kaniko runners).
-COPY rust/quip-coordinator/tools/fetch-miners.sh /usr/local/bin/fetch-miners.sh
+COPY crates/quip-coordinator/tools/fetch-miners.sh /usr/local/bin/fetch-miners.sh
 RUN TARGETARCH="${TARGETARCH}" MINERS_TAG="${MINERS_TAG}" MINER_SET=cpu \
     bash /usr/local/bin/fetch-miners.sh /usr/local/bin
 

@@ -14,9 +14,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --pr
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /src
-COPY rust/ rust/
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ crates/
 COPY proto/ proto/
-RUN cargo build --release -p quip-coordinator --manifest-path rust/Cargo.toml
+RUN cargo build --release -p quip-coordinator
 
 ARG MINERS_TAG=v0.3.0
 RUN python -m venv /opt/venv \
@@ -46,13 +47,13 @@ RUN userdel --remove ubuntu 2>/dev/null || true; \
     && useradd --system --uid 1000 --gid 1000 --home /home/quip \
        --create-home --shell /usr/sbin/nologin quip
 
-COPY --from=builder /src/rust/target/release/quip-coordinator /usr/local/bin/quip-coordinator
+COPY --from=builder /src/target/release/quip-coordinator /usr/local/bin/quip-coordinator
 COPY --from=builder /opt/venv /opt/venv
 
 # Released CPU + CUDA miner binaries (amd64 only for this image), via the shared
 # fetch-miners.sh — single source of truth. MINER_SET=cpu-cuda requires the cuda
 # assets (fails the build if missing), unlike the optional cuda in `auto` mode.
-COPY rust/quip-coordinator/tools/fetch-miners.sh /usr/local/bin/fetch-miners.sh
+COPY crates/quip-coordinator/tools/fetch-miners.sh /usr/local/bin/fetch-miners.sh
 RUN TARGETARCH=amd64 MINERS_TAG="${MINERS_TAG}" MINER_SET=cpu-cuda \
     bash /usr/local/bin/fetch-miners.sh /usr/local/bin
 
