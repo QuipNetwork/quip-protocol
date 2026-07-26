@@ -17,9 +17,12 @@ const ONE_SOLUTION: &str = r#"[{\"spins\":[1,-1],\"energy_milli\":-5}]"#;
 fn file_mode_delivers_model_and_parses_solutions() {
     // The solver only emits a solution when a non-empty model file is present at
     // the substituted path, proving file delivery.
-    let cmd = format!("sh -c 'test -s \"$1\" && echo \"{ONE_SOLUTION}\" || echo \"[]\"' _ {{model}}");
+    let cmd =
+        format!("sh -c 'test -s \"$1\" && echo \"{ONE_SOLUTION}\" || echo \"[]\"' _ {{model}}");
     let sampler = ExecSampler::new(&cmd, 5_000, false).expect("valid cmd");
-    let out = sampler.sample(&graph(), &SampleParams::default()).expect("ok");
+    let out = sampler
+        .sample(&graph(), &SampleParams::default())
+        .expect("ok");
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].spins, vec![1i8, -1]);
     assert_eq!(out[0].energy_milli, -5);
@@ -29,9 +32,12 @@ fn file_mode_delivers_model_and_parses_solutions() {
 fn stdin_mode_delivers_model_on_stdin() {
     // `cat` drains stdin to EOF (newline-independent); a non-empty capture
     // proves the model arrived on stdin.
-    let cmd = format!("sh -c 'in=$(cat); test -n \"$in\" && echo \"{ONE_SOLUTION}\" || echo \"[]\"'");
+    let cmd =
+        format!("sh -c 'in=$(cat); test -n \"$in\" && echo \"{ONE_SOLUTION}\" || echo \"[]\"'");
     let sampler = ExecSampler::new(&cmd, 5_000, true).expect("valid cmd");
-    let out = sampler.sample(&graph(), &SampleParams::default()).expect("ok");
+    let out = sampler
+        .sample(&graph(), &SampleParams::default())
+        .expect("ok");
     assert_eq!(out.len(), 1);
 }
 

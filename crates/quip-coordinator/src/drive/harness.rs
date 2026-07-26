@@ -17,8 +17,7 @@ use crate::topology::Topology;
 use crate::validate::validate_result;
 use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
 use quip_proto::v1::{
-    coord_msg, miner_msg, Configure, CoordMsg, Job, MinerMsg, Reject, Result as JobResult,
-    Welcome,
+    coord_msg, miner_msg, Configure, CoordMsg, Job, MinerMsg, Reject, Result as JobResult, Welcome,
 };
 use std::collections::HashMap;
 use std::path::Path;

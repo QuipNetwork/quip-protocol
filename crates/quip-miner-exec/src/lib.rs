@@ -97,8 +97,8 @@ impl Sampler for ExecSampler {
         graph: &IsingGraph,
         params: &SampleParams,
     ) -> Result<Vec<SamplerResult>, RejectReason> {
-        let model =
-            serde_json::to_vec(&ModelJson::new(graph, params)).map_err(|_| RejectReason::Malformed)?;
+        let model = serde_json::to_vec(&ModelJson::new(graph, params))
+            .map_err(|_| RejectReason::Malformed)?;
 
         let stdout = if self.use_stdin {
             run_solver(&self.argv_template, Some(model), self.timeout)?
@@ -214,11 +214,8 @@ impl TempModel {
     fn write(bytes: &[u8]) -> std::io::Result<Self> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "quip-exec-model-{}-{}.json",
-            std::process::id(),
-            n
-        ));
+        let path =
+            std::env::temp_dir().join(format!("quip-exec-model-{}-{}.json", std::process::id(), n));
         std::fs::write(&path, bytes)?;
         Ok(Self(path))
     }
@@ -258,18 +255,14 @@ mod tests {
         let got = render_argv(&tmpl, Path::new("/tmp/m.json"));
         assert_eq!(
             got,
-            vec![
-                "solver",
-                "--model=/tmp/m.json",
-                "/tmp/m.json",
-                "--reads=8"
-            ]
+            vec!["solver", "--model=/tmp/m.json", "/tmp/m.json", "--reads=8"]
         );
     }
 
     #[test]
     fn parse_solutions_maps_valid_reads() {
-        let json = br#"[{"spins":[1,-1],"energy_milli":-14000},{"spins":[-1,-1],"energy_milli":-1}]"#;
+        let json =
+            br#"[{"spins":[1,-1],"energy_milli":-14000},{"spins":[-1,-1],"energy_milli":-1}]"#;
         let got = parse_solutions(json, 2).expect("valid");
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].spins, vec![1i8, -1]);
