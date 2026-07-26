@@ -193,6 +193,34 @@ impl ChainClient for RealChainClient {
         Ok(Some(snap))
     }
 
+    async fn fetch_latest_qblock_id(&self) -> Result<Option<u64>, ChainError> {
+        let head = self
+            .rpc_call("chain_getBlockHash", Value::Array(vec![]))
+            .await?;
+        let block_hash = head
+            .as_str()
+            .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))
+            .and_then(|hex| hex_decode(hex).map_err(ChainError::Decode))?;
+
+        // `QuantumPowApi_latest_qblock_id()` takes no args → empty SCALE params.
+        let result = self
+            .rpc_call(
+                "state_call",
+                Value::Array(vec![
+                    Value::String("QuantumPowApi_latest_qblock_id".into()),
+                    Value::String(hex_encode(&[])),
+                    Value::String(hex_encode(&block_hash)),
+                ]),
+            )
+            .await?;
+
+        let Some(hex) = result.as_str() else {
+            return Ok(None);
+        };
+        let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
+        Decode::decode(&mut &bytes[..]).map_err(|e| ChainError::Decode(e.to_string()))
+    }
+
     async fn fetch_mempool_orders(
         &self,
         _miner_account: [u8; 32],

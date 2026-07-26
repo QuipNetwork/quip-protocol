@@ -1,8 +1,10 @@
 //! quip-coordinator: chain access, job production, routing, validation,
 //! miner session server, and process supervision for the v0.3 protocol.
 
+pub mod attempt;
 pub mod chain;
 pub mod config;
+pub mod dashboard;
 pub mod decay;
 pub mod drive;
 pub mod producer;

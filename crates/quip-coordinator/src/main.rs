@@ -169,6 +169,10 @@ fn run_config_path(config: Option<PathBuf>) -> StdExitCode {
         // fast, many-core backends; slow ones simply sit at the floor.
         buffer_depth: 256,
         poll_interval_ms: 1000,
+        dashboard: cfg
+            .dashboard
+            .as_ref()
+            .map(|d| (d.listen.clone(), PathBuf::from(&d.data_dir))),
     };
     eprintln!(
         "quip-coordinator: serving {} miner(s) on {}",

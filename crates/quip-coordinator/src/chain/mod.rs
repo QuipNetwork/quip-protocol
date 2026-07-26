@@ -57,4 +57,9 @@ pub trait ChainClient: Send + Sync {
 
     /// Hybrid-sign and submit a proof extrinsic; classify the receipt.
     async fn submit_proof(&self, proof: &Proof) -> Result<SubmitAction, ChainError>;
+
+    /// Current quantum-block id (`QuantumPowApi_latest_qblock_id`). `None` when
+    /// the chain hasn't started a round or doesn't expose one; used to key the
+    /// per-qblock mining-attempt logs.
+    async fn fetch_latest_qblock_id(&self) -> Result<Option<u64>, ChainError>;
 }

@@ -41,6 +41,9 @@ pub struct RuntimeParams {
     pub buffer_depth: usize,
     /// How often the feeder polls the chain head and tops up buffers.
     pub poll_interval_ms: u64,
+    /// Optional attempt-dashboard: `(listen_addr, data_dir)`. `None` disables
+    /// recording + the REST endpoint.
+    pub dashboard: Option<(String, std::path::PathBuf)>,
 }
 
 /// Inputs to the feeder loop.
@@ -161,9 +164,13 @@ pub async fn feeder_loop<C: ChainClient>(
                     &snap.allowed_j_milli,
                     &snap.allowed_spin_milli,
                 );
+                // Refresh the chain qblock id for the attempt logs (best-effort;
+                // fetched before locking so we never await under the state lock).
+                let qblock_id = chain.fetch_latest_qblock_id().await.ok().flatten();
                 let mut st = state.lock().await;
                 st.set_topology(Some(topo));
                 st.target = Some(target_from_snapshot(snap));
+                st.qblock_id = qblock_id;
                 st.router.cancel(generation - 1); // drop the prior generation
                 st.clear_salts();
             }
@@ -242,6 +249,17 @@ where
         }
     }
 
+    // Optional mining-attempt dashboard: a single writer thread records every
+    // solved model to `<data_dir>/<qblock_id>/attempts.jsonl`, and an HTTP task
+    // serves those files statically.
+    let dashboard_server = if let Some((listen, data_dir)) = params.dashboard.clone() {
+        let tx = crate::attempt::spawn_writer(data_dir.clone());
+        state.lock().await.attempt_tx = Some(tx);
+        Some(tokio::spawn(crate::dashboard::serve(listen, data_dir)))
+    } else {
+        None
+    };
+
     let svc = CoordinatorService {
         state: Arc::clone(&state),
         chain: Arc::clone(&chain),
@@ -291,6 +309,9 @@ where
         let _ = h.await;
     }
     server.abort();
+    if let Some(h) = dashboard_server {
+        h.abort();
+    }
     let _ = std::fs::remove_file(&params.sock_path);
     Ok(())
 }

@@ -21,3 +21,11 @@ binary = "quip-cpu-sa"   # or "quip-cpu-gibbs"
 # [dwave]
 # binary = "quip-dwave-qa"
 # daily_budget = "30s"
+
+# Mining-attempt dashboard. Records every solved model as JSONL under
+# data_dir/<qblock_id>/attempts.jsonl and serves them read-only over HTTP
+# (GET /<qblock_id>/attempts.jsonl, GET /qblocks, GET /healthz). Omit to
+# disable. Use the mounted /data volume so history survives restarts.
+# [dashboard]
+# listen = "0.0.0.0:9090"
+# data_dir = "/data/attempts"
