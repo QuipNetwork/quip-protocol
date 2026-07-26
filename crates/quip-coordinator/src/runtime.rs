@@ -63,11 +63,37 @@ const CONSUMPTION_EMA_ALPHA: f64 = 0.3;
 const WINDOW_HEADROOM: f64 = 2.0;
 
 /// Adaptive staging depth for one miner from its smoothed drain rate. The
-/// `buffer_depth` floor keeps a small reserve for idle/slow miners; there is no
-/// ceiling, so a many-core miner grows as deep as it drains. `ema` is anchored
-/// to real completions, so depth self-bounds to ~headroom × actual throughput.
+/// `buffer_depth` floor keeps a small reserve for idle/slow miners. `ema` is
+/// anchored to real completions, so depth self-bounds to ~headroom × actual
+/// throughput; the feeder additionally clamps it to [`stage_ceiling`] so a fast
+/// miner on a large topology can't stage an unbounded-memory reserve.
 fn adaptive_depth(ema: f64, floor: usize) -> usize {
     floor.max((ema * WINDOW_HEADROOM).ceil() as usize)
+}
+
+/// Per-miner budget on staged-job memory. The adaptive window sizes to drain
+/// rate with no ceiling of its own, so a fast miner on a large topology could
+/// stage an unbounded reserve — each staged PoW job holds a full materialized
+/// Ising model (`h`/`j`), ~`4·(nodes+edges)` bytes. This bounds the peak
+/// staging memory per miner regardless of topology size or drain rate.
+const MAX_STAGE_BYTES_PER_MINER: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// Estimated materialized-model bytes for one staged job on this topology: one
+/// i32 field per node (`h`) and one per edge (`j`). The 32-byte topology_hash
+/// and job_id are negligible next to these. Floored at 1 to avoid a zero
+/// divisor on an empty topology.
+fn est_job_bytes(num_nodes: usize, num_edges: usize) -> usize {
+    4usize
+        .saturating_mul(num_nodes.saturating_add(num_edges))
+        .max(1)
+}
+
+/// Memory-aware ceiling on the staging window: the most jobs that fit the
+/// per-miner byte budget, but never below `floor` — a miner must not idle for
+/// lack of a staged job even on a topology where the floor alone exceeds the
+/// budget.
+fn stage_ceiling(num_nodes: usize, num_edges: usize, floor: usize) -> usize {
+    floor.max(MAX_STAGE_BYTES_PER_MINER / est_job_bytes(num_nodes, num_edges))
 }
 
 /// Difficulty gates advertised to miners, from the snapshot.
@@ -158,7 +184,11 @@ pub async fn feeder_loop<C: ChainClient>(
                     None => consumed,
                 };
                 let _ = consumption_ema.insert(id.clone(), ema);
-                let depth = adaptive_depth(ema, params.buffer_depth);
+                let depth = adaptive_depth(ema, params.buffer_depth).min(stage_ceiling(
+                    snap.nodes.len(),
+                    snap.edges.len(),
+                    params.buffer_depth,
+                ));
                 while st.router.staged_len(&id) < depth {
                     salt_ctr = salt_ctr.saturating_add(1);
                     let salt = salt_from_counter(salt_ctr);
@@ -267,7 +297,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{adaptive_depth, WINDOW_HEADROOM};
+    use super::{adaptive_depth, stage_ceiling, MAX_STAGE_BYTES_PER_MINER, WINDOW_HEADROOM};
 
     #[test]
     fn adaptive_depth_holds_floor_when_idle() {
@@ -291,5 +321,31 @@ mod tests {
         // Fractional below the floor rounds up but the floor still wins:
         // 0.4 * 2.0 = 0.8 -> ceil 1, floor 4 -> 4.
         assert_eq!(adaptive_depth(0.4, 4), 4);
+    }
+
+    #[test]
+    fn stage_ceiling_never_binds_on_dev_topology() {
+        // 2 nodes / 1 edge -> ~12 bytes/job -> the byte budget allows millions
+        // of staged jobs, so the ceiling never clamps a real drain-driven depth.
+        let cap = stage_ceiling(2, 1, 8);
+        assert!(cap > 1_000_000, "dev topology must not be capped: {cap}");
+        assert!(cap >= MAX_STAGE_BYTES_PER_MINER / 12);
+    }
+
+    #[test]
+    fn stage_ceiling_caps_large_topology_below_uncapped_depth() {
+        // Zephyr-scale: ~4577 nodes / 41515 edges -> ~184 KB/job. A fast miner
+        // (ema 250 -> uncapped depth 500) is clamped to the byte budget.
+        let cap = stage_ceiling(4577, 41515, 8);
+        let uncapped = adaptive_depth(250.0, 8); // 500
+        assert!(cap >= 8, "never below floor: {cap}");
+        assert!(cap < uncapped, "large topology is memory-capped: {cap}");
+    }
+
+    #[test]
+    fn stage_ceiling_holds_floor_when_budget_smaller_than_floor() {
+        // Pathological topology where even one job exceeds the budget: the floor
+        // still wins so the miner never idles for lack of a staged job.
+        assert_eq!(stage_ceiling(usize::MAX / 8, 0, 8), 8);
     }
 }
