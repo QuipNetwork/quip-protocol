@@ -117,6 +117,19 @@ impl WinStash {
         })
     }
 
+    /// The candidate to submit now: the best due (viability block arrived,
+    /// unsubmitted) candidate that also strictly improves on `current_best`
+    /// (or when there is none). Mirrors [`crate::validate::beats_current`], so
+    /// the win-time path never regresses what the session path already sent.
+    pub fn due_improving(
+        &self,
+        current_block: u64,
+        current_best: Option<i64>,
+    ) -> Option<&Candidate> {
+        self.due_at(current_block)
+            .filter(|c| current_best.is_none_or(|b| c.best_energy_milli < b))
+    }
+
     /// Mark a candidate submitted so the driver won't re-submit it.
     pub fn mark_submitted(&mut self, job_id: &[u8]) {
         if let Some(c) = self.candidates.iter_mut().find(|c| c.job_id == job_id) {
@@ -246,6 +259,23 @@ mod tests {
         // Once cand 1 submitted, cand 2 becomes the best due one.
         s.mark_submitted(&[1]);
         assert_eq!(s.due_at(125).map(|c| c.job_id[0]), Some(2));
+    }
+
+    #[test]
+    fn due_improving_requires_arrival_and_improvement() {
+        let mut s = stash_with(vec![-50_000, -48_000, -46_000], 100, 10, 4);
+        s.insert(cand(1, -49_000)); // viable at block 110
+                                    // Not arrived yet → nothing.
+        assert!(s.due_improving(109, None).is_none());
+        // Arrived + no current best → submit.
+        assert_eq!(s.due_improving(110, None).map(|c| c.job_id[0]), Some(1));
+        // Arrived but a better proof already stands → don't regress.
+        assert!(s.due_improving(110, Some(-49_500)).is_none());
+        // Arrived + current best is worse → submit the improvement.
+        assert_eq!(
+            s.due_improving(110, Some(-48_000)).map(|c| c.job_id[0]),
+            Some(1)
+        );
     }
 
     #[test]

@@ -13,7 +13,6 @@ use crate::producer::derive_pow_job;
 use crate::session::{CoordinatorService, CoordinatorState};
 use crate::supervisor::{supervise_miner, BackoffPolicy};
 use crate::topology::Topology;
-use crate::validate::beats_current;
 use quip_proto::v1::miner_service_server::MinerServiceServer;
 use quip_proto::v1::SetTarget;
 use std::collections::HashMap;
@@ -265,11 +264,7 @@ pub async fn feeder_loop<C: ChainClient>(
                 .estimate_block(now_mono)
                 .unwrap_or(snap.block_number);
             let best = st.current_best_milli;
-            let due = st
-                .stash
-                .due_at(current_block)
-                .filter(|c| beats_current(c.best_energy_milli, best))
-                .cloned();
+            let due = st.stash.due_improving(current_block, best).cloned();
             drop(st);
 
             if let Some(cand) = due {
