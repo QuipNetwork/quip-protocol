@@ -28,6 +28,9 @@ jsonrpsee = { version = "0.24", features = [
     "client-ws-transport-tls",
     "macros",
 ] }
+# Metadata-aware event decoding for the mempool live-scan (QuantumComputeMempool
+# JobProposed). Read-only: submit stays on the hybrid-signed jsonrpsee path.
+subxt = "0.50.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tonic = { workspace = true }
