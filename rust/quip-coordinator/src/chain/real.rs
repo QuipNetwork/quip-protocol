@@ -22,6 +22,14 @@ use serde_json::Value;
 use sp_core::crypto::Ss58Codec;
 use sp_core::Pair as _;
 use std::sync::Mutex;
+use subxt::config::substrate::H256;
+use subxt::ext::scale_value::{Composite, Primitive, ValueDef};
+use tokio::sync::OnceCell;
+
+/// subxt client for read-only, metadata-aware event decoding. Submit stays on
+/// the hybrid-signed jsonrpsee path — subxt is used only to decode mempool
+/// `JobProposed` events, which needs the runtime type registry.
+type SubxtClient = subxt::OnlineClient<subxt::SubstrateConfig>;
 
 /// Production chain client (RPC + hybrid-signed submit).
 pub struct RealChainClient {
@@ -34,6 +42,8 @@ pub struct RealChainClient {
     last_snapshot: Mutex<Option<MiningSnapshot>>,
     /// Last allowed_spin spec (full AllowedValueSpec, not just Set values).
     last_spin_spec: Mutex<Option<AllowedValueSpec<Vec<i32>>>>,
+    /// Lazily-connected subxt client for mempool `JobProposed` event decoding.
+    subxt: OnceCell<SubxtClient>,
 }
 
 impl RealChainClient {
@@ -44,7 +54,20 @@ impl RealChainClient {
             pair: Mutex::new(None),
             last_snapshot: Mutex::new(None),
             last_spin_spec: Mutex::new(None),
+            subxt: OnceCell::new(),
         }
+    }
+
+    /// Lazily connect the read-only subxt client to the primary validator.
+    async fn subxt_client(&self) -> Result<&SubxtClient, ChainError> {
+        let url = self.primary_url()?.to_string();
+        self.subxt
+            .get_or_try_init(|| async move {
+                SubxtClient::from_url(&url)
+                    .await
+                    .map_err(|e| ChainError::Unavailable(format!("subxt connect: {e}")))
+            })
+            .await
     }
 
     fn pair(&self) -> Result<HybridPair, ChainError> {
@@ -184,21 +207,43 @@ impl ChainClient for RealChainClient {
             .as_str()
             .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?;
 
-        let events = self
-            .rpc_call(
-                "state_getStorage",
-                Value::Array(vec![
-                    // System.Events storage key: twox128("System")||twox128("Events")
-                    Value::String(hex_encode(&system_events_key())),
-                    Value::String(head_hex.to_string()),
-                ]),
-            )
-            .await?;
+        // Decode System.Events at head via subxt (metadata-aware) and collect
+        // the order_id of every QuantumComputeMempool::JobProposed. This finds
+        // orders proposed in the head block; still-open orders from earlier
+        // blocks are re-surfaced as they are re-proposed or by the storage-status
+        // filter below. Matches the Python reference (get_events_at → filter
+        // module_id/event_id → attributes.order_id).
+        let head_bytes = hex_decode(head_hex).map_err(ChainError::Decode)?;
+        if head_bytes.len() != 32 {
+            return Err(ChainError::Decode(format!(
+                "head hash is {} bytes, expected 32",
+                head_bytes.len()
+            )));
+        }
+        let head_hash = H256::from_slice(&head_bytes);
+
+        let client = self.subxt_client().await?;
+        let at = client
+            .at_block(head_hash)
+            .await
+            .map_err(|e| ChainError::Unavailable(format!("subxt at_block: {e}")))?;
+        let events = at
+            .events()
+            .fetch()
+            .await
+            .map_err(|e| ChainError::Unavailable(format!("subxt events fetch: {e}")))?;
 
         let mut order_ids: Vec<u64> = Vec::new();
-        if let Some(ev_hex) = events.as_str() {
-            if let Ok(ev_bytes) = hex_decode(ev_hex) {
-                order_ids.extend(scan_job_proposed_order_ids(&ev_bytes));
+        for ev in events.iter() {
+            let ev = ev.map_err(|e| ChainError::Decode(format!("event decode: {e}")))?;
+            if ev.pallet_name() != "QuantumComputeMempool" || ev.event_name() != "JobProposed" {
+                continue;
+            }
+            let fields = ev
+                .decode_fields_unchecked_as::<Composite<()>>()
+                .map_err(|e| ChainError::Decode(format!("JobProposed fields: {e}")))?;
+            if let Some(oid) = order_id_from_fields(&fields) {
+                order_ids.push(oid);
             }
         }
 
@@ -372,39 +417,23 @@ fn parse_block_number(header: &Value) -> Result<u64, ChainError> {
     Err(ChainError::Decode("header.number unparseable".into()))
 }
 
-fn system_events_key() -> Vec<u8> {
-    let mut key = Vec::with_capacity(32);
-    key.extend_from_slice(&twox128_local(b"System"));
-    key.extend_from_slice(&twox128_local(b"Events"));
-    key
-}
-
-fn twox128_local(data: &[u8]) -> [u8; 16] {
-    use std::hash::Hasher;
-    use twox_hash::XxHash64;
-    let mut h0 = XxHash64::with_seed(0);
-    h0.write(data);
-    let mut h1 = XxHash64::with_seed(1);
-    h1.write(data);
-    let mut out = [0u8; 16];
-    out[..8].copy_from_slice(&h0.finish().to_le_bytes());
-    out[8..].copy_from_slice(&h1.finish().to_le_bytes());
-    out
-}
-
-/// Best-effort scan of raw System.Events for JobProposed order_ids.
-///
-/// Full event decoding needs the metadata type registry. This scans for
-/// SCALE-encoded u64 values after a recognizable pallet/event tag sequence
-/// and is intentionally conservative — false positives are filtered by the
-/// subsequent storage read.
-fn scan_job_proposed_order_ids(events_bytes: &[u8]) -> Vec<u64> {
-    // Without metadata we cannot reliably decode. Return empty; operators
-    // that need live mempool should run against a node and extend this with
-    // a metadata-driven decoder. Storage-key enumeration is not available
-    // for Blake2_128Concat maps without knowing keys.
-    let _ = events_bytes;
-    Vec::new()
+/// Extract the `order_id` (u64) from a decoded `QuantumComputeMempool::
+/// JobProposed` event's fields. Prefers the named `order_id` field (matching
+/// the pallet's named event attributes); falls back to the first field of an
+/// unnamed composite. `None` if absent or not an unsigned primitive. Extra
+/// fields (proposer, reward, …) are ignored, so it survives event-shape growth.
+fn order_id_from_fields(fields: &Composite<()>) -> Option<u64> {
+    let value = match fields {
+        Composite::Named(named) => named
+            .iter()
+            .find(|(name, _)| name == "order_id")
+            .map(|(_, v)| v),
+        Composite::Unnamed(vals) => vals.first(),
+    }?;
+    match &value.value {
+        ValueDef::Primitive(Primitive::U128(n)) => u64::try_from(*n).ok(),
+        _ => None,
+    }
 }
 
 async fn rpc_request(url: &str, method: &str, params: Value) -> Result<Value, ChainError> {
@@ -459,5 +488,46 @@ fn rpc_params_from_value(params: Value) -> jsonrpsee::core::params::ArrayParams 
             let _ = p.insert(other);
             p
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::order_id_from_fields;
+    use subxt::ext::scale_value::{Composite, Value};
+
+    #[test]
+    fn order_id_from_named_ignores_other_fields() {
+        // Real JobProposed carries more than order_id (proposer, reward, …);
+        // the named lookup must pick order_id regardless of position.
+        let fields = Composite::Named(vec![
+            ("proposer".to_string(), Value::u128(999)),
+            ("order_id".to_string(), Value::u128(42)),
+            ("reward".to_string(), Value::u128(7)),
+        ]);
+        assert_eq!(order_id_from_fields(&fields), Some(42));
+    }
+
+    #[test]
+    fn order_id_from_unnamed_takes_first() {
+        let fields = Composite::Unnamed(vec![Value::u128(7), Value::u128(99)]);
+        assert_eq!(order_id_from_fields(&fields), Some(7));
+    }
+
+    #[test]
+    fn order_id_absent_wrong_type_or_empty_is_none() {
+        // No order_id field.
+        assert_eq!(
+            order_id_from_fields(&Composite::Named(vec![("x".to_string(), Value::u128(1))])),
+            None
+        );
+        // order_id present but not an unsigned primitive.
+        let nested = Value::named_composite(vec![("inner".to_string(), Value::u128(1))]);
+        assert_eq!(
+            order_id_from_fields(&Composite::Named(vec![("order_id".to_string(), nested)])),
+            None
+        );
+        // Empty unnamed composite.
+        assert_eq!(order_id_from_fields(&Composite::Unnamed(vec![])), None);
     }
 }
