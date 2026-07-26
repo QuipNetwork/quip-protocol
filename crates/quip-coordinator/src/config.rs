@@ -183,6 +183,8 @@ device_index = 1
 
 [dwave]
 daily_budget = "30s"
+min_block_budget = "90s"
+budget_cap = "5m"
 "#;
 
     #[test]
@@ -206,9 +208,15 @@ daily_budget = "30s"
 
     #[test]
     fn backend_toml_carries_unknown_keys() {
+        // The dwave miner consumes its budget knobs from `backend_toml`; the
+        // coordinator forwards every non-coordinator key verbatim, so all three
+        // budget dimensions reach the miner.
         let c = parse_config(SAMPLE).unwrap();
         let dwave = c.launch.iter().find(|e| e.miner_id == "qpu-0").unwrap();
-        assert!(dwave.configure.backend_toml.contains("daily_budget"));
+        let backend_toml = &dwave.configure.backend_toml;
+        assert!(backend_toml.contains("daily_budget"));
+        assert!(backend_toml.contains("min_block_budget"));
+        assert!(backend_toml.contains("budget_cap"));
     }
 
     #[test]
