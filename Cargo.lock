@@ -3360,6 +3360,63 @@ dependencies = [
 ]
 
 [[package]]
+name = "pyo3"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd274650b21d4bfc26a0a47587962c1edb425f69287324355cd040c3ea66071c"
+dependencies = [
+ "libc",
+ "once_cell",
+ "portable-atomic",
+ "pyo3-build-config",
+ "pyo3-ffi",
+ "pyo3-macros",
+]
+
+[[package]]
+name = "pyo3-build-config"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5e2a7d2f0d013342f295c048ad19237add5154a55b1c5a254c0ec93d4109078"
+dependencies = [
+ "target-lexicon",
+]
+
+[[package]]
+name = "pyo3-ffi"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca85c467da1bbc8d866eea5deff9cf29ea5f7785054a17da36e65bda9c05845b"
+dependencies = [
+ "libc",
+ "pyo3-build-config",
+]
+
+[[package]]
+name = "pyo3-macros"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ac53762fd065daa3194dd09337a38bd793a188100fd1a9304c4ab312d901771"
+dependencies = [
+ "proc-macro2",
+ "pyo3-macros-backend",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "pyo3-macros-backend"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ca3a1557399783172dc5bf39cfca835157732532cba56b71d2292161e53b362"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "quantum-validation"
 version = "0.2.1"
 source = "git+https://gitlab.com/quip.network/quip-protocol-rs.git?rev=5841672bf8d0f1908a6c455030efba08d0b44ad6#5841672bf8d0f1908a6c455030efba08d0b44ad6"
@@ -3508,6 +3565,14 @@ dependencies = [
  "serde_json",
  "tokio",
  "tonic",
+]
+
+[[package]]
+name = "quip-protocol-py"
+version = "0.3.0"
+dependencies = [
+ "pyo3",
+ "quip-protocol",
 ]
 
 [[package]]
@@ -5137,6 +5202,12 @@ name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
+
+[[package]]
+name = "target-lexicon"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tempfile"
