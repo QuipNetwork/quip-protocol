@@ -5,15 +5,21 @@
 //! Methods return transport errors when no validator is reachable.
 
 use super::extrinsic::{
-    build_hybrid_signed_extrinsic, hex_decode, hex_encode, job_orders_storage_key,
-    load_hybrid_pair, miner_identity_bytes, SignedExtensionContext,
+    build_hybrid_signed_extrinsic, difficulties_storage_key, hex_decode, hex_encode,
+    job_orders_storage_key, last_proof_block_storage_key, load_hybrid_pair, miner_identity_bytes,
+    topology_curve_c_storage_key, SignedExtensionContext,
 };
 use super::proof_encode::{build_quantum_proof, ProofBuildContext};
 use super::scale_types::{
-    encode_submit_proof_call, set_values, JobOrderScale, MiningSnapshotScale, OrderStatus,
+    encode_submit_proof_call, set_values, CurveCScale, DifficultyConfig, JobOrderScale,
+    MiningSnapshotScale, OrderStatus,
 };
 use super::submit::{classify_receipt, Proof, SubmitAction};
-use super::{ChainClient, ChainError, JobOrder, MiningSnapshot};
+use super::{ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot};
+use crate::decay::{
+    DEFAULT_BASE_MAX_ENERGY_MILLI, DEFAULT_C_EASY_MILLI, DEFAULT_C_HARD_MILLI,
+    DEFAULT_C_KNEE_MILLI, EPOCH_LENGTH_BLOCKS,
+};
 use async_trait::async_trait;
 use parity_scale_codec::Decode;
 use quantum_validation::AllowedValueSpec;
@@ -96,6 +102,31 @@ impl RealChainClient {
     async fn rpc_call(&self, method: &str, params: Value) -> Result<Value, ChainError> {
         let url = self.primary_url()?;
         rpc_request(url, method, params).await
+    }
+
+    /// Read + SCALE-decode a storage value at `at_hex`. `Ok(None)` when the key
+    /// is unset (null result).
+    async fn read_storage<T: Decode>(
+        &self,
+        key: &[u8],
+        at_hex: &str,
+    ) -> Result<Option<T>, ChainError> {
+        let raw = self
+            .rpc_call(
+                "state_getStorage",
+                Value::Array(vec![
+                    Value::String(hex_encode(key)),
+                    Value::String(at_hex.to_string()),
+                ]),
+            )
+            .await?;
+        let Some(hex) = raw.as_str() else {
+            return Ok(None);
+        };
+        let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
+        T::decode(&mut &bytes[..])
+            .map(Some)
+            .map_err(|e| ChainError::Decode(e.to_string()))
     }
 }
 
@@ -219,6 +250,51 @@ impl ChainClient for RealChainClient {
         };
         let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
         Decode::decode(&mut &bytes[..]).map_err(|e| ChainError::Decode(e.to_string()))
+    }
+
+    async fn fetch_decay_params(
+        &self,
+        topology_hash: [u8; 32],
+    ) -> Result<Option<DecayParams>, ChainError> {
+        let head = self
+            .rpc_call("chain_getBlockHash", Value::Array(vec![]))
+            .await?;
+        let at = head
+            .as_str()
+            .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?
+            .to_string();
+
+        // Base (un-decayed) difficulty; unset topology → chain genesis default.
+        let base: Option<DifficultyConfig> = self
+            .read_storage(&difficulties_storage_key(&topology_hash), &at)
+            .await?;
+        // LastProofBlock is a u32 BlockNumber (ValueQuery → 0 when unset).
+        let last_proof_block: u32 = self
+            .read_storage(&last_proof_block_storage_key(), &at)
+            .await?
+            .unwrap_or(0);
+        // Per-topology curve override; unset → the runtime CurveC* constants.
+        let curve: Option<CurveCScale> = self
+            .read_storage(&topology_curve_c_storage_key(&topology_hash), &at)
+            .await?;
+        let (c_easy_milli, c_knee_milli, c_hard_milli) = curve
+            .map(|c| (c.easy_milli, c.knee_milli, c.hard_milli))
+            .unwrap_or((
+                DEFAULT_C_EASY_MILLI,
+                DEFAULT_C_KNEE_MILLI,
+                DEFAULT_C_HARD_MILLI,
+            ));
+
+        Ok(Some(DecayParams {
+            base_max_energy_milli: base
+                .map(|d| d.max_energy_milli)
+                .unwrap_or(DEFAULT_BASE_MAX_ENERGY_MILLI),
+            last_proof_block: u64::from(last_proof_block),
+            epoch_length: EPOCH_LENGTH_BLOCKS,
+            c_easy_milli,
+            c_knee_milli,
+            c_hard_milli,
+        }))
     }
 
     async fn fetch_mempool_orders(

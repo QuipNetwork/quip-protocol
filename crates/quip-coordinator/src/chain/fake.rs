@@ -1,6 +1,6 @@
 //! Scripted chain for tests: fixed snapshot, optional mempool order, captured submits.
 
-use super::{ChainClient, ChainError, JobOrder, MiningSnapshot, Proof, SubmitAction};
+use super::{ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot, Proof, SubmitAction};
 use async_trait::async_trait;
 use std::sync::Mutex;
 
@@ -13,6 +13,8 @@ pub struct FakeChain {
     submit_result: Mutex<Result<SubmitAction, ChainError>>,
     /// Scripted `latest_qblock_id` (default `None`).
     qblock_id: Mutex<Option<u64>>,
+    /// Scripted `fetch_decay_params` (default `None`).
+    decay_params: Mutex<Option<DecayParams>>,
 }
 
 impl FakeChain {
@@ -23,11 +25,16 @@ impl FakeChain {
             submitted: Mutex::new(Vec::new()),
             submit_result: Mutex::new(Ok(SubmitAction::Success)),
             qblock_id: Mutex::new(None),
+            decay_params: Mutex::new(None),
         }
     }
 
     pub fn set_qblock_id(&self, id: Option<u64>) {
         *self.qblock_id.lock().unwrap() = id;
+    }
+
+    pub fn set_decay_params(&self, params: Option<DecayParams>) {
+        *self.decay_params.lock().unwrap() = params;
     }
 
     pub fn set_snapshot(&self, snap: Option<MiningSnapshot>) {
@@ -79,5 +86,12 @@ impl ChainClient for FakeChain {
 
     async fn fetch_latest_qblock_id(&self) -> Result<Option<u64>, ChainError> {
         Ok(*self.qblock_id.lock().unwrap())
+    }
+
+    async fn fetch_decay_params(
+        &self,
+        _topology_hash: [u8; 32],
+    ) -> Result<Option<DecayParams>, ChainError> {
+        Ok(self.decay_params.lock().unwrap().clone())
     }
 }

@@ -62,4 +62,14 @@ pub trait ChainClient: Send + Sync {
     /// the chain hasn't started a round or doesn't expose one; used to key the
     /// per-qblock mining-attempt logs.
     async fn fetch_latest_qblock_id(&self) -> Result<Option<u64>, ChainError>;
+
+    /// Fetch decay-projection inputs for `topology_hash`: base (un-decayed)
+    /// difficulty, last-proof block, epoch length, and the curve c-triple — so
+    /// the coordinator can locally project when a candidate becomes viable as
+    /// difficulty eases, without polling the chain every block. `None` if the
+    /// read fails.
+    async fn fetch_decay_params(
+        &self,
+        topology_hash: [u8; 32],
+    ) -> Result<Option<DecayParams>, ChainError>;
 }
