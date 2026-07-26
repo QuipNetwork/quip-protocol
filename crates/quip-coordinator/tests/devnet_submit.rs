@@ -30,10 +30,12 @@ use quantum_validation::{
     MilliValue,
 };
 use quip_coordinator::chain::extrinsic::{
-    build_hybrid_signed_extrinsic, hex_decode, hex_encode, job_orders_storage_key,
-    miner_identity_bytes, SignedExtensionContext,
+    build_hybrid_signed_extrinsic, hex_decode, hex_encode, miner_identity_bytes,
+    SignedExtensionContext,
 };
-use quip_coordinator::chain::scale_types::{JobOrderScale, MiningSnapshotScale, OrderStatus};
+use quip_coordinator::chain::scale_types::{
+    IsingParams, JobMode, MiningSnapshotScale, ResultDelivery, RewardResolution,
+};
 use quip_coordinator::chain::submit::SubmitAction;
 use quip_coordinator::chain::{ChainClient, JobOrder, RealChainClient};
 use quip_proto::v1::Solution;
@@ -592,6 +594,43 @@ async fn devnet_submit_proof_end_to_end() {
 const MEMPOOL_PALLET: u8 = 9;
 const PROPOSE_JOB_CALL: u8 = 3;
 
+/// Canonical default plain-Ising job spec name (`DEFAULT_ISING_SPEC_NAME`),
+/// seeded at genesis by the runtime. Its `spec_id` is deterministic, so M3 can
+/// propose against it on a fresh devnet without registering a spec.
+const DEFAULT_ISING_SPEC_NAME: &[u8] = b"plain-ising-v1";
+
+/// `propose_job` reward floor (`QuantumMinReward = UNIT`).
+const MIN_REWARD: u128 = 1_000_000_000_000;
+
+fn blake2_256(data: &[u8]) -> [u8; 32] {
+    use blake2::digest::{Update, VariableOutput};
+    use blake2::Blake2bVar;
+    let mut hasher = Blake2bVar::new(32).expect("32-byte blake2b");
+    hasher.update(data);
+    let mut out = [0u8; 32];
+    hasher.finalize_variable(&mut out).expect("finalize");
+    out
+}
+
+/// Derive the canonical default plain-Ising `spec_id`, mirroring the pallet's
+/// `job_spec_id`: `BlakeTwo256::hash_of(&(name, Formulation::Ising, None, None))`.
+/// The SCALE preimage is `Vec<u8>(name) ++ 0x00 (Ising) ++ 0x00 ++ 0x00`.
+fn default_ising_spec_id() -> [u8; 32] {
+    let mut preimage = DEFAULT_ISING_SPEC_NAME.to_vec().encode();
+    preimage.extend_from_slice(&[0u8, 0u8, 0u8]);
+    blake2_256(&preimage)
+}
+
+/// `Blake2_128Concat` storage key for `QuantumComputeMempool.JobSpecs(spec_id)`.
+fn job_specs_storage_key(spec_id: &[u8; 32]) -> Vec<u8> {
+    let mut k = Vec::new();
+    k.extend_from_slice(&twox128(b"QuantumComputeMempool"));
+    k.extend_from_slice(&twox128(b"JobSpecs"));
+    k.extend_from_slice(&blake2_128(spec_id));
+    k.extend_from_slice(spec_id);
+    k
+}
+
 /// Storage key for the plain `QuantumComputeMempool.NextOrderId` value.
 fn next_order_id_key() -> Vec<u8> {
     let mut k = Vec::new();
@@ -607,26 +646,26 @@ async fn read_next_order_id(url: &str) -> u64 {
     }
 }
 
-/// Re-encode a `propose_job(...)` call from a decoded on-chain order. The call
-/// args are a subset of the stored `JobOrder` fields with byte-identical nested
-/// types, so a live order is a pallet-valid template (topology, reward floor,
-/// and deadline/block-wait ceilings already passed when it was accepted).
-fn encode_propose_job_call(src: &JobOrderScale) -> Vec<u8> {
+/// SCALE-encode a `propose_job(spec_id, ising_params, reward, mode, resolution,
+/// deadline_blocks, block_wait, delivery)` call with an open, on-chain-only order.
+fn encode_propose_job_call(spec_id: &[u8; 32], ising: &IsingParams, reward: u128) -> Vec<u8> {
     let mut out = vec![MEMPOOL_PALLET, PROPOSE_JOB_CALL];
-    out.extend(src.spec_id.encode());
-    out.extend(src.ising_params.encode());
-    out.extend(src.reward.encode());
-    out.extend(src.mode.encode());
-    out.extend(src.resolution.encode());
-    out.extend(src.timing.deadline_blocks.encode());
-    out.extend(src.timing.block_wait.encode());
-    out.extend(src.delivery.encode());
+    out.extend_from_slice(spec_id);
+    out.extend(ising.encode());
+    out.extend(reward.encode());
+    out.extend(JobMode::Open.encode());
+    out.extend(RewardResolution::SingleBest.encode());
+    out.extend(100u32.encode()); // deadline_blocks (<= MaxDeadlineBlocks = 1000)
+    out.extend(10u32.encode()); // block_wait (<= MaxBlockWait = 100)
+    out.extend(ResultDelivery::OnChainOnly.encode());
     out
 }
 
-/// End-to-end: propose a job order, then confirm the coordinator's
-/// `fetch_mempool_orders` discovers its `order_id` from the head-block
-/// `JobProposed` event, storage-reads `JobOrders(oid)`, and builds a `JobOrder`.
+/// End-to-end: propose a fresh job order against the genesis default Ising spec,
+/// then confirm the coordinator's `fetch_mempool_orders` discovers its
+/// `order_id` from the head-block `JobProposed` event, storage-reads
+/// `JobOrders(oid)`, and builds a `JobOrder`. Self-seeding — needs only the
+/// genesis default spec, so it runs on a fresh devnet with an empty mempool.
 #[tokio::test]
 #[ignore = "requires a live devnet; set QUIP_DEVNET=ws://host:port"]
 async fn devnet_mempool_job_proposed_end_to_end() {
@@ -640,38 +679,37 @@ async fn devnet_mempool_job_proposed_end_to_end() {
     let alice_bytes: [u8; 32] = *AsRef::<[u8; 32]>::as_ref(&alice_acct);
     let client = RealChainClient::new(vec![url.clone()], "//Alice".to_string());
 
-    // Find an existing open order to use as a byte-valid propose_job template.
-    let next_id = read_next_order_id(&url).await;
+    // The canonical default plain-Ising spec is seeded at genesis; propose
+    // against it so no root-gated spec registration is needed.
+    let spec_id = default_ising_spec_id();
     assert!(
-        next_id > 0,
-        "devnet has no orders to template from (NextOrderId=0)"
+        get_storage(&url, &job_specs_storage_key(&spec_id), None)
+            .await
+            .is_some(),
+        "genesis default Ising spec {} not found on chain; the devnet must seed \
+         default_ising_spec_builder",
+        hex_encode(&spec_id)
     );
-    let mut template = None;
-    for oid in 0..next_id {
-        let Some(bytes) = get_storage(&url, &job_orders_storage_key(oid), None).await else {
-            continue;
-        };
-        let Ok(order) = JobOrderScale::decode(&mut &bytes[..]) else {
-            continue;
-        };
-        if order.status == OrderStatus::Opened {
-            println!(
-                "  template: order #{oid} decoded (nodes={} edges={} status=Opened)",
-                order.ising_params.nodes.len(),
-                order.ising_params.edges.len()
-            );
-            template = Some(order);
-            break;
-        }
-    }
-    let template = template.expect("no open order found to template from");
+
+    // A minimal structurally-consistent Ising: 2 nodes, 1 edge. propose_job
+    // validates topology with no allowed-value constraints, so any graph with
+    // matching h/j counts and in-range edges is accepted.
+    let ising = IsingParams {
+        nodes: vec![0, 1],
+        edges: vec![(0, 1)],
+        h_values: vec![0, 0],
+        j_values: vec![-1000],
+        min_energy_milli: None,
+        min_diversity_milli: None,
+        min_solutions: None,
+    };
 
     // Build + sign propose_job as //Alice; the assigned order_id is the current
-    // NextOrderId (chain is otherwise idle, so no competing proposer takes it).
+    // NextOrderId (no competing proposer takes it on an otherwise-idle chain).
     let expected_oid = read_next_order_id(&url).await;
     let nonce = account_nonce(&url, &alice_bytes).await;
     let ctx = fetch_ext_ctx(&url, nonce).await;
-    let call = encode_propose_job_call(&template);
+    let call = encode_propose_job_call(&spec_id, &ising, MIN_REWARD);
     let ext = build_hybrid_signed_extrinsic(&alice, &call, &ctx);
     let tx = rpc_try(
         &url,
@@ -681,7 +719,8 @@ async fn devnet_mempool_job_proposed_end_to_end() {
     .await;
     let tx = tx.expect("author_submitExtrinsic accepted propose_job");
     println!(
-        "  propose_job injected (expected order_id={expected_oid}), tx {}",
+        "  propose_job injected (spec_id={}, expected order_id={expected_oid}), tx {}",
+        hex_encode(&spec_id),
         tx.as_str().unwrap_or("?")
     );
 
@@ -716,20 +755,14 @@ async fn devnet_mempool_job_proposed_end_to_end() {
         panic!("fetch_mempool_orders never surfaced order #{expected_oid} at head within timeout")
     });
 
-    // The built Job must match the proposed Ising template end-to-end.
+    // The built Job must match the proposed Ising end-to-end.
     assert_eq!(order.order_id, want_id_le, "order_id mismatch");
-    assert_eq!(order.nodes, template.ising_params.nodes, "nodes mismatch");
-    assert_eq!(order.edges, template.ising_params.edges, "edges mismatch");
-    assert_eq!(
-        order.h_milli, template.ising_params.h_values,
-        "h_values mismatch"
-    );
-    assert_eq!(
-        order.j_milli, template.ising_params.j_values,
-        "j_values mismatch"
-    );
+    assert_eq!(order.nodes, ising.nodes, "nodes mismatch");
+    assert_eq!(order.edges, ising.edges, "edges mismatch");
+    assert_eq!(order.h_milli, ising.h_values, "h_values mismatch");
+    assert_eq!(order.j_milli, ising.j_values, "j_values mismatch");
     println!(
-        "M3 PASS: propose_job -> JobProposed(order_id={expected_oid}) discovered at head; \
+        "M3 PASS: propose_job(order_id={expected_oid}) -> JobProposed discovered at head; \
          JobOrders storage decoded + Job built (nodes={} edges={})",
         order.nodes.len(),
         order.edges.len()

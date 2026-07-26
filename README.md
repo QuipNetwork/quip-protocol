@@ -95,14 +95,13 @@ QUIP_DEVNET=ws://127.0.0.1:9944 \
   cargo test -p quip-coordinator --test devnet_submit -- --ignored --nocapture
 ```
 
-Two constraints:
+One constraint: **use a loopback URL** (`ws://127.0.0.1:…`) or `wss://`. subxt
+rejects plain `ws://` to a non-loopback host as insecure. To reach a remote
+node, tunnel its RPC port to localhost first.
 
-- **Use a loopback URL** (`ws://127.0.0.1:…`) or `wss://`. subxt rejects plain
-  `ws://` to a non-loopback host as insecure. To reach a remote node, tunnel
-  its RPC port to localhost first.
-- **M3 needs an existing open order** to use as a proposal template. A bare
-  devnet starts with an empty mempool; run M3 against a devnet that already has
-  at least one open order.
+M3 self-seeds — it proposes its own order against the canonical `plain-ising-v1`
+spec the runtime seeds at genesis, so it runs on a fresh devnet with an empty
+mempool.
 
 ## What changed from v0.2
 
