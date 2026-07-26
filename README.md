@@ -33,6 +33,8 @@ The miner binaries live in `quip.network/quip-miner-{cpu,cuda,metal,dwave}`.
 - `COORDINATOR.md` — how the coordinator works (chain access, feeder, routing,
   supervision, session protocol).
 - `MINER.md` — the `quip-miner-core` harness and its helper modules.
+- `MINER_PROTOCOL.md` — the coordinator↔miner wire contract: message API,
+  handshake, credits, cancel, liveness, and exit codes.
 - `NEWMINER.md` — how to add a new miner.
 - `docs/VERSIONING.md` — the release-tag standard.
 

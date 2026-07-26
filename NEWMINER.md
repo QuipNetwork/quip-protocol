@@ -131,7 +131,8 @@ real fetch stays inert until the miner repository has cut a release at the tag.
 ## A non-Rust backend
 
 A miner in another language speaks the same gRPC `MinerService` protocol
-directly. Use the `quip_proto` SDK: the generated `quip.v1` stubs for the wire,
+directly — `MINER_PROTOCOL.md` is the contract to implement against.
+Use the `quip_proto` SDK: the generated `quip.v1` stubs for the wire,
 and `quip_proto.scoring`/`quip_proto.wire` for the consensus math, so your
 energies match the Rust path exactly (the Rust in `quip-protocol` is the source
 of truth, exposed through PyO3). This is how the D-Wave miner works from Python.

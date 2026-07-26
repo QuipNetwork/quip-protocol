@@ -4,10 +4,12 @@
 binary is built on. A backend provides one thing — a `Sampler` that solves Ising
 problems — and calls `run`. The harness owns the gRPC session,
 the handshake, credits, job validation, adaptive parameters, reject reasons,
-status, idle timeout, and exit codes. The CPU, CUDA, and Metal miners are thin
+status, liveness, and exit codes. The CPU, CUDA, and Metal miners are thin
 binaries over this crate; the D-Wave miner uses the same protocol from Python.
 
-This document describes the modules. To add a backend, see `NEWMINER.md`.
+This document describes the modules. For the wire contract itself — the messages
+and the behaviors the coordinator expects — see `MINER_PROTOCOL.md`. To add a
+backend, see `NEWMINER.md`.
 
 ## The `Sampler` trait
 
@@ -63,9 +65,11 @@ runs the handshake (`Hello` → `Welcome`), applies `Configure` through the
 backend's `apply_config`, then requests work and services the bidirectional
 stream. It grants the coordinator `stream_width` credits up front and one per
 finished job, feeds incoming jobs to the backend through `sample_stream`, and
-returns each outcome as a `Result` or a `Reject`. It also sends `Status`,
-honors an in-band `Shutdown`, and exits on the idle timeout. Because the harness
-owns all of this, a backend never touches gRPC.
+returns each outcome as a `Result` or a `Reject`. It answers `Ping` and `Cancel`
+with `Status`, honors an in-band `Shutdown`, and ends when the coordinator closes
+the stream — there is no wall-clock idle timeout, since a miner grinding a hard
+nonce legitimately receives nothing meanwhile. Because the harness owns all of
+this, a backend never touches gRPC.
 
 ## Base problem types
 

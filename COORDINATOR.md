@@ -115,10 +115,11 @@ crash, `reclaim` returns its staged and in-flight jobs for re-queue.
 session it runs the handshake (`Hello` → `Welcome`), applies `Configure`, then
 services the bidirectional stream: a `JobRequest` grants credits, the
 coordinator dispatches staged `Job`s, and each `Result` or `Reject` is a
-terminal event that frees a credit and advances accounting. `Status` reports how
-busy the miner is; `Shutdown` ends the session in-band. The harness owns
-credits, reject reasons, and the idle timeout, so each backend only has to
-sample.
+terminal event that frees a credit and advances accounting. A periodic `Ping` (every 15s) draws a
+`Status` that reports how busy the miner is and surfaces paused or stale-round
+liveness; `Shutdown` ends the session in-band. The harness owns credits, reject
+reasons, and liveness, so each backend only has to sample. `MINER_PROTOCOL.md`
+specifies this contract from the miner's side.
 
 ## Supervision and shutdown
 
