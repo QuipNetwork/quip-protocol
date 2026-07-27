@@ -30,6 +30,7 @@ use sp_core::Pair as _;
 use std::sync::Mutex;
 use subxt::config::substrate::H256;
 use subxt::ext::scale_value::{Composite, Primitive, ValueDef};
+use subxt::transactions::TransactionStatus;
 use tokio::sync::OnceCell;
 
 /// subxt client for read-only, metadata-aware event decoding. Submit stays on
@@ -506,34 +507,70 @@ impl ChainClient for RealChainClient {
         };
         let ext = build_hybrid_signed_extrinsic(&pair, &call, &signed_ctx);
 
-        // Fire-and-forget submit via `author_submitExtrinsic`. NOTE: an `Ok`
-        // here means only that the node accepted the extrinsic into its pool —
-        // NOT that the pallet dispatched it successfully. A proof that passes
-        // signature checks can still `ExtrinsicFailed` on inclusion, and this
-        // path cannot observe that. Inclusion confirmation (author_submitAndWatch
-        // + ExtrinsicSuccess/Failed event scan) is tracked as a follow-up
-        // (quip-crj); until then callers treat `Success` as "accepted to pool"
-        // and the per-generation `current_best` reset bounds a wrong advance to a
-        // single generation.
-        let submit = self
-            .rpc_call(
-                "author_submitExtrinsic",
-                Value::Array(vec![Value::String(hex_encode(&ext))]),
-            )
-            .await;
-
-        match submit {
-            Ok(tx_hash) => {
-                tracing::info!(
-                    tx = %tx_hash,
-                    "extrinsic accepted to pool (not yet confirmed included)"
-                );
-                Ok(SubmitAction::Success)
+        // Submit via subxt's `author_submitAndWatchExtrinsic` and CONFIRM the
+        // on-chain outcome, rather than treating pool acceptance as success.
+        // We watch the status stream to in-best-block (not finality, to stay
+        // responsive — a re-org after this is rare on the local validator and
+        // the per-generation `current_best` reset bounds any wrong advance),
+        // then check the extrinsic's own events: `ExtrinsicSuccess` -> Success,
+        // `ExtrinsicFailed` -> classify the pallet error via `classify_receipt`.
+        let client = self.subxt_client().await?;
+        let tx_client = client
+            .tx()
+            .await
+            .map_err(|e| ChainError::Unavailable(format!("subxt tx client: {e}")))?;
+        let mut progress = tx_client
+            .from_bytes(ext)
+            .submit_and_watch()
+            .await
+            .map_err(|e| ChainError::Submit(format!("submit_and_watch: {e}")))?;
+        loop {
+            let status = progress
+                .next()
+                .await
+                .ok_or_else(|| ChainError::Unavailable("tx status stream ended".into()))?
+                .map_err(|e| ChainError::Unavailable(format!("tx progress: {e}")))?;
+            match status {
+                TransactionStatus::InBestBlock(in_block)
+                | TransactionStatus::InFinalizedBlock(in_block) => {
+                    return match in_block.wait_for_success().await {
+                        Ok(_events) => {
+                            tracing::info!(
+                                block = %in_block.block_hash(),
+                                "proof included and dispatched successfully"
+                            );
+                            Ok(SubmitAction::Success)
+                        }
+                        Err(e) => {
+                            // Included, but the pallet dispatch failed
+                            // (`ExtrinsicFailed`). Extract the `Pallet::Variant`
+                            // name for a precise classification (e.g. InvalidNonce
+                            // -> StopRoundStale/retry, not the default Fatal);
+                            // fall back to the Display string otherwise.
+                            let msg = match &e {
+                                subxt::error::TransactionEventsError::ExtrinsicFailed(
+                                    subxt::error::DispatchError::Module(m),
+                                ) => m.details_string(),
+                                other => other.to_string(),
+                            };
+                            tracing::warn!(error = %msg, "proof included but ExtrinsicFailed");
+                            Ok(classify_receipt(Some(&msg)))
+                        }
+                    };
+                }
+                TransactionStatus::Invalid { message } => {
+                    // Bad nonce / signature: stale for this round.
+                    tracing::warn!(%message, "proof rejected as invalid before inclusion");
+                    return Ok(classify_receipt(Some(&message)));
+                }
+                TransactionStatus::Dropped { message } | TransactionStatus::Error { message } => {
+                    // Pool drop / transient node error: retry the candidate.
+                    tracing::warn!(%message, "proof dropped by node before inclusion");
+                    return Ok(SubmitAction::Retry);
+                }
+                // Validated / Broadcasted / NoLongerInBestBlock: keep watching.
+                _ => {}
             }
-            Err(ChainError::Submit(msg) | ChainError::Unavailable(msg)) => {
-                Ok(classify_receipt(Some(&msg)))
-            }
-            Err(ChainError::Decode(msg)) => Err(ChainError::Decode(msg)),
         }
     }
 }
