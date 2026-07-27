@@ -289,6 +289,11 @@ async fn handshake(
     Some(configure)
 }
 
+/// Depth of the read loop's queue of credit grants to the dispatcher task.
+/// Grants are single `u32`s, so this only has to absorb a burst of
+/// `JobRequest`s arriving while the dispatcher is mid-send.
+const GRANT_CHANNEL_DEPTH: usize = 1024;
+
 /// Grant `credits` and dispatch every staged job the router allows.
 /// Returns `false` when the outbound channel is closed (session should end).
 async fn dispatch_jobs(
@@ -395,18 +400,25 @@ async fn handle_fatal(state: &Arc<Mutex<CoordinatorState>>, run: &Arc<RunState>)
 async fn handle_message(
     msg: MinerMsg,
     state: &Arc<Mutex<CoordinatorState>>,
-    miner_id: &str,
+    _miner_id: &str,
     tx: &mpsc::Sender<Result<CoordMsg, Status>>,
     run: &Arc<RunState>,
+    grants: &mpsc::Sender<u32>,
     seed_credits: u32,
 ) -> bool {
     match msg.msg {
-        Some(miner_msg::Msg::Ready(_)) => {
-            dispatch_jobs(state, miner_id, seed_credits, tx, run).await
-        }
-        Some(miner_msg::Msg::JobRequest(req)) => {
-            dispatch_jobs(state, miner_id, req.credits, tx, run).await
-        }
+        // Seed credits from Configure so the first job can dispatch before the
+        // miner sends JobRequest: quip-mock-miner only requests after
+        // completing a job. This makes the pool exceed the miner's stated depth
+        // by `queue_depth` — harmless now that neither side couples reads to
+        // writes, but see the note in MINER_PROTOCOL.md about making the miner
+        // the sole credit source once every backend sends an initial request.
+        Some(miner_msg::Msg::Ready(_)) => grants.send(seed_credits).await.is_ok(),
+        // Hand the grant to the dispatcher task rather than dispatching here:
+        // sending jobs blocks once the outbound channel fills, and this is the
+        // only task reading results. Blocking here stops us reading the very
+        // results that would free credits — the deadlock this split fixes.
+        Some(miner_msg::Msg::JobRequest(req)) => grants.send(req.credits).await.is_ok(),
         Some(miner_msg::Msg::Result(result)) => {
             // Validate concurrently so the session task keeps draining the
             // stream and dispatching replacement jobs instead of blocking
@@ -454,11 +466,29 @@ async fn run_drive_session(
         return;
     }
     let seed_credits = configure.queue_depth.max(1);
+    // Dispatcher task: the only place that writes `Job`s. Kept off the read
+    // path so a full outbound channel can never stop us draining results.
+    let (grants, mut grant_rx) = mpsc::channel::<u32>(GRANT_CHANNEL_DEPTH);
+    let dispatcher = {
+        let state = Arc::clone(&state);
+        let run = Arc::clone(&run);
+        let tx = tx.clone();
+        let miner_id = miner_id.clone();
+        tokio::spawn(async move {
+            while let Some(credits) = grant_rx.recv().await {
+                if !dispatch_jobs(&state, &miner_id, credits, &tx, &run).await {
+                    return;
+                }
+            }
+        })
+    };
+
     loop {
         let Ok(Some(msg)) = inbound.message().await else {
             break;
         };
-        let keep_going = handle_message(msg, &state, &miner_id, tx, &run, seed_credits).await;
+        let keep_going =
+            handle_message(msg, &state, &miner_id, tx, &run, &grants, seed_credits).await;
         if !keep_going {
             break;
         }
@@ -467,6 +497,8 @@ async fn run_drive_session(
             break;
         }
     }
+    drop(grants);
+    dispatcher.abort();
 }
 
 /// Full drive-many run: spawn the miner over UDS, stage every job, validate

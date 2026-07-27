@@ -19,6 +19,43 @@ use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
+/// Depth of the read loop's queue of credit grants to the dispatcher task.
+/// Grants are single `u32`s, so this only absorbs a burst of `JobRequest`s
+/// arriving while the dispatcher is mid-send.
+const GRANT_CHANNEL_DEPTH: usize = 1024;
+
+/// Grant `credits` and send every job the miner is now entitled to.
+///
+/// Jobs are collected under the state lock and sent after releasing it: the
+/// lock guards coordinator-wide state, so holding it across a `tx.send().await`
+/// blocks every *other* miner's session for as long as this one's outbound
+/// channel stays full.
+///
+/// Returns `false` when the outbound channel is closed (session is over).
+async fn dispatch_granted(
+    state: &Arc<Mutex<CoordinatorState>>,
+    miner_id: &str,
+    credits: u32,
+    tx: &mpsc::Sender<Result<CoordMsg, Status>>,
+) -> bool {
+    let jobs = {
+        let mut st = state.lock().await;
+        st.router.grant_credits(miner_id, credits);
+        let mut jobs = Vec::new();
+        while let Some(job) = st.router.next_job(miner_id) {
+            st.dispatch_inflight(miner_id, job.clone());
+            jobs.push(job);
+        }
+        jobs
+    };
+    for job in jobs {
+        if tx.send(Ok(coord(coord_msg::Msg::Job(job)))).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 /// Unguessable per-spawn session token (32 random bytes, hex-encoded).
 ///
 /// # Panics
@@ -338,7 +375,7 @@ async fn run_session<C: ChainClient>(
     {
         return;
     }
-    let seed_credits = configure.queue_depth.max(1);
+    let configure_queue_depth = configure.queue_depth;
     if tx
         .send(Ok(coord(coord_msg::Msg::Configure(configure))))
         .await
@@ -364,34 +401,46 @@ async fn run_session<C: ChainClient>(
     // in-band Shutdown/cancel while it runs; dropped when the loop exits.
     state.lock().await.register_outbound(&miner_id, tx.clone());
 
+    let seed_credits = configure_queue_depth.max(1);
+    // Dispatcher task: the only writer of `Job`s for this session.
+    //
+    // Job sends must not happen on the read path. `tx.send().await` blocks once
+    // the outbound channel fills, and this loop is the only reader of the
+    // miner's `Result`s — so blocking here stops us consuming the results that
+    // would free the miner's credits, while the miner (symmetrically blocked
+    // writing those results) stops reading jobs. Both peers park permanently.
+    let (grants, mut grant_rx) = mpsc::channel::<u32>(GRANT_CHANNEL_DEPTH);
+    let _dispatcher = {
+        let state = Arc::clone(&state);
+        let tx = tx.clone();
+        let miner_id = miner_id.clone();
+        tokio::spawn(async move {
+            while let Some(credits) = grant_rx.recv().await {
+                if !dispatch_granted(&state, &miner_id, credits, &tx).await {
+                    return;
+                }
+            }
+        })
+    };
+
     // 3. Message loop
     'session: loop {
         let Ok(Some(msg)) = inbound.message().await else {
             break;
         };
         match msg.msg {
+            // Seed credits from Configure so the first job can dispatch before
+            // the miner sends JobRequest (quip-mock-miner only requests after
+            // completing a job). Routed through the dispatcher like every other
+            // grant, so it never sends on the read path.
             Some(miner_msg::Msg::Ready(_)) => {
-                // Seed credits from Configure so the first job can dispatch
-                // before the miner sends JobRequest (mock-miner only requests
-                // after completing a job).
-                let credits = seed_credits;
-                let mut st = state.lock().await;
-                st.router.grant_credits(&miner_id, credits);
-                while let Some(job) = st.router.next_job(&miner_id) {
-                    st.dispatch_inflight(&miner_id, job.clone());
-                    if tx.send(Ok(coord(coord_msg::Msg::Job(job)))).await.is_err() {
-                        break 'session;
-                    }
+                if grants.send(seed_credits).await.is_err() {
+                    break 'session;
                 }
             }
             Some(miner_msg::Msg::JobRequest(req)) => {
-                let mut st = state.lock().await;
-                st.router.grant_credits(&miner_id, req.credits);
-                while let Some(job) = st.router.next_job(&miner_id) {
-                    st.dispatch_inflight(&miner_id, job.clone());
-                    if tx.send(Ok(coord(coord_msg::Msg::Job(job)))).await.is_err() {
-                        break 'session;
-                    }
+                if grants.send(req.credits).await.is_err() {
+                    break 'session;
                 }
             }
             Some(miner_msg::Msg::Result(result)) => {

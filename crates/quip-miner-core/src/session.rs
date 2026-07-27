@@ -15,7 +15,8 @@ use quip_proto::v1::{coord_msg, miner_msg, CoordMsg, JobKind, JobRequest, MinerM
 use quip_protocol::session::{build_hello, BackendCaps, ExitCode, SessionConfig, SessionError};
 use std::collections::HashMap;
 use std::process::ExitCode as StdExitCode;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -54,6 +55,19 @@ fn print_capabilities(id: &BackendIdentity) {
 /// Emit a miner progress line every N completed jobs (v0.2 `mine_work_item`
 /// parity).
 const PROGRESS_LOG_INTERVAL: u64 = 10;
+
+/// Depth of the read loop's queue to the outbound writer task.
+///
+/// Carries only control replies — `Ready`, `JobRequest`, `Status`, and
+/// prepare-time `Reject`s — which are small and, apart from a burst of rejects
+/// from a malformed job run, rare. Sized so the read loop never waits on it in
+/// practice while still bounding memory if the peer stops reading entirely.
+const CTRL_CHANNEL_DEPTH: usize = 256;
+
+/// `job_id` → the `(num_reads, num_sweeps)` resolved for it at prepare time,
+/// shared between the session's read loop (which inserts) and its outbound
+/// writer (which removes to build `SamplerMeta`).
+type PendingParams = Arc<StdMutex<HashMap<Vec<u8>, (u32, u32)>>>;
 
 #[expect(
     clippy::cast_precision_loss,
@@ -148,56 +162,115 @@ async fn run_session<S: Sampler>(
 
     let mut grace_ms: u64 = 5000;
     let mut num_sweeps = DEFAULT_NUM_SWEEPS;
-    let mut jobs_done: u64 = 0;
     let mut topology: Option<TopologyCache> = None;
     let mut target: Option<SessionTarget> = None;
     // job_id → (num_reads, num_sweeps) resolved at prepare, for the result meta.
-    let mut pending: HashMap<Vec<u8>, (u32, u32)> = HashMap::new();
-    // Progress logging (mirrors v0.2 mine_work_item's every-N-attempts line).
-    let session_start = std::time::Instant::now();
-    let mut best_energy_milli: i64 = i64::MAX;
+    // Shared: the read loop inserts at prepare, the writer task removes at
+    // finalize. The lock is never held across an await.
+    let pending: PendingParams = Arc::new(StdMutex::new(HashMap::new()));
+    // Published by the writer, read here for `Status.jobs_done`.
+    let jobs_done = Arc::new(AtomicU64::new(0));
 
-    loop {
-        tokio::select! {
-            biased;
-            // Drain completed results first so a busy sampler never backs up.
-            Some(sr) = res_rx.recv() => {
-                let (reads, sweeps) = pending.remove(&sr.job_id).unwrap_or((0, 0));
-                // A Cancelled job neither advances progress nor updates best
-                // energy; finalize_result just refunds its credit.
-                let completed = matches!(sr.outcome, StreamOutcome::Completed(_));
-                if let StreamOutcome::Completed(Ok(samples)) = &sr.outcome {
-                    if let Some(e) = samples.iter().map(|r| r.energy_milli).min() {
-                        best_energy_milli = best_energy_milli.min(e);
+    // Writer task: the SOLE owner of the outbound sender.
+    //
+    // Reading the inbound stream and writing to the outbound one must not live
+    // in the same task. A `tx.send().await` blocks once the outbound channel
+    // fills, which happens whenever the coordinator is slow to read — and if
+    // that await sits in the same loop as `inbound.message()`, the miner stops
+    // reading jobs precisely because it is busy returning results. The
+    // coordinator, symmetrically blocked writing jobs, then stops reading
+    // results, and both peers park forever. This was reproducible: a 480-credit
+    // grant (~89 MB of inline h/J in flight) deadlocked the session within
+    // three dispatches.
+    //
+    // So the read loop hands outbound traffic to this task and never awaits the
+    // wire itself. Results (large) arrive on `res_rx` straight from the sampler;
+    // control replies (small, rare) arrive on `ctrl_rx` from the read loop.
+    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<MinerMsg>(CTRL_CHANNEL_DEPTH);
+    let writer = {
+        let tx = tx.clone();
+        let pending = Arc::clone(&pending);
+        let jobs_done = Arc::clone(&jobs_done);
+        let backend = id.backend;
+        tokio::spawn(async move {
+            // Progress logging (mirrors v0.2 mine_work_item's every-N-attempts line).
+            let session_start = std::time::Instant::now();
+            let mut best_energy_milli: i64 = i64::MAX;
+            let mut done: u64 = 0;
+            loop {
+                tokio::select! {
+                    biased;
+                    // Drain completed results first so a busy sampler never backs up.
+                    Some(sr) = res_rx.recv() => {
+                        let (reads, sweeps) = {
+                            let mut p = match pending.lock() {
+                                Ok(p) => p,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            p.remove(&sr.job_id).unwrap_or((0, 0))
+                        };
+                        // A Cancelled job neither advances progress nor updates
+                        // best energy; finalize_result just refunds its credit.
+                        let completed = matches!(sr.outcome, StreamOutcome::Completed(_));
+                        if let StreamOutcome::Completed(Ok(samples)) = &sr.outcome {
+                            if let Some(e) = samples.iter().map(|r| r.energy_milli).min() {
+                                best_energy_milli = best_energy_milli.min(e);
+                            }
+                        }
+                        for reply in finalize_result(sr, reads, sweeps, &mut done) {
+                            if tx.send(reply).await.is_err() {
+                                return;
+                            }
+                        }
+                        jobs_done.store(done, Ordering::Relaxed);
+                        if completed && done > 0 && done.is_multiple_of(PROGRESS_LOG_INTERVAL) {
+                            log_progress(
+                                backend,
+                                done,
+                                session_start.elapsed(),
+                                reads,
+                                sweeps,
+                                best_energy_milli,
+                            );
+                        }
                     }
-                }
-                for reply in finalize_result(sr, reads, sweeps, &mut jobs_done) {
-                    tx.send(reply).await?;
-                }
-                if completed && jobs_done > 0 && jobs_done.is_multiple_of(PROGRESS_LOG_INTERVAL) {
-                    log_progress(
-                        id.backend,
-                        jobs_done,
-                        session_start.elapsed(),
-                        reads,
-                        sweeps,
-                        best_energy_milli,
-                    );
+                    ctrl = ctrl_rx.recv() => {
+                        match ctrl {
+                            Some(msg) => {
+                                if tx.send(msg).await.is_err() {
+                                    return;
+                                }
+                            }
+                            // Read loop is gone and the sampler has drained.
+                            None if res_rx.is_closed() => return,
+                            None => {}
+                        }
+                    }
+                    else => return,
                 }
             }
-            // No wall-clock idle timeout: a miner grinding a hard nonce for
-            // minutes-to-hours legitimately receives nothing from the
-            // coordinator meanwhile — it is busy, not dead. Liveness of a
-            // truly-gone peer surfaces here as a closed stream (`Ok(None)`) or
-            // a transport error (`Err`); dead-peer detection over the network
-            // belongs to HTTP/2 keepalive, not an application quiet-period.
-            msg = inbound.message() => {
-                let cm: CoordMsg = match msg {
-                    Ok(Some(cm)) => cm,
-                    Ok(None) => break,
-                    Err(status) => return Err(status.into()),
-                };
-                match cm.msg {
+        })
+    };
+
+    loop {
+        // Read loop: owns the inbound stream and nothing else. Every outbound
+        // message goes through `ctrl_tx` so this loop cannot be blocked by a
+        // slow or backed-up peer.
+        //
+        // No wall-clock idle timeout: a miner grinding a hard nonce for
+        // minutes-to-hours legitimately receives nothing from the
+        // coordinator meanwhile — it is busy, not dead. Liveness of a
+        // truly-gone peer surfaces here as a closed stream (`Ok(None)`) or
+        // a transport error (`Err`); dead-peer detection over the network
+        // belongs to HTTP/2 keepalive, not an application quiet-period.
+        let msg = inbound.message().await;
+        {
+            let cm: CoordMsg = match msg {
+                Ok(Some(cm)) => cm,
+                Ok(None) => break,
+                Err(status) => return Err(status.into()),
+            };
+            match cm.msg {
                     Some(coord_msg::Msg::Welcome(w)) => {
                         if w.protocol_version != 1 {
                             return Err(SessionError::BadWelcome(w.protocol_version).into());
@@ -210,7 +283,7 @@ async fn run_session<S: Sampler>(
                         sampler.apply_config(&c.backend_toml);
                         num_sweeps = num_sweeps_from_toml(&c.backend_toml);
                         let config = SessionConfig::from_configure(miner_id.into(), &c);
-                        tx.send(miner(miner_msg::Msg::Ready(Ready {}))).await?;
+                        ctrl_tx.send(miner(miner_msg::Msg::Ready(Ready {}))).await?;
                         // Request enough credits to keep the prefetch buffer
                         // full (active + next per lane), so the backend always
                         // has a NEXT slot to rotate into.
@@ -219,10 +292,18 @@ async fn run_session<S: Sampler>(
                             reason = "stream width / prefetch are small device-local counts well under u32::MAX"
                         )]
                         let depth = config.queue_depth.max(prefetch as u32);
-                        tx.send(miner(miner_msg::Msg::JobRequest(JobRequest {
-                            credits: depth,
-                        })))
-                        .await?;
+                        // INVARIANT: the granted pool must not exceed the job
+                        // channel's capacity (`cap`), or the read loop can block
+                        // on `job_tx.send` with jobs still arriving — the same
+                        // deadlock one layer down. `cap == prefetch` and
+                        // `depth <= prefetch` unless the coordinator's
+                        // `queue_depth` is larger, so clamp to `cap`.
+                        let depth = depth.min(u32::try_from(cap).unwrap_or(u32::MAX));
+                        ctrl_tx
+                            .send(miner(miner_msg::Msg::JobRequest(JobRequest {
+                                credits: depth,
+                            })))
+                            .await?;
                     }
                     Some(coord_msg::Msg::Topology(t)) => {
                         topology = Some(TopologyCache::from_proto(&t));
@@ -245,18 +326,25 @@ async fn run_session<S: Sampler>(
                                 // job, so ask for a replacement credit — same as
                                 // a completion — to keep the coordinator's
                                 // consume-on-dispatch pool from leaking a slot.
-                                tx.send(msg).await?;
-                                tx.send(miner(miner_msg::Msg::JobRequest(JobRequest {
-                                    credits: 1,
-                                })))
-                                .await?;
+                                ctrl_tx.send(msg).await?;
+                                ctrl_tx
+                                    .send(miner(miner_msg::Msg::JobRequest(JobRequest {
+                                        credits: 1,
+                                    })))
+                                    .await?;
                             }
                             Prepared::Sample {
                                 job,
                                 num_reads,
                                 num_sweeps: ns,
                             } => {
-                                let _ = pending.insert(job.job_id.clone(), (num_reads, ns));
+                                {
+                                    let mut p = match pending.lock() {
+                                        Ok(p) => p,
+                                        Err(poisoned) => poisoned.into_inner(),
+                                    };
+                                    let _ = p.insert(job.job_id.clone(), (num_reads, ns));
+                                }
                                 if job_tx.send(job).await.is_err() {
                                     break;
                                 }
@@ -269,11 +357,21 @@ async fn run_session<S: Sampler>(
                         // backends that override sample_stream) aborts the
                         // in-flight one at its next checkpoint.
                         cancel.cancel_through(c.max_generation);
-                        tx.send(status_msg(miner_id, jobs_done, sampler.utilization()))
+                        ctrl_tx
+                            .send(status_msg(
+                                miner_id,
+                                jobs_done.load(Ordering::Relaxed),
+                                sampler.utilization(),
+                            ))
                             .await?;
                     }
                     Some(coord_msg::Msg::Ping(_)) => {
-                        tx.send(status_msg(miner_id, jobs_done, sampler.utilization()))
+                        ctrl_tx
+                            .send(status_msg(
+                                miner_id,
+                                jobs_done.load(Ordering::Relaxed),
+                                sampler.utilization(),
+                            ))
                             .await?;
                     }
                     Some(coord_msg::Msg::Shutdown(s)) => {
@@ -287,17 +385,18 @@ async fn run_session<S: Sampler>(
                     None => {}
                 }
             }
-        }
     }
 
-    // Stop feeding, then drain in-flight results within the grace window.
+    // Stop feeding, then let the writer flush in-flight results within the
+    // grace window. Closing both of its inputs is what ends it: `job_tx` stops
+    // the sampler, which drops `res_tx`; `ctrl_tx` closes the control side.
+    // The writer drains whatever the sampler already produced before returning,
+    // so the drain that used to live here now happens there.
     drop(job_tx);
+    drop(ctrl_tx);
     let grace = Duration::from_millis(grace_ms);
-    while let Ok(Some(sr)) = tokio::time::timeout(grace, res_rx.recv()).await {
-        let (reads, sweeps) = pending.remove(&sr.job_id).unwrap_or((0, 0));
-        for reply in finalize_result(sr, reads, sweeps, &mut jobs_done) {
-            tx.send(reply).await?;
-        }
+    if tokio::time::timeout(grace, writer).await.is_err() {
+        tracing::warn!("outbound writer did not finish within the shutdown grace window");
     }
     // Surface sampler-worker panics: join Err is a panic payload, not a clean drain.
     if let Err(panic) = sampler_thread.join() {
