@@ -22,7 +22,7 @@ stages:
 
 rust:
   stage: test
-  image: rust:1.97
+  image: rust:1.97.1
   tags: [linux, amd64]
   before_script:
     - apt-get update && apt-get install -y protobuf-compiler
