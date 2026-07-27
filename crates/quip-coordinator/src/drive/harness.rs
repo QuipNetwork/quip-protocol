@@ -303,11 +303,22 @@ async fn dispatch_jobs(
     tx: &mpsc::Sender<Result<CoordMsg, Status>>,
     run: &Arc<RunState>,
 ) -> bool {
-    let mut st = state.lock().await;
-    st.router.grant_credits(miner_id, credits);
-    while let Some(job) = st.router.next_job(miner_id) {
-        run.note_dispatch(job.job_id.clone());
-        let _ = st.inflight.insert(job.job_id.clone(), job.clone());
+    // Collect everything to dispatch under the lock, then release it before
+    // sending. `tx.send().await` backpressures when the miner is busy, and
+    // holding `state` across it serializes result write-back — `handle_result`
+    // needs the same lock — which starves the miner's streaming pipeline.
+    let jobs: Vec<Job> = {
+        let mut st = state.lock().await;
+        st.router.grant_credits(miner_id, credits);
+        let mut jobs = Vec::new();
+        while let Some(job) = st.router.next_job(miner_id) {
+            run.note_dispatch(job.job_id.clone());
+            let _ = st.inflight.insert(job.job_id.clone(), job.clone());
+            jobs.push(job);
+        }
+        jobs
+    };
+    for job in jobs {
         if tx.send(Ok(coord(coord_msg::Msg::Job(job)))).await.is_err() {
             return false;
         }
