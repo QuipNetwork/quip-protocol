@@ -129,6 +129,41 @@ async fn broadcast_set_target(state: &Arc<Mutex<CoordinatorState>>, target: SetT
     }
 }
 
+/// Push a refreshed topology to every live miner off-lock. Live sessions only
+/// receive `Topology` at handshake, so a topology that first becomes available
+/// (miner connected before the first snapshot) or changes on reseed must be
+/// fanned out here — otherwise those miners reject subsequent hash-based jobs as
+/// topology-missing/mismatch.
+async fn broadcast_topology(state: &Arc<Mutex<CoordinatorState>>, topo: quip_proto::v1::Topology) {
+    let senders: Vec<_> = {
+        let st = state.lock().await;
+        st.outbound.values().cloned().collect()
+    };
+    for tx in senders {
+        let _ = tx
+            .send(Ok(coord(coord_msg::Msg::Topology(topo.clone()))))
+            .await;
+    }
+}
+
+/// Fan out a protocol `Cancel(max_generation)` to every live miner on reseed so
+/// they abandon stale-generation work promptly. Belt-and-suspenders with the
+/// miner-side cooperative-cancel guard and the cleared salts (which already make
+/// a late stale-generation result unsubmittable).
+async fn broadcast_cancel(state: &Arc<Mutex<CoordinatorState>>, max_generation: u64) {
+    let senders: Vec<_> = {
+        let st = state.lock().await;
+        st.outbound.values().cloned().collect()
+    };
+    for tx in senders {
+        let _ = tx
+            .send(Ok(coord(coord_msg::Msg::Cancel(quip_proto::v1::Cancel {
+                max_generation,
+            }))))
+            .await;
+    }
+}
+
 /// A unique 32-byte salt from a monotonic counter: distinct salts derive
 /// distinct nonces (job ids), so each attempt is a fresh PoW draw.
 fn salt_from_counter(ctr: u64) -> [u8; 32] {
@@ -159,6 +194,9 @@ pub async fn feeder_loop<C: ChainClient>(
     let mut consumption_ema: HashMap<String, f64> = HashMap::new();
     // Last difficulty triple broadcast to miners, so we only re-push on change.
     let mut last_broadcast: Option<(i64, u32, u32)> = None;
+    // Last topology hash pushed to miners, so we re-push only when it changes
+    // (including first availability), not on every per-block reseed.
+    let mut last_topology_hash: Option<Vec<u8>> = None;
 
     loop {
         let snap = match chain
@@ -189,9 +227,21 @@ pub async fn feeder_loop<C: ChainClient>(
                 // Refresh the chain qblock id + decay-projection inputs for the
                 // attempt logs and win-time stash (best-effort; fetched before
                 // locking so we never await under the state lock).
-                let qblock_id = chain.fetch_latest_qblock_id().await.ok().flatten();
+                let qblock_id = match chain.fetch_latest_qblock_id().await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "feeder: qblock id read failed; attempt logs lose the qblock key");
+                        None
+                    }
+                };
                 let decay = match <[u8; 32]>::try_from(snap.topology_hash.as_slice()) {
-                    Ok(h) => chain.fetch_decay_params(h).await.ok().flatten(),
+                    Ok(h) => match chain.fetch_decay_params(h).await {
+                        Ok(dp) => dp,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "feeder: decay params read failed; running without decay projection");
+                            None
+                        }
+                    },
                     Err(_) => None,
                 };
                 // Project the per-generation decay schedule for the stash.
@@ -218,15 +268,36 @@ pub async fn feeder_loop<C: ChainClient>(
                     }
                     None => (Vec::new(), 0, 0),
                 };
+                let topo_proto = topo.to_proto();
+                let topology_changed =
+                    last_topology_hash.as_deref() != Some(snap.topology_hash.as_slice());
                 let mut st = state.lock().await;
                 st.set_topology(Some(topo));
                 st.target = Some(target_from_snapshot(snap));
                 st.generation = generation;
                 st.qblock_id = qblock_id;
+                // Each generation is an independent PoW problem (new nonce/model),
+                // so best energies are not comparable across generations. Reset
+                // the best or later generations would have to beat a historical
+                // minimum and never submit (the chain clears its block-best too).
+                st.current_best_milli = None;
                 st.stash
                     .reset(generation, schedule, last_proof_block, epoch_length);
-                st.router.cancel(generation - 1); // drop the prior generation
+                st.router.cancel(generation - 1); // drop the prior generation's staged jobs
                 st.clear_salts();
+                drop(st);
+                // Fan out the reseed to live miners, off-lock. Cancel the prior
+                // generation's work (skip the first reseed: generation 0 has none).
+                if generation > 1 {
+                    broadcast_cancel(&state, generation - 1).await;
+                }
+                // Push topology only when it changed (incl. first availability),
+                // so a miner that connected before it was cached can resolve
+                // hash-based jobs — without re-sending an identical graph each block.
+                if topology_changed {
+                    broadcast_topology(&state, topo_proto).await;
+                    last_topology_hash = Some(snap.topology_hash.clone());
+                }
             }
 
             // Push the refreshed difficulty to live miners when it changed, so
@@ -247,6 +318,12 @@ pub async fn feeder_loop<C: ChainClient>(
             // jobs-consumed counter (read-and-reset), smooth it, and size the
             // staged reserve to ~headroom poll-intervals of that rate.
             let mut st = state.lock().await;
+            // Persist the current difficulty so session-path validation gates on
+            // the same target the miners were just told. Within one proof-block
+            // the decay ratchet eases `max_energy` each block without a reseed;
+            // without this, `st.target` would stay pinned at the last reseed's
+            // (harder) gate and under-accept solutions viable at the eased one.
+            st.target = Some(target);
             for id in st.router.miner_ids() {
                 let consumed = f64::from(st.router.take_consumed(&id));
                 let ema = match consumption_ema.get(&id) {
@@ -266,7 +343,18 @@ pub async fn feeder_loop<C: ChainClient>(
                 while st.router.staged_len(&id) < depth {
                     salt_ctr = salt_ctr.saturating_add(1);
                     let salt = salt_from_counter(salt_ctr);
-                    let job = derive_pow_job(snap, params.miner_account, salt, generation, 0);
+                    let job = match derive_pow_job(snap, params.miner_account, salt, generation, 0)
+                    {
+                        Ok(job) => job,
+                        Err(e) => {
+                            // The snapshot's allowed-value sets are validated at
+                            // fetch (`require_set_values`), so an empty set here is
+                            // an invariant violation, not routine. Stop topping up
+                            // this miner rather than crash the feeder.
+                            tracing::error!(error = %e, miner = %id, "feeder: cannot draw PoW job");
+                            break;
+                        }
+                    };
                     let job_id = job.job_id.clone();
                     if st.router.stage_on(&id, job) {
                         st.record_salt(&job_id, salt);
@@ -309,19 +397,46 @@ pub async fn feeder_loop<C: ChainClient>(
                     salt: cand.salt.map(|s| s.to_vec()).unwrap_or_default(),
                     device_access_time_us: cand.device_access_time_us,
                 };
-                if let Ok(crate::chain::SubmitAction::Success) = chain.submit_proof(&proof).await {
-                    let mut st = state.lock().await;
-                    st.stash.mark_submitted(&cand.job_id);
-                    st.current_best_milli = Some(cand.best_energy_milli);
-                    let qblock_id = st.qblock_id;
-                    let body = crate::attempt::summary_body(
-                        qblock_id,
-                        st.current_best_milli,
-                        st.results_validated,
-                        st.stash.summary(),
-                    );
-                    if let Some(tx) = st.attempt_tx.as_ref() {
-                        let _ = tx.send(crate::attempt::WriterMsg::Summary { qblock_id, body });
+                use crate::chain::SubmitAction;
+                let job_hex = crate::chain::extrinsic::hex_encode(&cand.job_id);
+                match chain.submit_proof(&proof).await {
+                    Ok(SubmitAction::Success) => {
+                        let mut st = state.lock().await;
+                        st.stash.mark_submitted(&cand.job_id);
+                        st.current_best_milli = Some(cand.best_energy_milli);
+                        let qblock_id = st.qblock_id;
+                        let body = crate::attempt::summary_body(
+                            qblock_id,
+                            st.current_best_milli,
+                            st.results_validated,
+                            st.stash.summary(),
+                        );
+                        if let Some(tx) = st.attempt_tx.as_ref() {
+                            let _ = tx.send(crate::attempt::WriterMsg::Summary { qblock_id, body });
+                        }
+                    }
+                    Ok(SubmitAction::Retry) => {
+                        // Retryable reject (e.g. InsufficientEnergy / ProofLimit):
+                        // leave the candidate in the stash so a later due-window
+                        // resubmits it; do NOT mark_submitted.
+                        tracing::warn!(job = %job_hex, "win-time submit rejected (retryable); leaving stashed");
+                    }
+                    Ok(SubmitAction::StopRoundStale) => {
+                        // Stale for this round (e.g. InvalidNonce / topology moved);
+                        // the next reseed clears the stash. Stop resubmitting it now.
+                        tracing::info!(job = %job_hex, "win-time submit stale for round; dropping candidate");
+                        state.lock().await.stash.mark_submitted(&cand.job_id);
+                    }
+                    Ok(SubmitAction::StopFatal) => {
+                        // Fatally rejected by the pallet (BadProof/BadSignature/...):
+                        // never retry it, or the same candidate loops every window.
+                        tracing::error!(job = %job_hex, "win-time submit fatally rejected by pallet; dropping candidate");
+                        state.lock().await.stash.mark_submitted(&cand.job_id);
+                    }
+                    Err(e) => {
+                        // Transient chain error (RPC down / unreachable): keep the
+                        // winning candidate stashed for the next due window.
+                        tracing::error!(job = %job_hex, error = %e, "win-time submit failed (transient); leaving stashed for retry");
                     }
                 }
             }

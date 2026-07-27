@@ -13,7 +13,7 @@ version = "0.3.0"
 description = "quip.network v0.3 SDK: PyO3 consensus primitives + generated gRPC stubs"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["grpcio>=1.60", "protobuf>=4.25"]
+dependencies = ["grpcio>=1.82.1", "protobuf>=7.35.1,<8"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0,<9", "pytest-asyncio>=0.23.0", "numpy>=1.24", "blake3>=1.0.5"]

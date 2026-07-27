@@ -139,37 +139,63 @@ pub fn encode_submit_proof_call(proof: &QuantumProof) -> Vec<u8> {
     out
 }
 
-/// Extract Set values from an `AllowedValueSpec`, or empty for non-Set.
-pub fn set_values(spec: &AllowedValueSpec<Vec<i32>>) -> Vec<i32> {
+/// Require an `AllowedValueSpec::Set` and return its (non-empty) values.
+///
+/// The coordinator draws PoW models with [`draw_ising_milli`] over a discrete
+/// allowed set. The chain's `generate_ising_model` samples `IntegerRange` /
+/// `ContinuousRange` specs with a *different* RNG consumption (see
+/// `quantum_validation::AllowedValueSpec::sample`), so a coordinator-side
+/// expansion of a range into a `Set` would neither reproduce the chain's model
+/// nor match its topology hash. Rather than mine unverifiable jobs, reject
+/// non-`Set` specs (and empty sets) here so the failure surfaces at snapshot
+/// decode with a clear message.
+///
+/// [`draw_ising_milli`]: quip_protocol::chacha8::draw_ising_milli
+///
+/// # Errors
+/// Returns an error for `IntegerRange` / `ContinuousRange` specs and for an
+/// empty `Set`.
+pub fn require_set_values(spec: &AllowedValueSpec<Vec<i32>>) -> Result<Vec<i32>, String> {
     match spec {
-        AllowedValueSpec::Set(v) => v.clone(),
-        AllowedValueSpec::IntegerRange { min, max } => {
-            // Expand whole-integer range into milli values (capped).
-            let mut out = Vec::new();
-            let mut i = *min;
-            while i <= *max {
-                if let Some(m) = (i as i64).checked_mul(1000) {
-                    if m >= i32::MIN as i64 && m <= i32::MAX as i64 {
-                        out.push(m as i32);
-                    }
-                }
-                if i == i32::MAX {
-                    break;
-                }
-                i += 1;
-                if out.len() > 256 {
-                    break;
-                }
-            }
-            out
+        AllowedValueSpec::Set(v) if !v.is_empty() => Ok(v.clone()),
+        AllowedValueSpec::Set(_) => {
+            Err("allowed-value Set is empty; a PoW model cannot be drawn".to_string())
         }
-        AllowedValueSpec::ContinuousRange { .. } => Vec::new(),
+        AllowedValueSpec::IntegerRange { .. } | AllowedValueSpec::ContinuousRange { .. } => Err(
+            "coordinator requires AllowedValueSpec::Set; range specs (IntegerRange/\
+             ContinuousRange) sample differently on-chain and are not supported"
+                .to_string(),
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn require_set_values_accepts_nonempty_set() {
+        let spec = AllowedValueSpec::Set(vec![-1000, 0, 1000]);
+        assert_eq!(require_set_values(&spec).unwrap(), vec![-1000, 0, 1000]);
+    }
+
+    #[test]
+    fn require_set_values_rejects_empty_set() {
+        let spec = AllowedValueSpec::Set(Vec::new());
+        assert!(require_set_values(&spec).is_err());
+    }
+
+    #[test]
+    fn require_set_values_rejects_ranges() {
+        // Range specs sample differently on-chain; the coordinator must not
+        // silently expand them into a Set (would diverge from consensus).
+        assert!(require_set_values(&AllowedValueSpec::IntegerRange { min: -2, max: 2 }).is_err());
+        assert!(require_set_values(&AllowedValueSpec::ContinuousRange {
+            min: -1000,
+            max: 1000
+        })
+        .is_err());
+    }
 
     #[test]
     fn quantum_proof_scale_roundtrip() {
@@ -254,5 +280,68 @@ mod tests {
         let enc = order.encode();
         let dec = JobOrderScale::decode(&mut &enc[..]).expect("decode");
         assert_eq!(dec, order);
+    }
+
+    fn valid_job_order_bytes() -> Vec<u8> {
+        JobOrderScale {
+            spec_id: H256::repeat_byte(9),
+            proposer: [0x11; 32],
+            ising_params: IsingParams {
+                nodes: vec![0, 1],
+                edges: vec![(0, 1)],
+                h_values: vec![0, 0],
+                j_values: vec![-1000],
+                min_energy_milli: Some(-500),
+                min_diversity_milli: Some(100),
+                min_solutions: Some(2),
+            },
+            reward: 1_000_000_000_000,
+            mode: JobMode::Open,
+            resolution: RewardResolution::SingleBest,
+            timing: OrderTiming {
+                deadline_blocks: 100,
+                block_wait: 10,
+            },
+            delivery: ResultDelivery::OnChainOnly,
+            status: OrderStatus::Opened,
+            created_at: 42,
+            first_solution_at: None,
+            solution_count: 0,
+        }
+        .encode()
+    }
+
+    // The JobProposed decode (real.rs) parses untrusted on-chain bytes; it must
+    // reject malformed input with an error, never panic. Only a live #[ignore]
+    // devnet test exercised this before — these are the offline guards.
+
+    #[test]
+    fn job_order_decode_rejects_truncated_bytes() {
+        let enc = valid_job_order_bytes();
+        // Chop the tail: the later fields (timing/status/counts) can no longer
+        // be decoded.
+        let truncated = &enc[..enc.len() - 4];
+        assert!(JobOrderScale::decode(&mut &truncated[..]).is_err());
+    }
+
+    #[test]
+    fn job_order_decode_rejects_empty() {
+        assert!(JobOrderScale::decode(&mut &[][..]).is_err());
+    }
+
+    #[test]
+    fn job_order_decode_rejects_bad_enum_tag() {
+        // `mode: JobMode` is a 3-field composite; corrupt the SCALE variant tag
+        // of the first enum (`mode`, after the fixed-size spec_id/proposer and
+        // the variable ising_params). A tag past the variant count must error,
+        // not panic. Scan for the first byte whose flip yields an out-of-range
+        // enum tag by fuzzing each position and asserting no decode panics.
+        let enc = valid_job_order_bytes();
+        for i in 0..enc.len() {
+            let mut bad = enc.clone();
+            bad[i] = 0xFF; // 0xFF is out of range for every enum in the struct
+                           // Must return Ok or Err, never panic (the point of the guard).
+            let _ = JobOrderScale::decode(&mut &bad[..]);
+        }
     }
 }

@@ -47,20 +47,41 @@ impl Router {
 
     pub fn register_miner(&mut self, miner_id: impl Into<String>, caps: MinerCaps) {
         let id = miner_id.into();
-        self.miners.insert(
-            id,
-            MinerQueue {
-                caps,
-                staged: VecDeque::new(),
-                granted_credits: 0,
-                consumed_since_poll: 0,
-                unsupported_kinds: HashSet::new(),
-            },
-        );
+        match self.miners.get_mut(&id) {
+            // Re-registration (e.g. a supervised restart of the same id): keep
+            // any jobs re-staged onto this id while it was down — otherwise the
+            // reclaim→re-route→re-handshake path silently drops them. Reset only
+            // the volatile per-connection state and refresh caps.
+            Some(q) => {
+                q.caps = caps;
+                q.granted_credits = 0;
+                q.consumed_since_poll = 0;
+                q.unsupported_kinds.clear();
+            }
+            None => {
+                self.miners.insert(
+                    id,
+                    MinerQueue {
+                        caps,
+                        staged: VecDeque::new(),
+                        granted_credits: 0,
+                        consumed_since_poll: 0,
+                        unsupported_kinds: HashSet::new(),
+                    },
+                );
+            }
+        }
     }
 
     /// Stage `job` on a capable miner; returns the chosen `miner_id`, or `None`.
     pub fn route(&mut self, job: Job) -> Option<String> {
+        self.route_excluding(job, None)
+    }
+
+    /// Like [`Router::route`], but never selects `exclude`. Used by
+    /// [`Router::on_reject`] so a rejected job is not re-staged onto the miner
+    /// that just rejected it.
+    fn route_excluding(&mut self, job: Job, exclude: Option<&str>) -> Option<String> {
         let n_nodes = job_node_count(&job);
         let n_edges = job_edge_count(&job);
         let kind = job.kind;
@@ -68,7 +89,7 @@ impl Router {
         let mut candidates: Vec<&String> = self
             .miners
             .iter()
-            .filter(|(_, q)| capable(q, kind, n_nodes, n_edges))
+            .filter(|(id, q)| exclude != Some(id.as_str()) && capable(q, kind, n_nodes, n_edges))
             .map(|(id, _)| id)
             .collect();
         candidates.sort(); // deterministic pick
@@ -113,15 +134,27 @@ impl Router {
             .unwrap_or(0)
     }
 
-    /// Handle a miner reject: mark unsupported kinds, re-route when possible.
+    /// Handle a miner reject: mark unsupported kinds, re-route to a *different*
+    /// capable miner.
+    ///
+    /// Re-routing excludes the rejecting miner: for a deterministic reject
+    /// (`Malformed`, `Expired`, `TopologyMissing`/`Mismatch`) the same job on the
+    /// same miner fails again, and since the rejection grants its own replacement
+    /// credit it would loop forever with a single miner. If no other miner can
+    /// take it, the job lands in `unroutable` (dropped) rather than spinning.
     pub fn on_reject(&mut self, miner_id: &str, job: Job, reason: i32) {
         if reason == RejectReason::UnsupportedKind as i32 {
             if let Some(q) = self.miners.get_mut(miner_id) {
                 q.unsupported_kinds.insert(job.kind);
             }
         }
-        // Re-route to another miner if possible.
-        let _ = self.route(job);
+        if self.route_excluding(job, Some(miner_id)).is_none() {
+            tracing::warn!(
+                miner = %miner_id,
+                reason,
+                "rejected job has no alternative capable miner; dropping"
+            );
+        }
     }
 
     /// Drop staged PoW jobs with `0 < generation <= max_generation`.
@@ -368,5 +401,34 @@ mod tests {
         r.route(make_job(2, JobKind::IsingSample));
         assert_eq!(r.staged_len("cpu-0"), 0);
         assert_eq!(r.staged_len("cpu-1"), 2);
+    }
+
+    #[test]
+    fn on_reject_terminal_does_not_reroute_onto_same_single_miner() {
+        // F6: with one capable miner, a deterministic reject must NOT re-stage
+        // onto the rejecting miner (which would loop forever); it drops instead.
+        let mut r = Router::new();
+        r.register_miner("cpu-0", caps_ising());
+        let job = make_job(1, JobKind::IsingSample);
+        r.route(job);
+        r.grant_credits("cpu-0", 1);
+        let dispatched = r.next_job("cpu-0").unwrap();
+        assert_eq!(r.staged_len("cpu-0"), 0);
+        r.on_reject("cpu-0", dispatched, RejectReason::Malformed as i32);
+        // Not re-staged onto the only (rejecting) miner.
+        assert_eq!(r.staged_len("cpu-0"), 0);
+    }
+
+    #[test]
+    fn reregister_preserves_staged_queue() {
+        // F8: a supervised restart of the same id must keep jobs re-staged onto
+        // it while it was down (reclaim → re-route → re-handshake path).
+        let mut r = Router::new();
+        r.register_miner("cpu-0", caps_ising());
+        r.route(make_job(0, JobKind::IsingSample)); // mempool order (generation 0)
+        assert_eq!(r.staged_len("cpu-0"), 1);
+        // Re-handshake with the same id: queue survives, credits reset.
+        r.register_miner("cpu-0", caps_ising());
+        assert_eq!(r.staged_len("cpu-0"), 1);
     }
 }

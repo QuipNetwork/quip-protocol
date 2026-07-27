@@ -41,6 +41,24 @@ def test_decode_i32_bad_length_raises():
         wire.decode_i32_le(b"\x00\x00\x00")
 
 
+def test_decode_spins_bad_byte_raises():
+    # 0x00 is neither 0x01 (+1) nor 0xFF (-1): the PyO3 wire.decode_spins must
+    # surface WireError::BadSpinByte as a Python ValueError, not silently accept.
+    with pytest.raises(ValueError):
+        wire.decode_spins(b"\x00")
+
+
+def test_wire_empty_payload_roundtrip():
+    assert wire.decode_i32_le(wire.encode_i32_le([])) == []
+    assert wire.decode_spins(wire.encode_spins([])) == []
+
+
+def test_wire_i32_bounds_roundtrip():
+    # i32::MIN / i32::MAX are load-bearing edge values for the LE codec.
+    vals = [-2147483648, -1, 0, 1, 2147483647]
+    assert wire.decode_i32_le(wire.encode_i32_le(vals)) == vals
+
+
 def test_positive_sign_convention():
     # spins [+1,-1]; h=[1.0,-0.5]; edge (0,1) J=2.0 -> E = 1 + 0.5 - 2.0 = -0.5 -> -500
     assert scoring.energy_milli([1, -1], [1.0, -0.5], [2.0], [(0, 1)]) == -500

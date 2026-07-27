@@ -54,7 +54,7 @@ fn ising_draw_order_matches_golden() {
             .iter()
             .map(|v| v.as_i64().unwrap() as i32)
             .collect();
-        let (h, j) = draw_ising_milli(nonce, n_nodes, n_edges, &allowed_h, &allowed_j);
+        let (h, j) = draw_ising_milli(nonce, n_nodes, n_edges, &allowed_h, &allowed_j).unwrap();
         let exp_h: Vec<i32> = case["h_milli"]
             .as_array()
             .unwrap()

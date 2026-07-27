@@ -131,12 +131,12 @@ fn build_entry_job(
             line: line_no,
             reason,
         })?;
-        Ok(build_ising_job_from_nonce(
-            snap,
-            nonce,
-            line_no as u64,
-            deadline_ms,
-        ))
+        build_ising_job_from_nonce(snap, nonce, line_no as u64, deadline_ms).map_err(|e| {
+            ListSourceError::Parse {
+                line: line_no,
+                reason: format!("cannot draw model from nonce-ref: {e}"),
+            }
+        })
     } else {
         Ok(build_explicit_job(entry, line_no as u64, deadline_ms))
     }

@@ -134,14 +134,18 @@ pub fn adapt_params(
 
     let (min_reads, max_reads) = if bounds.reads_solution_min_factor > 0 {
         (
-            (min_solutions * bounds.reads_solution_min_factor).max(bounds.min_reads),
-            (min_solutions * bounds.reads_solution_max_factor).max(bounds.max_reads),
+            min_solutions
+                .saturating_mul(bounds.reads_solution_min_factor)
+                .max(bounds.min_reads),
+            min_solutions
+                .saturating_mul(bounds.reads_solution_max_factor)
+                .max(bounds.max_reads),
         )
     } else {
         (bounds.min_reads, bounds.max_reads)
     };
     let num_reads = min_reads.max(trunc_u32(difficulty * f64::from(max_reads)));
-    let floor = min_solutions * bounds.reads_solution_floor_factor;
+    let floor = min_solutions.saturating_mul(bounds.reads_solution_floor_factor);
 
     AdaptParams {
         num_reads: num_reads.max(floor),

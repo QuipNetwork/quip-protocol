@@ -2,7 +2,7 @@
 
 use crate::chain::snapshot::MiningSnapshot;
 use quip_proto::v1::{ising_problem, IsingProblem, Job, JobKind, Provenance};
-use quip_protocol::chacha8::draw_ising_milli;
+use quip_protocol::chacha8::{draw_ising_milli, DrawError};
 use quip_protocol::derive::derive_nonce;
 use quip_protocol::wire::encode_i32_le;
 
@@ -10,13 +10,17 @@ use quip_protocol::wire::encode_i32_le;
 ///
 /// Uses `derive_nonce` + `draw_ising_milli` (golden-pinned). Graph is a
 /// `topology_hash` reference; gates come from the snapshot difficulty.
+///
+/// # Errors
+/// Propagates [`DrawError`] if the snapshot's allowed-value sets cannot produce
+/// a model (empty set).
 pub fn derive_pow_job(
     snap: &MiningSnapshot,
     miner_account: [u8; 32],
     salt: [u8; 32],
     generation: u64,
     deadline_ms: u64,
-) -> Job {
+) -> Result<Job, DrawError> {
     let nonce = derive_nonce(snap.last_proof_block_hash, miner_account, salt);
     build_ising_job_from_nonce(snap, nonce, generation, deadline_ms)
 }
@@ -27,20 +31,23 @@ pub fn derive_pow_job(
 ///
 /// Still golden-pinned: draws via `draw_ising_milli`, the same code the
 /// network uses.
+///
+/// # Errors
+/// Propagates [`DrawError`] if the snapshot's allowed-value sets are empty.
 pub fn build_ising_job_from_nonce(
     snap: &MiningSnapshot,
     nonce: [u8; 32],
     generation: u64,
     deadline_ms: u64,
-) -> Job {
+) -> Result<Job, DrawError> {
     let (h, j) = draw_ising_milli(
         nonce,
         snap.nodes.len(),
         snap.edges.len(),
         &snap.allowed_h_milli,
         &snap.allowed_j_milli,
-    );
-    Job {
+    )?;
+    Ok(Job {
         job_id: nonce.to_vec(),
         kind: JobKind::IsingSample as i32,
         generation,
@@ -59,7 +66,7 @@ pub fn build_ising_job_from_nonce(
             is_pow: true,
             order_id: vec![],
         }),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -87,7 +94,7 @@ mod tests {
     #[test]
     fn derives_job_with_correct_shape() {
         let snap = fixture();
-        let job = derive_pow_job(&snap, [1u8; 32], [2u8; 32], 42, 9999);
+        let job = derive_pow_job(&snap, [1u8; 32], [2u8; 32], 42, 9999).unwrap();
         assert_eq!(job.kind, JobKind::IsingSample as i32);
         assert_eq!(job.generation, 42);
         assert!(job.provenance.as_ref().unwrap().is_pow);
@@ -107,8 +114,8 @@ mod tests {
     #[test]
     fn derivation_is_deterministic_for_same_inputs() {
         let snap = fixture();
-        let a = derive_pow_job(&snap, [1u8; 32], [2u8; 32], 1, 1);
-        let b = derive_pow_job(&snap, [1u8; 32], [2u8; 32], 1, 1);
+        let a = derive_pow_job(&snap, [1u8; 32], [2u8; 32], 1, 1).unwrap();
+        let b = derive_pow_job(&snap, [1u8; 32], [2u8; 32], 1, 1).unwrap();
         assert_eq!(a.ising.unwrap().h_milli_le32, b.ising.unwrap().h_milli_le32);
     }
 }

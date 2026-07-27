@@ -73,11 +73,20 @@ impl SessionConfig {
     }
 }
 
+/// Backend size limits advertised in the `Hello`. `0` means "no limit" (the
+/// coordinator's router treats `0` as unlimited).
+#[derive(Debug, Clone, Copy)]
+pub struct BackendCaps {
+    pub max_nodes: u32,
+    pub max_edges: u32,
+}
+
 pub fn build_hello(
     miner_id: &str,
     backend: &str,
     algorithm: &str,
     supported: &[JobKind],
+    caps: BackendCaps,
 ) -> Result<Hello, SessionError> {
     let token = std::env::var("QUIP_SESSION_TOKEN").map_err(|_| SessionError::MissingToken)?;
     if token.is_empty() {
@@ -90,8 +99,8 @@ pub fn build_hello(
         backend: backend.into(),
         algorithm: algorithm.into(),
         supported_kinds: supported.iter().map(|k| *k as i32).collect(),
-        max_nodes: 0,
-        max_edges: 0,
+        max_nodes: caps.max_nodes,
+        max_edges: caps.max_edges,
         native_topology_hash: None,
         features: vec![],
     })
@@ -114,11 +123,30 @@ mod tests {
     fn hello_requires_token() {
         std::env::remove_var("QUIP_SESSION_TOKEN");
         assert!(matches!(
-            build_hello("cpu-0", "cpu", "sa", &[JobKind::IsingSample]),
+            build_hello(
+                "cpu-0",
+                "cpu",
+                "sa",
+                &[JobKind::IsingSample],
+                BackendCaps {
+                    max_nodes: 0,
+                    max_edges: 0
+                }
+            ),
             Err(SessionError::MissingToken)
         ));
         std::env::set_var("QUIP_SESSION_TOKEN", "tok-123");
-        let h = build_hello("cpu-0", "cpu", "sa", &[JobKind::IsingSample]).unwrap();
+        let h = build_hello(
+            "cpu-0",
+            "cpu",
+            "sa",
+            &[JobKind::IsingSample],
+            BackendCaps {
+                max_nodes: 0,
+                max_edges: 0,
+            },
+        )
+        .unwrap();
         assert_eq!(h.session_token, "tok-123");
         assert_eq!(h.protocol_version, 1);
         assert_eq!(h.miner_id, "cpu-0");
@@ -126,7 +154,16 @@ mod tests {
         // An empty (but present) token is treated the same as a missing one.
         std::env::set_var("QUIP_SESSION_TOKEN", "");
         assert!(matches!(
-            build_hello("cpu-0", "cpu", "sa", &[JobKind::IsingSample]),
+            build_hello(
+                "cpu-0",
+                "cpu",
+                "sa",
+                &[JobKind::IsingSample],
+                BackendCaps {
+                    max_nodes: 0,
+                    max_edges: 0
+                }
+            ),
             Err(SessionError::MissingToken)
         ));
         std::env::remove_var("QUIP_SESSION_TOKEN");

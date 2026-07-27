@@ -12,7 +12,7 @@ use crate::job::{
 use crate::{CancelGuard, Sampler, StreamJob, StreamOutcome, StreamResult};
 use quip_proto::v1::miner_service_client::MinerServiceClient;
 use quip_proto::v1::{coord_msg, miner_msg, CoordMsg, JobKind, JobRequest, MinerMsg, Ready};
-use quip_protocol::session::{build_hello, ExitCode, SessionConfig, SessionError};
+use quip_protocol::session::{build_hello, BackendCaps, ExitCode, SessionConfig, SessionError};
 use std::collections::HashMap;
 use std::process::ExitCode as StdExitCode;
 use std::sync::Arc;
@@ -70,7 +70,7 @@ fn log_progress(
     } else {
         best_energy_milli.to_string()
     };
-    eprintln!(
+    tracing::info!(
         "{backend} progress: {jobs_done} jobs | {rate:.1} jobs/s | reads={reads} sweeps={sweeps} | best={best} milli"
     );
 }
@@ -84,7 +84,16 @@ async fn run_session<S: Sampler>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Resolve token before any network I/O so a missing QUIP_SESSION_TOKEN
     // always maps to exit 77 (never InternalFatal from a connect failure).
-    let hello = build_hello(miner_id, id.backend, id.algorithm, &[JobKind::IsingSample])?;
+    let hello = build_hello(
+        miner_id,
+        id.backend,
+        id.algorithm,
+        &[JobKind::IsingSample],
+        BackendCaps {
+            max_nodes: id.max_nodes,
+            max_edges: id.max_edges,
+        },
+    )?;
 
     let path = uri.strip_prefix("unix://").unwrap_or(uri).to_string();
     let channel = Endpoint::try_from("http://[::]:50051")? // dummy authority for UDS
@@ -270,7 +279,12 @@ async fn run_session<S: Sampler>(
             tx.send(reply).await?;
         }
     }
-    let _ = sampler_thread.join();
+    // Surface sampler-worker panics: join Err is a panic payload, not a clean drain.
+    if let Err(panic) = sampler_thread.join() {
+        let payload = panic_payload_message(&*panic);
+        tracing::error!(panic = %payload, "sampler thread panicked");
+        return Err(format!("sampler thread panicked: {payload}").into());
+    }
 
     drop(tx);
     let drain = async {
@@ -279,6 +293,17 @@ async fn run_session<S: Sampler>(
     };
     let _ = tokio::time::timeout(grace, drain).await;
     Ok(())
+}
+
+/// Format a `JoinHandle` panic payload for logging / error messages.
+fn panic_payload_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
 }
 
 fn map_err_to_exit(err: Box<dyn std::error::Error>, backend: &str) -> StdExitCode {
@@ -299,7 +324,7 @@ fn map_err_to_exit(err: Box<dyn std::error::Error>, backend: &str) -> StdExitCod
     if msg.contains("unexpected protocol version") {
         return StdExitCode::from(ExitCode::ConfigInvalid as u8);
     }
-    eprintln!("quip-miner-{backend} fatal: {err}");
+    tracing::error!("quip-miner-{backend} fatal: {err}");
     StdExitCode::from(ExitCode::InternalFatal as u8)
 }
 
@@ -322,7 +347,7 @@ pub fn run<S: Sampler>(
         return match open() {
             Ok(_) => StdExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("{} check failed: {}", id.backend, e.0);
+                tracing::error!("{} check failed: {}", id.backend, e.0);
                 StdExitCode::from(ExitCode::EnvIncompatible as u8)
             }
         };
@@ -331,7 +356,7 @@ pub fn run<S: Sampler>(
     let uri = match &common.quip_coordinator {
         Some(u) => u.clone(),
         None => {
-            eprintln!("error: --quip-coordinator required for session mode");
+            tracing::error!("error: --quip-coordinator required for session mode");
             return StdExitCode::from(ExitCode::ConfigInvalid as u8);
         }
     };
@@ -343,7 +368,7 @@ pub fn run<S: Sampler>(
     let sampler = match open() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("failed to open {} device: {}", id.backend, e.0);
+            tracing::error!("failed to open {} device: {}", id.backend, e.0);
             return StdExitCode::from(ExitCode::EnvIncompatible as u8);
         }
     };
@@ -351,7 +376,7 @@ pub fn run<S: Sampler>(
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("failed to start tokio runtime: {e}");
+            tracing::error!("failed to start tokio runtime: {e}");
             return StdExitCode::from(ExitCode::InternalFatal as u8);
         }
     };

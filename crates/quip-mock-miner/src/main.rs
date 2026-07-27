@@ -6,7 +6,9 @@ use quip_proto::v1::{
     Topology,
 };
 use quip_protocol::scoring::energy_milli;
-use quip_protocol::session::{build_hello, check_welcome, ExitCode, SessionConfig, SessionError};
+use quip_protocol::session::{
+    build_hello, check_welcome, BackendCaps, ExitCode, SessionConfig, SessionError,
+};
 use quip_protocol::wire::decode_i32_le;
 use std::process::ExitCode as ProcessExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -243,8 +245,17 @@ fn handle_job(job: Job, topo: Option<&SessionTopo>) -> Vec<MinerMsg> {
 async fn run_session(uri: &str, miner_id: &str) -> Result<(), ExitCode> {
     // Resolve token before any network I/O so a missing QUIP_SESSION_TOKEN
     // always maps to exit 77 (never InternalFatal from a connect failure).
-    let hello = build_hello(miner_id, "mock", "sa", &[JobKind::IsingSample])
-        .map_err(|e: SessionError| ExitCode::from(e))?;
+    let hello = build_hello(
+        miner_id,
+        "mock",
+        "sa",
+        &[JobKind::IsingSample],
+        BackendCaps {
+            max_nodes: 0,
+            max_edges: 0,
+        },
+    )
+    .map_err(|e: SessionError| ExitCode::from(e))?;
 
     let path = uri.strip_prefix("unix://").unwrap_or(uri).to_string();
     let channel = Endpoint::try_from("http://[::]:50051") // dummy authority, unused for UDS

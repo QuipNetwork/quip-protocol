@@ -52,13 +52,19 @@ impl JobSource for RandomSource {
         }
         let salt = self.salt_for(self.next_index);
         let generation = u64::from(self.next_index) + 1;
-        let job = derive_pow_job(
+        let job = match derive_pow_job(
             &self.snapshot,
             self.miner_account,
             salt,
             generation,
             self.deadline_ms,
-        );
+        ) {
+            Ok(job) => job,
+            Err(e) => {
+                tracing::error!(error = %e, "random source: cannot draw job from snapshot");
+                return None;
+            }
+        };
         self.next_index += 1;
         Some(job)
     }

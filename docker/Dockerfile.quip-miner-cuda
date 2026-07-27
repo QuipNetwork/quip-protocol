@@ -4,7 +4,8 @@
 # run with `--gpus all`). CPU + CUDA miner binaries are downloaded from their
 # releases; the coordinator is built from source; D-Wave is a Python venv.
 
-# --- builder: quip-coordinator (Rust) + quip-dwave-qa venv (Python) ---
+# --- builder: quip-coordinator (Rust only; Python venv is built on the runtime
+# base so the interpreter path matches — venvs are not relocatable across distros) ---
 FROM python:3.12-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -19,12 +20,9 @@ COPY crates/ crates/
 COPY proto/ proto/
 RUN cargo build --release -p quip-coordinator
 
-ARG MINERS_TAG=v0.3.0
-RUN python -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir \
-       "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git@${MINERS_TAG}"
-
 # --- runtime (NVIDIA CUDA + Python) ---
+# Create the D-Wave venv here (same base as runtime) so /opt/venv/bin/python
+# resolves to this image's /usr/bin/python3, not the bookworm builder's path.
 FROM nvidia/cuda:12.9.1-base-ubuntu24.04
 
 LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-protocol"
@@ -37,7 +35,7 @@ ENV QUIP_DOCKER_IMAGE=${QUIP_DOCKER_IMAGE} \
     PATH="/opt/venv/bin:/usr/local/bin:${PATH}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        tini gosu curl ca-certificates python3 \
+        tini gosu curl ca-certificates python3 python3-venv python3-pip \
     && rm -rf /var/lib/apt/lists/*
 # ubuntu:24.04 (the nvidia/cuda base) ships a default ubuntu:ubuntu at 1000:1000;
 # drop it so quip can own UID/GID 1000, consistent with the non-CUDA image.
@@ -48,7 +46,11 @@ RUN userdel --remove ubuntu 2>/dev/null || true; \
        --create-home --shell /usr/sbin/nologin quip
 
 COPY --from=builder /src/target/release/quip-coordinator /usr/local/bin/quip-coordinator
-COPY --from=builder /opt/venv /opt/venv
+
+# Venv on the runtime interpreter (ubuntu24.04 /usr/bin/python3), not bookworm.
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir \
+       "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git@${MINERS_TAG}"
 
 # Released CPU + CUDA miner binaries (amd64 only for this image), via the shared
 # fetch-miners.sh — single source of truth. MINER_SET=cpu-cuda requires the cuda

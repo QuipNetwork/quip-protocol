@@ -41,4 +41,13 @@ mod tests {
         let b = derive_nonce([1u8; 32], [0u8; 32], [2u8; 32]);
         assert_ne!(a, b);
     }
+
+    #[test]
+    fn salt_is_load_bearing() {
+        // A bug that dropped `salt` from the hash would pass `input_order_is_
+        // load_bearing` (which only permutes last_proof/miner); pin salt too.
+        let a = derive_nonce([0u8; 32], [1u8; 32], [2u8; 32]);
+        let b = derive_nonce([0u8; 32], [1u8; 32], [3u8; 32]);
+        assert_ne!(a, b);
+    }
 }

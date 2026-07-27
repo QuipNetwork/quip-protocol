@@ -295,28 +295,41 @@ async fn feeder_broadcasts_set_target_once_per_difficulty() {
         stop_rx,
     ));
 
-    // First poll pushes the current difficulty to the live miner.
-    let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    // The first reseed pushes the topology (first availability) to the live
+    // miner, then the current difficulty. Cancel is skipped on the first reseed
+    // (generation 0 has nothing to cancel).
+    let topo_msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("no Topology within 2s")
+        .expect("outbound channel closed")
+        .expect("status error");
+    assert!(
+        matches!(&topo_msg.msg, Some(coord_msg::Msg::Topology(_))),
+        "first outbound message should be Topology (reseed push), got {:?}",
+        topo_msg.msg
+    );
+    let target_msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .expect("no SetTarget within 2s")
         .expect("outbound channel closed")
         .expect("status error");
     let snap = ising_snapshot();
     assert!(
-        matches!(&msg.msg, Some(coord_msg::Msg::SetTarget(_))),
-        "first outbound message should be SetTarget"
+        matches!(&target_msg.msg, Some(coord_msg::Msg::SetTarget(_))),
+        "second outbound message should be SetTarget"
     );
-    if let Some(coord_msg::Msg::SetTarget(t)) = msg.msg {
+    if let Some(coord_msg::Msg::SetTarget(t)) = target_msg.msg {
         assert_eq!(t.max_energy_milli, snap.max_energy_milli);
         assert_eq!(t.min_solutions, snap.min_solutions);
         assert_eq!(t.min_diversity_milli, snap.min_diversity_milli);
     }
 
-    // Unchanged difficulty across further polls must not re-broadcast.
+    // Unchanged head/difficulty across further polls must not re-broadcast
+    // (no reseed → no Topology/SetTarget re-push).
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
-        "unchanged difficulty must not re-broadcast SetTarget"
+        "unchanged difficulty/topology must not re-broadcast"
     );
 
     let _ = stop_tx.send(true);

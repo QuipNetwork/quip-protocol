@@ -201,6 +201,9 @@ mod tests {
             diversity_milli: 250,
             n_valid: 6,
             accepted: true,
+            selected_solutions: Vec::new(),
+            raw_best_energy_milli: -14_200,
+            stash_solutions: Vec::new(),
         };
         AttemptRecord::new(qblock_id, "cpu-0", job_id, &job, &v, is_pow, 1234)
     }

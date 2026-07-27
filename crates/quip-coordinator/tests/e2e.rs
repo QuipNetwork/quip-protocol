@@ -74,12 +74,12 @@ async fn e2e_mock_miner_pow_submit_via_fake_chain() {
     assert_eq!(topology.hash, snap.topology_hash);
 
     let deadline = now_ms() + 3_600_000;
-    let job = derive_pow_job(&snap, [1u8; 32], [2u8; 32], 1, deadline);
+    let job = derive_pow_job(&snap, [1u8; 32], [2u8; 32], 1, deadline).unwrap();
 
     // Second-generation job for cancel path.
     let mut snap2 = snap.clone();
     snap2.last_proof_block_hash = [8u8; 32];
-    let job2 = derive_pow_job(&snap2, [1u8; 32], [3u8; 32], 2, deadline);
+    let job2 = derive_pow_job(&snap2, [1u8; 32], [3u8; 32], 2, deadline).unwrap();
 
     let miner = mock_miner();
     let entry = LaunchEntry {

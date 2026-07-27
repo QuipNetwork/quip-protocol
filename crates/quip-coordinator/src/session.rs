@@ -378,13 +378,20 @@ async fn run_session<C: ChainClient>(
                     if let Some(ising) = job.ising.as_ref() {
                         let validated = validate_result(ising, &result.solutions, &gates, &topo);
                         let mut submitted = false;
+                        // Set when an accepted proof fails to submit for a
+                        // transient reason: keep it for the win-time retry loop
+                        // instead of dropping a genuine winner.
+                        let mut retain_for_retry = false;
                         if validated.accepted && beats_current(validated.best_energy_milli, best) {
                             let proof = Proof {
                                 job_id: result.job_id.clone(),
                                 best_energy_milli: validated.best_energy_milli,
                                 diversity_milli: validated.diversity_milli,
                                 n_valid: validated.n_valid,
-                                solutions: result.solutions.clone(),
+                                // Diverse gate-passing subset, capped at the
+                                // pallet's MAX_PROOF_SOLUTIONS (not all raw rows,
+                                // which would fail bounded-vec decode).
+                                solutions: validated.selected_solutions.clone(),
                                 is_pow: job.provenance.as_ref().map(|p| p.is_pow).unwrap_or(false),
                                 order_id: job
                                     .provenance
@@ -402,15 +409,31 @@ async fn run_session<C: ChainClient>(
                                     .map(|m| m.device_access_time_us)
                                     .unwrap_or(0),
                             };
-                            if let Ok(crate::chain::SubmitAction::Success) =
-                                chain.submit_proof(&proof).await
-                            {
-                                let mut st = state.lock().await;
-                                st.current_best_milli = Some(validated.best_energy_milli);
-                                if let Some(n) = submit_notify.lock().await.take() {
-                                    let _ = n.send(());
+                            use crate::chain::SubmitAction;
+                            let job_hex = crate::chain::extrinsic::hex_encode(&result.job_id);
+                            match chain.submit_proof(&proof).await {
+                                Ok(SubmitAction::Success) => {
+                                    let mut st = state.lock().await;
+                                    st.current_best_milli = Some(validated.best_energy_milli);
+                                    if let Some(n) = submit_notify.lock().await.take() {
+                                        let _ = n.send(());
+                                    }
+                                    submitted = true;
                                 }
-                                submitted = true;
+                                Ok(SubmitAction::Retry) => {
+                                    tracing::warn!(job = %job_hex, "session submit rejected (retryable); retaining accepted candidate for win-time retry");
+                                    retain_for_retry = true;
+                                }
+                                Ok(SubmitAction::StopRoundStale) => {
+                                    tracing::info!(job = %job_hex, "session submit stale for round; dropping candidate");
+                                }
+                                Ok(SubmitAction::StopFatal) => {
+                                    tracing::error!(job = %job_hex, "session submit fatally rejected by pallet; dropping candidate");
+                                }
+                                Err(e) => {
+                                    tracing::error!(job = %job_hex, error = %e, "session submit failed (transient); retaining accepted candidate for win-time retry");
+                                    retain_for_retry = true;
+                                }
                             }
                         }
                         // Record the attempt; stash sub-threshold candidates so
@@ -428,9 +451,12 @@ async fn run_session<C: ChainClient>(
 
                             // A solution below the current threshold is submitted
                             // immediately (above); one not yet viable is stashed
-                            // if the projection says the decay will clear it.
+                            // if the projection says the decay will clear it. An
+                            // accepted candidate whose submit failed transiently
+                            // (`retain_for_retry`) is also stashed so the win-time
+                            // loop resubmits it instead of losing a winner.
                             let mut stash_changed = false;
-                            if !validated.accepted {
+                            if !validated.accepted || retain_for_retry {
                                 let is_pow =
                                     job.provenance.as_ref().map(|p| p.is_pow).unwrap_or(false);
                                 let order_id = job
@@ -442,10 +468,14 @@ async fn run_session<C: ChainClient>(
                                     job_id: result.job_id.clone(),
                                     salt,
                                     generation: job.generation,
-                                    best_energy_milli: validated.best_energy_milli,
+                                    // Raw best (gate-agnostic) so the decay
+                                    // projection can decide when the easing gate
+                                    // admits it; the diverse/lowest-energy subset
+                                    // (≤ MAX_PROOF_SOLUTIONS) is what gets resubmitted.
+                                    best_energy_milli: validated.raw_best_energy_milli,
                                     diversity_milli: validated.diversity_milli,
                                     n_valid: validated.n_valid,
-                                    solutions: result.solutions.clone(),
+                                    solutions: validated.stash_solutions.clone(),
                                     is_pow,
                                     order_id,
                                     device_access_time_us: device_us,
@@ -939,7 +969,8 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                                         best_energy_milli: validated.best_energy_milli,
                                         diversity_milli: validated.diversity_milli,
                                         n_valid: validated.n_valid,
-                                        solutions: result.solutions.clone(),
+                                        // Capped diverse subset (pallet bound).
+                                        solutions: validated.selected_solutions.clone(),
                                         is_pow: job
                                             .provenance
                                             .as_ref()
@@ -958,9 +989,24 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                                             .map(|m| m.device_access_time_us)
                                             .unwrap_or(0),
                                     };
-                                    if let Ok(crate::chain::SubmitAction::Success) =
-                                        chain.submit_proof(&proof).await
-                                    {
+                                    let submit_result = chain.submit_proof(&proof).await;
+                                    if !matches!(
+                                        submit_result,
+                                        Ok(crate::chain::SubmitAction::Success)
+                                    ) {
+                                        match &submit_result {
+                                            Ok(_) => tracing::warn!(
+                                                job = %crate::chain::extrinsic::hex_encode(&result.job_id),
+                                                "submit not successful; best not advanced"
+                                            ),
+                                            Err(e) => tracing::error!(
+                                                job = %crate::chain::extrinsic::hex_encode(&result.job_id),
+                                                error = %e,
+                                                "submit failed; best not advanced"
+                                            ),
+                                        }
+                                    }
+                                    if let Ok(crate::chain::SubmitAction::Success) = submit_result {
                                         {
                                             let mut st = state.lock().await;
                                             st.current_best_milli =

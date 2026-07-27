@@ -6,6 +6,19 @@ fn sign(s: i8) -> f64 {
     }
 }
 
+/// Reference `energy_milli`: `Σ h_i·s_i + Σ j_k·s_u·s_v`, scaled to milli and
+/// truncated toward zero.
+///
+/// This SDK path accumulates in `f64` and is a **local, non-consensus** score
+/// (miner-side ranking / logging). The coordinator and chain re-score spins with
+/// integer-milli arithmetic (`quantum_validation`), which can differ from this
+/// `f64` accumulation on pathological inputs (e.g. many small terms summing with
+/// rounding). Never trust a miner-reported `energy_milli` for the accept/submit
+/// decision — the coordinator always re-scores.
+///
+/// Range edges are *not* Python-`int()`-identical: a non-finite accumulator
+/// (overflow to ±inf) returns the sentinel `1 << 62`, and finite values saturate
+/// on the `as i64` cast (Python's arbitrary-precision `int()` never saturates).
 pub fn energy_milli(spins: &[i8], h: &[f64], j: &[f64], edges: &[(usize, usize)]) -> i64 {
     let mut e = 0.0f64;
     for (i, &s) in spins.iter().enumerate() {
@@ -104,5 +117,21 @@ mod tests {
         assert_eq!(energy_milli(&[1], &[1e16], &[], &[]), i64::MAX);
         // Far past the boundary; must saturate, not panic or produce garbage.
         assert_eq!(energy_milli(&[1], &[1e308], &[], &[]), i64::MAX);
+    }
+
+    #[test]
+    fn energy_milli_saturates_at_negative_i64_boundary() {
+        // Ground states are negative-energy, so the negative overflow path is
+        // realistic; it must saturate to i64::MIN, not wrap. Mirrors the Python
+        // parity test's -1e16 case.
+        assert_eq!(energy_milli(&[1], &[-1e16], &[], &[]), i64::MIN);
+        assert_eq!(energy_milli(&[1], &[-1e308], &[], &[]), i64::MIN);
+    }
+
+    #[test]
+    fn energy_milli_non_finite_returns_sentinel() {
+        // An accumulator that overflows to +inf mid-sum returns the exact
+        // sentinel 1<<62, distinct from the i64::MAX/MIN saturation values.
+        assert_eq!(energy_milli(&[1, 1], &[1e308, 1e308], &[], &[]), 1i64 << 62);
     }
 }

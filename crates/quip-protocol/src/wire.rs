@@ -33,10 +33,17 @@ pub fn decode_i32_le(bytes: &[u8]) -> Result<Vec<i32>, WireError> {
         .collect())
 }
 
+/// Encode `{-1,+1}` spins to the one-byte wire form (`0x01`/`0xFF`).
+///
+/// Spins are `{-1,+1}` by contract. The `s > 0` boundary is deliberate: it
+/// matches [`crate::scoring::sign`] so a stray `0` maps to the same spin
+/// (`-1`/`0xFF`) in both the wire byte and the energy scorer. Using `s >= 0`
+/// here would encode `0` as `+1` while the scorer treats it as `-1`, silently
+/// disagreeing on a consensus-scored value.
 pub fn encode_spins(spins: &[i8]) -> Vec<u8> {
     spins
         .iter()
-        .map(|&s| if s >= 0 { 0x01u8 } else { 0xFFu8 })
+        .map(|&s| if s > 0 { 0x01u8 } else { 0xFFu8 })
         .collect()
 }
 
@@ -80,5 +87,33 @@ mod tests {
             decode_spins(&[0x00]),
             Err(WireError::BadSpinByte(0))
         ));
+    }
+
+    #[test]
+    fn encode_spins_zero_matches_scorer_sign() {
+        // Spins are {-1,+1} by contract, but a stray 0 must encode consistently
+        // with `scoring::sign` (which maps 0 -> -1, since it uses `s > 0`).
+        // Both now map 0 to the -1 byte, so the wire byte and the energy scorer
+        // agree on a consensus-scored value.
+        assert_eq!(encode_spins(&[0]), vec![0xFF]);
+    }
+
+    #[test]
+    fn wire_i32_roundtrip_at_i32_bounds() {
+        // i32::MIN/MAX are named load-bearing edge values for the LE codec.
+        let vals = [i32::MIN, -1, 0, 1, i32::MAX];
+        let bytes = encode_i32_le(&vals);
+        assert_eq!(decode_i32_le(&bytes).unwrap(), vals);
+        // Byte-level check of the sign boundary (little-endian).
+        assert_eq!(&encode_i32_le(&[i32::MIN]), &[0x00, 0x00, 0x00, 0x80]);
+        assert_eq!(&encode_i32_le(&[i32::MAX]), &[0xFF, 0xFF, 0xFF, 0x7F]);
+    }
+
+    #[test]
+    fn wire_empty_payload_roundtrips() {
+        assert_eq!(encode_i32_le(&[]), Vec::<u8>::new());
+        assert_eq!(decode_i32_le(&[]).unwrap(), Vec::<i32>::new());
+        assert_eq!(encode_spins(&[]), Vec::<u8>::new());
+        assert_eq!(decode_spins(&[]).unwrap(), Vec::<i8>::new());
     }
 }

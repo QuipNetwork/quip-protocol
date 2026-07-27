@@ -22,7 +22,7 @@ pub const SESSION_KEYS: &[&str] = &["num_sweeps"];
 pub fn config_override<T: PartialEq + Display>(name: &str, cli: T, from_config: Option<T>) -> T {
     match from_config {
         Some(value) if value != cli => {
-            eprintln!("config overrides {name}: {cli} -> {value} (from coordinator)");
+            tracing::warn!("config overrides {name}: {cli} -> {value} (from coordinator)");
             value
         }
         _ => cli,
@@ -42,7 +42,7 @@ where
         if SESSION_KEYS.contains(&key) {
             continue; // consumed by the session loop, not this backend
         }
-        eprintln!("config: unknown field '{key}' for {backend} (ignored)");
+        tracing::warn!("config: unknown field '{key}' for {backend} (ignored)");
     }
 }
 

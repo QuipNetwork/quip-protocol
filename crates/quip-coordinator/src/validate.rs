@@ -14,12 +14,33 @@ use quip_protocol::wire::decode_i32_le;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
+/// Upper bound on solutions packed into a submitted proof. Must not exceed the
+/// chain pallet's `QuantumPowMaxSolutions` (`BoundedVec` bound, currently 32):
+/// a proof carrying more rows fails SCALE bounded-vector decode before the
+/// extrinsic dispatches. The coordinator therefore submits only the
+/// diverse-selected subset, and the pallet re-selects within it.
+pub const MAX_PROOF_SOLUTIONS: usize = 32;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Validated {
     pub best_energy_milli: i64,
     pub diversity_milli: u32,
     pub n_valid: u32,
     pub accepted: bool,
+    /// The diverse-selected *gate-passing* solutions to submit now
+    /// (≤ [`MAX_PROOF_SOLUTIONS`]). Empty when no rows cleared the energy gate.
+    /// Packed into the immediate-submit proof instead of the raw result rows so
+    /// submissions stay within the pallet's bound.
+    pub selected_solutions: Vec<Solution>,
+    /// Minimum energy over *all* shape-valid rows, ignoring the current gate.
+    /// Unlike `best_energy_milli` (which is `i64::MAX` when nothing clears the
+    /// gate) this reflects the true best the miner found, so the decay-ratchet
+    /// stash can project when the easing gate will admit it.
+    pub raw_best_energy_milli: i64,
+    /// The lowest-energy deduped rows (≤ [`MAX_PROOF_SOLUTIONS`]) regardless of
+    /// the current gate — the candidates the stash retains for a future,
+    /// eased-threshold submission.
+    pub stash_solutions: Vec<Solution>,
 }
 
 /// Build validation gates from the session difficulty target (`SetTarget`), or
@@ -152,8 +173,33 @@ pub fn validate_result(
     gates: &QualityGates,
     topo: &ResolvedTopo,
 ) -> Validated {
-    let h_milli = decode_i32_le(&problem.h_milli_le32).unwrap_or_default();
-    let j_milli = decode_i32_le(&problem.j_milli_le32).unwrap_or_default();
+    // The problem's h/j are coordinator-authored (encoded with `encode_i32_le`
+    // when the job was built). A decode failure here therefore means the
+    // coordinator's own encoding is corrupt — surface it and reject, rather
+    // than silently scoring against a truncated (empty) problem, which would
+    // drop coupling/field terms and yield a plausible-but-wrong accept/reject.
+    let (h_milli, j_milli) = match (
+        decode_i32_le(&problem.h_milli_le32),
+        decode_i32_le(&problem.j_milli_le32),
+    ) {
+        (Ok(h), Ok(j)) => (h, j),
+        (h, j) => {
+            tracing::error!(
+                h_err = ?h.err(),
+                j_err = ?j.err(),
+                "validate_result: malformed problem wire bytes (not i32-aligned); rejecting result"
+            );
+            return Validated {
+                best_energy_milli: i64::MAX,
+                diversity_milli: 0,
+                n_valid: 0,
+                accepted: false,
+                selected_solutions: Vec::new(),
+                raw_best_energy_milli: i64::MAX,
+                stash_solutions: Vec::new(),
+            };
+        }
+    };
 
     // Position-resolved edges: inline jobs carry their own (endpoints already
     // spin indices); topology-hash jobs borrow the run constant.
@@ -204,8 +250,10 @@ pub fn validate_result(
         .collect();
     let n_valid = unique_valid_indices.len() as u32;
 
-    let (best_energy_milli, diversity_milli) = if unique_valid_indices.is_empty() {
-        (i64::MAX, 0u32)
+    let (best_energy_milli, diversity_milli, selected_solutions) = if unique_valid_indices
+        .is_empty()
+    {
+        (i64::MAX, 0u32, Vec::new())
     } else {
         // Diversity reads the valid spin vectors as `&[i8]` reinterpreted from
         // their wire bytes (0x01/0xFF -> +1/-1) — a zero-copy view, sound
@@ -215,25 +263,72 @@ pub fn validate_result(
             .map(|&i| bytemuck::cast_slice::<u8, i8>(byte_rows[i]))
             .collect();
         let target = energy_valid.len().min(gates.min_solutions.max(1) as usize);
-        let selected = select_diverse(&energy_valid, target)
-            .unwrap_or_else(|_| (0..energy_valid.len()).collect());
+        let selected = select_diverse(&energy_valid, target).unwrap_or_else(|e| {
+            // Unreachable in principle (every byte was validated during
+            // scoring); log if the invariant ever breaks instead of silently
+            // accepting the full set.
+            tracing::warn!(error = ?e, "select_diverse failed on validated spins; selecting all");
+            (0..energy_valid.len()).collect()
+        });
         let selected_spins: Vec<&[i8]> = selected.iter().map(|&i| energy_valid[i]).collect();
-        let diversity = calculate_diversity(&selected_spins).unwrap_or(0);
+        let diversity = calculate_diversity(&selected_spins).unwrap_or_else(|e| {
+            tracing::warn!(error = ?e, "calculate_diversity failed on validated spins; treating as 0");
+            0
+        });
         let best = selected
             .iter()
             .map(|&i| energies[unique_valid_indices[i]])
             .min()
             .unwrap_or(i64::MAX);
-        (best, diversity)
+        // Materialize the diverse subset (capped at the pallet bound) as the
+        // exact rows to submit, so proofs never exceed MAX_PROOF_SOLUTIONS.
+        let selected_solutions: Vec<Solution> = selected
+            .iter()
+            .take(MAX_PROOF_SOLUTIONS)
+            .map(|&i| {
+                let row = unique_valid_indices[i];
+                Solution {
+                    spins_bytes: byte_rows[row].to_vec(),
+                    energy_milli: energies[row],
+                }
+            })
+            .collect();
+        (best, diversity, selected_solutions)
     };
 
     let accepted = n_valid >= gates.min_solutions && diversity_milli >= gates.min_diversity_milli;
+
+    // Gate-agnostic view for the decay-ratchet stash: the true best energy the
+    // miner found and the lowest-energy deduped rows (capped at the pallet
+    // bound). These are what becomes viable as the difficulty eases, so they are
+    // chosen by energy rather than by the current (harder) gate.
+    let raw_best_energy_milli = energies.iter().copied().min().unwrap_or(i64::MAX);
+    let stash_solutions: Vec<Solution> = {
+        let mut idx: Vec<usize> = (0..byte_rows.len()).collect();
+        idx.sort_by_key(|&i| energies[i]);
+        let mut seen: HashSet<Vec<i8>> = HashSet::new();
+        idx.into_iter()
+            .filter(|&i| {
+                seen.insert(canonicalize_spins(bytemuck::cast_slice::<u8, i8>(
+                    byte_rows[i],
+                )))
+            })
+            .take(MAX_PROOF_SOLUTIONS)
+            .map(|i| Solution {
+                spins_bytes: byte_rows[i].to_vec(),
+                energy_milli: energies[i],
+            })
+            .collect()
+    };
 
     Validated {
         best_energy_milli,
         diversity_milli,
         n_valid,
         accepted,
+        selected_solutions,
+        raw_best_energy_milli,
+        stash_solutions,
     }
 }
 
@@ -334,6 +429,43 @@ mod tests {
         assert!(!beats_current(-500, Some(-500))); // strict <
         assert!(!beats_current(-499, Some(-500)));
         assert!(beats_current(-1, None));
+    }
+
+    #[test]
+    fn stash_view_retains_raw_best_when_gate_not_cleared() {
+        // E([1,-1]) = 1000 - (-500) - 2000 = -500 milli. Gate demands < -1000,
+        // so it does NOT clear. F7: the gate-passing best is i64::MAX, but the
+        // raw best (-500) and the candidate rows survive so the decay-ratchet
+        // stash can retain what will win once the gate eases. F1: the submit
+        // subset is capped at MAX_PROOF_SOLUTIONS.
+        let problem = IsingProblem {
+            graph: Some(ising_problem::Graph::Edges(quip_proto::v1::EdgeList {
+                u: vec![0],
+                v: vec![1],
+            })),
+            h_milli_le32: encode_i32_le(&[1000, -500]),
+            j_milli_le32: encode_i32_le(&[2000]),
+            num_reads: 1,
+            num_sweeps: 0,
+            anneal_time_us: 0,
+        };
+        let sol = Solution {
+            spins_bytes: encode_spins(&[1, -1]),
+            energy_milli: -500,
+        };
+        let gates = QualityGates {
+            min_energy_milli: -1000,
+            min_diversity_milli: 0,
+            min_solutions: 1,
+        };
+        let v = validate_result(&problem, &[sol], &gates, &ResolvedTopo::default());
+        assert!(!v.accepted);
+        assert_eq!(v.n_valid, 0);
+        assert_eq!(v.best_energy_milli, i64::MAX); // nothing cleared the gate
+        assert_eq!(v.raw_best_energy_milli, -500); // true best, for the stash
+        assert_eq!(v.stash_solutions.len(), 1); // candidate retained
+        assert!(v.selected_solutions.is_empty()); // nothing to submit now
+        assert!(v.stash_solutions.len() <= MAX_PROOF_SOLUTIONS);
     }
 
     /// Regression for quip-w5p.14: a large topology must not stall the debug

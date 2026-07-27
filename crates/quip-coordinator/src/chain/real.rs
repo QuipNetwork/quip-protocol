@@ -11,7 +11,7 @@ use super::extrinsic::{
 };
 use super::proof_encode::{build_quantum_proof, ProofBuildContext};
 use super::scale_types::{
-    encode_submit_proof_call, set_values, CurveCScale, DifficultyConfig, JobOrderScale,
+    encode_submit_proof_call, require_set_values, CurveCScale, DifficultyConfig, JobOrderScale,
     MiningSnapshotScale, OrderStatus,
 };
 use super::submit::{classify_receipt, Proof, SubmitAction};
@@ -206,9 +206,12 @@ impl ChainClient for RealChainClient {
             topology_hash: scale.topology_hash.0.to_vec(),
             nodes: scale.nodes,
             edges: scale.edges,
-            allowed_h_milli: set_values(&scale.allowed_h_values),
-            allowed_j_milli: set_values(&scale.allowed_j_values),
-            allowed_spin_milli: set_values(&scale.allowed_spin_values),
+            allowed_h_milli: require_set_values(&scale.allowed_h_values)
+                .map_err(ChainError::Decode)?,
+            allowed_j_milli: require_set_values(&scale.allowed_j_values)
+                .map_err(ChainError::Decode)?,
+            allowed_spin_milli: require_set_values(&scale.allowed_spin_values)
+                .map_err(ChainError::Decode)?,
             min_solutions: scale.difficulty.min_solutions,
             max_energy_milli: scale.difficulty.max_energy_milli,
             min_diversity_milli: scale.difficulty.min_diversity_milli,
@@ -444,7 +447,12 @@ impl ChainClient for RealChainClient {
                 Value::Array(vec![Value::String(account_ss58)]),
             )
             .await?;
-        let account_nonce = nonce_val.as_u64().unwrap_or(0) as u32;
+        let account_nonce = u32::try_from(
+            nonce_val
+                .as_u64()
+                .ok_or_else(|| ChainError::Decode("system_accountNextIndex not a u64".into()))?,
+        )
+        .map_err(|_| ChainError::Decode("account nonce exceeds u32".into()))?;
 
         let genesis = self
             .rpc_call(
@@ -465,11 +473,22 @@ impl ChainClient for RealChainClient {
         let rv = self
             .rpc_call("state_getRuntimeVersion", Value::Array(vec![]))
             .await?;
-        let spec_version = rv.get("specVersion").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let transaction_version = rv
-            .get("transactionVersion")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
+        let spec_version = u32::try_from(
+            rv.get("specVersion")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    ChainError::Decode("runtime specVersion missing/not a u64".into())
+                })?,
+        )
+        .map_err(|_| ChainError::Decode("specVersion exceeds u32".into()))?;
+        let transaction_version = u32::try_from(
+            rv.get("transactionVersion")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    ChainError::Decode("runtime transactionVersion missing/not a u64".into())
+                })?,
+        )
+        .map_err(|_| ChainError::Decode("transactionVersion exceeds u32".into()))?;
 
         let signed_ctx = SignedExtensionContext {
             account_nonce,
@@ -480,7 +499,15 @@ impl ChainClient for RealChainClient {
         };
         let ext = build_hybrid_signed_extrinsic(&pair, &call, &signed_ctx);
 
-        // Submit (watch preferred; fall back to fire-and-forget).
+        // Fire-and-forget submit via `author_submitExtrinsic`. NOTE: an `Ok`
+        // here means only that the node accepted the extrinsic into its pool —
+        // NOT that the pallet dispatched it successfully. A proof that passes
+        // signature checks can still `ExtrinsicFailed` on inclusion, and this
+        // path cannot observe that. Inclusion confirmation (author_submitAndWatch
+        // + ExtrinsicSuccess/Failed event scan) is tracked as a follow-up
+        // (quip-crj); until then callers treat `Success` as "accepted to pool"
+        // and the per-generation `current_best` reset bounds a wrong advance to a
+        // single generation.
         let submit = self
             .rpc_call(
                 "author_submitExtrinsic",
@@ -489,7 +516,13 @@ impl ChainClient for RealChainClient {
             .await;
 
         match submit {
-            Ok(_) => Ok(SubmitAction::Success),
+            Ok(tx_hash) => {
+                tracing::info!(
+                    tx = %tx_hash,
+                    "extrinsic accepted to pool (not yet confirmed included)"
+                );
+                Ok(SubmitAction::Success)
+            }
             Err(ChainError::Submit(msg)) | Err(ChainError::Unavailable(msg)) => {
                 Ok(classify_receipt(Some(&msg)))
             }
