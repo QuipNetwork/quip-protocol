@@ -11,3 +11,6 @@ crate-type = ["cdylib"]
 [dependencies]
 quip-protocol = { path = "../quip-protocol" }
 pyo3 = { version = "0.29", features = ["abi3-py311", "extension-module"] }
+
+[lints]
+workspace = true

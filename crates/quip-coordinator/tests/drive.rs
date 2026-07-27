@@ -1,12 +1,22 @@
-//! Integration: drive quip-mock-miner end-to-end over UDS with a 2-entry
+//! Integration: drive `quip-mock-miner` end-to-end over UDS with a 2-entry
 //! JSONL list, via the generalized `JobSource`-driven harness.
+
+#![expect(
+    clippy::expect_used,
+    reason = "helper builds mock miner outside #[test]"
+)]
+#![expect(clippy::unwrap_used, reason = "now_ms helper outside #[test]")]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "test wall-clock millis fit u64"
+)]
 
 use quip_coordinator::config::LaunchEntry;
 use quip_coordinator::drive::{aggregate, drain_all, DriveManyParams, ListSource};
 use quip_proto::v1::Configure;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Sibling `quip-mock-miner` binary (not same package → no CARGO_BIN_EXE_*).
+/// Sibling `quip-mock-miner` binary (not same package → no `CARGO_BIN_EXE_*`).
 fn mock_miner() -> String {
     let status = std::process::Command::new(env!("CARGO"))
         .args(["build", "-p", "quip-mock-miner"])
@@ -19,8 +29,8 @@ fn mock_miner() -> String {
         "quip-mock-miner"
     };
     let mut p = std::env::current_exe().expect("test exe path");
-    p.pop();
-    p.pop();
+    let _ = p.pop();
+    let _ = p.pop();
     p.push(name);
     p.to_string_lossy().into_owned()
 }

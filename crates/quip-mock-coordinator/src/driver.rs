@@ -15,26 +15,32 @@ use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
-/// A reject observed during the scripted session, bound to its job_id.
+/// A reject observed during the scripted session, bound to its `job_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedReject {
+    /// Job id the miner attached to the `Reject`.
     pub job_id: Vec<u8>,
+    /// Proto `RejectReason` discriminant as `i32`.
     pub reason: i32,
 }
 
-/// A `Result` observed during the scripted session: its job_id, the
+/// A `Result` observed during the scripted session: its `job_id`, the
 /// `energy_milli` of every returned solution (order preserved), and whether
 /// `SamplerMeta` was attached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedResult {
+    /// Job id the miner attached to the `Result`.
     pub job_id: Vec<u8>,
+    /// `energy_milli` of each solution, in arrival order.
     pub solution_energies_milli: Vec<i64>,
+    /// Whether `SamplerMeta` was present on the `Result`.
     pub meta_present: bool,
 }
 
 /// Outcome of driving one miner through the conformance session.
 #[derive(Debug, Clone)]
 pub struct DriverReport {
+    /// True when the first inbound message was a valid `Hello`.
     pub handshake_ok: bool,
     /// True when a `Ready` arrived after `Configure` was sent.
     pub ready_received: bool,
@@ -48,6 +54,7 @@ pub struct DriverReport {
     pub cancel_acked: bool,
     /// `(exit_code, reason)` from a `Fatal`, if the miner sent one.
     pub fatal: Option<(i32, String)>,
+    /// Process exit code of the spawned miner binary.
     pub exit_code: i32,
 }
 
@@ -60,6 +67,7 @@ impl DriverReport {
     }
 
     /// Full conformance verdict — every axis the harness grades.
+    #[must_use]
     pub fn is_conformant(&self) -> bool {
         self.handshake_ok
             && self.ready_received
@@ -87,6 +95,8 @@ impl DriverReport {
                 .all(|r| !r.solution_energies_milli.is_empty() && r.meta_present)
     }
 
+    /// True when a `Reject` with the given `job_id` and `reason` was observed.
+    #[must_use]
     pub fn has_reject(&self, job_id: &[u8], reason: RejectReason) -> bool {
         self.rejects
             .iter()
@@ -134,7 +144,7 @@ impl MinerService for MockCoordinator {
         let outcome_tx = self.outcome_tx.lock().await.take();
         let script = self.script;
 
-        tokio::spawn(async move {
+        let _handle = tokio::spawn(async move {
             let outcome = match script {
                 ScriptKind::Full => run_script(&mut inbound, &tx).await,
                 ScriptKind::BadWelcome => run_script_bad_welcome(&mut inbound, &tx).await,
@@ -149,10 +159,16 @@ impl MinerService for MockCoordinator {
 }
 
 fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "unix epoch millis fit in u64 for practical wall-clock times"
+    )]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
 }
 
 /// Build a `CoordMsg` from a oneof payload. Callers wrap it in `Ok` for the
@@ -249,13 +265,19 @@ async fn drain_replies(inbound: &mut Streaming<MinerMsg>, outcome: &mut SessionO
             // This script only emits Status as the Cancel acknowledgement
             // (no Ping), so any Status counts as the cancel ack.
             miner_msg::Msg::Status(_) => outcome.cancel_acked = true,
-            miner_msg::Msg::Fatal(f) => outcome.fatal = Some((f.exit_code as i32, f.reason)),
-            _ => {}
+            miner_msg::Msg::Fatal(f) => {
+                outcome.fatal = Some((f.exit_code.cast_signed(), f.reason));
+            }
+            miner_msg::Msg::Hello(_) => {}
         }
     }
 }
 
-/// Drive the full scripted CoordMsg sequence and collect the miner's replies.
+/// Drive the full scripted `CoordMsg` sequence and collect the miner's replies.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single scripted session walk kept linear for readability"
+)]
 async fn run_script(
     inbound: &mut Streaming<MinerMsg>,
     tx: &mpsc::Sender<Result<CoordMsg, Status>>,
@@ -427,6 +449,10 @@ async fn run_script_bad_welcome(
 async fn drive_miner_with_script(bin_path: &str, socket: &str, script: ScriptKind) -> DriverReport {
     let path = socket.strip_prefix("unix://").unwrap_or(socket).to_string();
     let _ = std::fs::remove_file(&path);
+    #[expect(
+        clippy::expect_used,
+        reason = "test harness panics on bind failure rather than restructuring error flow"
+    )]
     let uds = UnixListener::bind(&path).expect("bind unix socket");
     let incoming = UnixListenerStream::new(uds);
 
@@ -442,6 +468,10 @@ async fn drive_miner_with_script(bin_path: &str, socket: &str, script: ScriptKin
             .await
     });
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test harness panics on spawn failure rather than restructuring error flow"
+    )]
     let mut child = Command::new(bin_path)
         .arg("--quip-coordinator")
         .arg(socket)
@@ -454,20 +484,24 @@ async fn drive_miner_with_script(bin_path: &str, socket: &str, script: ScriptKin
     // Bound the wait so a hung miner can't hang the test suite; on timeout,
     // kill the child and report a sentinel exit code so callers fail loudly
     // instead of blocking forever.
-    let exit_code =
-        match tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await {
-            Ok(status) => status.expect("wait for miner").code().unwrap_or(-1),
-            Err(_) => {
-                let _ = child.kill().await;
-                -1
-            }
-        };
+    let exit_code = if let Ok(status) =
+        tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await
+    {
+        #[expect(
+            clippy::expect_used,
+            reason = "test harness panics if wait fails after spawn succeeded"
+        )]
+        status.expect("wait for miner").code().unwrap_or(-1)
+    } else {
+        let _ = child.kill().await;
+        -1
+    };
     // The session handler sends the outcome as the miner closes its stream on
     // exit; the timeout guards a miner that dies before ever connecting.
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), orx)
         .await
         .ok()
-        .and_then(|r| r.ok())
+        .and_then(Result::ok)
         .unwrap_or_default();
     server.abort();
     let _ = std::fs::remove_file(&path);
@@ -568,6 +602,10 @@ mod tests {
 
         // Empty solutions on one Result -> fails, even though meta is present.
         let mut empty_solutions = full_results();
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "full_results always has length 3; index 0 is in bounds"
+        )]
         empty_solutions[0].solution_energies_milli.clear();
         let mut r_empty = bare_report();
         r_empty.results = empty_solutions;
@@ -578,7 +616,13 @@ mod tests {
 
         // Missing meta on one Result -> fails, even though solutions are present.
         let mut missing_meta = full_results();
-        missing_meta[1].meta_present = false;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "full_results always has length 3; index 1 is in bounds"
+        )]
+        {
+            missing_meta[1].meta_present = false;
+        }
         let mut r_meta = bare_report();
         r_meta.results = missing_meta;
         assert!(

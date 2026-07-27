@@ -94,10 +94,16 @@ pub(crate) const DEFAULT_NUM_SWEEPS: usize = 64;
 const GIBBS_SWEEP_MULTIPLIER: u32 = 2;
 
 pub(crate) fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "unix ms since epoch fits u64 for the lifetime of this protocol"
+    )]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
 }
 
 /// Fresh per-job seed from OS entropy. Two jobs issued in the same
@@ -105,7 +111,13 @@ pub(crate) fn now_unix_ms() -> u64 {
 /// would cause (miner-core is shared by cpu/cuda/metal).
 fn os_seed() -> u64 {
     let mut bytes = [0u8; 8];
-    getrandom::getrandom(&mut bytes).expect("os rng");
+    #[expect(
+        clippy::expect_used,
+        reason = "OS CSPRNG failure is unrecoverable at process level; seed is required"
+    )]
+    {
+        getrandom::getrandom(&mut bytes).expect("os rng");
+    }
     u64::from_le_bytes(bytes)
 }
 
@@ -119,7 +131,7 @@ pub(crate) fn status_msg(miner_id: &str, jobs_done: u64, utilization: f64) -> Mi
         utilization,
         jobs_done,
         abandoned_generation: 0,
-        sampler_stats: Default::default(),
+        sampler_stats: HashMap::default(),
     }))
 }
 
@@ -134,7 +146,7 @@ pub(crate) fn reject(job_id: Vec<u8>, reason: RejectReason) -> MinerMsg {
 fn decode_milli_f64(bytes: &[u8]) -> Result<Vec<f64>, WireError> {
     Ok(decode_i32_le(bytes)?
         .iter()
-        .map(|&v| v as f64 / 1000.0)
+        .map(|&v| f64::from(v) / 1000.0)
         .collect())
 }
 
@@ -228,7 +240,7 @@ pub(crate) enum Prepared {
 }
 
 /// Validate + resolve one job: reject reasons short-circuit; otherwise resolve
-/// the sampling budget (per-job override > SetTarget override > adapt > default)
+/// the sampling budget (per-job override > `SetTarget` override > adapt > default)
 /// and return a [`StreamJob`] for the streaming sampler.
 pub(crate) fn prepare_job<S: Sampler>(
     job: Job,
@@ -251,9 +263,8 @@ pub(crate) fn prepare_job<S: Sampler>(
     if job.deadline_ms != 0 && job.deadline_ms < now_unix_ms() {
         return Prepared::Reject(reject(job_id, RejectReason::Expired));
     }
-    let ising = match job.ising {
-        Some(i) => i,
-        None => return Prepared::Reject(reject(job_id, RejectReason::Malformed)),
+    let Some(ising) = job.ising else {
+        return Prepared::Reject(reject(job_id, RejectReason::Malformed));
     };
 
     let graph = match parse_ising(&ising, id.max_nodes, id.max_edges, cache) {
@@ -277,6 +288,10 @@ pub(crate) fn prepare_job<S: Sampler>(
     let t_reads = target.map_or(0, |t| t.num_reads);
     let t_sweeps = target.map_or(0, |t| t.num_sweeps);
     let num_reads = pick_param(ising.num_reads, t_reads, adapt.map(|a| a.num_reads), 1);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "default_sweeps comes from config/CLI and is a small sweep budget well under u32::MAX"
+    )]
     let num_sweeps = pick_param(
         ising.num_sweeps,
         t_sweeps,
@@ -359,7 +374,7 @@ pub(crate) fn finalize_result(
             sweeps: num_sweeps,
             device_access_time_us: sr.device_access_time_us,
             qpu_access_us: 0,
-            extra: Default::default(),
+            extra: HashMap::default(),
         }),
     };
 
@@ -379,7 +394,7 @@ mod tests {
 
     struct StubSampler;
 
-    impl crate::Sampler for StubSampler {
+    impl Sampler for StubSampler {
         fn sample(
             &self,
             _graph: &IsingGraph,
@@ -590,8 +605,14 @@ mod tests {
             panic!("expected Sample");
         };
 
-        assert_eq!(sa_sweeps, default_sweeps as u32);
-        assert_eq!(gibbs_sweeps, sa_sweeps * GIBBS_SWEEP_MULTIPLIER);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "test default_sweeps is a small constant well under u32::MAX"
+        )]
+        {
+            assert_eq!(sa_sweeps, default_sweeps as u32);
+            assert_eq!(gibbs_sweeps, sa_sweeps * GIBBS_SWEEP_MULTIPLIER);
+        }
     }
 
     #[test]

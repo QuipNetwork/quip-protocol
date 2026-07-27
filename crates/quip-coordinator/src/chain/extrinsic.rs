@@ -9,11 +9,15 @@ use sp_core::Pair as _;
 /// Chain state required to build signed-extension extras / additional.
 #[derive(Clone, Debug)]
 pub struct SignedExtensionContext {
+    /// Account nonce for `CheckNonce`.
     pub account_nonce: u32,
+    /// Genesis block hash (also used for immortal era).
     pub genesis_hash: [u8; 32],
+    /// Runtime `spec_version`.
     pub spec_version: u32,
+    /// Runtime `transaction_version`.
     pub transaction_version: u32,
-    /// Tip in plancks (Compact<u128> on the wire).
+    /// Tip in plancks (`Compact<u128>` on the wire).
     pub tip: u128,
 }
 
@@ -29,6 +33,7 @@ pub struct SignedExtensionContext {
 /// Signing payload = `call || extra || additional`, blake2_256-hashed when
 /// longer than 256 bytes. The hybrid pair applies its own domain prefix
 /// inside `HybridTxSignature::sign`.
+#[must_use]
 pub fn build_hybrid_signed_extrinsic(
     pair: &HybridPair,
     call_bytes: &[u8],
@@ -65,6 +70,10 @@ pub fn build_hybrid_signed_extrinsic(
     body.extend_from_slice(&extra);
     body.extend_from_slice(call_bytes);
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "signed extrinsic body length is far below u32::MAX"
+    )]
     let mut full = Compact(body.len() as u32).encode();
     full.extend_from_slice(&body);
     full
@@ -82,7 +91,7 @@ fn encode_extra(nonce: u32, tip: u128) -> Vec<u8> {
     out
 }
 
-/// Signed-extension additional_signed in metadata order.
+/// Signed-extension `additional_signed` in metadata order.
 fn encode_additional(
     spec_version: u32,
     transaction_version: u32,
@@ -98,6 +107,7 @@ fn encode_additional(
 }
 
 /// Hex-encode bytes with a `0x` prefix (for RPC params).
+#[must_use]
 pub fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(2 + bytes.len() * 2);
     s.push_str("0x");
@@ -109,6 +119,9 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Decode a `0x`-optional hex string.
+///
+/// # Errors
+/// Returns an error when the hex string has odd length or a non-hex nibble.
 pub fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     if !s.len().is_multiple_of(2) {
@@ -122,6 +135,10 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
 
 /// Load a hybrid pair from a Python-compatible keystore JSON path, a raw
 /// 32-byte hex seed, or a `//DevUri` string.
+///
+/// # Errors
+/// Returns an error when the path cannot be read/parsed, the seed is not 32
+/// bytes, or a `//` URI fails to derive a pair.
 pub fn load_hybrid_pair(signer_key: &str) -> Result<HybridPair, String> {
     let path = std::path::Path::new(signer_key);
     if path.exists() {
@@ -165,6 +182,7 @@ pub fn load_hybrid_pair(signer_key: &str) -> Result<HybridPair, String> {
 /// Matches the pallet: `blake2_256(account.encode())` where account is the
 /// SCALE-encoded `AccountId32` (32 raw bytes, no length prefix beyond the
 /// fixed array encoding).
+#[must_use]
 pub fn miner_identity_bytes(pair: &HybridPair) -> [u8; 32] {
     let account = account_id_from_public(&pair.public());
     // AccountId32 SCALE-encodes as the raw 32 bytes.
@@ -172,6 +190,7 @@ pub fn miner_identity_bytes(pair: &HybridPair) -> [u8; 32] {
 }
 
 /// Substrate storage key for `QuantumComputeMempool.JobOrders(order_id)`.
+#[must_use]
 pub fn job_orders_storage_key(order_id: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(16 + 16 + 16 + 8);
     key.extend_from_slice(&twox128(b"QuantumComputeMempool"));
@@ -183,7 +202,7 @@ pub fn job_orders_storage_key(order_id: u64) -> Vec<u8> {
     key
 }
 
-/// `QuantumPow` Blake2_128Concat storage-map key for a 32-byte topology hash
+/// `QuantumPow` `Blake2_128Concat` storage-map key for a 32-byte topology hash
 /// (`H256` encodes as its raw 32 bytes, no length prefix).
 fn quantum_pow_map_key(item: &[u8], topology_hash: &[u8; 32]) -> Vec<u8> {
     let mut key = Vec::with_capacity(16 + 16 + 16 + 32);
@@ -195,17 +214,20 @@ fn quantum_pow_map_key(item: &[u8], topology_hash: &[u8; 32]) -> Vec<u8> {
 }
 
 /// `QuantumPow::Difficulties[topology_hash]` — base (un-decayed) `DifficultyConfig`.
+#[must_use]
 pub fn difficulties_storage_key(topology_hash: &[u8; 32]) -> Vec<u8> {
     quantum_pow_map_key(b"Difficulties", topology_hash)
 }
 
 /// `QuantumPow::TopologyCurveC[topology_hash]` — per-topology c-triple override.
+#[must_use]
 pub fn topology_curve_c_storage_key(topology_hash: &[u8; 32]) -> Vec<u8> {
     quantum_pow_map_key(b"TopologyCurveC", topology_hash)
 }
 
 /// `QuantumPow::LastProofBlock` — plain `StorageValue` (block number of the last
 /// winning proof).
+#[must_use]
 pub fn last_proof_block_storage_key() -> Vec<u8> {
     let mut key = Vec::with_capacity(32);
     key.extend_from_slice(&twox128(b"QuantumPow"));
@@ -229,10 +251,20 @@ fn twox128(data: &[u8]) -> [u8; 16] {
 fn blake2_128(data: &[u8]) -> [u8; 16] {
     use blake2::digest::{Update, VariableOutput};
     use blake2::Blake2bVar;
+    #[expect(
+        clippy::expect_used,
+        reason = "Blake2bVar::new(16) is infallible for a fixed 16-byte digest"
+    )]
     let mut hasher = Blake2bVar::new(16).expect("16-byte blake2b");
     hasher.update(data);
     let mut out = [0u8; 16];
-    hasher.finalize_variable(&mut out).expect("finalize");
+    #[expect(
+        clippy::expect_used,
+        reason = "finalize into a 16-byte buffer matching the hasher size"
+    )]
+    {
+        hasher.finalize_variable(&mut out).expect("finalize");
+    }
     out
 }
 
@@ -265,9 +297,15 @@ mod tests {
         // still starts with 0x84 after the compact prefix.
         assert!(ext.len() > 100, "extrinsic too short: {}", ext.len());
         // Find signed version byte: after compact length.
-        let body_start = compact_len_bytes(ext[0]);
-        assert_eq!(ext[body_start], 0x84);
-        assert_eq!(ext[body_start + 1], 0x00); // MultiAddress::Id
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "extrinsic is asserted >100 bytes; compact prefix is 1–5 bytes"
+        )]
+        {
+            let body_start = compact_len_bytes(ext[0]);
+            assert_eq!(ext[body_start], 0x84);
+            assert_eq!(ext[body_start + 1], 0x00); // MultiAddress::Id
+        }
     }
 
     #[test]

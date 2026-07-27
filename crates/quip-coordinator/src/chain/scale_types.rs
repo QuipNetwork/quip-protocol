@@ -4,6 +4,14 @@
 //! polkadot-sdk git + full FRAME). Layout must stay byte-identical to
 //! `pallet_quantum_pow` / `pallet_quantum_compute_mempool`.
 
+// SCALE `Encode` for multi-field enum variants emits `index as u8` in a
+// derived impl; the lint span points at the variant but attributes on the
+// enum do not cover the sibling impl, so suppress at module scope.
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "SCALE Encode writes enum discriminants as u8; pallet enums are tiny"
+)]
+
 use parity_scale_codec::{Decode, Encode};
 use quantum_validation::AllowedValueSpec;
 use sp_core::{H256, U256};
@@ -11,8 +19,11 @@ use sp_core::{H256, U256};
 /// On-wire difficulty config (matches pallet `DifficultyConfig`).
 #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
 pub struct DifficultyConfig {
+    /// Minimum valid solutions required.
     pub min_solutions: u32,
+    /// Energy ceiling in milli units (solutions must be strictly below).
     pub max_energy_milli: i64,
+    /// Minimum diversity of the solution set in milli units.
     pub min_diversity_milli: u32,
 }
 
@@ -20,8 +31,11 @@ pub struct DifficultyConfig {
 /// stored under `TopologyCurveC[topology_hash]`. Field order is the pallet's.
 #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
 pub struct CurveCScale {
+    /// Easy-regime curve c (per-mille).
     pub easy_milli: u32,
+    /// Knee-regime curve c (per-mille).
     pub knee_milli: u32,
+    /// Hard-regime curve c (per-mille).
     pub hard_milli: u32,
 }
 
@@ -30,13 +44,21 @@ pub struct CurveCScale {
 /// Note: no `block_number` field — callers fetch the header separately.
 #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
 pub struct MiningSnapshotScale {
+    /// Hash of the block that contained the last winning proof.
     pub last_proof_block_hash: H256,
+    /// Current (possibly decayed) difficulty gates.
     pub difficulty: DifficultyConfig,
+    /// Topology identity hash.
     pub topology_hash: H256,
+    /// Topology node ids.
     pub nodes: Vec<u32>,
+    /// Topology undirected edges as `(u, v)` node-id pairs.
     pub edges: Vec<(u32, u32)>,
+    /// Allowed linear-field values.
     pub allowed_h_values: AllowedValueSpec<Vec<i32>>,
+    /// Allowed coupling values.
     pub allowed_j_values: AllowedValueSpec<Vec<i32>>,
+    /// Allowed spin values.
     pub allowed_spin_values: AllowedValueSpec<Vec<i32>>,
 }
 
@@ -48,54 +70,84 @@ pub struct MiningSnapshotScale {
 /// observability, unverifiable; `0` = unreported).
 #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
 pub struct QuantumProof {
+    /// Topology the proof was mined for.
     pub topology_hash: H256,
+    /// Derived `PoW` nonce.
     pub nonce: U256,
+    /// 32-byte salt used in nonce derivation.
     pub salt: [u8; 32],
+    /// Bit-packed spin vectors.
     pub solutions: Vec<Vec<u8>>,
+    /// Miner-reported device access time in microseconds (`0` = unreported).
     pub device_access_time_us: u64,
 }
 
 /// Ising params nested in a mempool `JobOrder`.
 #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
 pub struct IsingParams {
+    /// Topology node ids.
     pub nodes: Vec<u32>,
+    /// Topology undirected edges as `(u, v)` node-id pairs.
     pub edges: Vec<(u32, u32)>,
+    /// Per-node linear fields (aligned with `nodes`).
     pub h_values: Vec<i32>,
+    /// Per-edge couplings (aligned with `edges`).
     pub j_values: Vec<i32>,
+    /// Optional energy gate.
     pub min_energy_milli: Option<i64>,
+    /// Optional diversity gate.
     pub min_diversity_milli: Option<u32>,
+    /// Optional minimum solution count.
     pub min_solutions: Option<u32>,
 }
 
-/// Order timing (BlockNumber = u32 on the default runtime).
+/// Order timing (`BlockNumber` = `u32` on the default runtime).
 #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
 pub struct OrderTiming {
+    /// Blocks until the order expires.
     pub deadline_blocks: u32,
+    /// Blocks to wait after first solution before closing.
     pub block_wait: u32,
 }
 
 /// Minimal status enum (SCALE tag order must match the pallet).
 #[derive(Clone, Copy, Debug, Encode, Decode, PartialEq, Eq)]
 pub enum OrderStatus {
+    /// Order is open for solutions.
     Opened,
+    /// Order expired without closing.
     Expired,
+    /// Order closed (rewarded / settled).
     Closed,
 }
 
 /// Reward resolution enum (SCALE tag order must match the pallet).
 #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
 pub enum RewardResolution {
+    /// Winner-take-all on best energy.
     SingleBest,
-    TopNWeighted { n: u32 },
-    TopNEqual { n: u32 },
+    /// Weighted split across top-`n` solutions.
+    TopNWeighted {
+        /// Number of top solutions that share the reward.
+        n: u32,
+    },
+    /// Equal split across top-`n` solutions.
+    TopNEqual {
+        /// Number of top solutions that share the reward.
+        n: u32,
+    },
 }
 
 /// Job mode enum. Bid carries optional account / miner-type filters.
 #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
 pub enum JobMode {
+    /// Any registered miner may answer.
     Open,
+    /// Restricted bid with optional miner and type filters.
     Bid {
+        /// Allowed miner account ids (`AccountId32` raw bytes).
         miners: Option<Vec<[u8; 32]>>,
+        /// Allowed miner-type tags.
         miner_types: Option<Vec<u8>>,
     },
 }
@@ -103,33 +155,56 @@ pub enum JobMode {
 /// Result delivery enum.
 #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
 pub enum ResultDelivery {
+    /// Results stay on-chain only.
     OnChainOnly,
-    Callback { endpoint: Vec<u8> },
-    CallbackWithPoll { endpoint: Vec<u8> },
+    /// Push results to a callback endpoint.
+    Callback {
+        /// Callback endpoint bytes.
+        endpoint: Vec<u8>,
+    },
+    /// Callback plus poll-for-result path.
+    CallbackWithPoll {
+        /// Callback endpoint bytes.
+        endpoint: Vec<u8>,
+    },
 }
 
-/// Full on-chain `JobOrder` (AccountId32 / Balance=u128 / BlockNumber=u32).
+/// Full on-chain `JobOrder` (`AccountId32` / `Balance=u128` / `BlockNumber=u32`).
 #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
 pub struct JobOrderScale {
+    /// Spec / topology identity.
     pub spec_id: H256,
+    /// Proposer account (`AccountId32` raw bytes).
     pub proposer: [u8; 32],
+    /// Nested Ising problem statement.
     pub ising_params: IsingParams,
+    /// Reward amount in plancks.
     pub reward: u128,
+    /// Open vs bid mode.
     pub mode: JobMode,
+    /// How the reward is split among winners.
     pub resolution: RewardResolution,
+    /// Deadline and wait timing.
     pub timing: OrderTiming,
+    /// How results are delivered.
     pub delivery: ResultDelivery,
+    /// Current order status.
     pub status: OrderStatus,
+    /// Block number when the order was created.
     pub created_at: u32,
+    /// Block of the first accepted solution, if any.
     pub first_solution_at: Option<u32>,
+    /// Number of solutions accepted so far.
     pub solution_count: u32,
 }
 
-/// Call indices for hand-assembled extrinsics (from runtime construct).
+/// Pallet index of `QuantumPow` in the runtime construct.
 pub const QUANTUM_POW_PALLET_INDEX: u8 = 10;
+/// Call index of `submit_proof` within `QuantumPow`.
 pub const SUBMIT_PROOF_CALL_INDEX: u8 = 4;
 
 /// SCALE-encode the `QuantumPow.submit_proof(proof)` call body.
+#[must_use]
 pub fn encode_submit_proof_call(proof: &QuantumProof) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(QUANTUM_POW_PALLET_INDEX);
@@ -141,7 +216,7 @@ pub fn encode_submit_proof_call(proof: &QuantumProof) -> Vec<u8> {
 
 /// Require an `AllowedValueSpec::Set` and return its (non-empty) values.
 ///
-/// The coordinator draws PoW models with [`draw_ising_milli`] over a discrete
+/// The coordinator draws `PoW` models with [`draw_ising_milli`] over a discrete
 /// allowed set. The chain's `generate_ising_model` samples `IntegerRange` /
 /// `ContinuousRange` specs with a *different* RNG consumption (see
 /// `quantum_validation::AllowedValueSpec::sample`), so a coordinator-side
@@ -243,10 +318,16 @@ mod tests {
             device_access_time_us: 0,
         };
         let call = encode_submit_proof_call(&proof);
-        assert_eq!(call[0], QUANTUM_POW_PALLET_INDEX);
-        assert_eq!(call[1], SUBMIT_PROOF_CALL_INDEX);
-        // Remainder is the proof encoding.
-        assert_eq!(&call[2..], &proof.encode());
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "call always starts with pallet+call index bytes"
+        )]
+        {
+            assert_eq!(call[0], QUANTUM_POW_PALLET_INDEX);
+            assert_eq!(call[1], SUBMIT_PROOF_CALL_INDEX);
+            // Remainder is the proof encoding.
+            assert_eq!(&call[2..], &proof.encode());
+        }
     }
 
     #[test]
@@ -320,6 +401,10 @@ mod tests {
         let enc = valid_job_order_bytes();
         // Chop the tail: the later fields (timing/status/counts) can no longer
         // be decoded.
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "enc is a full JobOrderScale encode; len-4 is in bounds"
+        )]
         let truncated = &enc[..enc.len() - 4];
         assert!(JobOrderScale::decode(&mut &truncated[..]).is_err());
     }
@@ -339,8 +424,14 @@ mod tests {
         let enc = valid_job_order_bytes();
         for i in 0..enc.len() {
             let mut bad = enc.clone();
-            bad[i] = 0xFF; // 0xFF is out of range for every enum in the struct
-                           // Must return Ok or Err, never panic (the point of the guard).
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "i iterates 0..enc.len(); in-bounds by construction"
+            )]
+            {
+                bad[i] = 0xFF; // 0xFF is out of range for every enum in the struct
+            }
+            // Must return Ok or Err, never panic (the point of the guard).
             let _ = JobOrderScale::decode(&mut &bad[..]);
         }
     }

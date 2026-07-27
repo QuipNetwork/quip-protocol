@@ -1,4 +1,21 @@
-//! End-to-end: coordinator drives quip-mock-miner with FakeChain.
+//! End-to-end: coordinator drives `quip-mock-miner` with `FakeChain`.
+
+#![expect(
+    clippy::expect_used,
+    reason = "helper builds mock miner outside #[test]"
+)]
+#![expect(
+    clippy::unwrap_used,
+    reason = "now_ms / config helpers outside #[test]"
+)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "test wall-clock millis fit u64"
+)]
+#![expect(
+    clippy::indexing_slicing,
+    reason = "config launch table is fixture-sized"
+)]
 
 use quip_coordinator::chain::{FakeChain, MiningSnapshot};
 use quip_coordinator::config::{parse_config, LaunchEntry};
@@ -21,8 +38,8 @@ fn mock_miner() -> String {
         "quip-mock-miner"
     };
     let mut p = std::env::current_exe().expect("test exe path");
-    p.pop();
-    p.pop();
+    let _ = p.pop();
+    let _ = p.pop();
     p.push(name);
     p.to_string_lossy().into_owned()
 }

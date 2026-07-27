@@ -13,3 +13,6 @@ tokio-stream = { version = "0.1", features = ["net"] }
 tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
 clap = { version = "4", features = ["derive"] }
+
+[lints]
+workspace = true

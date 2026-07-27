@@ -1,4 +1,4 @@
-//! Derive PoW `Job`s from mining snapshots via golden-pinned ChaCha8 + derive_nonce.
+//! Derive `PoW` [`Job`]s from mining snapshots via golden-pinned `ChaCha8` + `derive_nonce`.
 
 use crate::chain::snapshot::MiningSnapshot;
 use quip_proto::v1::{ising_problem, IsingProblem, Job, JobKind, Provenance};
@@ -6,9 +6,9 @@ use quip_protocol::chacha8::{draw_ising_milli, DrawError};
 use quip_protocol::derive::derive_nonce;
 use quip_protocol::wire::encode_i32_le;
 
-/// Build an `ISING_SAMPLE` PoW job from a snapshot, miner account, and salt.
+/// Build an `ISING_SAMPLE` `PoW` job from a snapshot, miner account, and salt.
 ///
-/// Uses `derive_nonce` + `draw_ising_milli` (golden-pinned). Graph is a
+/// Uses [`derive_nonce`] + [`draw_ising_milli`] (golden-pinned). Graph is a
 /// `topology_hash` reference; gates come from the snapshot difficulty.
 ///
 /// # Errors

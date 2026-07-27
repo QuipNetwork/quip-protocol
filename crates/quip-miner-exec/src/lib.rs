@@ -71,6 +71,11 @@ pub struct ExecSampler {
 impl ExecSampler {
     /// Build from the raw `--solver-cmd` template. Fails if the template is not
     /// a valid command, or (in file mode) lacks the `{model}` placeholder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when `solver_cmd` is empty/unparseable, or when
+    /// file mode is requested without a `{model}` placeholder.
     pub fn new(solver_cmd: &str, timeout_ms: u64, use_stdin: bool) -> Result<Self, String> {
         let argv_template = shlex::split(solver_cmd)
             .ok_or_else(|| format!("--solver-cmd is not a valid command: {solver_cmd:?}"))?;
@@ -150,8 +155,8 @@ fn run_solver(
 ) -> Result<Vec<u8>, RejectReason> {
     let (prog, args) = argv.split_first().ok_or(RejectReason::Malformed)?;
     let mut cmd = Command::new(prog);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::null());
-    cmd.stdin(if stdin_bytes.is_some() {
+    let _ = cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::null());
+    let _ = cmd.stdin(if stdin_bytes.is_some() {
         Stdio::piped()
     } else {
         Stdio::null()
@@ -249,9 +254,8 @@ mod tests {
     #[test]
     fn render_argv_substitutes_every_model_token() {
         let tmpl: Vec<String> = ["solver", "--model={model}", "{model}", "--reads=8"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+            .map(str::to_owned)
+            .to_vec();
         let got = render_argv(&tmpl, Path::new("/tmp/m.json"));
         assert_eq!(
             got,
@@ -265,9 +269,15 @@ mod tests {
             br#"[{"spins":[1,-1],"energy_milli":-14000},{"spins":[-1,-1],"energy_milli":-1}]"#;
         let got = parse_solutions(json, 2).expect("valid");
         assert_eq!(got.len(), 2);
-        assert_eq!(got[0].spins, vec![1i8, -1]);
-        assert_eq!(got[0].energy_milli, -14000);
-        assert_eq!(got[1].energy_milli, -1);
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "fixture yields two solutions; indices 0 and 1 are in bounds"
+        )]
+        {
+            assert_eq!(got[0].spins, vec![1i8, -1]);
+            assert_eq!(got[0].energy_milli, -14000);
+            assert_eq!(got[1].energy_milli, -1);
+        }
     }
 
     #[test]
@@ -307,10 +317,16 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_slice(&serde_json::to_vec(&ModelJson::new(&graph, &params)).unwrap())
                 .unwrap();
-        assert_eq!(v["h"], serde_json::json!([1.0, -1.0]));
-        assert_eq!(v["edges"], serde_json::json!([[0, 1]]));
-        assert_eq!(v["num_reads"], 8);
-        assert_eq!(v["beta_range"], serde_json::json!([0.1, 3.0]));
-        assert_eq!(v["seed"], 7);
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "serialized model always includes these fixed schema keys"
+        )]
+        {
+            assert_eq!(v["h"], serde_json::json!([1.0, -1.0]));
+            assert_eq!(v["edges"], serde_json::json!([[0, 1]]));
+            assert_eq!(v["num_reads"], 8);
+            assert_eq!(v["beta_range"], serde_json::json!([0.1, 3.0]));
+            assert_eq!(v["seed"], 7);
+        }
     }
 }

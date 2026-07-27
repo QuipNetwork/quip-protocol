@@ -31,6 +31,7 @@ impl TimingTracker {
     /// `fallback_interval_s` seeds `interval_s` until two heads give a real
     /// observation; `lag_min_s`/`lag_max_s` clamp the measured lag; `ema_alpha`
     /// weights each new observation.
+    #[must_use]
     pub fn new(fallback_interval_s: f64, lag_min_s: f64, lag_max_s: f64, ema_alpha: f64) -> Self {
         Self {
             lag_min_s,
@@ -48,6 +49,7 @@ impl TimingTracker {
 
     /// Defaults matching v0.2: 6s fallback interval, lag clamped to [0, 12]s,
     /// EMA alpha 0.3.
+    #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(6.0, 0.0, 12.0, 0.3)
     }
@@ -64,6 +66,10 @@ impl TimingTracker {
     ) {
         if let Some(prev) = self.prev_block {
             if block_number > prev && chain_ts_s > self.prev_chain_ts_s {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "block delta is small; used only as f64 interval divisor"
+                )]
                 let observed = (chain_ts_s - self.prev_chain_ts_s) / (block_number - prev) as f64;
                 if self.have_interval {
                     self.interval_s =
@@ -91,20 +97,33 @@ impl TimingTracker {
     /// Estimate the current chain block from the monotonic anchor + interval:
     /// `anchor_block + floor((now - anchor_monotonic) / interval)`. `None` until
     /// a head has been observed; never below the anchor block.
+    #[must_use]
     pub fn estimate_block(&self, now_monotonic: f64) -> Option<u64> {
         let anchor = self.anchor_block?;
         if self.interval_s <= 0.0 {
             return None;
         }
         let elapsed = (now_monotonic - self.anchor_monotonic_s).max(0.0);
-        Some(anchor + (elapsed / self.interval_s) as u64)
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "elapsed/interval is non-negative; block estimate truncates toward zero"
+        )]
+        {
+            Some(anchor + (elapsed / self.interval_s) as u64)
+        }
     }
 
     /// Monotonic deadline to fire for target block `b_star`:
     /// `anchor_monotonic + (b_star - anchor_block) * interval - lag`. `None`
     /// until a head has been observed; may be ≤ now (fire immediately).
+    #[must_use]
     pub fn fire_deadline_monotonic(&self, b_star: u64) -> Option<f64> {
         let anchor = self.anchor_block?;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "block numbers used as f64 magnitudes for deadline math"
+        )]
         let chain_delta = (b_star as f64 - anchor as f64) * self.interval_s;
         Some(self.anchor_monotonic_s + chain_delta - self.lag_s)
     }

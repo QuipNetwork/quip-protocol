@@ -1,7 +1,25 @@
+//! Golden energy, diversity, and truncation vectors vs `conformance/golden_vectors.json`.
+#![expect(
+    clippy::indexing_slicing,
+    reason = "golden JSON keys are fixed by the fixture"
+)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "golden spins/edges and int(energy*1000) truncation are in-range by fixture"
+)]
+#![expect(
+    clippy::cast_precision_loss,
+    reason = "milli values cast to f64 for local energy path parity"
+)]
+
 use quip_protocol::scoring::{energy_milli, set_diversity};
 use serde_json::Value;
 use std::fs;
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "integration-test helper; missing golden fixture should panic"
+)]
 fn golden() -> Value {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),

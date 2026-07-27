@@ -9,28 +9,39 @@ use std::process::Command;
 
 /// Build the named example and return its binary path.
 fn example_bin(name: &str) -> String {
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper: cargo build failure is a setup error"
+    )]
     let status = Command::new(env!("CARGO"))
         .args(["build", "--example", name, "-p", "quip-miner-core"])
         .status()
         .expect("cargo build --example");
     assert!(status.success(), "failed to build example {name}");
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper: current_exe is always available under cargo test"
+    )]
     let mut p = std::env::current_exe().expect("test exe path");
-    p.pop(); // deps/
-    p.pop(); // <profile>/
+    let _ = p.pop(); // deps/
+    let _ = p.pop(); // <profile>/
     p.push("examples");
     p.push(name);
     p.to_string_lossy().into_owned()
 }
 
 fn unique_socket(tag: &str) -> String {
-    format!(
-        "/tmp/quip-core-{tag}-{}-{}.sock",
-        std::process::id(),
+    let nanos = {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test helper: system clock is after UNIX_EPOCH"
+        )]
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
-    )
+    };
+    format!("/tmp/quip-core-{tag}-{}-{nanos}.sock", std::process::id())
 }
 
 #[tokio::test]

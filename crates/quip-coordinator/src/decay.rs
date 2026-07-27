@@ -27,7 +27,9 @@ pub const EPOCH_LENGTH_BLOCKS: u64 = 100;
 /// `CurveC{Easy,Knee,Hard}Milli` constants. A topology may override these via
 /// `TopologyCurveC` storage, probed separately.
 pub const DEFAULT_C_EASY_MILLI: u32 = 700;
+/// Default knee calibration c (per-mille: 725 == 0.725).
 pub const DEFAULT_C_KNEE_MILLI: u32 = 725;
+/// Default hard calibration c (per-mille: 750 == 0.75).
 pub const DEFAULT_C_HARD_MILLI: u32 = 750;
 /// Default base difficulty `max_energy_milli` when `Difficulties[hash]` is unset
 /// (`DifficultyConfig::default()` on chain: `{5, -1_200_000, 200}`).
@@ -38,15 +40,27 @@ pub const DEFAULT_BASE_MAX_ENERGY_MILLI: i64 = -1_200_000;
 /// the chain curve and the (separate) curve-construction path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnergyCurve {
+    /// Hard (most negative) GSE bound in milli.
     pub min_milli: i64,
+    /// Knee GSE bound in milli.
     pub knee_milli: i64,
+    /// Easy (least negative) GSE bound in milli — ease cap.
     pub max_milli: i64,
 }
 
 /// `round(room * rate)` (half away from zero) floored at `min_delta`.
 fn geometric_floored(room: i64, rate_milli: i64, min_delta: i64) -> i64 {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "decay room and rate fit exact f64 for operational magnitudes"
+    )]
     let rate = rate_milli as f64 / 1000.0;
     // f64::round is half-away-from-zero (libm::round); float→int cast saturates.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        reason = "geometric step is intentionally rounded f64; magnitudes fit i64"
+    )]
     let stepped = (room as f64 * rate).round() as i64;
     stepped.max(min_delta)
 }
@@ -54,6 +68,7 @@ fn geometric_floored(room: i64, rate_milli: i64, min_delta: i64) -> i64 {
 /// One EASIER decay step on `current` max-energy toward `curve.max_milli`,
 /// capped there (never ease past the easy bound). A degenerate curve
 /// (`max <= min`) or a current already at/past the cap is a no-op.
+#[must_use]
 pub fn ease_step(current: i64, curve: &EnergyCurve) -> i64 {
     if curve.max_milli <= curve.min_milli {
         return current;
@@ -67,6 +82,7 @@ pub fn ease_step(current: i64, curve: &EnergyCurve) -> i64 {
 }
 
 /// Apply `steps` EASIER steps to `base_max_energy_milli`.
+#[must_use]
 pub fn apply_decay(base_max_energy_milli: i64, steps: u64, curve: &EnergyCurve) -> i64 {
     let mut cur = base_max_energy_milli;
     for _ in 0..steps {
@@ -78,6 +94,7 @@ pub fn apply_decay(base_max_energy_milli: i64, steps: u64, curve: &EnergyCurve) 
 /// Active `max_energy_milli` at `block_number`: base difficulty with per-epoch
 /// decay for blocks elapsed since the last winning proof. `last_proof_block == 0`
 /// (genesis) or `epoch_length == 0` disables decay, as does a `None` curve.
+#[must_use]
 pub fn current_max_energy(
     block_number: u64,
     base_max_energy_milli: i64,
@@ -99,6 +116,7 @@ pub fn current_max_energy(
 /// `max_energy_milli` threshold at each decay step `0..=horizon` (inclusive),
 /// built incrementally. Monotonic non-decreasing (decay only eases upward). A
 /// `None` curve yields a flat schedule (decay disabled).
+#[must_use]
 pub fn build_decay_schedule(
     base_max_energy_milli: i64,
     curve: Option<&EnergyCurve>,
@@ -126,7 +144,8 @@ pub fn build_decay_schedule(
 /// First step `s` where `schedule[s] > floor_energy_milli` (the strict
 /// `best_energy_milli < max_energy_milli` gate), or `None` if a candidate with
 /// that floor never clears within the schedule's horizon. `schedule` is
-/// monotonic non-decreasing, so this is a binary search (bisect_right).
+/// monotonic non-decreasing, so this is a binary search (`bisect_right`).
+#[must_use]
 pub fn step_for_energy(schedule: &[i64], floor_energy_milli: i64) -> Option<usize> {
     let i = schedule.partition_point(|&t| t <= floor_energy_milli);
     (i < schedule.len()).then_some(i)
@@ -147,7 +166,13 @@ fn mean_abs_unit(allowed_milli: &[i32]) -> f64 {
         return 0.0;
     }
     let sum_abs: i64 = allowed_milli.iter().map(|&v| i64::from(v).abs()).sum();
-    sum_abs as f64 / (allowed_milli.len() as f64 * MILLI_SCALE)
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "allowed-set magnitude sums and lengths fit exact f64 here"
+    )]
+    {
+        sum_abs as f64 / (allowed_milli.len() as f64 * MILLI_SCALE)
+    }
 }
 
 /// Expected ground-state-energy estimate (milli) for a topology + calibration
@@ -155,6 +180,7 @@ fn mean_abs_unit(allowed_milli: &[i32]) -> f64 {
 /// `quantum_validation::expected_gse_for_specs`; must match the chain to the
 /// milli or the whole `EnergyCurve` (and decay trajectory) drifts. Zero nodes or
 /// edges yields 0 (matches the pallet guard).
+#[must_use]
 pub fn expected_gse_milli(
     num_nodes: u64,
     num_edges: u64,
@@ -167,13 +193,27 @@ pub fn expected_gse_milli(
     }
     let h_mean_abs = mean_abs_unit(allowed_h_milli);
     let j_mean_abs = mean_abs_unit(allowed_j_milli);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "topology node/edge counts used as f64 magnitudes in GSE formula"
+    )]
     let n = num_nodes as f64;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "topology node/edge counts used as f64 magnitudes in GSE formula"
+    )]
     let m = num_edges as f64;
     let avg_degree = (2.0 * m) / n;
     let sqrt_avg_degree = avg_degree.sqrt();
     let j_contribution = -c * j_mean_abs * sqrt_avg_degree * n;
     let h_contribution = -c * DEFAULT_H_ALPHA * h_mean_abs * n / sqrt_avg_degree;
-    ((j_contribution + h_contribution) * MILLI_SCALE).round() as i64
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "GSE estimate is intentionally rounded to nearest milli i64"
+    )]
+    {
+        ((j_contribution + h_contribution) * MILLI_SCALE).round() as i64
+    }
 }
 
 impl EnergyCurve {
@@ -182,6 +222,7 @@ impl EnergyCurve {
     /// the GSE estimates at `c_hard`/`c_knee`/`c_easy`; since a larger `c` is
     /// more negative, `min_milli < knee_milli < max_milli` for any legitimate
     /// input. Mirrors `EnergyCurve::from_topology` in `difficulty.rs`.
+    #[must_use]
     pub fn from_topology(
         num_nodes: u64,
         num_edges: u64,

@@ -50,15 +50,21 @@ struct TopologySpecJson {
 /// Errors parsing/validating a drive-mode topology-spec file.
 #[derive(Debug, PartialEq)]
 pub enum TopologySpecError {
+    /// JSON decode failure (message is the serde error).
     Json(String),
+    /// `nodes` array was empty.
     EmptyNodes,
+    /// `allowed_h_milli` array was empty.
     EmptyAllowedH,
+    /// `allowed_j_milli` array was empty.
     EmptyAllowedJ,
     /// An `edges` endpoint is a node id not present in `nodes`. Edges reference
     /// native node ids (possibly sparse), which the miner and consensus scorer
     /// map to dense positions — so an id just has to exist in `nodes`.
     EdgeUnknownNode {
+        /// Zero-based index of the bad edge in the `edges` array.
         edge_index: usize,
+        /// Node id that was not present in `nodes`.
         endpoint: u32,
     },
 }
@@ -66,15 +72,15 @@ pub enum TopologySpecError {
 impl std::fmt::Display for TopologySpecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TopologySpecError::Json(e) => write!(f, "invalid topology spec JSON: {e}"),
-            TopologySpecError::EmptyNodes => write!(f, "topology spec: nodes must be non-empty"),
-            TopologySpecError::EmptyAllowedH => {
+            Self::Json(e) => write!(f, "invalid topology spec JSON: {e}"),
+            Self::EmptyNodes => write!(f, "topology spec: nodes must be non-empty"),
+            Self::EmptyAllowedH => {
                 write!(f, "topology spec: allowed_h_milli must be non-empty")
             }
-            TopologySpecError::EmptyAllowedJ => {
+            Self::EmptyAllowedJ => {
                 write!(f, "topology spec: allowed_j_milli must be non-empty")
             }
-            TopologySpecError::EdgeUnknownNode {
+            Self::EdgeUnknownNode {
                 edge_index,
                 endpoint,
             } => write!(
@@ -93,18 +99,26 @@ impl std::error::Error for TopologySpecError {}
 /// `MiningSnapshot`.
 #[derive(Debug, Clone)]
 pub struct TopologySpec {
+    /// Topology wire message (nodes, edges, hash) sent to the miner.
     pub topology: Topology,
+    /// Allowed h-field values (milli) for golden draw.
     pub allowed_h_milli: Vec<i32>,
+    /// Allowed J-coupling values (milli) for golden draw.
     pub allowed_j_milli: Vec<i32>,
+    /// Allowed solution-spin values (milli); defaults to `±1000` when omitted.
     pub allowed_spin_milli: Vec<i32>,
+    /// Minimum number of solutions required to pass quality gates.
     pub min_solutions: u32,
+    /// Maximum (worst) energy (milli) accepted by quality gates.
     pub max_energy_milli: i64,
+    /// Minimum diversity (milli) required to pass quality gates.
     pub min_diversity_milli: u32,
 }
 
 impl TopologySpec {
     /// Build a synthetic `MiningSnapshot`: chain-only fields (last proof
     /// block hash, block number) are zeroed since drive mode has no chain.
+    #[must_use]
     pub fn to_snapshot(&self) -> MiningSnapshot {
         MiningSnapshot {
             last_proof_block_hash: [0u8; 32],
@@ -138,6 +152,11 @@ fn validate_edges(nodes: &[u32], edges: &[(u32, u32)]) -> Result<(), TopologySpe
 }
 
 /// Parse and validate a drive-mode topology-spec JSON document.
+///
+/// # Errors
+///
+/// Returns [`TopologySpecError`] when the JSON is invalid, required fields are
+/// empty, or an edge references an unknown node id.
 pub fn parse_topology_spec(text: &str) -> Result<TopologySpec, TopologySpecError> {
     let raw: TopologySpecJson =
         serde_json::from_str(text).map_err(|e| TopologySpecError::Json(e.to_string()))?;

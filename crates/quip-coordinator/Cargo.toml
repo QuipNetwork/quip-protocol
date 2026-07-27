@@ -72,3 +72,6 @@ blake2 = "0.10"
 twox-hash = "1.6"
 rand = "0.8"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

@@ -2,26 +2,33 @@
 
 use quip_proto::v1::Configure;
 
+/// Errors raised while parsing a coordinator TOML config.
 #[derive(Debug, PartialEq)]
 pub enum ConfigError {
+    /// No `[miner]` section present.
     MissingMiner,
+    /// TOML parse failure (message from the parser).
     BadToml(String),
 }
 
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConfigError::MissingMiner => write!(f, "missing [miner] section"),
-            ConfigError::BadToml(e) => write!(f, "bad toml: {e}"),
+            Self::MissingMiner => write!(f, "missing [miner] section"),
+            Self::BadToml(e) => write!(f, "bad toml: {e}"),
         }
     }
 }
 
 impl std::error::Error for ConfigError {}
 
+/// Fully parsed coordinator config: chain endpoints, signer, and launch plan.
 pub struct CoordinatorConfig {
+    /// Validator WebSocket endpoints.
     pub validators: Vec<String>,
+    /// Signer key URI or keystore path.
     pub signer_key: String,
+    /// One entry per supervised miner subprocess.
     pub launch: Vec<LaunchEntry>,
     /// Optional mining-attempt dashboard (`[dashboard]` section). `None`
     /// disables recording + the REST endpoint.
@@ -36,9 +43,13 @@ pub struct DashboardConfig {
     pub data_dir: String,
 }
 
+/// One supervised miner: identity, binary path, and handshake `Configure`.
 pub struct LaunchEntry {
+    /// Miner id used on the session wire (`cpu-0`, `cuda-1`, …).
     pub miner_id: String,
+    /// Executable name or path for the miner subprocess.
     pub binary: String,
+    /// Handshake configure payload (queue depths, heartbeat, backend TOML).
     pub configure: Configure,
 }
 
@@ -46,9 +57,17 @@ fn make_configure(table: &toml::Table) -> Configure {
     let u32_of = |k: &str, d: u32| {
         table
             .get(k)
-            .and_then(|v| v.as_integer())
-            .map(|i| i as u32)
-            .unwrap_or(d)
+            .and_then(toml::Value::as_integer)
+            .map_or(d, |i| {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "config u32 knobs are small non-negative integers"
+                )]
+                {
+                    i as u32
+                }
+            })
     };
     // Strip coordinator-owned keys; the rest passes through verbatim.
     let mut passthrough = table.clone();
@@ -59,7 +78,7 @@ fn make_configure(table: &toml::Table) -> Configure {
         "heartbeat_s",
         "reconnect_window_s",
     ] {
-        passthrough.remove(k);
+        let _ = passthrough.remove(k);
     }
     Configure {
         queue_depth: u32_of("queue_depth", 3),
@@ -81,8 +100,7 @@ fn entry(miner_id: &str, backend: &str, table: &toml::Table) -> LaunchEntry {
     let binary = table
         .get("binary")
         .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| default_binary(backend));
+        .map_or_else(|| default_binary(backend), String::from);
     LaunchEntry {
         miner_id: miner_id.into(),
         binary,
@@ -94,6 +112,10 @@ fn entry(miner_id: &str, backend: &str, table: &toml::Table) -> LaunchEntry {
 ///
 /// Section mapping: `[cpu]`→`cpu-0`, `[cuda.N]`→`cuda-N`, `[metal]`→`metal-0`,
 /// `[dwave]`/`[qpu]`→`qpu-0`.
+///
+/// # Errors
+/// Returns [`ConfigError::MissingMiner`] when the `[miner]` section is absent,
+/// or [`ConfigError::BadToml`] when the input is not valid TOML.
 pub fn parse_config(toml_text: &str) -> Result<CoordinatorConfig, ConfigError> {
     let root: toml::Table =
         toml::from_str(toml_text).map_err(|e| ConfigError::BadToml(e.to_string()))?;

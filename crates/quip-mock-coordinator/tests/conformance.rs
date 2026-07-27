@@ -1,3 +1,6 @@
+//! Integration tests: drive `quip-mock-miner` through the mock coordinator's
+//! scripted conformance session.
+
 use quip_mock_coordinator::driver::{drive_miner, drive_miner_bad_welcome};
 use quip_proto::v1::RejectReason;
 
@@ -13,6 +16,10 @@ use quip_proto::v1::RejectReason;
 /// already current, and the outer test run has released the build lock by the
 /// time tests execute.
 fn miner_bin() -> String {
+    #[expect(
+        clippy::expect_used,
+        reason = "integration test panics if nested cargo build fails to start"
+    )]
     let status = std::process::Command::new(env!("CARGO"))
         .args(["build", "-p", "quip-mock-miner"])
         .status()
@@ -24,9 +31,13 @@ fn miner_bin() -> String {
     } else {
         "quip-mock-miner"
     };
+    #[expect(
+        clippy::expect_used,
+        reason = "integration test panics if test binary path cannot be resolved"
+    )]
     let mut p = std::env::current_exe().expect("test exe path");
-    p.pop(); // deps/
-    p.pop(); // <profile>/
+    let _ = p.pop(); // deps/
+    let _ = p.pop(); // <profile>/
     p.push(name);
     p.to_string_lossy().into_owned()
 }
@@ -38,7 +49,7 @@ fn unique_socket(label: &str) -> String {
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_nanos()
     )
 }
@@ -119,7 +130,7 @@ async fn mock_miner_passes_conformance() {
 }
 
 /// A conformant miner must reject an unsupported `Welcome.protocol_version`
-/// cleanly: emit `Fatal` (exit_code=ConfigInvalid=64) and exit with that same
+/// cleanly: emit `Fatal` (`exit_code=ConfigInvalid=64`) and exit with that same
 /// code, rather than proceeding to `Configure`.
 #[tokio::test]
 async fn mock_miner_rejects_bad_welcome() {

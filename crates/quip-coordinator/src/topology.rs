@@ -17,6 +17,7 @@ pub const DEFAULT_SPIN_SET: [MilliValue; 2] = [-1000, 1000];
 pub struct Topology {
     /// 32-byte chain-canonical topology hash.
     pub hash: Vec<u8>,
+    /// Node ids in the graph (order preserved for position mapping).
     pub nodes: Vec<u32>,
     /// Parallel edge endpoint arrays `(u, v)`.
     pub edges: (Vec<u32>, Vec<u32>),
@@ -27,6 +28,7 @@ pub struct Topology {
 
 impl Topology {
     /// Build a topology using the given allowed-value *sets* (Set-variant specs).
+    #[must_use]
     pub fn from_nodes_edges(
         nodes: Vec<u32>,
         edges: Vec<(u32, u32)>,
@@ -44,6 +46,8 @@ impl Topology {
         }
     }
 
+    /// Rebuild edges as `(u, v)` pairs from the parallel endpoint arrays.
+    #[must_use]
     pub fn edge_pairs(&self) -> Vec<(u32, u32)> {
         self.edges
             .0
@@ -53,6 +57,8 @@ impl Topology {
             .collect()
     }
 
+    /// Convert to the wire `Topology` message sent at session handshake.
+    #[must_use]
     pub fn to_proto(&self) -> quip_proto::v1::Topology {
         quip_proto::v1::Topology {
             hash: self.hash.clone(),
@@ -69,6 +75,7 @@ impl Topology {
 /// Canonical chain topology hash for full `AllowedValueSpec` inputs.
 ///
 /// Byte-identical to `pallet_quantum_pow::topology::hash_topology`.
+#[must_use]
 pub fn topology_hash(
     nodes: &[u32],
     edges: &[(u32, u32)],
@@ -98,6 +105,7 @@ pub fn topology_hash(
 }
 
 /// Convenience wrapper when all three specs are discrete sets.
+#[must_use]
 pub fn topology_hash_sets(
     nodes: &[u32],
     edges: &[(u32, u32)],
@@ -119,7 +127,7 @@ mod tests {
     use super::*;
 
     /// Pinned against the pallet construction: sorted nodes, min/max edges,
-    /// set-canonical specs, SCALE-encoded tuple, blake2_256.
+    /// set-canonical specs, SCALE-encoded tuple, `blake2_256`.
     #[test]
     fn golden_topology_hash_known_fixture() {
         let nodes = [0u32, 1, 2];
@@ -168,7 +176,13 @@ mod tests {
     fn hex_literal(s: &str) -> [u8; 32] {
         let mut out = [0u8; 32];
         for i in 0..32 {
-            out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("hex");
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "fixed 32-byte output; s is a 64-char hex fixture"
+            )]
+            {
+                out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("hex");
+            }
         }
         out
     }

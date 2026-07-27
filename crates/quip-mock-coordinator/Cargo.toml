@@ -20,3 +20,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "pro
 tokio-stream = { version = "0.1", features = ["net"] }
 tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
+
+[lints]
+workspace = true

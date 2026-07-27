@@ -8,6 +8,7 @@ use std::sync::Mutex;
 pub struct FakeChain {
     snapshot: Mutex<Option<MiningSnapshot>>,
     orders: Mutex<Vec<JobOrder>>,
+    /// Captured proofs from [`ChainClient::submit_proof`].
     pub submitted: Mutex<Vec<Proof>>,
     /// Optional scripted submit result (default Success).
     submit_result: Mutex<Result<SubmitAction, ChainError>>,
@@ -18,6 +19,8 @@ pub struct FakeChain {
 }
 
 impl FakeChain {
+    /// Build a fake chain with a fixed snapshot and optional single order.
+    #[must_use]
     pub fn new(snapshot: MiningSnapshot, order: Option<JobOrder>) -> Self {
         Self {
             snapshot: Mutex::new(Some(snapshot)),
@@ -29,28 +32,90 @@ impl FakeChain {
         }
     }
 
+    /// Script the next `fetch_latest_qblock_id` return value.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
     pub fn set_qblock_id(&self, id: Option<u64>) {
-        *self.qblock_id.lock().unwrap() = id;
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.qblock_id.lock().unwrap() = id;
+        }
     }
 
+    /// Script the next `fetch_decay_params` return value.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
     pub fn set_decay_params(&self, params: Option<DecayParams>) {
-        *self.decay_params.lock().unwrap() = params;
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.decay_params.lock().unwrap() = params;
+        }
     }
 
+    /// Replace the scripted mining snapshot (`None` → empty snapshot fetch).
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
     pub fn set_snapshot(&self, snap: Option<MiningSnapshot>) {
-        *self.snapshot.lock().unwrap() = snap;
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.snapshot.lock().unwrap() = snap;
+        }
     }
 
+    /// Replace the scripted open mempool orders.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
     pub fn set_orders(&self, orders: Vec<JobOrder>) {
-        *self.orders.lock().unwrap() = orders;
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.orders.lock().unwrap() = orders;
+        }
     }
 
+    /// Number of proofs captured via `submit_proof`.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
     pub fn submitted_count(&self) -> usize {
-        self.submitted.lock().unwrap().len()
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            self.submitted.lock().unwrap().len()
+        }
     }
 
+    /// Drain and return all captured submits.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
     pub fn take_submitted(&self) -> Vec<Proof> {
-        std::mem::take(&mut *self.submitted.lock().unwrap())
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            std::mem::take(&mut *self.submitted.lock().unwrap())
+        }
     }
 }
 
@@ -62,36 +127,66 @@ impl ChainClient for FakeChain {
         _miner_account: [u8; 32],
         _topology_hash: Option<[u8; 32]>,
     ) -> Result<Option<MiningSnapshot>, ChainError> {
-        Ok(self.snapshot.lock().unwrap().clone())
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            Ok(self.snapshot.lock().unwrap().clone())
+        }
     }
 
     async fn fetch_mempool_orders(
         &self,
         _miner_account: [u8; 32],
     ) -> Result<Vec<JobOrder>, ChainError> {
-        Ok(self.orders.lock().unwrap().clone())
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            Ok(self.orders.lock().unwrap().clone())
+        }
     }
 
     async fn submit_proof(&self, proof: &Proof) -> Result<SubmitAction, ChainError> {
-        self.submitted.lock().unwrap().push(proof.clone());
-        // Can't move out of Mutex guard for Result with ChainError (not Clone);
-        // reconstruct Success/Retry/etc from a stored pattern.
-        match &*self.submit_result.lock().unwrap() {
-            Ok(a) => Ok(*a),
-            Err(ChainError::Unavailable(s)) => Err(ChainError::Unavailable(s.clone())),
-            Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
-            Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            self.submitted.lock().unwrap().push(proof.clone());
+            // Can't move out of Mutex guard for Result with ChainError (not Clone);
+            // reconstruct Success/Retry/etc from a stored pattern.
+            match &*self.submit_result.lock().unwrap() {
+                Ok(a) => Ok(*a),
+                Err(ChainError::Unavailable(s)) => Err(ChainError::Unavailable(s.clone())),
+                Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
+                Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),
+            }
         }
     }
 
     async fn fetch_latest_qblock_id(&self) -> Result<Option<u64>, ChainError> {
-        Ok(*self.qblock_id.lock().unwrap())
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            Ok(*self.qblock_id.lock().unwrap())
+        }
     }
 
     async fn fetch_decay_params(
         &self,
         _topology_hash: [u8; 32],
     ) -> Result<Option<DecayParams>, ChainError> {
-        Ok(self.decay_params.lock().unwrap().clone())
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            Ok(self.decay_params.lock().unwrap().clone())
+        }
     }
 }

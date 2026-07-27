@@ -21,17 +21,20 @@ use async_trait::async_trait;
 /// Errors from chain I/O (RPC, decode, submit).
 #[derive(Debug)]
 pub enum ChainError {
+    /// Node / transport unreachable or misconfigured.
     Unavailable(String),
+    /// SCALE or hex decode of a chain response failed.
     Decode(String),
+    /// Extrinsic submit or proof-encode path failed.
     Submit(String),
 }
 
 impl std::fmt::Display for ChainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ChainError::Unavailable(s) => write!(f, "chain unavailable: {s}"),
-            ChainError::Decode(s) => write!(f, "decode error: {s}"),
-            ChainError::Submit(s) => write!(f, "submit error: {s}"),
+            Self::Unavailable(s) => write!(f, "chain unavailable: {s}"),
+            Self::Decode(s) => write!(f, "decode error: {s}"),
+            Self::Submit(s) => write!(f, "submit error: {s}"),
         }
     }
 }

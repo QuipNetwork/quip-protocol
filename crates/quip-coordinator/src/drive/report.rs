@@ -1,26 +1,35 @@
 //! Per-job scoring rows, aggregate stats, and stdout/JSONL report output.
 
 use serde_json::json;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::Path;
 
 /// One row: a job's validated `Result` scored against its quality gates.
 #[derive(Debug, Clone)]
 pub struct JobRow {
+    /// Job identifier bytes (nonce for `PoW`, synthetic label for explicit jobs).
     pub job_id: Vec<u8>,
-    /// True when the job was PoW/nonce-derived (`job_id` is a nonce);
+    /// True when the job was `PoW`/nonce-derived (`job_id` is a nonce);
     /// false for explicit-entry jobs (`job_id` is a synthetic label).
     pub is_pow: bool,
+    /// Number of solutions returned by the miner for this job.
     pub n_solutions: usize,
+    /// Best (lowest) energy among accepted solutions, in milli-units.
     pub best_energy_milli: i64,
+    /// Diversity score of the solution set, in milli-units.
     pub diversity_milli: u32,
+    /// Whether the result passed the quality gates.
     pub passed: bool,
+    /// Device access time reported by the miner, microseconds.
     pub device_access_time_us: u64,
+    /// Wall-clock ms from dispatch of this job to its terminal outcome.
     pub wall_ms: u64,
     /// Resolved `num_reads`/`num_sweeps` the miner actually ran (from
     /// `SamplerMeta`). Zero on rejected rows. For matched-condition parity
     /// runs these show what each backend's adapt envelope settled on.
     pub reads: u32,
+    /// Resolved sweeps the miner actually ran (see `reads`).
     pub sweeps: u32,
     /// True if the miner rejected the job outright (no `Result` returned).
     pub rejected: bool,
@@ -29,11 +38,15 @@ pub struct JobRow {
 /// Aggregate stats over a full drive run.
 #[derive(Debug, Clone, Default)]
 pub struct Aggregate {
+    /// Number of job rows included in the aggregate.
     pub total_jobs: usize,
+    /// Jobs that passed quality gates.
     pub passed: usize,
+    /// Jobs the miner rejected outright.
     pub rejected: usize,
     /// Real wall-clock span of the run (first dispatch → last result), ms.
     pub wall_ms_total: u64,
+    /// Throughput in jobs per second using `wall_ms_total`.
     pub throughput_per_s: f64,
 }
 
@@ -42,6 +55,11 @@ pub struct Aggregate {
 /// result). Throughput uses it — NOT the sum of per-job `wall_ms`, which
 /// overcounts the streaming backends' concurrent, overlapping jobs (e.g. 12
 /// jobs each ~3.3s that all overlap take ~3.3s of wall clock, not ~40s).
+#[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "job count and wall-clock ms are small; f64 throughput is display-only"
+)]
 pub fn aggregate(rows: &[JobRow], run_wall_ms: u64) -> Aggregate {
     let total_jobs = rows.len();
     let passed = rows.iter().filter(|r| r.passed).count();
@@ -61,6 +79,7 @@ pub fn aggregate(rows: &[JobRow], run_wall_ms: u64) -> Aggregate {
 }
 
 /// Print a human-readable table: one row per job, then an aggregate summary.
+#[expect(clippy::print_stdout, reason = "drive CLI output")]
 pub fn print_table(rows: &[JobRow], agg: &Aggregate) {
     println!(
         "{:<4} {:<18} {:>10} {:>12} {:>10} {:>6} {:>8}",
@@ -123,7 +142,11 @@ fn truncate_hex(s: &str) -> String {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    let mut s = String::with_capacity(bytes.len().saturating_mul(2));
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 fn row_to_json(r: &JobRow) -> serde_json::Value {
@@ -143,6 +166,10 @@ fn row_to_json(r: &JobRow) -> serde_json::Value {
 }
 
 /// Write one JSON object per job followed by a trailing aggregate record.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file cannot be created or written.
 pub fn write_jsonl(path: &Path, rows: &[JobRow], agg: &Aggregate) -> std::io::Result<()> {
     let mut f = std::fs::File::create(path)?;
     for r in rows {
@@ -204,7 +231,10 @@ mod tests {
     fn aggregate_of_empty_rows_has_zero_throughput() {
         let agg = aggregate(&[], 0);
         assert_eq!(agg.total_jobs, 0);
-        assert_eq!(agg.throughput_per_s, 0.0);
+        #[expect(clippy::float_cmp, reason = "exact zero throughput on empty run")]
+        {
+            assert_eq!(agg.throughput_per_s, 0.0);
+        }
     }
 
     #[test]
@@ -217,10 +247,16 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3); // 2 rows + 1 aggregate
-        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(first["passed"], true);
-        let last: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
-        assert_eq!(last["aggregate"], true);
-        assert_eq!(last["total_jobs"], 2);
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "len asserted to 3 immediately above"
+        )]
+        {
+            let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+            assert_eq!(first["passed"], true);
+            let last: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+            assert_eq!(last["aggregate"], true);
+            assert_eq!(last["total_jobs"], 2);
+        }
     }
 }

@@ -18,6 +18,8 @@ pub struct RandomSource {
 }
 
 impl RandomSource {
+    /// Build a source that yields `count` deterministic jobs for `(spec, seed)`.
+    #[must_use]
     pub fn new(
         spec: &TopologySpec,
         miner_account: [u8; 32],
@@ -39,8 +41,8 @@ impl RandomSource {
     /// `(seed, index)` always derives the same nonce/problem.
     fn salt_for(&self, index: u32) -> [u8; 32] {
         let mut h = blake3::Hasher::new();
-        h.update(&self.seed.to_le_bytes());
-        h.update(&index.to_le_bytes());
+        let _ = h.update(&self.seed.to_le_bytes());
+        let _ = h.update(&index.to_le_bytes());
         *h.finalize().as_bytes()
     }
 }
@@ -114,7 +116,9 @@ mod tests {
         let mut b = RandomSource::new(&spec, [1u8; 32], 2, 3, 9_999_999);
         let jobs_a = drain_all(&mut a);
         let jobs_b = drain_all(&mut b);
-        assert_ne!(jobs_a[0].job_id, jobs_b[0].job_id);
+        let id_a = jobs_a.first().map(|j| &j.job_id);
+        let id_b = jobs_b.first().map(|j| &j.job_id);
+        assert_ne!(id_a, id_b);
     }
 
     #[test]

@@ -1,3 +1,9 @@
+//! Local (non-consensus) energy and diversity scoring helpers.
+//!
+//! `energy_milli` accumulates in `f64` for miner-side ranking/logging only.
+//! Coordinator/chain re-score with integer-milli arithmetic.
+
+/// Map a spin to ±1.0 for the local `f64` energy path (`s > 0` → `+1.0`).
 fn sign(s: i8) -> f64 {
     if s > 0 {
         1.0
@@ -19,52 +25,102 @@ fn sign(s: i8) -> f64 {
 /// Range edges are *not* Python-`int()`-identical: a non-finite accumulator
 /// (overflow to ±inf) returns the sentinel `1 << 62`, and finite values saturate
 /// on the `as i64` cast (Python's arbitrary-precision `int()` never saturates).
+#[must_use]
 pub fn energy_milli(spins: &[i8], h: &[f64], j: &[f64], edges: &[(usize, usize)]) -> i64 {
     let mut e = 0.0f64;
     for (i, &s) in spins.iter().enumerate() {
         if i < h.len() {
-            e += h[i] * sign(s);
+            #[expect(clippy::indexing_slicing, reason = "i < h.len() just checked")]
+            {
+                e += h[i] * sign(s);
+            }
         }
     }
     for (k, &(u, v)) in edges.iter().enumerate() {
         if k < j.len() && u < spins.len() && v < spins.len() {
-            e += j[k] * sign(spins[u]) * sign(spins[v]);
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "k/u/v bounds checked in the if guard"
+            )]
+            {
+                e += j[k] * sign(spins[u]) * sign(spins[v]);
+            }
         }
     }
     if !e.is_finite() {
         return 1i64 << 62;
     }
-    (e * 1000.0) as i64 // truncation toward zero, matches Python int(energy*1000)
+    // Truncation toward zero, matches Python int(energy*1000). Saturates at
+    // i64 bounds on overflow of the cast (documented above).
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Python-parity int(energy*1000) truncation toward zero"
+    )]
+    {
+        (e * 1000.0) as i64
+    }
 }
 
+/// Flip-invariant Hamming distance between two spin vectors (min of raw and
+/// its complement), as `u32`.
+#[must_use]
 pub fn hamming_flip_invariant(a: &[i8], b: &[i8]) -> u32 {
     let n = a.len();
     let raw = a
         .iter()
         .zip(b)
-        .filter(|(x, y)| sign(**x) != sign(**y))
+        // Same threshold as `sign`: s > 0 is +1, else -1.
+        .filter(|(x, y)| (**x > 0) != (**y > 0))
         .count();
-    raw.min(n - raw) as u32
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "API returns u32; distance is at most min(a.len(), b.len()) / 2"
+    )]
+    {
+        raw.min(n - raw) as u32
+    }
 }
 
+/// Mean pairwise flip-invariant Hamming distance over a solution set, normalized
+/// by spin width. Returns `0.0` for fewer than two solutions or zero width.
+#[must_use]
 pub fn set_diversity(solutions: &[Vec<i8>]) -> f64 {
     if solutions.len() < 2 {
         return 0.0;
     }
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "solutions.len() >= 2 checked above"
+    )]
     let n = solutions[0].len();
     if n == 0 {
         return 0.0;
     }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "spin width n is problem-sized; f64 mantissa holds typical N"
+    )]
     let n = n as f64;
     let mut sum = 0.0f64;
     let mut pairs = 0u64;
     for i in 0..solutions.len() {
         for k in (i + 1)..solutions.len() {
-            sum += hamming_flip_invariant(&solutions[i], &solutions[k]) as f64 / n;
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "i and k range over 0..solutions.len()"
+            )]
+            let dist = hamming_flip_invariant(&solutions[i], &solutions[k]);
+            sum += f64::from(dist) / n;
             pairs += 1;
         }
     }
-    sum / pairs as f64
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "pair count fits exact integer f64 for practical solution-set sizes"
+    )]
+    {
+        sum / pairs as f64
+    }
 }
 
 #[cfg(test)]
@@ -98,17 +154,26 @@ mod tests {
     #[test]
     fn diversity_flip_invariant() {
         // a and its exact inverse have flip-invariant distance 0 -> diversity 0
-        assert_eq!(set_diversity(&[vec![1, 1, -1], vec![-1, -1, 1]]), 0.0);
+        #[expect(clippy::float_cmp, reason = "exact golden equality for diversity 0")]
+        {
+            assert_eq!(set_diversity(&[vec![1, 1, -1], vec![-1, -1, 1]]), 0.0);
+        }
         // a vs one-bit-flipped: min(1, 2)=1 over N=3 -> 1/3
         assert!((set_diversity(&[vec![1, 1, 1], vec![-1, 1, 1]]) - 1.0 / 3.0).abs() < 1e-12);
-        assert_eq!(set_diversity(&[vec![1, 1]]), 0.0); // <2 solutions
+        #[expect(clippy::float_cmp, reason = "exact golden equality for <2 solutions")]
+        {
+            assert_eq!(set_diversity(&[vec![1, 1]]), 0.0); // <2 solutions
+        }
     }
 
     #[test]
     fn diversity_zero_width_solutions_is_zero_not_nan() {
         // Two zero-length solution vectors would divide by n=0; must return
         // 0.0, matching the shared reference (not NaN).
-        assert_eq!(set_diversity(&[vec![], vec![]]), 0.0);
+        #[expect(clippy::float_cmp, reason = "exact golden equality for zero-width")]
+        {
+            assert_eq!(set_diversity(&[vec![], vec![]]), 0.0);
+        }
     }
 
     #[test]

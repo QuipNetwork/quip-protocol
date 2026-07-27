@@ -6,8 +6,9 @@ use quip_protocol::wire::encode_i32_le;
 
 /// Convert a mempool order into an `ISING_SAMPLE` job with inline edges.
 ///
-/// `generation = 0` (mempool is not cancelled by PoW generation swaps).
+/// `generation = 0` (mempool is not cancelled by `PoW` generation swaps).
 /// Missing gate floors default to 0.
+#[must_use]
 pub fn job_order_to_job(order: &JobOrder) -> Job {
     let (u, v): (Vec<u32>, Vec<u32>) = order.edges.iter().copied().unzip();
     Job {

@@ -8,6 +8,7 @@ pub mod dashboard;
 pub mod decay;
 pub mod drive;
 pub mod liveness;
+/// `PoW` and mempool job construction helpers.
 pub mod producer;
 pub mod router;
 pub mod runtime;

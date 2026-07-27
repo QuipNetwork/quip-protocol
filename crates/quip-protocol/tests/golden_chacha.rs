@@ -1,7 +1,21 @@
+//! Golden `ChaCha8` keystream and Ising draw order vs `conformance/golden_vectors.json`.
+#![expect(
+    clippy::indexing_slicing,
+    reason = "golden JSON keys and 64-char hex slices are fixed by the fixture"
+)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "golden milli values fit in i32 by fixture contract"
+)]
+
 use quip_protocol::chacha8::{draw_ising_milli, ChaCha8Rng};
 use serde_json::Value;
 use std::fs;
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "integration-test helper; missing golden fixture should panic"
+)]
 fn golden() -> Value {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -10,6 +24,10 @@ fn golden() -> Value {
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "integration-test helper; golden hex is always valid 32-byte seed"
+)]
 fn hex32(s: &str) -> [u8; 32] {
     let bytes: Vec<u8> = (0..32)
         .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
@@ -30,7 +48,7 @@ fn chacha8_keystream_matches_golden() {
             .map(|w| w.as_u64().unwrap())
             .collect();
         for &w in &expected {
-            assert_eq!(rng.next_u32() as u64, w);
+            assert_eq!(u64::from(rng.next_u32()), w);
         }
     }
 }

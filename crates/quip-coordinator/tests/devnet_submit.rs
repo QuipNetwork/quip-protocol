@@ -12,12 +12,30 @@
 //! real `MiningSnapshot` (runtime API `state_call` + SCALE decode) and reports
 //! the topology size and default difficulty.
 //!
-//! Milestone 2 (submit path): register `//Alice` as a miner, derive the PoW
+//! Milestone 2 (submit path): register `//Alice` as a miner, derive the `PoW`
 //! Ising from the snapshot, solve it locally (greedy spin-glass descent),
 //! re-validate with `quantum_validation` exactly as the pallet does, then drive
 //! the coordinator's `RealChainClient::submit_proof` and assert the pallet
 //! accepts it (persistent `Miners.proofs_submitted` increment + `ProofAccepted`
 //! event), or report the exact pallet error.
+
+#![expect(clippy::expect_used, reason = "integration test helpers")]
+#![expect(clippy::unwrap_used, reason = "integration test helpers")]
+#![expect(clippy::panic, reason = "tests panic on hard failures")]
+#![expect(clippy::print_stdout, reason = "devnet test diagnostic output")]
+#![expect(clippy::print_stderr, reason = "devnet test diagnostic output")]
+#![expect(
+    clippy::indexing_slicing,
+    reason = "event-scan and solver use fixture-bounded indices"
+)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "RPC / solution counts fit target widths in fixtures"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "end-to-end devnet scenario is intentionally linear"
+)]
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -46,7 +64,7 @@ use sp_core::Pair;
 const QUANTUM_POW_PALLET: u8 = 10;
 const REGISTER_MINER_CALL: u8 = 0;
 
-/// QuantumPow `Error` variants in declaration order (module error index).
+/// `QuantumPow` `Error` variants in declaration order (module error index).
 const POW_ERRORS: &[&str] = &[
     "MinerAlreadyRegistered",
     "MinerNotRegistered",
@@ -158,34 +176,32 @@ fn events_key() -> Vec<u8> {
 #[derive(Decode)]
 struct AccountNonce {
     nonce: u32,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "decoded for layout parity only")]
     consumers: u32,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "decoded for layout parity only")]
     providers: u32,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "decoded for layout parity only")]
     sufficients: u32,
 }
 
 /// SCALE mirror of `pallet_quantum_pow::MinerInfo<u128, u32>`.
 #[derive(Decode)]
 struct MinerInfoLite {
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "decoded for layout parity only")]
     registered_at: u32,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "decoded for layout parity only")]
     deposit: u128,
     proofs_submitted: u32,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "decoded for layout parity only")]
     proofs_won: u32,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "decoded for layout parity only")]
     rewards_earned: u128,
 }
 
 async fn account_nonce(url: &str, acct: &[u8; 32]) -> u32 {
     let key = map_key(b"System", b"Account", acct);
     match get_storage(url, &key, None).await {
-        Some(bytes) => AccountNonce::decode(&mut &bytes[..])
-            .map(|a| a.nonce)
-            .unwrap_or(0),
+        Some(bytes) => AccountNonce::decode(&mut &bytes[..]).map_or(0, |a| a.nonce),
         None => 0,
     }
 }
@@ -285,8 +301,8 @@ where
     Err(format!("[{label}] condition not met within timeout"))
 }
 
-/// Scan raw `System.Events` across recent blocks for a QuantumPow module error
-/// or a QuantumPow event naming `acct`. Returns a human-readable finding.
+/// Scan raw `System.Events` across recent blocks for a `QuantumPow` module error
+/// or a `QuantumPow` event naming `acct`. Returns a human-readable finding.
 async fn scan_recent_events(url: &str, acct: &[u8; 32], depth: u64) -> Option<String> {
     let head = head_number(url).await;
     let mut seen = HashSet::new();
@@ -351,10 +367,10 @@ fn solve_one(
         .collect();
     let mut lf: Vec<i64> = (0..n)
         .map(|p| {
-            h[p] as i64
+            i64::from(h[p])
                 + adj[p]
                     .iter()
-                    .map(|&(q, j)| j as i64 * s[q] as i64)
+                    .map(|&(q, j)| i64::from(j) * i64::from(s[q]))
                     .sum::<i64>()
         })
         .collect();
@@ -362,11 +378,11 @@ fn solve_one(
         let mut improved = false;
         for p in 0..n {
             // Flip lowers energy iff s[p] * local_field[p] > 0.
-            if (s[p] as i64) * lf[p] > 0 {
-                let ds = (-2 * s[p]) as i64;
+            if i64::from(s[p]) * lf[p] > 0 {
+                let ds = i64::from(-2 * s[p]);
                 s[p] = -s[p];
                 for &(q, j) in &adj[p] {
-                    lf[q] += j as i64 * ds;
+                    lf[q] += i64::from(j) * ds;
                 }
                 improved = true;
             }
@@ -590,7 +606,7 @@ async fn devnet_submit_proof_end_to_end() {
 // ----------------------------------------------------------------------------
 
 /// `QuantumComputeMempool` pallet + `propose_job` call indices (runtime
-/// `construct_runtime`: pallet_index 9, call_index 3).
+/// `construct_runtime`: `pallet_index` 9, `call_index` 3).
 const MEMPOOL_PALLET: u8 = 9;
 const PROPOSE_JOB_CALL: u8 = 3;
 

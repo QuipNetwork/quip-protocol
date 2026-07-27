@@ -9,6 +9,7 @@
 use crate::validate::Validated;
 use quip_proto::v1::Job;
 use serde::Serialize;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -22,28 +23,34 @@ pub struct AttemptRecord {
     /// Chain quantum-block id (`QuantumPowApi_latest_qblock_id`). `None` before
     /// the chain assigns one (e.g. drive mode) — those land under `pending/`.
     pub qblock_id: Option<u64>,
-    /// PoW cancellation generation of the job (0 for mempool).
+    /// `PoW` cancellation generation of the job (0 for mempool).
     pub generation: u64,
     /// Miner that solved the model.
     pub miner_id: String,
     /// Job id (nonce) in hex.
     pub job_id: String,
+    /// Whether this job was a `PoW` job (`true`) or mempool (`false`).
     pub is_pow: bool,
-    /// Mempool order id in hex; empty for PoW.
+    /// Mempool order id in hex; empty for `PoW`.
     pub order_id: String,
+    /// Best solution energy in milli-units.
     pub best_energy_milli: i64,
+    /// Pairwise diversity of the accepted set in milli-units.
     pub diversity_milli: u32,
+    /// Count of gate-passing solutions in the result.
     pub n_valid: u32,
-    /// Met the acceptance gate (energy + diversity + min_solutions).
+    /// Met the acceptance gate (energy + diversity + `min_solutions`).
     pub accepted: bool,
     /// The coordinator submitted this attempt as a proof.
     pub submitted: bool,
+    /// Device access time reported by the miner, in microseconds.
     pub device_access_time_us: u64,
 }
 
 impl AttemptRecord {
     /// Build a record from a validated result. `miner_id` is the solving miner;
     /// `submitted` is whether the coordinator submitted it as a proof.
+    #[must_use]
     pub fn new(
         qblock_id: Option<u64>,
         miner_id: &str,
@@ -56,8 +63,7 @@ impl AttemptRecord {
         let (is_pow, order_id) = job
             .provenance
             .as_ref()
-            .map(|p| (p.is_pow, hex(&p.order_id)))
-            .unwrap_or((false, String::new()));
+            .map_or((false, String::new()), |p| (p.is_pow, hex(&p.order_id)));
         Self {
             ts_ms: now_ms(),
             qblock_id,
@@ -80,15 +86,21 @@ impl AttemptRecord {
 /// win-time stash annotations (most-viable candidates + projected blocks).
 #[derive(Debug, Clone, Serialize)]
 pub struct QblockSummary {
+    /// Quantum-block id, or `None` for the `pending/` bucket.
     pub qblock_id: Option<u64>,
+    /// Unix-epoch milliseconds when this summary was written.
     pub updated_ts_ms: u64,
+    /// Best accepted energy so far for this qblock, if any.
     pub current_best_milli: Option<i64>,
+    /// Number of results validated for this qblock.
     pub results_validated: u64,
+    /// Win-time stash annotation snapshot.
     pub stash: crate::stash::StashSummary,
 }
 
 /// Serialize a qblock summary for `attempts.json` (empty string on the
 /// impossible serialize error, so the caller never has to handle it).
+#[must_use]
 pub fn summary_body(
     qblock_id: Option<u64>,
     current_best_milli: Option<i64>,
@@ -108,9 +120,7 @@ pub fn summary_body(
 /// Directory segment for a qblock: its id, or `pending` before the chain
 /// assigns one (e.g. drive mode).
 fn qblock_dir_name(qblock_id: Option<u64>) -> String {
-    qblock_id
-        .map(|id| id.to_string())
-        .unwrap_or_else(|| "pending".to_string())
+    qblock_id.map_or_else(|| "pending".to_string(), |id| id.to_string())
 }
 
 /// A message to the single writer thread: either one attempt line, or a
@@ -120,28 +130,40 @@ pub enum WriterMsg {
     Attempt(AttemptRecord),
     /// Overwrite `<qblock>/attempts.json` with `body` (a serialized summary).
     Summary {
+        /// Quantum-block id for the directory segment (or `None` → `pending`).
         qblock_id: Option<u64>,
+        /// Serialized [`QblockSummary`] body.
         body: String,
     },
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "unix millis fit u64 for the foreseeable future"
+        )]
+        {
+            d.as_millis() as u64
+        }
+    })
 }
 
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+        let _ = write!(s, "{b:02x}");
     }
     s
 }
 
 /// Append one record as a JSON line to `<data_dir>/<qblock_id>/attempts.jsonl`,
 /// creating the per-qblock directory on first write.
+///
+/// # Errors
+///
+/// Returns an I/O error if the directory cannot be created, the file cannot be
+/// opened, serialization fails, or the line cannot be written.
 pub fn append_record(data_dir: &Path, rec: &AttemptRecord) -> std::io::Result<()> {
     let dir = data_dir.join(qblock_dir_name(rec.qblock_id));
     std::fs::create_dir_all(&dir)?;
@@ -155,6 +177,11 @@ pub fn append_record(data_dir: &Path, rec: &AttemptRecord) -> std::io::Result<()
 }
 
 /// Overwrite `<data_dir>/<qblock_id>/attempts.json` with the summary `body`.
+///
+/// # Errors
+///
+/// Returns an I/O error if the directory cannot be created or the file cannot
+/// be written.
 pub fn write_summary(data_dir: &Path, qblock_id: Option<u64>, body: &str) -> std::io::Result<()> {
     let dir = data_dir.join(qblock_dir_name(qblock_id));
     std::fs::create_dir_all(&dir)?;
@@ -163,9 +190,10 @@ pub fn write_summary(data_dir: &Path, qblock_id: Option<u64>, body: &str) -> std
 
 /// Spawn the single writer thread and return the sender the sessions push to.
 /// Blocking file I/O runs on this dedicated thread, off the async runtime.
+#[must_use]
 pub fn spawn_writer(data_dir: PathBuf) -> mpsc::Sender<WriterMsg> {
     let (tx, rx) = mpsc::channel::<WriterMsg>();
-    std::thread::spawn(move || {
+    let _ = std::thread::spawn(move || {
         while let Ok(msg) = rx.recv() {
             let res = match msg {
                 WriterMsg::Attempt(rec) => append_record(&data_dir, &rec),
@@ -213,14 +241,17 @@ mod tests {
         let r = rec(Some(42), &[0x01, 0xff], true);
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
-        assert_eq!(v["qblock_id"], 42);
-        assert_eq!(v["job_id"], "01ff");
-        assert_eq!(v["miner_id"], "cpu-0");
-        assert_eq!(v["is_pow"], true);
-        assert_eq!(v["order_id"], "");
-        assert_eq!(v["best_energy_milli"], -14_200);
-        assert_eq!(v["n_valid"], 6);
-        assert_eq!(v["submitted"], true);
+        assert_eq!(v.get("qblock_id"), Some(&serde_json::json!(42)));
+        assert_eq!(v.get("job_id"), Some(&serde_json::json!("01ff")));
+        assert_eq!(v.get("miner_id"), Some(&serde_json::json!("cpu-0")));
+        assert_eq!(v.get("is_pow"), Some(&serde_json::json!(true)));
+        assert_eq!(v.get("order_id"), Some(&serde_json::json!("")));
+        assert_eq!(
+            v.get("best_energy_milli"),
+            Some(&serde_json::json!(-14_200))
+        );
+        assert_eq!(v.get("n_valid"), Some(&serde_json::json!(6)));
+        assert_eq!(v.get("submitted"), Some(&serde_json::json!(true)));
     }
 
     #[test]

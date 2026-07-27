@@ -24,9 +24,13 @@ use tonic::transport::{Endpoint, Uri};
 /// Static backend metadata advertised in capabilities and Hello.
 #[derive(Clone, Copy, Debug)]
 pub struct BackendIdentity {
+    /// Backend name advertised in Hello / capabilities (e.g. `"cpu"`, `"cuda"`).
     pub backend: &'static str,
+    /// Algorithm name advertised in Hello / capabilities (e.g. `"sa"`, `"gibbs"`).
     pub algorithm: &'static str,
+    /// Hard cap on variables accepted for a job.
     pub max_nodes: u32,
+    /// Hard cap on edges accepted for a job.
     pub max_edges: u32,
     /// Sampling-parameter envelope used by `adapt::adapt_params`.
     pub adapt: crate::adapt::AdaptBounds,
@@ -36,6 +40,10 @@ pub struct BackendIdentity {
 #[derive(Debug)]
 pub struct OpenError(pub String);
 
+#[expect(
+    clippy::print_stdout,
+    reason = "user-facing CLI capabilities JSON for --capabilities"
+)]
 fn print_capabilities(id: &BackendIdentity) {
     println!(
         r#"{{"backend":"{}","algorithm":"{}","supported_kinds":["ISING_SAMPLE"],"max_nodes":{},"max_edges":{}}}"#,
@@ -54,7 +62,7 @@ const PROGRESS_LOG_INTERVAL: u64 = 10;
 fn log_progress(
     backend: &str,
     jobs_done: u64,
-    elapsed: std::time::Duration,
+    elapsed: Duration,
     reads: u32,
     sweeps: u32,
     best_energy_milli: i64,
@@ -75,6 +83,10 @@ fn log_progress(
     );
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "single bidi session select-loop; splitting would obscure the control flow"
+)]
 async fn run_session<S: Sampler>(
     uri: &str,
     miner_id: &str,
@@ -202,6 +214,10 @@ async fn run_session<S: Sampler>(
                         // Request enough credits to keep the prefetch buffer
                         // full (active + next per lane), so the backend always
                         // has a NEXT slot to rotate into.
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "stream width / prefetch are small device-local counts well under u32::MAX"
+                        )]
                         let depth = config.queue_depth.max(prefetch as u32);
                         tx.send(miner(miner_msg::Msg::JobRequest(JobRequest {
                             credits: depth,
@@ -261,7 +277,11 @@ async fn run_session<S: Sampler>(
                             .await?;
                     }
                     Some(coord_msg::Msg::Shutdown(s)) => {
-                        grace_ms = if s.grace_ms == 0 { 5000 } else { s.grace_ms as u64 };
+                        grace_ms = if s.grace_ms == 0 {
+                            5000
+                        } else {
+                            u64::from(s.grace_ms)
+                        };
                         break;
                     }
                     None => {}
@@ -353,12 +373,9 @@ pub fn run<S: Sampler>(
         };
     }
 
-    let uri = match &common.quip_coordinator {
-        Some(u) => u.clone(),
-        None => {
-            tracing::error!("error: --quip-coordinator required for session mode");
-            return StdExitCode::from(ExitCode::ConfigInvalid as u8);
-        }
+    let Some(uri) = common.quip_coordinator.clone() else {
+        tracing::error!("error: --quip-coordinator required for session mode");
+        return StdExitCode::from(ExitCode::ConfigInvalid as u8);
     };
     let miner_id = common
         .miner_id

@@ -1,15 +1,21 @@
 //! Capability index, per-miner staged queue, credit accounting, cancel, reject.
 
+use quip_proto::v1::ising_problem;
 use quip_proto::v1::{Job, RejectReason};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Capability envelope advertised in `Hello`.
 #[derive(Debug, Clone)]
 pub struct MinerCaps {
+    /// Backend name (e.g. `"cpu"`, `"cuda"`).
     pub backend: String,
+    /// Sampling algorithm name (e.g. `"sa"`, `"gibbs"`).
     pub algorithm: String,
+    /// Job kinds this miner accepts; empty means all kinds.
     pub supported_kinds: Vec<i32>,
+    /// Maximum nodes; `0` means unlimited.
     pub max_nodes: u32,
+    /// Maximum edges; `0` means unlimited.
     pub max_edges: u32,
 }
 
@@ -41,10 +47,13 @@ pub struct Router {
 }
 
 impl Router {
+    /// Empty router with no registered miners.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Register (or re-register) a miner with the given capability envelope.
     pub fn register_miner(&mut self, miner_id: impl Into<String>, caps: MinerCaps) {
         let id = miner_id.into();
         match self.miners.get_mut(&id) {
@@ -59,7 +68,7 @@ impl Router {
                 q.unsupported_kinds.clear();
             }
             None => {
-                self.miners.insert(
+                let _ = self.miners.insert(
                     id,
                     MinerQueue {
                         caps,
@@ -106,6 +115,7 @@ impl Router {
         }
     }
 
+    /// Add `credits` to the miner's consumable credit pool.
     pub fn grant_credits(&mut self, miner_id: &str, credits: u32) {
         if let Some(q) = self.miners.get_mut(miner_id) {
             q.granted_credits = q.granted_credits.saturating_add(credits);
@@ -130,8 +140,7 @@ impl Router {
     pub fn take_consumed(&mut self, miner_id: &str) -> u32 {
         self.miners
             .get_mut(miner_id)
-            .map(|q| std::mem::take(&mut q.consumed_since_poll))
-            .unwrap_or(0)
+            .map_or(0, |q| std::mem::take(&mut q.consumed_since_poll))
     }
 
     /// Handle a miner reject: mark unsupported kinds, re-route to a *different*
@@ -145,7 +154,7 @@ impl Router {
     pub fn on_reject(&mut self, miner_id: &str, job: Job, reason: i32) {
         if reason == RejectReason::UnsupportedKind as i32 {
             if let Some(q) = self.miners.get_mut(miner_id) {
-                q.unsupported_kinds.insert(job.kind);
+                let _ = q.unsupported_kinds.insert(job.kind);
             }
         }
         if self.route_excluding(job, Some(miner_id)).is_none() {
@@ -157,7 +166,7 @@ impl Router {
         }
     }
 
-    /// Drop staged PoW jobs with `0 < generation <= max_generation`.
+    /// Drop staged `PoW` jobs where `0 < generation <= max_generation`.
     /// Mempool jobs (`generation == 0`) are preserved.
     pub fn cancel(&mut self, max_generation: u64) {
         for q in self.miners.values_mut() {
@@ -175,19 +184,21 @@ impl Router {
         Vec::new()
     }
 
+    /// Capability envelope for a registered miner, if any.
+    #[must_use]
     pub fn caps(&self, miner_id: &str) -> Option<&MinerCaps> {
         self.miners.get(miner_id).map(|q| &q.caps)
     }
 
+    /// Number of jobs currently staged for `miner_id` (0 if unknown).
+    #[must_use]
     pub fn staged_len(&self, miner_id: &str) -> usize {
-        self.miners
-            .get(miner_id)
-            .map(|q| q.staged.len())
-            .unwrap_or(0)
+        self.miners.get(miner_id).map_or(0, |q| q.staged.len())
     }
 
     /// Registered miner ids, sorted for deterministic iteration (the feeder
     /// walks them to top each up to buffer depth).
+    #[must_use]
     pub fn miner_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.miners.keys().cloned().collect();
         ids.sort();
@@ -228,6 +239,10 @@ fn capable(q: &MinerQueue, kind: i32, n_nodes: u32, n_edges: u32) -> bool {
     true
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Ising h-field length / 4 is a node count that fits in u32"
+)]
 fn job_node_count(job: &Job) -> u32 {
     let Some(ising) = job.ising.as_ref() else {
         return 0;
@@ -236,11 +251,14 @@ fn job_node_count(job: &Job) -> u32 {
     (ising.h_milli_le32.len() / 4) as u32
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Ising edge counts fit in u32 for staged problems"
+)]
 fn job_edge_count(job: &Job) -> u32 {
     let Some(ising) = job.ising.as_ref() else {
         return 0;
     };
-    use quip_proto::v1::ising_problem;
     match &ising.graph {
         Some(ising_problem::Graph::Edges(e)) => e.u.len() as u32,
         _ => (ising.j_milli_le32.len() / 4) as u32,
@@ -296,8 +314,8 @@ mod tests {
     fn next_job_consumes_credits() {
         let mut r = Router::new();
         r.register_miner("cpu-0", caps_ising());
-        r.route(make_job(1, JobKind::IsingSample));
-        r.route(make_job(2, JobKind::IsingSample));
+        let _ = r.route(make_job(1, JobKind::IsingSample));
+        let _ = r.route(make_job(2, JobKind::IsingSample));
         assert!(r.next_job("cpu-0").is_none()); // no credits
         r.grant_credits("cpu-0", 1);
         assert!(r.next_job("cpu-0").is_some()); // spends the one credit
@@ -311,8 +329,8 @@ mod tests {
     fn never_exceeds_credits() {
         let mut r = Router::new();
         r.register_miner("cpu-0", caps_ising());
-        r.route(make_job(1, JobKind::IsingSample));
-        r.route(make_job(2, JobKind::IsingSample));
+        let _ = r.route(make_job(1, JobKind::IsingSample));
+        let _ = r.route(make_job(2, JobKind::IsingSample));
         r.grant_credits("cpu-0", 1);
         assert!(r.next_job("cpu-0").is_some());
         assert!(r.next_job("cpu-0").is_none());
@@ -322,8 +340,8 @@ mod tests {
     fn take_consumed_counts_dispatches_then_resets() {
         let mut r = Router::new();
         r.register_miner("cpu-0", caps_ising());
-        r.route(make_job(1, JobKind::IsingSample));
-        r.route(make_job(2, JobKind::IsingSample));
+        let _ = r.route(make_job(1, JobKind::IsingSample));
+        let _ = r.route(make_job(2, JobKind::IsingSample));
         r.grant_credits("cpu-0", 2);
         assert!(r.next_job("cpu-0").is_some());
         assert!(r.next_job("cpu-0").is_some());
@@ -336,10 +354,10 @@ mod tests {
     fn cancel_drops_pow_keeps_mempool_and_newer() {
         let mut r = Router::new();
         r.register_miner("cpu-0", caps_ising());
-        r.route(make_job(0, JobKind::IsingSample)); // mempool
-        r.route(make_job(3, JobKind::IsingSample));
-        r.route(make_job(5, JobKind::IsingSample));
-        r.route(make_job(6, JobKind::IsingSample));
+        let _ = r.route(make_job(0, JobKind::IsingSample)); // mempool
+        let _ = r.route(make_job(3, JobKind::IsingSample));
+        let _ = r.route(make_job(5, JobKind::IsingSample));
+        let _ = r.route(make_job(6, JobKind::IsingSample));
         r.cancel(5);
         // keep gen 0 and gen 6
         assert_eq!(r.staged_len("cpu-0"), 2);
@@ -390,7 +408,7 @@ mod tests {
             },
         );
         let job = make_job(1, JobKind::IsingSample);
-        r.route(job.clone());
+        let _ = r.route(job);
         r.grant_credits("cpu-0", 1);
         let dispatched = r.next_job("cpu-0").unwrap();
         r.on_reject("cpu-0", dispatched, RejectReason::UnsupportedKind as i32);
@@ -398,7 +416,7 @@ mod tests {
         assert_eq!(r.staged_len("cpu-0"), 0);
         assert_eq!(r.staged_len("cpu-1"), 1);
         // further routes skip cpu-0
-        r.route(make_job(2, JobKind::IsingSample));
+        let _ = r.route(make_job(2, JobKind::IsingSample));
         assert_eq!(r.staged_len("cpu-0"), 0);
         assert_eq!(r.staged_len("cpu-1"), 2);
     }
@@ -410,7 +428,7 @@ mod tests {
         let mut r = Router::new();
         r.register_miner("cpu-0", caps_ising());
         let job = make_job(1, JobKind::IsingSample);
-        r.route(job);
+        let _ = r.route(job);
         r.grant_credits("cpu-0", 1);
         let dispatched = r.next_job("cpu-0").unwrap();
         assert_eq!(r.staged_len("cpu-0"), 0);
@@ -425,7 +443,7 @@ mod tests {
         // it while it was down (reclaim → re-route → re-handshake path).
         let mut r = Router::new();
         r.register_miner("cpu-0", caps_ising());
-        r.route(make_job(0, JobKind::IsingSample)); // mempool order (generation 0)
+        let _ = r.route(make_job(0, JobKind::IsingSample)); // mempool order (generation 0)
         assert_eq!(r.staged_len("cpu-0"), 1);
         // Re-handshake with the same id: queue survives, credits reset.
         r.register_miner("cpu-0", caps_ising());

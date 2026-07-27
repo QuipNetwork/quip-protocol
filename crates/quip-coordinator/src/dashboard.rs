@@ -32,7 +32,7 @@ async fn list_qblocks(State(data_dir): State<PathBuf>) -> Json<Vec<String>> {
     let mut ids = Vec::new();
     if let Ok(mut rd) = tokio::fs::read_dir(&data_dir).await {
         while let Ok(Some(entry)) = rd.next_entry().await {
-            let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+            let is_dir = entry.file_type().await.is_ok_and(|t| t.is_dir());
             if is_dir {
                 if let Some(name) = entry.file_name().to_str() {
                     ids.push(name.to_string());

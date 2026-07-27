@@ -14,6 +14,10 @@ const ALPHA: f64 = 0.88;
 const DEFAULT_H: [f64; 3] = [-1.0, 0.0, 1.0];
 
 /// Expected ground-state energy: `GSE ≈ -c·√(avg_degree)·N` plus an h-field term.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "graph sizes for Ising topologies fit exact f64 integer range (mantissa 53 bits)"
+)]
 fn expected_solution_energy(num_nodes: usize, num_edges: usize, c: f64, h_values: &[f64]) -> f64 {
     if num_nodes == 0 || num_edges == 0 {
         return 0.0;
@@ -21,7 +25,15 @@ fn expected_solution_energy(num_nodes: usize, num_edges: usize, c: f64, h_values
     let n = num_nodes as f64;
     let avg_degree = (2.0 * num_edges as f64) / n;
     let j_contribution = -c * avg_degree.sqrt() * n;
-    let h_contribution = if h_values.len() == 1 && h_values[0] == 0.0 {
+    let h_contribution = if h_values.len() == 1 && {
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "len() == 1 guarantees index 0 is in bounds"
+        )]
+        {
+            h_values[0] == 0.0
+        }
+    } {
         0.0
     } else {
         let nonzero = h_values.iter().filter(|&&v| v != 0.0).count() as f64 / h_values.len() as f64;
@@ -32,7 +44,7 @@ fn expected_solution_energy(num_nodes: usize, num_edges: usize, c: f64, h_values
 
 /// `(min_energy @ c_hard, knee @ c_mid, max_energy @ c_easy)`.
 fn calc_energy_range(num_nodes: usize, num_edges: usize, h_values: &[f64]) -> (f64, f64, f64) {
-    let c_knee = (C_EASY + C_HARD) / 2.0;
+    let c_knee = f64::midpoint(C_EASY, C_HARD);
     (
         expected_solution_energy(num_nodes, num_edges, C_HARD, h_values),
         expected_solution_energy(num_nodes, num_edges, c_knee, h_values),
@@ -42,7 +54,7 @@ fn calc_energy_range(num_nodes: usize, num_edges: usize, h_values: &[f64]) -> (f
 
 /// Convert a target energy (milli) to a normalized difficulty in `[0, 1]`.
 ///
-/// `0.0` = easiest (target ≥ max_energy), `1.0` = hardest (target ≤ min_energy),
+/// `0.0` = easiest (target ≥ `max_energy`), `1.0` = hardest (target ≤ `min_energy`),
 /// with a piecewise curve: concave `sqrt` below the knee, convex `square` above.
 #[must_use]
 pub fn energy_to_difficulty(
@@ -51,6 +63,10 @@ pub fn energy_to_difficulty(
     num_edges: usize,
     allowed_h_milli: &[i32],
 ) -> f64 {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "milli-energy magnitudes used in practice fit exact f64 integer range"
+    )]
     let target = target_milli as f64 / 1000.0;
     let h_owned: Vec<f64>;
     let h_values: &[f64] = if allowed_h_milli.is_empty() {
@@ -88,19 +104,28 @@ pub fn energy_to_difficulty(
 /// `ADAPT_*` class attributes on each Python miner subclass.
 #[derive(Clone, Copy, Debug)]
 pub struct AdaptBounds {
+    /// Lower bound on sweeps after difficulty interpolation.
     pub min_sweeps: u32,
+    /// Upper bound on sweeps after difficulty interpolation.
     pub max_sweeps: u32,
+    /// Lower bound on reads after difficulty interpolation.
     pub min_reads: u32,
+    /// Upper bound on reads after difficulty interpolation.
     pub max_reads: u32,
+    /// Multiplier of `min_solutions` for the reads floor (0 disables).
     pub reads_solution_min_factor: u32,
+    /// Multiplier of `min_solutions` for the reads ceiling (0 disables).
     pub reads_solution_max_factor: u32,
+    /// Multiplier of `min_solutions` applied as a final reads floor.
     pub reads_solution_floor_factor: u32,
 }
 
 /// Resolved sampling budget for one job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdaptParams {
+    /// Number of independent reads (samples) to take.
     pub num_reads: u32,
+    /// Annealing sweeps per read.
     pub num_sweeps: u32,
 }
 
@@ -175,12 +200,28 @@ mod tests {
             "/../../conformance/golden_adapt.json"
         ));
         let golden: Value = serde_json::from_str(text).expect("parse golden");
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "golden JSON schema keys are fixed by the conformance fixture"
+        )]
         let cases = golden["energy_to_difficulty"].as_array().expect("cases");
         assert!(!cases.is_empty());
         for c in cases {
             let target = c["target_milli"].as_i64().unwrap();
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "golden fixture sizes fit usize; milli values fit i32"
+            )]
             let n = c["num_nodes"].as_u64().unwrap() as usize;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "golden fixture sizes fit usize"
+            )]
             let m = c["num_edges"].as_u64().unwrap() as usize;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "allowed_h_milli golden values fit i32"
+            )]
             let h: Vec<i32> = c["allowed_h_milli"]
                 .as_array()
                 .unwrap()
@@ -203,13 +244,33 @@ mod tests {
             "/../../conformance/golden_adapt.json"
         ));
         let golden: Value = serde_json::from_str(text).expect("parse golden");
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "golden JSON schema keys are fixed by the conformance fixture"
+        )]
         let cases = golden["adapt_params_cpu_sa"].as_array().expect("cases");
         assert!(!cases.is_empty());
         for c in cases {
             let target = c["target_milli"].as_i64().unwrap();
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "golden fixture sizes fit usize"
+            )]
             let n = c["num_nodes"].as_u64().unwrap() as usize;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "golden fixture sizes fit usize"
+            )]
             let m = c["num_edges"].as_u64().unwrap() as usize;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "golden min_solutions fits u32"
+            )]
             let min_sol = c["min_solutions"].as_u64().unwrap() as u32;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "allowed_h_milli golden values fit i32"
+            )]
             let h: Vec<i32> = c["allowed_h_milli"]
                 .as_array()
                 .unwrap()
@@ -217,16 +278,22 @@ mod tests {
                 .map(|v| v.as_i64().unwrap() as i32)
                 .collect();
             let got = adapt_params(target, min_sol, n, m, &h, &CPU_SA);
-            assert_eq!(
-                got.num_reads,
-                c["num_reads"].as_u64().unwrap() as u32,
-                "reads {c}"
-            );
-            assert_eq!(
-                got.num_sweeps,
-                c["num_sweeps"].as_u64().unwrap() as u32,
-                "sweeps {c}"
-            );
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "golden num_reads/num_sweeps fit u32"
+            )]
+            {
+                assert_eq!(
+                    got.num_reads,
+                    c["num_reads"].as_u64().unwrap() as u32,
+                    "reads {c}"
+                );
+                assert_eq!(
+                    got.num_sweeps,
+                    c["num_sweeps"].as_u64().unwrap() as u32,
+                    "sweeps {c}"
+                );
+            }
         }
     }
 

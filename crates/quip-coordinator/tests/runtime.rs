@@ -1,7 +1,20 @@
-//! Runtime lifecycle: run_runtime binds the server, supervises a real
-//! quip-mock-miner, and shuts down cleanly on signal. Job production (feeding
-//! work, solve→submit) is exercised by tests/e2e.rs; this covers the process
+//! Runtime lifecycle: `run_runtime` binds the server, supervises a real
+//! `quip-mock-miner`, and shuts down cleanly on signal. Job production (feeding
+//! work, solve→submit) is exercised by `tests/e2e.rs`; this covers the process
 //! wiring + graceful-shutdown seam.
+
+#![expect(
+    clippy::expect_used,
+    reason = "helper builds mock miner outside #[test]"
+)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "fixture drain rates fit u32"
+)]
+#![expect(
+    clippy::items_after_statements,
+    reason = "test-local constants next to usage"
+)]
 
 use quip_coordinator::chain::{FakeChain, MiningSnapshot};
 use quip_coordinator::config::LaunchEntry;
@@ -28,8 +41,8 @@ fn mock_miner() -> String {
         "quip-mock-miner"
     };
     let mut p = std::env::current_exe().expect("test exe path");
-    p.pop();
-    p.pop();
+    let _ = p.pop();
+    let _ = p.pop();
     p.push(name);
     p.to_string_lossy().into_owned()
 }
@@ -124,7 +137,7 @@ async fn runtime_serves_supervises_and_shuts_down_clean() {
     res.expect("run_runtime returned an error");
 }
 
-/// A non-trivial snapshot (real nodes/edges) so derived PoW jobs are staged.
+/// A non-trivial snapshot (real nodes/edges) so derived `PoW` jobs are staged.
 fn ising_snapshot() -> MiningSnapshot {
     let nodes = vec![0, 1, 2, 3];
     let edges = vec![(0, 1), (1, 2), (2, 3), (0, 3)];

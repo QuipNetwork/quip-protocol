@@ -1,17 +1,18 @@
-//! PoW nonce derivation: BLAKE3 over (last_proof, miner, salt).
+//! `PoW` nonce derivation: BLAKE3 over (`last_proof`, miner, salt).
 //!
 //! Golden-pinned against `conformance/golden_vectors.json` `derive_nonce`.
 
-/// Derive the canonical 32-byte PoW nonce.
+/// Derive the canonical 32-byte `PoW` nonce.
 ///
 /// Input order is load-bearing: `last_proof` then `miner` then `salt`.
 /// Mirrors `shared.quantum_proof_of_work.derive_nonce` and
 /// `quantum_validation::derive_nonce`.
+#[must_use]
 pub fn derive_nonce(last_proof: [u8; 32], miner: [u8; 32], salt: [u8; 32]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
-    h.update(&last_proof);
-    h.update(&miner);
-    h.update(&salt);
+    let _ = h.update(&last_proof);
+    let _ = h.update(&miner);
+    let _ = h.update(&salt);
     *h.finalize().as_bytes()
 }
 

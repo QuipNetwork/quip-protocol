@@ -34,6 +34,8 @@ pub trait JobSource {
 pub struct VecSource(std::vec::IntoIter<Job>);
 
 impl VecSource {
+    /// Wrap `jobs` as a [`JobSource`] that yields them in order once.
+    #[must_use]
     pub fn new(jobs: Vec<Job>) -> Self {
         Self(jobs.into_iter())
     }

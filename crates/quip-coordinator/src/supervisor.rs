@@ -22,12 +22,12 @@ pub enum Restart {
 }
 
 /// Map a process exit code to the coordinator restart policy.
+#[must_use]
 pub fn restart_policy(exit_code: i32) -> Restart {
     match exit_code {
         0 => Restart::OnDemand,
         64 | 69 | 77 => Restart::Never,
-        70 => Restart::Backoff,
-        // Negative codes (signals) and anything else → backoff.
+        // 70 (crash), negative codes (signals), and anything else → backoff.
         _ => Restart::Backoff,
     }
 }
@@ -84,6 +84,8 @@ pub struct RestartTracker {
 }
 
 impl RestartTracker {
+    /// Create a tracker with the given backoff policy.
+    #[must_use]
     pub fn new(policy: BackoffPolicy) -> Self {
         Self {
             policy,
@@ -125,12 +127,17 @@ impl RestartTracker {
 
 /// Tracks per-miner children and tokens.
 pub struct Supervisor {
+    /// Live miner child processes keyed by miner id.
     pub children: HashMap<String, Child>,
+    /// Session tokens issued to each miner id.
     pub tokens: HashMap<String, String>,
+    /// Unix-domain socket path miners connect to.
     pub sock: String,
 }
 
 impl Supervisor {
+    /// Create a supervisor bound to the given UDS path.
+    #[must_use]
     pub fn new(sock: impl Into<String>) -> Self {
         Self {
             children: HashMap::new(),
@@ -140,6 +147,13 @@ impl Supervisor {
     }
 
     /// Spawn a miner binary with `QUIP_SESSION_TOKEN` (never argv).
+    ///
+    /// # Errors
+    /// Returns any I/O error from spawning the child process.
+    #[expect(
+        clippy::unused_async,
+        reason = "public API kept async for call-site uniformity with other supervisor methods"
+    )]
     pub async fn spawn(
         &mut self,
         entry: &LaunchEntry,
@@ -154,13 +168,17 @@ impl Supervisor {
             .env("QUIP_SESSION_TOKEN", token)
             .kill_on_drop(true)
             .spawn()?;
-        self.tokens
+        let _ = self
+            .tokens
             .insert(entry.miner_id.clone(), token.to_string());
-        self.children.insert(entry.miner_id.clone(), child);
+        let _ = self.children.insert(entry.miner_id.clone(), child);
         Ok(())
     }
 
     /// Spawn with a freshly generated token; returns the token.
+    ///
+    /// # Errors
+    /// Propagates spawn I/O errors from [`Self::spawn`].
     pub async fn spawn_with_new_token(
         &mut self,
         entry: &LaunchEntry,
@@ -174,7 +192,7 @@ impl Supervisor {
     /// Kill all children after a grace period (in-band Shutdown is preferred
     /// when a live session channel is available).
     pub async fn shutdown_all(&mut self, grace_ms: u32) {
-        tokio::time::sleep(std::time::Duration::from_millis(grace_ms as u64)).await;
+        tokio::time::sleep(Duration::from_millis(u64::from(grace_ms))).await;
         for child in self.children.values_mut() {
             let _ = child.kill().await;
         }
@@ -261,9 +279,11 @@ pub async fn supervise_miner(
             if let Some(tx) = tx {
                 let _ = tx.send(Ok(shutdown_msg(grace_ms))).await;
             }
-            let _ =
-                tokio::time::timeout(Duration::from_millis(grace_ms as u64 + 500), child.wait())
-                    .await;
+            let _ = tokio::time::timeout(
+                Duration::from_millis(u64::from(grace_ms) + 500),
+                child.wait(),
+            )
+            .await;
             let _ = child.kill().await;
             let _ = child.wait().await;
             break;
@@ -283,6 +303,10 @@ pub async fn supervise_miner(
             }
         }
 
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "elapsed ms since process start fits u64 for supervisor lifetime"
+        )]
         let now_ms = start.elapsed().as_millis() as u64;
         match tracker.on_exit(code, now_ms) {
             RestartAction::OnDemand => {
@@ -290,17 +314,15 @@ pub async fn supervise_miner(
                 // the live loop (quip-agm) refines this to "respawn only when
                 // jobs exist". Honour stop during the wait.
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(policy.base_ms)) => {}
+                    () = tokio::time::sleep(Duration::from_millis(policy.base_ms)) => {}
                     _ = stop.changed() => break,
                 }
-                continue;
             }
             RestartAction::Backoff(delay) => {
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                    () = tokio::time::sleep(Duration::from_millis(delay)) => {}
                     _ = stop.changed() => break,
                 }
-                continue;
             }
             RestartAction::Never | RestartAction::Unhealthy => {
                 tracing::warn!(miner = %entry.miner_id, code, "miner not restarting");

@@ -16,11 +16,15 @@ pub enum Algorithm {
 /// Per-job sampling knobs.
 #[derive(Clone, Debug)]
 pub struct SampleParams {
+    /// Independent reads (samples) to produce.
     pub num_reads: usize,
+    /// Annealing sweeps per read.
     pub num_sweeps: usize,
+    /// Sweeps spent at each beta rung.
     pub sweeps_per_beta: usize,
     /// Optional `(hot_beta, cold_beta)`. `None` → auto from biases.
     pub beta_range: Option<(f64, f64)>,
+    /// PRNG seed for this job.
     pub seed: u64,
 }
 
@@ -39,24 +43,32 @@ impl Default for SampleParams {
 /// One completed read: spins in {-1,+1} and consensus milli-energy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SamplerResult {
+    /// Spin configuration, one entry per variable, values in `{-1, +1}`.
     pub spins: Vec<i8>,
+    /// Consensus energy of `spins`, in milli units.
     pub energy_milli: i64,
 }
 
 /// Wire-parsed Ising problem: dense biases, flat couplings, and edge list.
 #[derive(Clone, Debug)]
 pub struct IsingGraph {
+    /// Linear biases, one per variable.
     pub h: Vec<f64>,
+    /// Couplings aligned with `edges`.
     pub j: Vec<f64>,
+    /// Undirected edge list `(u, v)` in received order.
     pub edges: Vec<(usize, usize)>,
 }
 
 impl IsingGraph {
     /// Store flat `h` / `j` / edge lists as the base problem.
+    #[must_use]
     pub fn new(h: Vec<f64>, j: Vec<f64>, edges: Vec<(usize, usize)>) -> Self {
         Self { h, j, edges }
     }
 
+    /// Number of variables (length of `h`).
+    #[must_use]
     pub fn num_nodes(&self) -> usize {
         self.h.len()
     }

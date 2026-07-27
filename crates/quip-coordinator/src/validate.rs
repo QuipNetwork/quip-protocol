@@ -21,11 +21,16 @@ use std::collections::{HashMap, HashSet};
 /// diverse-selected subset, and the pallet re-selects within it.
 pub const MAX_PROOF_SOLUTIONS: usize = 32;
 
+/// Outcome of coordinator-side result revalidation for miner gating.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Validated {
+    /// Best energy among gate-passing rows, or `i64::MAX` if none cleared.
     pub best_energy_milli: i64,
+    /// Diversity (milli) of the diverse-selected subset.
     pub diversity_milli: u32,
+    /// Count of unique energy-valid solutions after Z2 dedup.
     pub n_valid: u32,
+    /// Whether `n_valid` and diversity clear the advertised gates.
     pub accepted: bool,
     /// The diverse-selected *gate-passing* solutions to submit now
     /// (≤ [`MAX_PROOF_SOLUTIONS`]). Empty when no rows cleared the energy gate.
@@ -121,7 +126,7 @@ fn byte_spin(b: u8) -> Option<i64> {
 /// each row whose anchor spin is `-1`). Note this is *not* about energy: at
 /// `h != 0` the field term flips sign under `s -> -s`, so `E(-s) != E(s)` and
 /// twin pairs that are both energy-valid are vanishingly rare — canonicalization
-/// is a near-no-op there. It bites at `h = 0` (parity_shared), where flip-
+/// is a near-no-op there. It bites at `h = 0` (`parity_shared`), where flip-
 /// symmetric ground states genuinely appear and would otherwise double-count.
 fn canonicalize_spins(spins: &[i8]) -> Vec<i8> {
     if spins.first() == Some(&-1) {
@@ -167,6 +172,18 @@ fn energy_in_place(
 /// `topo` is the run-resolved position-indexed graph, used for topology-hash
 /// jobs; inline `EdgeList` jobs carry their own (already position-indexed)
 /// edges.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single validation pipeline: score, dedup, diversity, stash view"
+)]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "indices drawn from enumerate/len of the same scored buffers"
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "n_valid is solution count; pallet bound is 32, well below u32::MAX"
+)]
 pub fn validate_result(
     problem: &IsingProblem,
     solutions: &[Solution],
@@ -333,6 +350,7 @@ pub fn validate_result(
 }
 
 /// Strict less-than tie-break: first accepted holds on equal energy.
+#[must_use]
 pub fn beats_current(candidate_milli: i64, current_best_milli: Option<i64>) -> bool {
     match current_best_milli {
         None => true,
@@ -475,29 +493,44 @@ mod tests {
     /// `debug_assert_energies_match` skips it, so `validate_result` returns fast.
     #[test]
     fn large_topology_does_not_stall_debug_golden_check() {
-        let n = 5000usize;
-        let m = 30_000usize; // edges*nodes = 150M, far above the 1M cap
-        let h: Vec<i32> = (0..n).map(|i| ((i % 3) as i32 - 1) * 1000).collect();
-        let mut u = Vec::with_capacity(m);
-        let mut v = Vec::with_capacity(m);
-        let mut j = Vec::with_capacity(m);
-        for k in 0..m {
-            u.push((k % n) as u32);
-            v.push(((k * 7 + 1) % n) as u32);
-            j.push(if k % 2 == 0 { 1000 } else { -1000 });
+        let num_nodes = 5000usize;
+        let num_edges = 30_000usize; // edges*nodes = 150M, far above the 1M cap
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "test fixture: i % 3 is 0..=2"
+        )]
+        let fields: Vec<i32> = (0..num_nodes)
+            .map(|idx| ((idx % 3) as i32 - 1) * 1000)
+            .collect();
+        let mut edge_u = Vec::with_capacity(num_edges);
+        let mut edge_v = Vec::with_capacity(num_edges);
+        let mut couplings = Vec::with_capacity(num_edges);
+        for edge_idx in 0..num_edges {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "test fixture: node indices < 5000 fit u32"
+            )]
+            {
+                edge_u.push((edge_idx % num_nodes) as u32);
+                edge_v.push(((edge_idx * 7 + 1) % num_nodes) as u32);
+            }
+            couplings.push(if edge_idx % 2 == 0 { 1000 } else { -1000 });
         }
         let problem = IsingProblem {
             graph: Some(ising_problem::Graph::Edges(quip_proto::v1::EdgeList {
-                u,
-                v,
+                u: edge_u,
+                v: edge_v,
             })),
-            h_milli_le32: encode_i32_le(&h),
-            j_milli_le32: encode_i32_le(&j),
+            h_milli_le32: encode_i32_le(&fields),
+            j_milli_le32: encode_i32_le(&couplings),
             num_reads: 0,
             num_sweeps: 0,
             anneal_time_us: 0,
         };
-        let spins: Vec<i8> = (0..n).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect();
+        let spins: Vec<i8> = (0..num_nodes)
+            .map(|idx| if idx % 2 == 0 { 1 } else { -1 })
+            .collect();
         let sols: Vec<Solution> = (0..4)
             .map(|_| Solution {
                 spins_bytes: encode_spins(&spins),

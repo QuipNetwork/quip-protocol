@@ -11,11 +11,17 @@ use sp_core::{H256, U256};
 /// Inputs needed to pack and nonce a proof for submission.
 #[derive(Clone, Debug)]
 pub struct ProofBuildContext {
+    /// Topology hash the proof is mined against.
     pub topology_hash: [u8; 32],
+    /// Last winning proof's block hash (nonce derivation input).
     pub last_proof_block_hash: [u8; 32],
+    /// Miner identity bytes (nonce derivation input).
     pub miner_identity: [u8; 32],
+    /// 32-byte `PoW` salt.
     pub salt: [u8; 32],
+    /// Expected spin vector length (topology node count).
     pub num_nodes: usize,
+    /// Allowed spin values used when bit-packing solutions.
     pub allowed_spin: AllowedValueSpec<Vec<i32>>,
 }
 
@@ -23,6 +29,10 @@ pub struct ProofBuildContext {
 ///
 /// Spins are bit-packed under `allowed_spin`. Energies are discarded — the
 /// chain recomputes them. Nonce is `derive_nonce(last_proof, miner, salt)`.
+///
+/// # Errors
+/// Returns an error when a solution's spins cannot be decoded, length does
+/// not match `num_nodes`, or bit-packing under `allowed_spin` fails.
 pub fn build_quantum_proof(proof: &Proof, ctx: &ProofBuildContext) -> Result<QuantumProof, String> {
     let spin_spec = ctx.allowed_spin.as_slice();
     let mut packed = Vec::with_capacity(proof.solutions.len());
@@ -40,7 +50,7 @@ pub fn build_quantum_proof(proof: &Proof, ctx: &ProofBuildContext) -> Result<Qua
             .map(|&s| match s {
                 1 => 1000,
                 -1 => -1000,
-                other => other as i32 * 1000,
+                other => i32::from(other) * 1000,
             })
             .collect();
         let bytes =
@@ -60,6 +70,7 @@ pub fn build_quantum_proof(proof: &Proof, ctx: &ProofBuildContext) -> Result<Qua
 }
 
 /// SCALE-encode a quantum proof (for tests / debugging).
+#[must_use]
 pub fn encode_quantum_proof(proof: &QuantumProof) -> Vec<u8> {
     proof.encode()
 }
@@ -106,7 +117,13 @@ mod tests {
         assert_eq!(qp.device_access_time_us, 123_456);
         assert_eq!(qp.solutions.len(), 1);
         // 4 spins * 1 bit = 1 byte
-        assert_eq!(qp.solutions[0].len(), 1);
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "single packed solution asserted above"
+        )]
+        {
+            assert_eq!(qp.solutions[0].len(), 1);
+        }
         let expected = derive_nonce(&ctx.last_proof_block_hash, &ctx.miner_identity, &ctx.salt);
         assert_eq!(qp.nonce, expected);
 

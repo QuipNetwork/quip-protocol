@@ -1,3 +1,5 @@
+//! CLI smoke tests for the mock miner binary (`--capabilities`, `--check`, exit codes).
+
 use std::process::Command;
 
 fn bin() -> &'static str {

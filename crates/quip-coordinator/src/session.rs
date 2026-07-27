@@ -1,6 +1,6 @@
 //! tonic `MinerService` server: token verify, handshake, job dispatch, results.
 
-use crate::chain::{ChainClient, Proof};
+use crate::chain::{ChainClient, Proof, SubmitAction};
 use crate::config::LaunchEntry;
 use crate::router::{MinerCaps, Router};
 use crate::topology::Topology;
@@ -8,6 +8,7 @@ use crate::validate::{beats_current, validate_result, ResolvedTopo};
 use quip_proto::v1::miner_service_server::{MinerService, MinerServiceServer};
 use quip_proto::v1::{coord_msg, miner_msg, Configure, CoordMsg, MinerMsg, Shutdown, Welcome};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,10 +20,25 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 /// Unguessable per-spawn session token (32 random bytes, hex-encoded).
+///
+/// # Panics
+///
+/// Panics if the OS random number generator fails.
+#[must_use]
 pub fn gen_session_token() -> String {
     let mut buf = [0u8; 32];
-    getrandom::getrandom(&mut buf).expect("os rng");
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    #[expect(
+        clippy::expect_used,
+        reason = "OS RNG failure is unrecoverable at process start"
+    )]
+    {
+        getrandom::getrandom(&mut buf).expect("os rng");
+    }
+    let mut s = String::with_capacity(buf.len() * 2);
+    for b in &buf {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 pub(crate) fn coord(msg: coord_msg::Msg) -> CoordMsg {
@@ -55,8 +71,11 @@ const WIN_STASH_K: usize = 8;
 
 /// Shared coordinator runtime state for one or more miner sessions.
 pub struct CoordinatorState {
+    /// Per-miner expected session tokens (`miner_id` → hex token).
     pub expected_tokens: HashMap<String, String>,
+    /// Per-miner `Configure` messages to send after `Welcome`.
     pub configure: HashMap<String, Configure>,
+    /// Active graph topology advertised to miners, if any.
     pub topology: Option<Topology>,
     /// Position-indexed scoring form of `topology`, resolved once via
     /// [`CoordinatorState::set_topology`]. A run constant every result borrows
@@ -64,10 +83,11 @@ pub struct CoordinatorState {
     pub resolved_topo: Arc<ResolvedTopo>,
     /// Difficulty target advertised to miners via `SetTarget`.
     pub target: Option<quip_proto::v1::SetTarget>,
+    /// Work router: credits, staging queues, and miner caps.
     pub router: Router,
-    /// job_id → Job, for validation context.
+    /// `job_id` → `Job`, for validation context.
     pub inflight: HashMap<Vec<u8>, quip_proto::v1::Job>,
-    /// job_id → owning miner_id, so a crashed miner's in-flight jobs can be
+    /// `job_id` → owning `miner_id`, so a crashed miner's in-flight jobs can be
     /// isolated and re-routed. Maintained on the production path via
     /// [`CoordinatorState::dispatch_inflight`]/[`CoordinatorState::complete_inflight`];
     /// the drive harness leaves it empty (it never crash-requeues).
@@ -76,12 +96,15 @@ pub struct CoordinatorState {
     /// `Shutdown`/cancel to a running session. Registered on handshake success,
     /// removed when the session ends.
     pub outbound: HashMap<String, mpsc::Sender<Result<CoordMsg, Status>>>,
-    /// job_id (nonce) → the 32-byte salt it was derived from, so the winning
-    /// Proof carries the salt live submit requires. Recorded when the feeder
-    /// stages a job, consumed on its Result, cleared on reseed.
+    /// `job_id` (nonce) → the 32-byte salt it was derived from, so the winning
+    /// `Proof` carries the salt live submit requires. Recorded when the feeder
+    /// stages a job, consumed on its `Result`, cleared on reseed.
     pub salts: HashMap<Vec<u8>, [u8; 32]>,
+    /// Best accepted energy so far this generation, if any.
     pub current_best_milli: Option<i64>,
+    /// Count of results that passed through validation.
     pub results_validated: u64,
+    /// Highest abandoned generation reported by any miner via `Status`.
     pub last_abandoned_generation: u64,
     /// Sink for mining-attempt records + summaries (dashboard). `None` disables
     /// recording.
@@ -103,6 +126,8 @@ pub struct CoordinatorState {
 }
 
 impl CoordinatorState {
+    /// Empty coordinator state with default stash size and timing tracker.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             expected_tokens: HashMap::new(),
@@ -157,9 +182,10 @@ impl CoordinatorState {
 
     /// Record a dispatched job as in-flight, attributing it to `miner_id`.
     pub fn dispatch_inflight(&mut self, miner_id: &str, job: quip_proto::v1::Job) {
-        self.inflight_owner
+        let _ = self
+            .inflight_owner
             .insert(job.job_id.clone(), miner_id.to_string());
-        self.inflight.insert(job.job_id.clone(), job);
+        let _ = self.inflight.insert(job.job_id.clone(), job);
     }
 
     /// Clear an in-flight job on a terminal event (Result/Reject); returns the
@@ -214,7 +240,9 @@ impl Default for CoordinatorState {
 
 /// gRPC service holding shared state + chain client.
 pub struct CoordinatorService<C: ChainClient + 'static> {
+    /// Shared session state.
     pub state: Arc<Mutex<CoordinatorState>>,
+    /// Chain client for proof submit.
     pub chain: Arc<C>,
     /// Notifies waiters when a proof is submitted successfully.
     pub submit_notify: Arc<Mutex<Option<oneshot::Sender<()>>>>,
@@ -234,14 +262,18 @@ impl<C: ChainClient + 'static> MinerService for CoordinatorService<C> {
         let chain = Arc::clone(&self.chain);
         let submit_notify = Arc::clone(&self.submit_notify);
 
-        tokio::spawn(async move {
+        drop(tokio::spawn(async move {
             run_session(&mut inbound, &tx, state, chain, submit_notify).await;
-        });
+        }));
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "session loop is one cohesive handshake + message dispatch"
+)]
 async fn run_session<C: ChainClient>(
     inbound: &mut Streaming<MinerMsg>,
     tx: &mpsc::Sender<Result<CoordMsg, Status>>,
@@ -250,11 +282,11 @@ async fn run_session<C: ChainClient>(
     submit_notify: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 ) {
     // 1. Hello
-    let hello = match inbound.message().await {
-        Ok(Some(MinerMsg {
-            msg: Some(miner_msg::Msg::Hello(h)),
-        })) => h,
-        _ => return,
+    let Ok(Some(MinerMsg {
+        msg: Some(miner_msg::Msg::Hello(hello)),
+    })) = inbound.message().await
+    else {
+        return;
     };
 
     let miner_id = hello.miner_id.clone();
@@ -334,10 +366,8 @@ async fn run_session<C: ChainClient>(
 
     // 3. Message loop
     'session: loop {
-        let msg = match inbound.message().await {
-            Ok(Some(m)) => m,
-            Ok(None) => break,
-            Err(_) => break,
+        let Ok(Some(msg)) = inbound.message().await else {
+            break;
         };
         match msg.msg {
             Some(miner_msg::Msg::Ready(_)) => {
@@ -392,7 +422,7 @@ async fn run_session<C: ChainClient>(
                                 // pallet's MAX_PROOF_SOLUTIONS (not all raw rows,
                                 // which would fail bounded-vec decode).
                                 solutions: validated.selected_solutions.clone(),
-                                is_pow: job.provenance.as_ref().map(|p| p.is_pow).unwrap_or(false),
+                                is_pow: job.provenance.as_ref().is_some_and(|p| p.is_pow),
                                 order_id: job
                                     .provenance
                                     .as_ref()
@@ -402,14 +432,12 @@ async fn run_session<C: ChainClient>(
                                 // Salt is chosen by the feeder when the PoW job
                                 // is derived and remembered by job_id; the live
                                 // RealChainClient submit requires 32 bytes.
-                                salt: salt.map(|s| s.to_vec()).unwrap_or_default(),
+                                salt: salt.map_or_else(Vec::new, |s| s.to_vec()),
                                 device_access_time_us: result
                                     .meta
                                     .as_ref()
-                                    .map(|m| m.device_access_time_us)
-                                    .unwrap_or(0),
+                                    .map_or(0, |m| m.device_access_time_us),
                             };
-                            use crate::chain::SubmitAction;
                             let job_hex = crate::chain::extrinsic::hex_encode(&result.job_id);
                             match chain.submit_proof(&proof).await {
                                 Ok(SubmitAction::Success) => {
@@ -443,11 +471,8 @@ async fn run_session<C: ChainClient>(
                             let mut st = state.lock().await;
                             st.results_validated += 1;
                             let qblock_id = st.qblock_id;
-                            let device_us = result
-                                .meta
-                                .as_ref()
-                                .map(|m| m.device_access_time_us)
-                                .unwrap_or(0);
+                            let device_us =
+                                result.meta.as_ref().map_or(0, |m| m.device_access_time_us);
 
                             // A solution below the current threshold is submitted
                             // immediately (above); one not yet viable is stashed
@@ -457,8 +482,7 @@ async fn run_session<C: ChainClient>(
                             // loop resubmits it instead of losing a winner.
                             let mut stash_changed = false;
                             if !validated.accepted || retain_for_retry {
-                                let is_pow =
-                                    job.provenance.as_ref().map(|p| p.is_pow).unwrap_or(false);
+                                let is_pow = job.provenance.as_ref().is_some_and(|p| p.is_pow);
                                 let order_id = job
                                     .provenance
                                     .as_ref()
@@ -541,7 +565,7 @@ async fn run_session<C: ChainClient>(
                     log_liveness(&miner_id, qblock, ev);
                 }
             }
-            Some(miner_msg::Msg::Fatal(_)) | Some(miner_msg::Msg::Hello(_)) | None => {}
+            Some(miner_msg::Msg::Fatal(_) | miner_msg::Msg::Hello(_)) | None => {}
         }
     }
 
@@ -549,6 +573,10 @@ async fn run_session<C: ChainClient>(
 }
 
 /// Push a cancel for generations `<= max_generation` to a live session channel.
+///
+/// # Errors
+///
+/// Returns a send error if the session channel is closed.
 pub async fn send_cancel(
     tx: &mpsc::Sender<Result<CoordMsg, Status>>,
     max_generation: u64,
@@ -562,14 +590,21 @@ pub async fn send_cancel(
 /// Result of a one-shot handshake harness run.
 #[derive(Debug)]
 pub struct SessionHarnessReport {
+    /// Miner caps registered on a successful handshake.
     pub caps: Option<MinerCaps>,
+    /// Miner process exit code (`-1` if unknown).
     pub miner_exit_code: i32,
+    /// Whether the handshake completed and caps were registered.
     pub handshake_ok: bool,
 }
 
 /// Spawn `miner_bin` against a coordinator on `sock_path`, expecting `token`.
 ///
 /// Used by integration tests. `sock_path` is a filesystem path (no `unix://`).
+///
+/// # Errors
+///
+/// Returns [`SessionHarnessError`] when the handshake fails or caps are missing.
 pub async fn serve_one_session(
     miner_bin: &str,
     sock_path: &str,
@@ -590,9 +625,12 @@ pub async fn serve_one_session(
     }
 }
 
+/// Failure from a one-shot handshake harness run.
 #[derive(Debug)]
 pub struct SessionHarnessError {
+    /// Miner process exit code (`-1` if unknown).
     pub miner_exit_code: i32,
+    /// Human-readable failure reason.
     pub reason: String,
 }
 
@@ -608,8 +646,13 @@ impl std::fmt::Display for SessionHarnessError {
 
 impl std::error::Error for SessionHarnessError {}
 
-/// Like `serve_one_session`, but the coordinator expects `coord_token` while
+/// Like [`serve_one_session`], but the coordinator expects `coord_token` while
 /// the miner is given `miner_token` (for mismatch tests).
+///
+/// # Panics
+///
+/// Panics if the Unix socket cannot be bound or the miner process cannot be
+/// spawned.
 pub async fn serve_one_session_expecting(
     miner_bin: &str,
     sock_path: &str,
@@ -622,13 +665,18 @@ pub async fn serve_one_session_expecting(
         let _ = std::fs::create_dir_all(parent);
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test harness: bind failure is a setup bug"
+    )]
     let uds = UnixListener::bind(sock_path).expect("bind unix socket");
     let incoming = UnixListenerStream::new(uds);
 
     let mut st = CoordinatorState::new();
-    st.expected_tokens
+    let _ = st
+        .expected_tokens
         .insert(miner_id.into(), coord_token.into());
-    st.configure.insert(
+    let _ = st.configure.insert(
         miner_id.into(),
         Configure {
             queue_depth: 3,
@@ -670,6 +718,10 @@ pub async fn serve_one_session_expecting(
     });
 
     let socket_uri = format!("unix://{sock_path}");
+    #[expect(
+        clippy::expect_used,
+        reason = "test harness: spawn failure is a setup bug"
+    )]
     let mut child = Command::new(miner_bin)
         .arg("--quip-coordinator")
         .arg(&socket_uri)
@@ -711,21 +763,34 @@ pub async fn serve_one_session_expecting(
     }
 }
 
-/// Inputs for the e2e PoW drive harness.
+/// Inputs for the e2e `PoW` drive harness.
 pub struct DrivePowParams<'a, C: ChainClient + 'static> {
+    /// Path to the miner binary to spawn.
     pub miner_bin: &'a str,
+    /// Unix socket filesystem path (no `unix://` prefix).
     pub sock_path: &'a str,
+    /// Miner id string the binary will announce.
     pub miner_id: &'a str,
+    /// Session token shared by coordinator and miner.
     pub token: &'a str,
+    /// Launch config providing the miner's `Configure` message.
     pub entry: &'a LaunchEntry,
+    /// Topology staged into coordinator state before connect.
     pub topology: Topology,
+    /// First `PoW` job staged for the miner.
     pub job: quip_proto::v1::Job,
+    /// Chain client used for proof submit.
     pub chain: Arc<C>,
     /// After first submit, optionally cancel this generation and stage a second job.
     pub cancel_then_job: Option<(u64, quip_proto::v1::Job)>,
 }
 
-/// Full end-to-end drive: handshake, feed one PoW job, validate Result, submit.
+/// Full end-to-end drive: handshake, feed one `PoW` job, validate `Result`, submit.
+///
+/// # Panics
+///
+/// Panics if the Unix socket cannot be bound or the miner process cannot be
+/// spawned.
 pub async fn drive_pow_round<C: ChainClient + 'static>(p: DrivePowParams<'_, C>) -> DriveReport {
     let sock_path = p.sock_path;
     let miner_id = p.miner_id;
@@ -734,12 +799,17 @@ pub async fn drive_pow_round<C: ChainClient + 'static>(p: DrivePowParams<'_, C>)
         let _ = std::fs::create_dir_all(parent);
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test harness: bind failure is a setup bug"
+    )]
     let uds = UnixListener::bind(sock_path).expect("bind");
     let incoming = UnixListenerStream::new(uds);
 
     let mut st = CoordinatorState::new();
-    st.expected_tokens.insert(miner_id.into(), p.token.into());
-    st.configure
+    let _ = st.expected_tokens.insert(miner_id.into(), p.token.into());
+    let _ = st
+        .configure
         .insert(miner_id.into(), p.entry.configure.clone());
     st.set_topology(Some(p.topology));
     // Stage the PoW job before the miner connects so JobRequest can pull it.
@@ -780,6 +850,10 @@ pub async fn drive_pow_round<C: ChainClient + 'static>(p: DrivePowParams<'_, C>)
     });
 
     let socket_uri = format!("unix://{sock_path}");
+    #[expect(
+        clippy::expect_used,
+        reason = "test harness: spawn failure is a setup bug"
+    )]
     let mut child = Command::new(p.miner_bin)
         .arg("--quip-coordinator")
         .arg(&socket_uri)
@@ -814,22 +888,34 @@ pub async fn drive_pow_round<C: ChainClient + 'static>(p: DrivePowParams<'_, C>)
     }
 }
 
+/// Outcome of a [`drive_pow_round`] harness run.
 #[derive(Debug)]
 pub struct DriveReport {
+    /// Whether the miner completed handshake and registered caps.
     pub handshake_ok: bool,
+    /// Number of results that passed through validation.
     pub results_validated: u64,
+    /// Whether at least one proof submit succeeded.
     pub submitted: bool,
+    /// Highest abandoned generation reported via `Status`.
     pub abandoned_generation: u64,
+    /// Miner process exit code (`-1` if unknown).
     pub miner_exit_code: i32,
 }
 
-/// Session service used by the e2e harness: injects pre-staged jobs on Ready.
+/// Session service used by the e2e harness: injects pre-staged jobs on `Ready`.
 struct DriveService<C: ChainClient + 'static> {
+    /// Shared coordinator state.
     inner_state: Arc<Mutex<CoordinatorState>>,
+    /// Chain client for proof submit.
     chain: Arc<C>,
+    /// Notifies the harness when a proof is submitted.
     submit_notify: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// Jobs staged into the router after handshake.
     pre_jobs: Arc<Mutex<Vec<quip_proto::v1::Job>>>,
+    /// Optional cancel generation + follow-up job after first submit.
     cancel_then: Arc<Mutex<Option<(u64, quip_proto::v1::Job)>>>,
+    /// Miner id this harness session is bound to.
     miner_id: String,
 }
 
@@ -837,6 +923,10 @@ struct DriveService<C: ChainClient + 'static> {
 impl<C: ChainClient + 'static> MinerService for DriveService<C> {
     type SessionStream = ReceiverStream<Result<CoordMsg, Status>>;
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "drive harness session is one cohesive handshake + inject loop"
+    )]
     async fn session(
         &self,
         request: Request<Streaming<MinerMsg>>,
@@ -850,13 +940,13 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
         let cancel_then = Arc::clone(&self.cancel_then);
         let miner_id = self.miner_id.clone();
 
-        tokio::spawn(async move {
+        drop(tokio::spawn(async move {
             // Reuse handshake logic by running a tailored loop.
-            let hello = match inbound.message().await {
-                Ok(Some(MinerMsg {
-                    msg: Some(miner_msg::Msg::Hello(h)),
-                })) => h,
-                _ => return,
+            let Ok(Some(MinerMsg {
+                msg: Some(miner_msg::Msg::Hello(hello)),
+            })) = inbound.message().await
+            else {
+                return;
             };
             {
                 let st = state.lock().await;
@@ -884,7 +974,7 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                 // Stage pre-jobs now that the miner is registered.
                 let jobs = pre_jobs.lock().await.drain(..).collect::<Vec<_>>();
                 for j in jobs {
-                    st.router.route(j);
+                    let _ = st.router.route(j);
                 }
             }
 
@@ -920,16 +1010,15 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
             let mut cancel_sent = false;
 
             loop {
-                let msg = match inbound.message().await {
-                    Ok(Some(m)) => m,
-                    _ => break,
+                let Ok(Some(msg)) = inbound.message().await else {
+                    break;
                 };
                 match msg.msg {
                     Some(miner_msg::Msg::Ready(_)) => {
                         let mut st = state.lock().await;
                         st.router.grant_credits(&miner_id, seed_credits);
                         while let Some(job) = st.router.next_job(&miner_id) {
-                            st.inflight.insert(job.job_id.clone(), job.clone());
+                            let _ = st.inflight.insert(job.job_id.clone(), job.clone());
                             if tx.send(Ok(coord(coord_msg::Msg::Job(job)))).await.is_err() {
                                 return;
                             }
@@ -939,7 +1028,7 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                         let mut st = state.lock().await;
                         st.router.grant_credits(&miner_id, req.credits);
                         while let Some(job) = st.router.next_job(&miner_id) {
-                            st.inflight.insert(job.job_id.clone(), job.clone());
+                            let _ = st.inflight.insert(job.job_id.clone(), job.clone());
                             if tx.send(Ok(coord(coord_msg::Msg::Job(job)))).await.is_err() {
                                 return;
                             }
@@ -971,11 +1060,7 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                                         n_valid: validated.n_valid,
                                         // Capped diverse subset (pallet bound).
                                         solutions: validated.selected_solutions.clone(),
-                                        is_pow: job
-                                            .provenance
-                                            .as_ref()
-                                            .map(|p| p.is_pow)
-                                            .unwrap_or(false),
+                                        is_pow: job.provenance.as_ref().is_some_and(|p| p.is_pow),
                                         order_id: job
                                             .provenance
                                             .as_ref()
@@ -986,14 +1071,10 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                                         device_access_time_us: result
                                             .meta
                                             .as_ref()
-                                            .map(|m| m.device_access_time_us)
-                                            .unwrap_or(0),
+                                            .map_or(0, |m| m.device_access_time_us),
                                     };
                                     let submit_result = chain.submit_proof(&proof).await;
-                                    if !matches!(
-                                        submit_result,
-                                        Ok(crate::chain::SubmitAction::Success)
-                                    ) {
+                                    if !matches!(submit_result, Ok(SubmitAction::Success)) {
                                         match &submit_result {
                                             Ok(_) => tracing::warn!(
                                                 job = %crate::chain::extrinsic::hex_encode(&result.job_id),
@@ -1006,7 +1087,7 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                                             ),
                                         }
                                     }
-                                    if let Ok(crate::chain::SubmitAction::Success) = submit_result {
+                                    if let Ok(SubmitAction::Success) = submit_result {
                                         {
                                             let mut st = state.lock().await;
                                             st.current_best_milli =
@@ -1035,7 +1116,7 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                                                 // Stage next generation job.
                                                 {
                                                     let mut st = state.lock().await;
-                                                    st.router.route(next_job);
+                                                    let _ = st.router.route(next_job);
                                                 }
                                             }
                                         }
@@ -1062,13 +1143,14 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                     _ => {}
                 }
             }
-        });
+        }));
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 
-/// Issue a Shutdown on an outbound channel (for supervisor).
+/// Issue a `Shutdown` on an outbound channel (for supervisor).
+#[must_use]
 pub fn shutdown_msg(grace_ms: u32) -> CoordMsg {
     coord(coord_msg::Msg::Shutdown(Shutdown { grace_ms }))
 }

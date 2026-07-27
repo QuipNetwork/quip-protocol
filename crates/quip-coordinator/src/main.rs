@@ -80,11 +80,11 @@ struct DriveArgs {
     /// Minimum unique solutions gate. Overrides the spec.
     #[arg(long)]
     min_solutions: Option<u32>,
-    /// Pin num_reads via the SetTarget control-plane override (bypasses adapt).
+    /// Pin `num_reads` via the `SetTarget` control-plane override (bypasses adapt).
     /// Useful for the dwave/QPU path, which does not adapt yet.
     #[arg(long)]
     num_reads: Option<u32>,
-    /// Pin num_sweeps via the SetTarget override (bypasses adapt). Pairs with
+    /// Pin `num_sweeps` via the `SetTarget` override (bypasses adapt). Pairs with
     /// `--num-reads` for controlled, matched-condition throughput/parity runs.
     #[arg(long)]
     num_sweeps: Option<u32>,
@@ -112,6 +112,10 @@ fn main() -> StdExitCode {
     }
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "CLI binary reports config/runtime errors to stderr"
+)]
 fn run_config_path(config: Option<PathBuf>) -> StdExitCode {
     // --help is handled by clap (exit 0). Missing/invalid config → exit 64.
     let Some(config_path) = config else {
@@ -217,10 +221,16 @@ async fn shutdown_signal() {
 
 fn now_unix_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "unix millis fit u64 for practical coordinator lifetimes"
+    )]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
 }
 
 type BuiltJobs = (
@@ -338,6 +348,10 @@ fn preset_path(name: &str) -> Result<PathBuf, String> {
         .join(format!("{name}.spec.json")))
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "CLI binary reports drive runtime errors to stderr"
+)]
 fn run_drive_cli(args: DriveArgs) -> StdExitCode {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -349,6 +363,10 @@ fn run_drive_cli(args: DriveArgs) -> StdExitCode {
     rt.block_on(drive_main(args))
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "CLI binary reports drive run failures to stderr"
+)]
 async fn drive_main(args: DriveArgs) -> StdExitCode {
     // 0 => no deadline (the sentinel the miner honors); otherwise an absolute
     // wall-clock deadline `now + args.deadline_ms`.

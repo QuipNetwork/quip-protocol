@@ -10,8 +10,11 @@ use crate::ising::IsingGraph;
 /// Ising problem with CSR adjacency plus f32 upload buffers.
 #[derive(Clone, Debug)]
 pub struct CsrGraph {
+    /// Linear biases (f64, for consensus scoring).
     pub h: Vec<f64>,
+    /// Couplings aligned with `edges` (f64, for consensus scoring).
     pub j: Vec<f64>,
+    /// Undirected edge list `(u, v)` in received order.
     pub edges: Vec<(usize, usize)>,
     /// CSR row pointers, length `N + 1`.
     pub row_ptr: Vec<i32>,
@@ -29,6 +32,7 @@ impl CsrGraph {
     /// Edges whose endpoints are out of range for `h.len()` are skipped (same
     /// defensive posture as `energy_milli`). Couplings shorter than edges are
     /// treated as 0 for the missing entries.
+    #[must_use]
     pub fn from_base(g: &IsingGraph) -> Self {
         let n = g.h.len();
         let mut adj: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
@@ -36,10 +40,20 @@ impl CsrGraph {
             if u >= n || v >= n {
                 continue;
             }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "kernel upload path intentionally narrows coupling f64 to f32"
+            )]
             let coup = g.j.get(k).copied().unwrap_or(0.0) as f32;
-            adj[u].push((v, coup));
-            if u != v {
-                adj[v].push((u, coup));
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "u and v checked against n; adj length is n"
+            )]
+            {
+                adj[u].push((v, coup));
+                if u != v {
+                    adj[v].push((u, coup));
+                }
             }
         }
         // Deterministic neighbor order (matches Python GPU CSR builder).
@@ -51,13 +65,26 @@ impl CsrGraph {
         let mut col_ind = Vec::new();
         let mut j_csr = Vec::new();
         for i in 0..n {
-            for &(nbr, coup) in &adj[i] {
-                col_ind.push(nbr as i32);
-                j_csr.push(coup);
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap,
+                clippy::indexing_slicing,
+                reason = "i in 0..n indexes adj/row_ptr of length n/n+1; nnz and node \
+                          indices for device topologies fit i32 CSR encoding"
+            )]
+            {
+                for &(nbr, coup) in &adj[i] {
+                    col_ind.push(nbr as i32);
+                    j_csr.push(coup);
+                }
+                row_ptr[i + 1] = col_ind.len() as i32;
             }
-            row_ptr[i + 1] = col_ind.len() as i32;
         }
 
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "kernel upload path intentionally narrows bias f64 to f32"
+        )]
         let h_f32: Vec<f32> = g.h.iter().map(|&v| v as f32).collect();
         Self {
             h: g.h.clone(),
@@ -70,10 +97,14 @@ impl CsrGraph {
         }
     }
 
+    /// Number of variables (length of `h`).
+    #[must_use]
     pub fn num_nodes(&self) -> usize {
         self.h.len()
     }
 
+    /// Number of directed half-edges in the CSR (`col_ind` length).
+    #[must_use]
     pub fn nnz(&self) -> usize {
         self.col_ind.len()
     }

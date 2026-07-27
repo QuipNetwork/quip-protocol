@@ -18,22 +18,40 @@ use tokio::sync::{watch, Mutex};
 /// Last-known self-reported liveness for one miner.
 #[derive(Clone, Default, PartialEq, Debug)]
 pub struct MinerLiveness {
+    /// Whether the miner last reported `state=paused`.
     pub paused: bool,
+    /// Pause reason from `sampler_stats` when paused.
     pub reason: Option<String>,
+    /// Last reported generation from `sampler_stats`, if any.
     pub generation: Option<u64>,
 }
 
 /// A change worth logging, derived from a ping-reply `Status`.
 #[derive(Debug)]
 pub enum LivenessEvent {
-    EnteredPaused { reason: Option<String> },
+    /// Miner transitioned into the paused state.
+    EnteredPaused {
+        /// Pause reason from the miner's stats, if provided.
+        reason: Option<String>,
+    },
+    /// Miner left the paused state and resumed mining.
     Resumed,
-    StaleRound { reported: u64, current: u64 },
+    /// Miner reported a generation behind the feeder's live round.
+    StaleRound {
+        /// Generation the miner reported.
+        reported: u64,
+        /// Feeder's current generation.
+        current: u64,
+    },
 }
 
 /// Fold a `Status`'s `sampler_stats` into the prior liveness, returning the new
 /// liveness and the transitions to log. `current_generation` is the feeder's
 /// live round; a reported generation below it is stale.
+#[expect(
+    clippy::implicit_hasher,
+    reason = "callers pass the default hasher; generalizing is a public API change"
+)]
 pub fn evaluate_status(
     prev: &MinerLiveness,
     stats: &HashMap<String, String>,

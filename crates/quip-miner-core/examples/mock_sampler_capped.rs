@@ -1,4 +1,4 @@
-//! Test-support miner with `max_reads() == 0`, so every job (num_reads ≥ 1) is
+//! Test-support miner with `max_reads() == 0`, so every job (`num_reads` ≥ 1) is
 //! rejected `TooLarge`. Used by `tests/loop_conformance.rs` to exercise the
 //! reads-cap path.
 

@@ -1,3 +1,5 @@
+//! CLI smoke tests for the `quip-coordinator` binary.
+
 use std::process::Command;
 
 fn bin() -> &'static str {

@@ -1,3 +1,5 @@
+//! Supervisor restart-policy and reclaim integration tests.
+
 use quip_coordinator::supervisor::{restart_policy, Restart};
 
 #[test]

@@ -79,8 +79,11 @@ mod cancel_tests {
 
 /// One job entering the streaming sampler.
 pub struct StreamJob {
+    /// Opaque job id from the coordinator (echoed on Result/Reject).
     pub job_id: Vec<u8>,
+    /// Wire-parsed Ising problem for this job.
     pub graph: IsingGraph,
+    /// Resolved sampling knobs for this job.
     pub params: SampleParams,
     /// Reseed round the job belongs to; what a `Cancel` invalidates. `0` for
     /// mempool jobs (never reseed-cancelled).
@@ -89,7 +92,9 @@ pub struct StreamJob {
 
 /// One job leaving the streaming sampler, in completion order.
 pub struct StreamResult {
+    /// Opaque job id, matching the inbound [`StreamJob`].
     pub job_id: Vec<u8>,
+    /// Completed samples, reject reason, or cancelled generation.
     pub outcome: StreamOutcome,
     /// Per-model device/sample time in microseconds, reported in `SamplerMeta`.
     pub device_access_time_us: u64,
@@ -113,6 +118,11 @@ pub enum StreamOutcome {
 pub trait Sampler: Send + Sync + 'static {
     /// Sample one job. Device errors map to a reject reason
     /// (`Overloaded`, `TooLarge`, …).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RejectReason`] when the backend cannot complete the job
+    /// (device overload, size limit, malformed device state, …).
     fn sample(
         &self,
         graph: &IsingGraph,
@@ -155,6 +165,10 @@ pub trait Sampler: Send + Sync + 'static {
             }
             let t0 = std::time::Instant::now();
             let result = self.sample(&j.graph, &j.params);
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "per-job sample duration in micros fits u64 for any realistic device runtime"
+            )]
             let device_access_time_us = t0.elapsed().as_micros() as u64;
             if out
                 .blocking_send(StreamResult {
@@ -251,6 +265,10 @@ mod stream_tests {
             let mut seen: Vec<u8> = Vec::new();
             while let Some(r) = res_rx.recv().await {
                 assert!(matches!(r.outcome, StreamOutcome::Completed(Ok(_))));
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "test jobs use single-byte ids (vec![i])"
+                )]
                 seen.push(r.job_id[0]);
             }
             seen.sort_unstable();
@@ -266,7 +284,8 @@ mod stream_tests {
             graph: &IsingGraph,
             _params: &SampleParams,
         ) -> Result<Vec<SamplerResult>, RejectReason> {
-            let _ = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            use std::sync::atomic::Ordering;
+            let _ = self.0.fetch_add(1, Ordering::SeqCst);
             Ok(vec![SamplerResult {
                 spins: vec![1i8; graph.h.len()],
                 energy_milli: 0,
@@ -288,8 +307,7 @@ mod stream_tests {
         cancel.cancel_through(3); // generations 1..=3 abandoned
 
         let sampler = CountingSampler(Arc::clone(&calls));
-        let cg = cancel.clone();
-        let worker = std::thread::spawn(move || sampler.sample_stream(job_rx, res_tx, cg));
+        let worker = std::thread::spawn(move || sampler.sample_stream(job_rx, res_tx, cancel));
 
         rt.block_on(async {
             job_tx
@@ -315,6 +333,10 @@ mod stream_tests {
             let mut cancelled: std::collections::HashMap<u8, bool> =
                 std::collections::HashMap::new();
             while let Some(r) = res_rx.recv().await {
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "test jobs use single-byte ids (vec![1]/vec![2])"
+                )]
                 let _ =
                     cancelled.insert(r.job_id[0], matches!(r.outcome, StreamOutcome::Cancelled));
             }

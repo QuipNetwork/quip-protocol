@@ -9,3 +9,6 @@ prost = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }
+
+# quip-proto is 100% prost/tonic-generated (tonic::include_proto!); it stays on
+# default lints rather than opting into the strict workspace set.

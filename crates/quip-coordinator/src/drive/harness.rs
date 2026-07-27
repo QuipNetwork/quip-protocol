@@ -32,13 +32,21 @@ use tonic::{Request, Response, Status, Streaming};
 
 /// Inputs for a full drive-many run.
 pub struct DriveManyParams<'a> {
+    /// Absolute or `PATH`-resolved miner binary to spawn.
     pub miner_bin: &'a str,
+    /// Unix-domain socket path the coordinator binds and the miner dials.
     pub sock_path: &'a str,
+    /// Miner id registered on the coordinator and passed as `--miner-id`.
     pub miner_id: &'a str,
+    /// Session token the miner must present in `Hello`.
     pub token: &'a str,
+    /// Launch plan (configure payload) for this miner.
     pub entry: &'a LaunchEntry,
+    /// Optional topology wire message staged after handshake.
     pub topology: Option<Topology>,
+    /// Optional quality-gate target staged after handshake.
     pub target: Option<quip_proto::v1::SetTarget>,
+    /// Jobs to stage and drive to terminal outcomes.
     pub jobs: Vec<Job>,
     /// Forwarded to the spawned miner's `--utilization` when set (GPU backends).
     pub utilization: Option<u32>,
@@ -49,12 +57,15 @@ pub struct DriveManyParams<'a> {
 /// Result of a drive-many run: per-job rows plus handshake/exit status.
 #[derive(Debug, Default)]
 pub struct DriveManyReport {
+    /// Whether the miner completed a successful Hello/Welcome handshake.
     pub handshake_ok: bool,
+    /// Per-job scoring rows recorded during the run.
     pub rows: Vec<JobRow>,
     /// Number of jobs handed to the run. `rows.len() < total` means the run was
     /// truncated (miner crash / dropped Result / timeout) — an incomplete run,
     /// not per-job data.
     pub total: usize,
+    /// Miner process exit code (`-1` if killed or wait failed).
     pub miner_exit_code: i32,
     /// Real wall-clock span first-dispatch → last-result (ms). Throughput is
     /// `jobs / this`, not the sum of per-job `wall_ms` (which overcounts the
@@ -81,7 +92,7 @@ fn failing_row(job_id: Vec<u8>, is_pow: bool, wall_ms: u64) -> JobRow {
 }
 
 fn job_is_pow(job: &Job) -> bool {
-    job.provenance.as_ref().map(|p| p.is_pow).unwrap_or(false)
+    job.provenance.as_ref().is_some_and(|p| p.is_pow)
 }
 
 /// Shared per-run bookkeeping the session task mutates as jobs complete.
@@ -105,30 +116,47 @@ impl RunState {
         }
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "StdMutex poison only if a prior holder panicked"
+    )]
     fn note_dispatch(&self, job_id: Vec<u8>) {
         let now = Instant::now();
-        self.dispatch_at.lock().unwrap().insert(job_id, now);
+        let _ = self.dispatch_at.lock().unwrap().insert(job_id, now);
         let mut span = self.span.lock().unwrap();
         if span.0.is_none() {
             span.0 = Some(now);
         }
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        clippy::cast_possible_truncation,
+        reason = "StdMutex poison only if a prior holder panicked; wall-clock ms fit in u64 for drive runs"
+    )]
     fn wall_ms_since_dispatch(&self, job_id: &[u8]) -> u64 {
         self.dispatch_at
             .lock()
             .unwrap()
             .remove(job_id)
-            .map(|t| t.elapsed().as_millis() as u64)
-            .unwrap_or(0)
+            .map_or(0, |t| t.elapsed().as_millis() as u64)
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "StdMutex poison only if a prior holder panicked"
+    )]
     fn record(&self, row: JobRow) {
         self.rows.lock().unwrap().push(row);
         self.span.lock().unwrap().1 = Some(Instant::now());
     }
 
     /// Real wall-clock span first-dispatch → last-result, in ms.
+    #[expect(
+        clippy::unwrap_used,
+        clippy::cast_possible_truncation,
+        reason = "StdMutex poison only if a prior holder panicked; wall-clock ms fit in u64 for drive runs"
+    )]
     fn wall_span_ms(&self) -> u64 {
         let span = self.span.lock().unwrap();
         match (span.0, span.1) {
@@ -137,6 +165,10 @@ impl RunState {
         }
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "StdMutex poison only if a prior holder panicked"
+    )]
     fn is_complete(&self) -> bool {
         self.rows.lock().unwrap().len() >= self.total
     }
@@ -167,9 +199,9 @@ impl MinerService for DriveManyService {
         let run = Arc::clone(&self.run);
         let miner_id = self.miner_id.clone();
 
-        tokio::spawn(async move {
+        drop(tokio::spawn(async move {
             run_drive_session(&mut inbound, &tx, state, jobs, run, miner_id).await;
-        });
+        }));
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
@@ -186,11 +218,11 @@ async fn handshake(
     run: &Arc<RunState>,
     miner_id: &str,
 ) -> Option<Configure> {
-    let hello = match inbound.message().await {
-        Ok(Some(MinerMsg {
-            msg: Some(miner_msg::Msg::Hello(h)),
-        })) => h,
-        _ => return None,
+    let Ok(Some(MinerMsg {
+        msg: Some(miner_msg::Msg::Hello(hello)),
+    })) = inbound.message().await
+    else {
+        return None;
     };
     {
         let st = state.lock().await;
@@ -219,7 +251,7 @@ async fn handshake(
         );
         let staged = jobs.lock().await.drain(..).collect::<Vec<_>>();
         for j in staged {
-            st.router.route(j);
+            let _ = st.router.route(j);
         }
         // Reconcile jobs no registered miner can serve: record failing rows now
         // so the completion gate accounts for them instead of stalling to the
@@ -270,7 +302,7 @@ async fn dispatch_jobs(
     st.router.grant_credits(miner_id, credits);
     while let Some(job) = st.router.next_job(miner_id) {
         run.note_dispatch(job.job_id.clone());
-        st.inflight.insert(job.job_id.clone(), job.clone());
+        let _ = st.inflight.insert(job.job_id.clone(), job.clone());
         if tx.send(Ok(coord(coord_msg::Msg::Job(job)))).await.is_err() {
             return false;
         }
@@ -300,7 +332,7 @@ async fn handle_result(
         (job, topo, gates)
     };
     let Some(job) = job else { return };
-    let is_pow = job.provenance.as_ref().map(|p| p.is_pow).unwrap_or(false);
+    let is_pow = job.provenance.as_ref().is_some_and(|p| p.is_pow);
     let Some(ising) = job.ising else { return };
     let job_id = result.job_id;
     let solutions = result.solutions;
@@ -308,15 +340,13 @@ async fn handle_result(
     let (device_us, reads, sweeps) = result
         .meta
         .as_ref()
-        .map(|m| (m.device_access_time_us, m.reads, m.sweeps))
-        .unwrap_or((0, 0, 0));
-    let validated = match tokio::task::spawn_blocking(move || {
-        validate_result(&ising, &solutions, &gates, &topo)
-    })
-    .await
-    {
-        Ok(v) => v,
-        Err(_) => return, // validation task panicked; leave the run to time out
+        .map_or((0, 0, 0), |m| (m.device_access_time_us, m.reads, m.sweeps));
+    let Ok(validated) =
+        tokio::task::spawn_blocking(move || validate_result(&ising, &solutions, &gates, &topo))
+            .await
+    else {
+        // validation task panicked; leave the run to time out
+        return;
     };
     let wall_ms = run.wall_ms_since_dispatch(&job_id);
     run.record(JobRow {
@@ -341,8 +371,7 @@ async fn handle_reject(state: &Arc<Mutex<CoordinatorState>>, rej: Reject, run: &
         let mut st = state.lock().await;
         st.inflight
             .remove(&rej.job_id)
-            .map(|j| job_is_pow(&j))
-            .unwrap_or(false)
+            .is_some_and(|j| job_is_pow(&j))
     };
     let wall_ms = run.wall_ms_since_dispatch(&rej.job_id);
     run.record(failing_row(rej.job_id, is_pow, wall_ms));
@@ -426,9 +455,8 @@ async fn run_drive_session(
     }
     let seed_credits = configure.queue_depth.max(1);
     loop {
-        let msg = match inbound.message().await {
-            Ok(Some(m)) => m,
-            _ => break,
+        let Ok(Some(msg)) = inbound.message().await else {
+            break;
         };
         let keep_going = handle_message(msg, &state, &miner_id, tx, &run, seed_credits).await;
         if !keep_going {
@@ -443,6 +471,17 @@ async fn run_drive_session(
 
 /// Full drive-many run: spawn the miner over UDS, stage every job, validate
 /// every `Result`, and send a clean `Shutdown` once all jobs are terminal.
+///
+/// # Panics
+///
+/// Panics if the Unix socket cannot be bound or the miner process cannot be
+/// spawned (drive CLI setup failures are fatal).
+#[expect(
+    clippy::expect_used,
+    clippy::print_stderr,
+    clippy::unwrap_used,
+    reason = "drive CLI: bind/spawn failures are fatal setup errors; StdMutex poison only if a prior holder panicked; eprintln is drive CLI interrupt notice"
+)]
 pub async fn run_drive(p: DriveManyParams<'_>) -> DriveManyReport {
     let sock_path = p.sock_path;
     let miner_id = p.miner_id;
@@ -455,8 +494,9 @@ pub async fn run_drive(p: DriveManyParams<'_>) -> DriveManyReport {
     let incoming = UnixListenerStream::new(uds);
 
     let mut st = CoordinatorState::new();
-    st.expected_tokens.insert(miner_id.into(), p.token.into());
-    st.configure
+    let _ = st.expected_tokens.insert(miner_id.into(), p.token.into());
+    let _ = st
+        .configure
         .insert(miner_id.into(), p.entry.configure.clone());
     // Resolves the position-indexed scoring topology once (a run constant);
     // every result handler borrows it by `Arc`, never rebuilding the graph.
@@ -483,7 +523,8 @@ pub async fn run_drive(p: DriveManyParams<'_>) -> DriveManyReport {
 
     let socket_uri = format!("unix://{sock_path}");
     let mut cmd = Command::new(p.miner_bin);
-    cmd.arg("--quip-coordinator")
+    let _ = cmd
+        .arg("--quip-coordinator")
         .arg(&socket_uri)
         .arg("--miner-id")
         .arg(miner_id)
@@ -491,10 +532,10 @@ pub async fn run_drive(p: DriveManyParams<'_>) -> DriveManyReport {
     // Mechanism A: forward governor flags to the spawned miner's own CLI
     // (cuda/metal). config.toml still overrides these via backend_toml.
     if let Some(util) = p.utilization {
-        cmd.arg("--utilization").arg(util.to_string());
+        let _ = cmd.arg("--utilization").arg(util.to_string());
     }
     if p.yielding {
-        cmd.arg("--yielding");
+        let _ = cmd.arg("--yielding");
     }
     let mut child = cmd.spawn().expect("spawn miner");
 
@@ -504,7 +545,7 @@ pub async fn run_drive(p: DriveManyParams<'_>) -> DriveManyReport {
     // The only early stop is the operator: Ctrl-C kills the miner and reports
     // whatever completed so far (`rows.len() < total` marks it truncated).
     let exit_code = tokio::select! {
-        status = child.wait() => status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1),
+        status = child.wait() => status.map_or(-1, |s| s.code().unwrap_or(-1)),
         _ = tokio::signal::ctrl_c() => {
             eprintln!("drive: interrupted; stopping and reporting completed jobs");
             let _ = child.kill().await;

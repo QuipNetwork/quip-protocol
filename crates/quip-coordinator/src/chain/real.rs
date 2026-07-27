@@ -39,20 +39,24 @@ type SubxtClient = subxt::OnlineClient<subxt::SubstrateConfig>;
 
 /// Production chain client (RPC + hybrid-signed submit).
 pub struct RealChainClient {
+    /// Validator WebSocket / HTTP RPC URLs (primary first).
     pub validators: Vec<String>,
+    /// Hybrid keystore path, `//DevUri`, or 32-byte hex seed.
     pub signer_key: String,
     /// Cached hybrid pair (loaded lazily from `signer_key`).
     pair: Mutex<Option<HybridPair>>,
     /// Last fetched mining snapshot — used by `submit_proof` to pack spins
     /// and derive the nonce. Updated by `fetch_mining_snapshot`.
     last_snapshot: Mutex<Option<MiningSnapshot>>,
-    /// Last allowed_spin spec (full AllowedValueSpec, not just Set values).
+    /// Last `allowed_spin` spec (full `AllowedValueSpec`, not just Set values).
     last_spin_spec: Mutex<Option<AllowedValueSpec<Vec<i32>>>>,
     /// Lazily-connected subxt client for mempool `JobProposed` event decoding.
     subxt: OnceCell<SubxtClient>,
 }
 
 impl RealChainClient {
+    /// Construct a client over the given validators and signer material.
+    #[must_use]
     pub fn new(validators: Vec<String>, signer_key: String) -> Self {
         Self {
             validators,
@@ -138,26 +142,25 @@ impl ChainClient for RealChainClient {
         _miner_account: [u8; 32],
         topology_hash: Option<[u8; 32]>,
     ) -> Result<Option<MiningSnapshot>, ChainError> {
-        let block_hash = match at {
-            Some(h) => h,
-            None => {
-                let head = self
-                    .rpc_call("chain_getBlockHash", Value::Array(vec![]))
-                    .await?;
-                let hex = head
-                    .as_str()
-                    .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?;
-                let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
-                if bytes.len() != 32 {
-                    return Err(ChainError::Decode(format!(
-                        "block hash len {}",
-                        bytes.len()
-                    )));
-                }
-                let mut h = [0u8; 32];
-                h.copy_from_slice(&bytes);
-                h
+        let block_hash = if let Some(h) = at {
+            h
+        } else {
+            let head = self
+                .rpc_call("chain_getBlockHash", Value::Array(vec![]))
+                .await?;
+            let hex = head
+                .as_str()
+                .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?;
+            let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
+            if bytes.len() != 32 {
+                return Err(ChainError::Decode(format!(
+                    "block hash len {}",
+                    bytes.len()
+                )));
             }
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&bytes);
+            h
         };
 
         // Parameter: Option<H256> SCALE-encoded.
@@ -280,18 +283,18 @@ impl ChainClient for RealChainClient {
         let curve: Option<CurveCScale> = self
             .read_storage(&topology_curve_c_storage_key(&topology_hash), &at)
             .await?;
-        let (c_easy_milli, c_knee_milli, c_hard_milli) = curve
-            .map(|c| (c.easy_milli, c.knee_milli, c.hard_milli))
-            .unwrap_or((
+        let (c_easy_milli, c_knee_milli, c_hard_milli) = curve.map_or(
+            (
                 DEFAULT_C_EASY_MILLI,
                 DEFAULT_C_KNEE_MILLI,
                 DEFAULT_C_HARD_MILLI,
-            ));
+            ),
+            |c| (c.easy_milli, c.knee_milli, c.hard_milli),
+        );
 
         Ok(Some(DecayParams {
             base_max_energy_milli: base
-                .map(|d| d.max_energy_milli)
-                .unwrap_or(DEFAULT_BASE_MAX_ENERGY_MILLI),
+                .map_or(DEFAULT_BASE_MAX_ENERGY_MILLI, |d| d.max_energy_milli),
             last_proof_block: u64::from(last_proof_block),
             epoch_length: EPOCH_LENGTH_BLOCKS,
             c_easy_milli,
@@ -393,6 +396,10 @@ impl ChainClient for RealChainClient {
         Ok(orders)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "hybrid sign + RPC submit path is one linear procedure"
+    )]
     async fn submit_proof(&self, proof: &Proof) -> Result<SubmitAction, ChainError> {
         let pair = self.pair()?;
         let snap = self
@@ -475,7 +482,7 @@ impl ChainClient for RealChainClient {
             .await?;
         let spec_version = u32::try_from(
             rv.get("specVersion")
-                .and_then(serde_json::Value::as_u64)
+                .and_then(Value::as_u64)
                 .ok_or_else(|| {
                     ChainError::Decode("runtime specVersion missing/not a u64".into())
                 })?,
@@ -483,7 +490,7 @@ impl ChainClient for RealChainClient {
         .map_err(|_| ChainError::Decode("specVersion exceeds u32".into()))?;
         let transaction_version = u32::try_from(
             rv.get("transactionVersion")
-                .and_then(serde_json::Value::as_u64)
+                .and_then(Value::as_u64)
                 .ok_or_else(|| {
                     ChainError::Decode("runtime transactionVersion missing/not a u64".into())
                 })?,
@@ -523,7 +530,7 @@ impl ChainClient for RealChainClient {
                 );
                 Ok(SubmitAction::Success)
             }
-            Err(ChainError::Submit(msg)) | Err(ChainError::Unavailable(msg)) => {
+            Err(ChainError::Submit(msg) | ChainError::Unavailable(msg)) => {
                 Ok(classify_receipt(Some(&msg)))
             }
             Err(ChainError::Decode(msg)) => Err(ChainError::Decode(msg)),

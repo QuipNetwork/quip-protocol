@@ -24,8 +24,14 @@ fn file_mode_delivers_model_and_parses_solutions() {
         .sample(&graph(), &SampleParams::default())
         .expect("ok");
     assert_eq!(out.len(), 1);
-    assert_eq!(out[0].spins, vec![1i8, -1]);
-    assert_eq!(out[0].energy_milli, -5);
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "len asserted to 1; single solution at index 0"
+    )]
+    {
+        assert_eq!(out[0].spins, vec![1i8, -1]);
+        assert_eq!(out[0].energy_milli, -5);
+    }
 }
 
 #[test]

@@ -26,18 +26,23 @@ struct ListEntryJson {
 /// Errors reading/parsing a drive-mode JSONL model list.
 #[derive(Debug, PartialEq)]
 pub enum ListSourceError {
+    /// Filesystem read failure (message is the I/O error).
     Io(String),
     /// `reason` names the JSON decode failure; `line` is 1-based.
     Parse {
+        /// 1-based line number in the JSONL file.
         line: usize,
+        /// Decode or nonce-draw failure detail.
         reason: String,
     },
     /// Neither or both of `nonce` / `h_milli` present.
     AmbiguousEntry {
+        /// 1-based line number of the ambiguous entry.
         line: usize,
     },
     /// A nonce-ref entry with no `--topology` spec supplied.
     MissingTopologyForNonceRef {
+        /// 1-based line number of the nonce-ref entry.
         line: usize,
     },
 }
@@ -45,15 +50,15 @@ pub enum ListSourceError {
 impl std::fmt::Display for ListSourceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ListSourceError::Io(e) => write!(f, "cannot read list file: {e}"),
-            ListSourceError::Parse { line, reason } => {
+            Self::Io(e) => write!(f, "cannot read list file: {e}"),
+            Self::Parse { line, reason } => {
                 write!(f, "line {line}: {reason}")
             }
-            ListSourceError::AmbiguousEntry { line } => write!(
+            Self::AmbiguousEntry { line } => write!(
                 f,
                 "line {line}: entry must have exactly one of `nonce` or `h_milli`"
             ),
-            ListSourceError::MissingTopologyForNonceRef { line } => write!(
+            Self::MissingTopologyForNonceRef { line } => write!(
                 f,
                 "line {line}: nonce-ref entry requires --topology <spec.json>"
             ),
@@ -151,6 +156,11 @@ pub struct ListSource {
 impl ListSource {
     /// Load and parse `path`. `topology_snapshot` is required when the file
     /// contains any nonce-ref entry; explicit-only lists can pass `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ListSourceError`] on I/O failure or when any line fails to
+    /// parse or validate (ambiguous entry, missing topology for a nonce-ref).
     pub fn load(
         path: &std::path::Path,
         topology_snapshot: Option<&MiningSnapshot>,
@@ -161,6 +171,11 @@ impl ListSource {
     }
 
     /// Parse already-loaded JSONL text (used directly by tests).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ListSourceError`] when any line fails to parse or validate
+    /// (ambiguous entry, missing topology for a nonce-ref, bad JSON).
     pub fn parse(
         text: &str,
         topology_snapshot: Option<&MiningSnapshot>,

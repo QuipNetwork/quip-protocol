@@ -34,7 +34,7 @@ pub struct RuntimeParams {
     /// Restart backoff + failure budget applied to each miner.
     pub backoff: BackoffPolicy,
     /// Canonical miner account (`blake2_256(SCALE(account))`) seeding nonce
-    /// derivation for PoW jobs.
+    /// derivation for `PoW` jobs.
     pub miner_account: [u8; 32],
     /// Floor for the adaptive staging window: minimum staged jobs per miner
     /// (0 disables feeding). The window grows above this with each miner's
@@ -49,11 +49,13 @@ pub struct RuntimeParams {
 
 /// Inputs to the feeder loop.
 pub struct FeederParams {
+    /// Canonical miner account seeding `PoW` nonce derivation.
     pub miner_account: [u8; 32],
     /// Floor for the adaptive staging window: the minimum staged jobs kept per
     /// miner (0 disables feeding). The window grows above this from the miner's
     /// observed drain rate — see [`feeder_loop`] — with no ceiling.
     pub buffer_depth: usize,
+    /// How often the feeder polls the chain head and tops up buffers.
     pub poll_interval: Duration,
 }
 
@@ -76,19 +78,29 @@ const DECAY_HORIZON_STEPS: usize = 256;
 /// throughput; the feeder additionally clamps it to [`stage_ceiling`] so a fast
 /// miner on a large topology can't stage an unbounded-memory reserve.
 fn adaptive_depth(ema: f64, floor: usize) -> usize {
-    floor.max((ema * WINDOW_HEADROOM).ceil() as usize)
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "EMA*headroom is non-negative and small for operational drain rates"
+    )]
+    {
+        floor.max((ema * WINDOW_HEADROOM).ceil() as usize)
+    }
 }
 
 /// Per-miner budget on staged-job memory. The adaptive window sizes to drain
 /// rate with no ceiling of its own, so a fast miner on a large topology could
-/// stage an unbounded reserve — each staged PoW job holds a full materialized
+/// stage an unbounded reserve — each staged `PoW` job holds a full materialized
 /// Ising model (`h`/`j`), ~`4·(nodes+edges)` bytes. This bounds the peak
 /// staging memory per miner regardless of topology size or drain rate.
 const MAX_STAGE_BYTES_PER_MINER: usize = 64 * 1024 * 1024; // 64 MiB
 
+/// Periodic liveness ping interval for [`crate::liveness::liveness_loop`].
+const LIVENESS_PING_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Estimated materialized-model bytes for one staged job on this topology: one
-/// i32 field per node (`h`) and one per edge (`j`). The 32-byte topology_hash
-/// and job_id are negligible next to these. Floored at 1 to avoid a zero
+/// i32 field per node (`h`) and one per edge (`j`). The 32-byte `topology_hash`
+/// and `job_id` are negligible next to these. Floored at 1 to avoid a zero
 /// divisor on an empty topology.
 fn est_job_bytes(num_nodes: usize, num_edges: usize) -> usize {
     4usize
@@ -165,20 +177,24 @@ async fn broadcast_cancel(state: &Arc<Mutex<CoordinatorState>>, max_generation: 
 }
 
 /// A unique 32-byte salt from a monotonic counter: distinct salts derive
-/// distinct nonces (job ids), so each attempt is a fresh PoW draw.
+/// distinct nonces (job ids), so each attempt is a fresh `PoW` draw.
 fn salt_from_counter(ctr: u64) -> [u8; 32] {
     let mut salt = [0u8; 32];
     salt[..8].copy_from_slice(&ctr.to_le_bytes());
     salt
 }
 
-/// The replenished PoW feeder: follow the chain head, and keep each registered
+/// The replenished `PoW` feeder: follow the chain head, and keep each registered
 /// miner's staged queue topped up to `buffer_depth` with fresh-salt jobs.
 ///
 /// On a new `last_proof_block_hash` it reseeds — bump the generation, cancel the
 /// prior generation's staged jobs, refresh topology + difficulty target, and
 /// drop stale salts — then refills under the new seed. Runs until `stop` flips.
 /// `pub` so it can be exercised directly in tests without a gRPC server.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single feeder loop: reseed, top-up, win-time submit"
+)]
 pub async fn feeder_loop<C: ChainClient>(
     chain: Arc<C>,
     state: Arc<Mutex<CoordinatorState>>,
@@ -372,8 +388,7 @@ pub async fn feeder_loop<C: ChainClient>(
             let now_mono = start.elapsed().as_secs_f64();
             let now_wall = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0);
+                .map_or(0.0, |d| d.as_secs_f64());
             st.timing
                 .observe_head(snap.block_number, now_wall, now_mono, now_wall);
             let current_block = st
@@ -385,6 +400,8 @@ pub async fn feeder_loop<C: ChainClient>(
             drop(st);
 
             if let Some(cand) = due {
+                use crate::chain::SubmitAction;
+
                 let proof = crate::chain::Proof {
                     job_id: cand.job_id.clone(),
                     best_energy_milli: cand.best_energy_milli,
@@ -397,7 +414,6 @@ pub async fn feeder_loop<C: ChainClient>(
                     salt: cand.salt.map(|s| s.to_vec()).unwrap_or_default(),
                     device_access_time_us: cand.device_access_time_us,
                 };
-                use crate::chain::SubmitAction;
                 let job_hex = crate::chain::extrinsic::hex_encode(&cand.job_id);
                 match chain.submit_proof(&proof).await {
                     Ok(SubmitAction::Success) => {
@@ -443,7 +459,7 @@ pub async fn feeder_loop<C: ChainClient>(
         }
 
         tokio::select! {
-            _ = tokio::time::sleep(params.poll_interval) => {}
+            () = tokio::time::sleep(params.poll_interval) => {}
             _ = stop.changed() => break,
         }
     }
@@ -451,9 +467,12 @@ pub async fn feeder_loop<C: ChainClient>(
 
 /// Serve the UDS session server, supervise every miner in `launch`, and return
 /// once `shutdown` resolves — fanning an in-band `Shutdown` to each live miner
-/// and killing after grace. Generic over `ChainClient` so tests drive it with
+/// and killing after grace. Generic over [`ChainClient`] so tests drive it with
 /// `FakeChain`; `main` passes `RealChainClient`. `state` is shared with the
 /// caller so a live coordinator (and tests) can inspect routing/inflight.
+///
+/// # Errors
+/// Returns an I/O error if the UDS socket cannot be bound.
 pub async fn run_runtime<C, S>(
     launch: Vec<LaunchEntry>,
     chain: Arc<C>,
@@ -529,9 +548,6 @@ where
         stop_rx.clone(),
     ));
 
-    // Periodic liveness ping: miners' Status replies surface paused/stale
-    // transitions, logged by the session Status handler.
-    const LIVENESS_PING_INTERVAL: Duration = Duration::from_secs(15);
     let liveness = tokio::spawn(crate::liveness::liveness_loop(
         Arc::clone(&state),
         LIVENESS_PING_INTERVAL,
@@ -572,7 +588,13 @@ mod tests {
     #[test]
     fn adaptive_depth_grows_with_consumption_no_ceiling() {
         // depth = ceil(ema * headroom), floor when that is smaller.
-        assert_eq!(adaptive_depth(10.0, 8), (10.0 * WINDOW_HEADROOM) as usize);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "test fixture: exact integer headroom product"
+        )]
+        let expected = (10.0 * WINDOW_HEADROOM) as usize;
+        assert_eq!(adaptive_depth(10.0, 8), expected);
         // A many-core miner grows far past the floor — no upper cap.
         assert_eq!(adaptive_depth(250.0, 8), 500);
     }

@@ -1,6 +1,13 @@
+//! Handshake integration tests against `quip-mock-miner`.
+
+#![expect(
+    clippy::expect_used,
+    reason = "helper builds mock miner outside #[test]"
+)]
+
 use quip_coordinator::session::{serve_one_session, serve_one_session_expecting};
 
-/// Sibling `quip-mock-miner` binary (not same package → no CARGO_BIN_EXE_*).
+/// Sibling `quip-mock-miner` binary (not same package → no `CARGO_BIN_EXE_*`).
 fn mock_miner() -> String {
     let status = std::process::Command::new(env!("CARGO"))
         .args(["build", "-p", "quip-mock-miner"])
@@ -13,8 +20,8 @@ fn mock_miner() -> String {
         "quip-mock-miner"
     };
     let mut p = std::env::current_exe().expect("test exe path");
-    p.pop(); // deps/
-    p.pop(); // profile/
+    let _ = p.pop(); // deps/
+    let _ = p.pop(); // profile/
     p.push(name);
     p.to_string_lossy().into_owned()
 }

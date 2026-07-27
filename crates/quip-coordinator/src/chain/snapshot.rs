@@ -2,21 +2,30 @@
 
 use crate::topology::{topology_hash_sets, DEFAULT_SPIN_SET};
 
-/// Chain mining snapshot consumed by the PoW producer.
+/// Chain mining snapshot consumed by the `PoW` producer.
 #[derive(Debug, Clone)]
 pub struct MiningSnapshot {
+    /// Hash of the block that contained the last winning proof.
     pub last_proof_block_hash: [u8; 32],
+    /// Topology identity bytes (32-byte hash when provided by the chain).
     pub topology_hash: Vec<u8>,
+    /// Topology node ids.
     pub nodes: Vec<u32>,
+    /// Topology undirected edges as `(u, v)` node-id pairs.
     pub edges: Vec<(u32, u32)>,
+    /// Allowed linear-field values in milli units.
     pub allowed_h_milli: Vec<i32>,
+    /// Allowed coupling values in milli units.
     pub allowed_j_milli: Vec<i32>,
     /// Allowed spin milli values (Set); default binary `±1000` when empty.
     pub allowed_spin_milli: Vec<i32>,
+    /// Minimum number of valid solutions required.
     pub min_solutions: u32,
     /// Energy ceiling: solutions must be strictly below this (milli).
     pub max_energy_milli: i64,
+    /// Minimum diversity of the solution set (milli).
     pub min_diversity_milli: u32,
+    /// Chain block number the snapshot was taken at.
     pub block_number: u64,
 }
 
@@ -36,12 +45,15 @@ pub struct DecayParams {
     /// Resolved curve c-triple (per-mille: 700 == 0.70), after any per-topology
     /// `TopologyCurveC` override.
     pub c_easy_milli: u32,
+    /// Knee c of the difficulty curve (per-mille).
     pub c_knee_milli: u32,
+    /// Hard c of the difficulty curve (per-mille).
     pub c_hard_milli: u32,
 }
 
 impl DecayParams {
     /// Genesis / no-proof defaults: base difficulty is active (no decay).
+    #[must_use]
     pub fn genesis() -> Self {
         Self {
             base_max_energy_milli: crate::decay::DEFAULT_BASE_MAX_ENERGY_MILLI,
@@ -57,19 +69,21 @@ impl DecayParams {
 /// Change-detection key over the round-identifying snapshot fields.
 ///
 /// Mirrors `substrate/event_manager.py:_state_key`: a new key means a new
-/// PoW generation. Pure blake3 over identifying fields (groundable).
+/// `PoW` generation. Pure `blake3` over identifying fields (groundable).
+#[must_use]
 pub fn head_state_key(snap: &MiningSnapshot) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
-    h.update(&snap.last_proof_block_hash);
-    h.update(&snap.topology_hash);
-    h.update(&snap.min_solutions.to_le_bytes());
-    h.update(&snap.max_energy_milli.to_le_bytes());
-    h.update(&snap.min_diversity_milli.to_le_bytes());
-    h.update(&snap.block_number.to_le_bytes());
+    let _ = h.update(&snap.last_proof_block_hash);
+    let _ = h.update(&snap.topology_hash);
+    let _ = h.update(&snap.min_solutions.to_le_bytes());
+    let _ = h.update(&snap.max_energy_milli.to_le_bytes());
+    let _ = h.update(&snap.min_diversity_milli.to_le_bytes());
+    let _ = h.update(&snap.block_number.to_le_bytes());
     *h.finalize().as_bytes()
 }
 
 /// Build topology hash for a snapshot's graph when not provided by the chain.
+#[must_use]
 pub fn snapshot_topology_hash(snap: &MiningSnapshot) -> Vec<u8> {
     if snap.topology_hash.len() == 32 {
         snap.topology_hash.clone()
@@ -152,11 +166,17 @@ mod tests {
         let curve = topology_curve_c_storage_key(&hash);
         assert_eq!(curve.len(), 80);
         // Same pallet prefix, different storage item.
-        assert_eq!(diff[..16], curve[..16]);
-        assert_ne!(diff[16..32], curve[16..32]);
-        // Plain StorageValue: pallet + item, no key suffix.
-        assert_eq!(last_proof_block_storage_key().len(), 32);
-        assert_eq!(last_proof_block_storage_key()[..16], diff[..16]);
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "storage keys are fixed 80/32 bytes; prefixes checked by len asserts"
+        )]
+        {
+            assert_eq!(diff[..16], curve[..16]);
+            assert_ne!(diff[16..32], curve[16..32]);
+            // Plain StorageValue: pallet + item, no key suffix.
+            assert_eq!(last_proof_block_storage_key().len(), 32);
+            assert_eq!(last_proof_block_storage_key()[..16], diff[..16]);
+        }
     }
 
     #[test]
