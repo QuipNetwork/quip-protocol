@@ -271,120 +271,118 @@ async fn run_session<S: Sampler>(
                 Err(status) => return Err(status.into()),
             };
             match cm.msg {
-                    Some(coord_msg::Msg::Welcome(w)) => {
-                        if w.protocol_version != 1 {
-                            return Err(SessionError::BadWelcome(w.protocol_version).into());
-                        }
+                Some(coord_msg::Msg::Welcome(w)) => {
+                    if w.protocol_version != 1 {
+                        return Err(SessionError::BadWelcome(w.protocol_version).into());
                     }
-                    Some(coord_msg::Msg::Configure(c)) => {
-                        // Hand the verbatim config subsection to the backend to
-                        // parse against its own schema (overrides CLI, warns on
-                        // unknown fields / overrides) before mining starts.
-                        sampler.apply_config(&c.backend_toml);
-                        num_sweeps = num_sweeps_from_toml(&c.backend_toml);
-                        let config = SessionConfig::from_configure(miner_id.into(), &c);
-                        ctrl_tx.send(miner(miner_msg::Msg::Ready(Ready {}))).await?;
-                        // Request enough credits to keep the prefetch buffer
-                        // full (active + next per lane), so the backend always
-                        // has a NEXT slot to rotate into.
-                        #[expect(
-                            clippy::cast_possible_truncation,
-                            reason = "stream width / prefetch are small device-local counts well under u32::MAX"
-                        )]
-                        let depth = config.queue_depth.max(prefetch as u32);
-                        // INVARIANT: the granted pool must not exceed the job
-                        // channel's capacity (`cap`), or the read loop can block
-                        // on `job_tx.send` with jobs still arriving — the same
-                        // deadlock one layer down. `cap == prefetch` and
-                        // `depth <= prefetch` unless the coordinator's
-                        // `queue_depth` is larger, so clamp to `cap`.
-                        let depth = depth.min(u32::try_from(cap).unwrap_or(u32::MAX));
-                        ctrl_tx
-                            .send(miner(miner_msg::Msg::JobRequest(JobRequest {
-                                credits: depth,
-                            })))
-                            .await?;
-                    }
-                    Some(coord_msg::Msg::Topology(t)) => {
-                        topology = Some(TopologyCache::from_proto(&t));
-                    }
-                    Some(coord_msg::Msg::SetTarget(s)) => {
-                        target = Some(SessionTarget::from_proto(&s));
-                    }
-                    Some(coord_msg::Msg::Job(job)) => {
-                        match prepare_job(
-                            job,
-                            &*sampler,
-                            id,
-                            num_sweeps,
-                            sweeps_per_beta,
-                            topology.as_ref(),
-                            target.as_ref(),
-                        ) {
-                            Prepared::Reject(msg) => {
-                                // Rejecting at prepare time is terminal for the
-                                // job, so ask for a replacement credit — same as
-                                // a completion — to keep the coordinator's
-                                // consume-on-dispatch pool from leaking a slot.
-                                ctrl_tx.send(msg).await?;
-                                ctrl_tx
-                                    .send(miner(miner_msg::Msg::JobRequest(JobRequest {
-                                        credits: 1,
-                                    })))
-                                    .await?;
-                            }
-                            Prepared::Sample {
-                                job,
-                                num_reads,
-                                num_sweeps: ns,
-                            } => {
-                                {
-                                    let mut p = match pending.lock() {
-                                        Ok(p) => p,
-                                        Err(poisoned) => poisoned.into_inner(),
-                                    };
-                                    let _ = p.insert(job.job_id.clone(), (num_reads, ns));
-                                }
-                                if job_tx.send(job).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Some(coord_msg::Msg::Cancel(c)) => {
-                        // Abandon every generation at/below the watermark; the
-                        // sampler skips buffered stale jobs at dequeue and (in
-                        // backends that override sample_stream) aborts the
-                        // in-flight one at its next checkpoint.
-                        cancel.cancel_through(c.max_generation);
-                        ctrl_tx
-                            .send(status_msg(
-                                miner_id,
-                                jobs_done.load(Ordering::Relaxed),
-                                sampler.utilization(),
-                            ))
-                            .await?;
-                    }
-                    Some(coord_msg::Msg::Ping(_)) => {
-                        ctrl_tx
-                            .send(status_msg(
-                                miner_id,
-                                jobs_done.load(Ordering::Relaxed),
-                                sampler.utilization(),
-                            ))
-                            .await?;
-                    }
-                    Some(coord_msg::Msg::Shutdown(s)) => {
-                        grace_ms = if s.grace_ms == 0 {
-                            5000
-                        } else {
-                            u64::from(s.grace_ms)
-                        };
-                        break;
-                    }
-                    None => {}
                 }
+                Some(coord_msg::Msg::Configure(c)) => {
+                    // Hand the verbatim config subsection to the backend to
+                    // parse against its own schema (overrides CLI, warns on
+                    // unknown fields / overrides) before mining starts.
+                    sampler.apply_config(&c.backend_toml);
+                    num_sweeps = num_sweeps_from_toml(&c.backend_toml);
+                    let config = SessionConfig::from_configure(miner_id.into(), &c);
+                    ctrl_tx.send(miner(miner_msg::Msg::Ready(Ready {}))).await?;
+                    // Request enough credits to keep the prefetch buffer
+                    // full (active + next per lane), so the backend always
+                    // has a NEXT slot to rotate into.
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "stream width / prefetch are small device-local counts well under u32::MAX"
+                    )]
+                    let depth = config.queue_depth.max(prefetch as u32);
+                    // INVARIANT: the granted pool must not exceed the job
+                    // channel's capacity (`cap`), or the read loop can block
+                    // on `job_tx.send` with jobs still arriving — the same
+                    // deadlock one layer down. `cap == prefetch` and
+                    // `depth <= prefetch` unless the coordinator's
+                    // `queue_depth` is larger, so clamp to `cap`.
+                    let depth = depth.min(u32::try_from(cap).unwrap_or(u32::MAX));
+                    ctrl_tx
+                        .send(miner(miner_msg::Msg::JobRequest(JobRequest {
+                            credits: depth,
+                        })))
+                        .await?;
+                }
+                Some(coord_msg::Msg::Topology(t)) => {
+                    topology = Some(TopologyCache::from_proto(&t));
+                }
+                Some(coord_msg::Msg::SetTarget(s)) => {
+                    target = Some(SessionTarget::from_proto(&s));
+                }
+                Some(coord_msg::Msg::Job(job)) => {
+                    match prepare_job(
+                        job,
+                        &*sampler,
+                        id,
+                        num_sweeps,
+                        sweeps_per_beta,
+                        topology.as_ref(),
+                        target.as_ref(),
+                    ) {
+                        Prepared::Reject(msg) => {
+                            // Rejecting at prepare time is terminal for the
+                            // job, so ask for a replacement credit — same as
+                            // a completion — to keep the coordinator's
+                            // consume-on-dispatch pool from leaking a slot.
+                            ctrl_tx.send(msg).await?;
+                            ctrl_tx
+                                .send(miner(miner_msg::Msg::JobRequest(JobRequest { credits: 1 })))
+                                .await?;
+                        }
+                        Prepared::Sample {
+                            job,
+                            num_reads,
+                            num_sweeps: ns,
+                        } => {
+                            {
+                                let mut p = match pending.lock() {
+                                    Ok(p) => p,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                let _ = p.insert(job.job_id.clone(), (num_reads, ns));
+                            }
+                            if job_tx.send(job).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Some(coord_msg::Msg::Cancel(c)) => {
+                    // Abandon every generation at/below the watermark; the
+                    // sampler skips buffered stale jobs at dequeue and (in
+                    // backends that override sample_stream) aborts the
+                    // in-flight one at its next checkpoint.
+                    cancel.cancel_through(c.max_generation);
+                    ctrl_tx
+                        .send(status_msg(
+                            miner_id,
+                            jobs_done.load(Ordering::Relaxed),
+                            sampler.utilization(),
+                        ))
+                        .await?;
+                }
+                Some(coord_msg::Msg::Ping(_)) => {
+                    ctrl_tx
+                        .send(status_msg(
+                            miner_id,
+                            jobs_done.load(Ordering::Relaxed),
+                            sampler.utilization(),
+                        ))
+                        .await?;
+                }
+                Some(coord_msg::Msg::Shutdown(s)) => {
+                    grace_ms = if s.grace_ms == 0 {
+                        5000
+                    } else {
+                        u64::from(s.grace_ms)
+                    };
+                    break;
+                }
+                None => {}
             }
+        }
     }
 
     // Stop feeding, then let the writer flush in-flight results within the

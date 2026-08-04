@@ -53,7 +53,9 @@ fn now_ms() -> u64 {
 /// buffers absorb the burst and the deadlock does not appear.
 fn ring_jobs(count: usize, nodes: usize) -> Vec<Job> {
     let deadline = now_ms() + 3_600_000;
-    let h: Vec<i32> = (0..nodes).map(|i| if i % 2 == 0 { 1000 } else { -1000 }).collect();
+    let h: Vec<i32> = (0..nodes)
+        .map(|i| if i % 2 == 0 { 1000 } else { -1000 })
+        .collect();
     let u: Vec<u32> = (0..nodes as u32).collect();
     let v: Vec<u32> = (0..nodes as u32).map(|i| (i + 1) % nodes as u32).collect();
     let j: Vec<i32> = vec![500; nodes];
