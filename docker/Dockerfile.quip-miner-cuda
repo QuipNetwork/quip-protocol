@@ -48,9 +48,22 @@ RUN userdel --remove ubuntu 2>/dev/null || true; \
 COPY --from=builder /src/target/release/quip-coordinator /usr/local/bin/quip-coordinator
 
 # Venv on the runtime interpreter (ubuntu24.04 /usr/bin/python3), not bookworm.
-RUN python3 -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir \
-       "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git@${MINERS_TAG}"
+#
+# The install needs a build toolchain the runtime base does not carry: `git`
+# because the miner comes from a `git+https://` URL, and cargo/cc/protoc because
+# `quip_proto` has no wheel yet, so pip builds it through maturin. Everything
+# build-only is installed, used and removed inside this single RUN so none of it
+# reaches the published image — a later `rm` would not shrink an earlier layer.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git build-essential protobuf-compiler \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+       | sh -s -- -y --profile minimal --no-modify-path \
+    && python3 -m venv /opt/venv \
+    && PATH="/root/.cargo/bin:${PATH}" /opt/venv/bin/pip install --no-cache-dir \
+       "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git@${MINERS_TAG}" \
+    && apt-get purge -y git build-essential protobuf-compiler \
+    && apt-get autoremove -y --purge \
+    && rm -rf /root/.cargo /root/.rustup /root/.cache /var/lib/apt/lists/*
 
 # Released CPU + CUDA miner binaries (amd64 only for this image), via the shared
 # fetch-miners.sh — single source of truth. MINER_SET=cpu-cuda requires the cuda
