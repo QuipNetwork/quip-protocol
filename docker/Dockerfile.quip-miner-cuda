@@ -28,7 +28,7 @@ FROM nvidia/cuda:12.9.1-base-ubuntu24.04
 LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-protocol"
 LABEL description="quip-miner-cuda v0.3 — coordinator + CPU + D-Wave + CUDA"
 
-ARG MINERS_TAG=v0.3.0
+ARG MINERS_TAG=v0.3.0-rc1
 ARG QUIP_DOCKER_IMAGE=""
 ENV QUIP_DOCKER_IMAGE=${QUIP_DOCKER_IMAGE} \
     DEBIAN_FRONTEND=noninteractive \

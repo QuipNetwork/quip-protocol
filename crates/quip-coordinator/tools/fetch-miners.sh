@@ -11,7 +11,7 @@
 #
 # Usage: fetch-miners.sh [DEST_DIR]        (default: ./miners)
 # Env:
-#   MINERS_TAG  release tag to pull (default: v0.3.0).
+#   MINERS_TAG  release tag to pull (default: v0.3.0-rc1).
 #   MINER_SET   which miners to fetch:
 #                 auto      (default) derive from this host's OS/arch —
 #                           Linux -> cpu (+cuda if amd64, optional);
@@ -26,12 +26,12 @@
 # Assets are published as "<name>-<arch>" but saved locally as "<name>" (no
 # arch suffix) to match config.toml's `binary = "quip-cpu-sa"` references.
 #
-# NOTE: a real (non-DRY_RUN) run is inert until the miner repos have cut
-# releases at MINERS_TAG.
+# NOTE: a real (non-DRY_RUN) run needs the miner repos to have cut releases at
+# MINERS_TAG. All four (cpu, cuda, dwave, metal) are released at v0.3.0-rc1.
 set -euo pipefail
 
 DEST="${1:-./miners}"
-TAG="${MINERS_TAG:-v0.3.0}"
+TAG="${MINERS_TAG:-v0.3.0-rc1}"
 MINER_SET="${MINER_SET:-auto}"
 API="https://gitlab.com/api/v4"
 GROUP="quip.network"

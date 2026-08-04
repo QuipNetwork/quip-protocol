@@ -20,7 +20,7 @@ COPY proto/ proto/
 RUN cargo build --release -p quip-coordinator
 
 # D-Wave miner into an isolated venv (pulls + builds quip_proto via maturin).
-ARG MINERS_TAG=v0.3.0
+ARG MINERS_TAG=v0.3.0-rc1
 RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir \
        "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git@${MINERS_TAG}"
@@ -32,7 +32,7 @@ LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-prot
 LABEL description="quip-miner v0.3 — coordinator + CPU + D-Wave"
 
 ARG TARGETARCH
-ARG MINERS_TAG=v0.3.0
+ARG MINERS_TAG=v0.3.0-rc1
 ARG QUIP_DOCKER_IMAGE=""
 ENV QUIP_DOCKER_IMAGE=${QUIP_DOCKER_IMAGE} \
     PATH="/opt/venv/bin:/usr/local/bin:${PATH}"
