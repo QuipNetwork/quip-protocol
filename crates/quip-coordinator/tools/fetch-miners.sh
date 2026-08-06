@@ -11,7 +11,7 @@
 #
 # Usage: fetch-miners.sh [DEST_DIR]        (default: ./miners)
 # Env:
-#   MINERS_TAG  release tag to pull (default: v0.3.0-rc1).
+#   MINERS_TAG  release tag to pull (default: v0.3.0-rc2).
 #   MINER_SET   which miners to fetch:
 #                 auto      (default) derive from this host's OS/arch —
 #                           Linux -> cpu (+cuda if amd64, optional);
@@ -22,16 +22,19 @@
 #               without downloading (used by the CI verify job).
 #   TARGETARCH  explicit target arch (amd64|arm64) for docker builds; defaults
 #               to `uname -m` for the native/host install.
+#   TARGETOS    explicit target OS (linux|darwin); defaults to `uname -s`.
 #
-# Assets are published as "<name>-<arch>" but saved locally as "<name>" (no
-# arch suffix) to match config.toml's `binary = "quip-cpu-sa"` references.
+# Assets are published as "<name>-<os>-<arch>" but saved locally as "<name>"
+# (no suffix) to match config.toml's `binary = "quip-cpu-sa"` references. The
+# OS is part of the name because arch alone is ambiguous: the cpu miner ships
+# both a linux-arm64 and a darwin-arm64 build.
 #
 # NOTE: a real (non-DRY_RUN) run needs the miner repos to have cut releases at
-# MINERS_TAG. All four (cpu, cuda, dwave, metal) are released at v0.3.0-rc1.
+# MINERS_TAG. All four (cpu, cuda, dwave, metal) are released at v0.3.0-rc2.
 set -euo pipefail
 
 DEST="${1:-./miners}"
-TAG="${MINERS_TAG:-v0.3.0-rc1}"
+TAG="${MINERS_TAG:-v0.3.0-rc2}"
 MINER_SET="${MINER_SET:-auto}"
 API="https://gitlab.com/api/v4"
 GROUP="quip.network"
@@ -48,19 +51,30 @@ case "$raw_arch" in
     exit 1
     ;;
 esac
-os="$(uname -s)"
+# OS: same treatment as the arch above. `uname -s` is already correct inside a
+# docker build, but TARGETOS is honoured for symmetry so a caller preparing a
+# build for another platform is never mis-detected.
+raw_os="${TARGETOS:-$(uname -s)}"
+case "$raw_os" in
+  Linux | linux) os_tag=linux ;;
+  Darwin | darwin) os_tag=darwin ;;
+  *)
+    echo "unsupported OS: $raw_os" >&2
+    exit 1
+    ;;
+esac
 
 mkdir -p "$DEST"
 
-# fetch PROJ NAME...  — download "<NAME>-<arch>" from PROJ's generic package
-# registry, saving it as "<NAME>" (arch suffix stripped) in DEST. PROJ is the
-# URL-encoded "group/repo". DRY_RUN prints the plan and skips the download.
+# fetch PROJ NAME...  — download "<NAME>-<os>-<arch>" from PROJ's generic
+# package registry, saving it as "<NAME>" (suffix stripped) in DEST. PROJ is
+# the URL-encoded "group/repo". DRY_RUN prints the plan and skips the download.
 fetch() {
   local proj="$1"
   shift
   local name asset url
   for name in "$@"; do
-    asset="${name}-${arch}"
+    asset="${name}-${os_tag}-${arch}"
     url="${API}/projects/${proj}/packages/generic/${proj##*%2F}/${TAG}/${asset}"
     if [ -n "${DRY_RUN:-}" ]; then
       echo "would fetch: ${asset} -> ${DEST}/${name}  <- ${url}"
@@ -85,18 +99,15 @@ case "$MINER_SET" in
     cuda_required=true
     ;;
   auto)
-    case "$os" in
-      Linux)
+    # `os_tag` is already validated above, so there is no catch-all arm here.
+    case "$os_tag" in
+      linux)
         want_cpu=true
         [ "$arch" = amd64 ] && want_cuda=true
         ;;
-      Darwin)
+      darwin)
         want_metal=true
         want_cpu=true
-        ;;
-      *)
-        echo "unsupported OS: $os" >&2
-        exit 1
         ;;
     esac
     ;;
