@@ -171,7 +171,7 @@ image-quip-miner-amd64:
     KANIKO_LIB_IGNORE: "--ignore-path=/lib"
   script:
     - |
-      TAG="${CI_COMMIT_TAG:-v0.3.0-rc1}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner"
+      TAG="${CI_COMMIT_TAG:-v0.3.0-rc2}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner"
       REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
       DEST="--destination $IMAGE:$REF-amd64"; [ -z "$CI_COMMIT_TAG" ] && DEST="--no-push"
       /kaniko/executor \
@@ -194,7 +194,7 @@ image-quip-miner-arm64:
     KANIKO_EXTRA: "--compressed-caching=false"
   script:
     - |
-      TAG="${CI_COMMIT_TAG:-v0.3.0-rc1}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner"
+      TAG="${CI_COMMIT_TAG:-v0.3.0-rc2}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner"
       REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
       DEST="--destination $IMAGE:$REF-arm64"; [ -z "$CI_COMMIT_TAG" ] && DEST="--no-push"
       /kaniko/executor \
@@ -237,7 +237,7 @@ image-quip-miner-cuda:
     KANIKO_LIB_IGNORE: "--ignore-path=/lib"
   script:
     - |
-      TAG="${CI_COMMIT_TAG:-v0.3.0-rc1}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner-cuda"
+      TAG="${CI_COMMIT_TAG:-v0.3.0-rc2}"; IMAGE="$CI_REGISTRY_IMAGE/v0.3/quip-miner-cuda"
       REF="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
       DEST="--destination $IMAGE:$REF"
       [ -n "$CI_COMMIT_TAG" ] && DEST="$DEST --destination $IMAGE:latest"
