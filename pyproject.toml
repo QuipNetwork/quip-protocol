@@ -26,7 +26,18 @@ features = ["pyo3/extension-module"]
 # maturin auto-bundles the package matching module-name (quip_proto). The
 # generated gRPC stubs live in the sibling `quip` package (python/quip), which
 # quip_proto/__init__.py imports; include it so the wheel is self-contained.
-include = [{ path = "quip/**/*.py", format = "wheel" }]
+#
+# The sdist needs two more things that `cargo package` cannot reach, because
+# both live outside every crate directory: the same gRPC stubs (wheel include
+# paths are relative to python-source, sdist ones to the project root), and
+# proto/quip/v1/miner.proto, which quip-proto's build.rs compiles through
+# tonic-build via a ../../ path. Without them `pip install` of the sdist fails
+# in build.rs with "Could not make proto path relative".
+include = [
+    { path = "quip/**/*.py", format = "wheel" },
+    { path = "python/quip/**/*.py", format = "sdist" },
+    { path = "proto/**/*.proto", format = "sdist" },
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
