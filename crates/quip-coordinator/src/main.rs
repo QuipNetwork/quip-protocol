@@ -38,6 +38,15 @@ struct Cli {
 enum Command {
     /// Drive a spawned miner with synthetic work; no chain, no submit.
     Drive(DriveArgs),
+    /// Create a signer keystore at --out. Refuses to overwrite.
+    Keygen(KeygenArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct KeygenArgs {
+    /// Destination path for the keystore JSON.
+    #[arg(long)]
+    out: PathBuf,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -108,7 +117,26 @@ fn main() -> StdExitCode {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Drive(args)) => run_drive_cli(args),
+        Some(Command::Keygen(args)) => run_keygen_cli(&args),
         None => run_config_path(cli.config),
+    }
+}
+
+#[expect(
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "CLI binary reports keystore path to stdout and errors to stderr"
+)]
+fn run_keygen_cli(args: &KeygenArgs) -> StdExitCode {
+    match quip_coordinator::keygen::write_keystore(&args.out) {
+        Ok(()) => {
+            println!("wrote keystore to {}", args.out.display());
+            StdExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            StdExitCode::from(ExitCode::ConfigInvalid as u8)
+        }
     }
 }
 
