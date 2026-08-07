@@ -297,14 +297,26 @@ build-coordinator-darwin-arm64:
     - cargo build --release -p quip-coordinator
     - mkdir -p dist
     - cp target/release/quip-coordinator dist/quip-coordinator-darwin-arm64
-    - ./dist/quip-coordinator-darwin-arm64 --version
+    # The compiled-in version must match the tag. v0.3.0-rc3 shipped a binary
+    # reporting 0.3.0, which sorts as newer than every rc tag, so quip-node-
+    # manager saw the install as ahead of the release and stopped offering
+    # updates. Fail the release rather than publish that skew again.
+    - built=$(./dist/quip-coordinator-darwin-arm64 --version | awk '{print $2}')
+    - |
+      if [ "$built" != "${CI_COMMIT_TAG#v}" ]; then
+        echo "version skew: binary reports '$built', tag is '${CI_COMMIT_TAG#v}'" >&2
+        echo "bump version in crates/quip-coordinator/Cargo.toml to match" >&2
+        exit 1
+      fi
   artifacts:
     paths: [dist/]
     expire_in: 1 week
 
 # One macOS artifact: the coordinator plus every darwin-arm64 miner binary,
-# each stored under its bare name so config.toml's `binary = "quip-cpu-sa"`
-# resolves after extraction. Miner versions resolve to each repo's own latest
+# each stored under the bare name the config's `binary` key names. The
+# coordinator spawns miners with a PATH lookup, so an installer either puts
+# this directory on PATH or writes absolute paths into the config; quip-node-
+# manager does the latter. Miner versions resolve to each repo's own latest
 # release at bundle time; this tarball then pins them, and MANIFEST records
 # which release each binary came from.
 bundle-darwin-arm64:
