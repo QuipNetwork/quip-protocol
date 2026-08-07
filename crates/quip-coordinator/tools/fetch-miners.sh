@@ -11,7 +11,11 @@
 #
 # Usage: fetch-miners.sh [DEST_DIR]        (default: ./miners)
 # Env:
-#   MINERS_TAG  release tag to pull (default: v0.3.0-rc2).
+#   MINERS_TAG  release tag for the cpu, cuda and metal miners
+#               (default: v0.3.0-rc2).
+#   DWAVE_MINERS_TAG
+#               release tag for the dwave miner (default: v0.3.0-rc3). Separate
+#               because the miners version independently.
 #   MINER_SET   which miners to fetch:
 #                 auto      (default) derive from this host's OS/arch —
 #                           Linux -> cpu (+cuda if amd64, optional);
@@ -30,11 +34,17 @@
 # both a linux-arm64 and a darwin-arm64 build.
 #
 # NOTE: a real (non-DRY_RUN) run needs the miner repos to have cut releases at
-# MINERS_TAG. All four (cpu, cuda, dwave, metal) are released at v0.3.0-rc2.
+# the tags above. cpu, cuda and metal are released at v0.3.0-rc2; dwave is at
+# v0.3.0-rc3, which is the first release carrying its macOS binary.
 set -euo pipefail
 
 DEST="${1:-./miners}"
 TAG="${MINERS_TAG:-v0.3.0-rc2}"
+# The dwave miner versions on its own cadence and is ahead of the others: it cut
+# rc3 to publish its first macOS binary while cpu, cuda and metal are still at
+# rc2. One tag for every repo would 404 here, which is the cost of pinning the
+# miners independently.
+DWAVE_TAG="${DWAVE_MINERS_TAG:-v0.3.0-rc3}"
 MINER_SET="${MINER_SET:-auto}"
 API="https://gitlab.com/api/v4"
 GROUP="quip.network"
@@ -66,16 +76,17 @@ esac
 
 mkdir -p "$DEST"
 
-# fetch PROJ NAME...  — download "<NAME>-<os>-<arch>" from PROJ's generic
-# package registry, saving it as "<NAME>" (suffix stripped) in DEST. PROJ is
-# the URL-encoded "group/repo". DRY_RUN prints the plan and skips the download.
+# fetch TAG PROJ NAME...  — download "<NAME>-<os>-<arch>" from PROJ's generic
+# package registry at TAG, saving it as "<NAME>" (suffix stripped) in DEST.
+# PROJ is the URL-encoded "group/repo". TAG is per call because the miners
+# version independently. DRY_RUN prints the plan and skips the download.
 fetch() {
-  local proj="$1"
-  shift
+  local tag="$1" proj="$2"
+  shift 2
   local name asset url
   for name in "$@"; do
     asset="${name}-${os_tag}-${arch}"
-    url="${API}/projects/${proj}/packages/generic/${proj##*%2F}/${TAG}/${asset}"
+    url="${API}/projects/${proj}/packages/generic/${proj##*%2F}/${tag}/${asset}"
     if [ -n "${DRY_RUN:-}" ]; then
       echo "would fetch: ${asset} -> ${DEST}/${name}  <- ${url}"
       continue
@@ -118,10 +129,10 @@ case "$MINER_SET" in
 esac
 
 if [ "$want_metal" = true ]; then
-  fetch "quip.network%2Fquip-miner-metal" "quip-metal-sa" "quip-metal-gibbs"
+  fetch "$TAG" "quip.network%2Fquip-miner-metal" "quip-metal-sa" "quip-metal-gibbs"
 fi
 if [ "$want_cpu" = true ]; then
-  fetch "quip.network%2Fquip-miner-cpu" "quip-cpu-sa" "quip-cpu-gibbs"
+  fetch "$TAG" "quip.network%2Fquip-miner-cpu" "quip-cpu-sa" "quip-cpu-gibbs"
 fi
 if [ "$want_cuda" = true ]; then
   if [ "$arch" != amd64 ]; then
@@ -131,13 +142,20 @@ if [ "$want_cuda" = true ]; then
       exit 1
     fi
   elif [ "$cuda_required" = true ]; then
-    fetch "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs"
+    fetch "$TAG" "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs"
   else
-    fetch "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs" ||
+    fetch "$TAG" "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs" ||
       echo "note: cuda binaries optional (no GPU host)"
   fi
 fi
 
-# The dwave miner is a Python wheel, not a native binary:
-echo "dwave: pip install 'quip-miner-dwave @ git+https://gitlab.com/${GROUP}/quip-miner-dwave.git@${TAG}'"
+# The dwave miner ships as a frozen executable on macOS and as a Python package
+# everywhere else. The coordinator spawns it as `binary = "quip-dwave-qa"`
+# either way, so on darwin it is fetched like any other miner. On linux there
+# is no published binary yet, so the container images keep installing from git.
+if [ "$os_tag" = darwin ]; then
+  fetch "$DWAVE_TAG" "quip.network%2Fquip-miner-dwave" "quip-dwave-qa"
+else
+  echo "dwave: pip install 'quip-miner-dwave @ git+https://gitlab.com/${GROUP}/quip-miner-dwave.git@${DWAVE_TAG}'"
+fi
 echo "done -> $DEST"
