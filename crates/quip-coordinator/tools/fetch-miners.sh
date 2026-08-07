@@ -9,13 +9,14 @@
 # and the native/host install both call this script instead of duplicating the
 # fetch logic.
 #
-# Usage: fetch-miners.sh [DEST_DIR]        (default: ./miners)
+# Usage: fetch-miners.sh [DEST_DIR]           (default: ./miners)
+#        fetch-miners.sh --print-tag MINER    (cpu|cuda|metal|dwave)
 # Env:
-#   MINERS_TAG  release tag for the cpu, cuda and metal miners
-#               (default: v0.3.0-rc2).
-#   DWAVE_MINERS_TAG
-#               release tag for the dwave miner (default: v0.3.0-rc3). Separate
-#               because the miners version independently.
+#   CPU_MINERS_TAG, CUDA_MINERS_TAG, METAL_MINERS_TAG, DWAVE_MINERS_TAG
+#               release tag per miner repo, each overriding the pin set below.
+#               One variable per repo because the miners version independently:
+#               as of this writing cpu, cuda and dwave are at v0.3.0-rc3 while
+#               metal is still at v0.3.0-rc2.
 #   MINER_SET   which miners to fetch:
 #                 auto      (default) derive from this host's OS/arch —
 #                           Linux -> cpu (+cuda if amd64, optional);
@@ -33,18 +34,39 @@
 # OS is part of the name because arch alone is ambiguous: the cpu miner ships
 # both a linux-arm64 and a darwin-arm64 build.
 #
-# NOTE: a real (non-DRY_RUN) run needs the miner repos to have cut releases at
-# the tags above. cpu, cuda and metal are released at v0.3.0-rc2; dwave is at
-# v0.3.0-rc3, which is the first release carrying its macOS binary.
+# NOTE: a real (non-DRY_RUN) run needs each miner repo to have cut a release at
+# its pin below. Bump a pin only when that repo publishes a new release.
 set -euo pipefail
 
-DEST="${1:-./miners}"
-TAG="${MINERS_TAG:-v0.3.0-rc2}"
-# The dwave miner versions on its own cadence and is ahead of the others: it cut
-# rc3 to publish its first macOS binary while cpu, cuda and metal are still at
-# rc2. One tag for every repo would 404 here, which is the cost of pinning the
-# miners independently.
+# One pin per miner repo, because the miners release on their own cadence and
+# are routinely at different tags. These are the single source of truth: the
+# container images read them through `--print-tag` rather than repeating them.
+#
+# Never derive these from the coordinator's own release tag. quip-miner v0.3.0-rc4
+# shipped a coordinator fix while every miner stood still, and a build that
+# assumed one shared tag looked for miner releases that were never cut.
+CPU_TAG="${CPU_MINERS_TAG:-v0.3.0-rc3}"
+CUDA_TAG="${CUDA_MINERS_TAG:-v0.3.0-rc3}"
+METAL_TAG="${METAL_MINERS_TAG:-v0.3.0-rc2}"
 DWAVE_TAG="${DWAVE_MINERS_TAG:-v0.3.0-rc3}"
+
+# `--print-tag <miner>` reports one pin and exits, so a Dockerfile can install
+# the dwave miner at the same version this script would fetch.
+if [ "${1:-}" = "--print-tag" ]; then
+  case "${2:-}" in
+    cpu) printf '%s\n' "$CPU_TAG" ;;
+    cuda) printf '%s\n' "$CUDA_TAG" ;;
+    metal) printf '%s\n' "$METAL_TAG" ;;
+    dwave) printf '%s\n' "$DWAVE_TAG" ;;
+    *)
+      echo "--print-tag needs a miner: cpu|cuda|metal|dwave" >&2
+      exit 1
+      ;;
+  esac
+  exit 0
+fi
+
+DEST="${1:-./miners}"
 MINER_SET="${MINER_SET:-auto}"
 API="https://gitlab.com/api/v4"
 GROUP="quip.network"
@@ -129,10 +151,10 @@ case "$MINER_SET" in
 esac
 
 if [ "$want_metal" = true ]; then
-  fetch "$TAG" "quip.network%2Fquip-miner-metal" "quip-metal-sa" "quip-metal-gibbs"
+  fetch "$METAL_TAG" "quip.network%2Fquip-miner-metal" "quip-metal-sa" "quip-metal-gibbs"
 fi
 if [ "$want_cpu" = true ]; then
-  fetch "$TAG" "quip.network%2Fquip-miner-cpu" "quip-cpu-sa" "quip-cpu-gibbs"
+  fetch "$CPU_TAG" "quip.network%2Fquip-miner-cpu" "quip-cpu-sa" "quip-cpu-gibbs"
 fi
 if [ "$want_cuda" = true ]; then
   if [ "$arch" != amd64 ]; then
@@ -142,9 +164,9 @@ if [ "$want_cuda" = true ]; then
       exit 1
     fi
   elif [ "$cuda_required" = true ]; then
-    fetch "$TAG" "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs"
+    fetch "$CUDA_TAG" "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs"
   else
-    fetch "$TAG" "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs" ||
+    fetch "$CUDA_TAG" "quip.network%2Fquip-miner-cuda" "quip-cuda-sa" "quip-cuda-gibbs" ||
       echo "note: cuda binaries optional (no GPU host)"
   fi
 fi

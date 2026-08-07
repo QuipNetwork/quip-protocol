@@ -28,7 +28,6 @@ FROM nvidia/cuda:12.9.1-base-ubuntu24.04
 LABEL org.opencontainers.image.source="https://gitlab.com/quip.network/quip-protocol"
 LABEL description="quip-miner-cuda v0.3 — coordinator + CPU + D-Wave + CUDA"
 
-ARG MINERS_TAG=v0.3.0-rc2
 ARG QUIP_DOCKER_IMAGE=""
 ENV QUIP_DOCKER_IMAGE=${QUIP_DOCKER_IMAGE} \
     DEBIAN_FRONTEND=noninteractive \
@@ -47,6 +46,9 @@ RUN userdel --remove ubuntu 2>/dev/null || true; \
 
 COPY --from=builder /src/target/release/quip-coordinator /usr/local/bin/quip-coordinator
 
+# Copied before the venv RUN below, which reads the dwave pin out of it.
+COPY crates/quip-coordinator/tools/fetch-miners.sh /usr/local/bin/fetch-miners.sh
+
 # Venv on the runtime interpreter (ubuntu24.04 /usr/bin/python3), not bookworm.
 #
 # The install needs a build toolchain the runtime base does not carry: `git`
@@ -59,8 +61,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
        | sh -s -- -y --profile minimal --no-modify-path \
     && python3 -m venv /opt/venv \
+    && DWAVE_TAG="$(sh /usr/local/bin/fetch-miners.sh --print-tag dwave)" \
     && PATH="/root/.cargo/bin:${PATH}" /opt/venv/bin/pip install --no-cache-dir \
-       "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git@${MINERS_TAG}" \
+       "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git@${DWAVE_TAG}" \
     && apt-get purge -y git build-essential protobuf-compiler \
     && apt-get autoremove -y --purge \
     && rm -rf /root/.cargo /root/.rustup /root/.cache /var/lib/apt/lists/*
@@ -68,8 +71,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Released CPU + CUDA miner binaries (amd64 only for this image), via the shared
 # fetch-miners.sh — single source of truth. MINER_SET=cpu-cuda requires the cuda
 # assets (fails the build if missing), unlike the optional cuda in `auto` mode.
-COPY crates/quip-coordinator/tools/fetch-miners.sh /usr/local/bin/fetch-miners.sh
-RUN TARGETARCH=amd64 MINERS_TAG="${MINERS_TAG}" MINER_SET=cpu-cuda \
+RUN TARGETARCH=amd64 MINER_SET=cpu-cuda \
     bash /usr/local/bin/fetch-miners.sh /usr/local/bin
 
 WORKDIR /app
