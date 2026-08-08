@@ -133,6 +133,24 @@ verify-fetch-miners:
         echo "ERROR: darwin must fetch the dwave binary, not print a pip line"; exit 1
       fi
       if echo "$out" | grep -q 'quip-cuda'; then echo "ERROR: darwin pulled cuda"; exit 1; fi
+      # Every pin must name a release that exists. The images build from these,
+      # and a missing tag fails only at image-build time otherwise: v0.3.0-rc4
+      # derived the miner tags from the coordinator's tag and asked four repos
+      # for a release none of them had cut.
+      echo "--- pins resolve to real releases ---"
+      for m in cpu cuda metal dwave; do
+        tag=$(bash "$S" --print-tag "$m")
+        url="https://gitlab.com/api/v4/projects/quip.network%2Fquip-miner-${m}/releases/${tag}"
+        if wget -q -O /dev/null "$url"; then
+          echo "ok   quip-miner-${m} ${tag}"
+        else
+          echo "ERROR: quip-miner-${m} has no release ${tag}" >&2
+          exit 1
+        fi
+      done
+      if bash "$S" --print-tag nonsense 2>/dev/null; then
+        echo "ERROR: --print-tag accepted an unknown miner"; exit 1
+      fi
   rules:
     - if: $CI_COMMIT_TAG
       when: never
@@ -196,7 +214,6 @@ image-quip-miner-amd64:
       /kaniko/executor \
         --context "$CI_PROJECT_DIR" \
         --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile.quip-miner" \
-        --build-arg "MINERS_TAG=$TAG" \
         --build-arg "TARGETARCH=amd64" \
         --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" \
         $KANIKO_LIB_IGNORE \
@@ -219,7 +236,6 @@ image-quip-miner-arm64:
       /kaniko/executor \
         --context "$CI_PROJECT_DIR" \
         --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile.quip-miner" \
-        --build-arg "MINERS_TAG=$TAG" \
         --build-arg "TARGETARCH=arm64" \
         --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" \
         $KANIKO_EXTRA \
@@ -264,7 +280,6 @@ image-quip-miner-cuda:
       /kaniko/executor \
         --context "$CI_PROJECT_DIR" \
         --dockerfile "$CI_PROJECT_DIR/docker/Dockerfile.quip-miner-cuda" \
-        --build-arg "MINERS_TAG=$TAG" \
         --build-arg "QUIP_DOCKER_IMAGE=$IMAGE:$TAG" \
         $KANIKO_LIB_IGNORE \
         $DEST
