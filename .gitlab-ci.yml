@@ -151,6 +151,18 @@ verify-fetch-miners:
       if bash "$S" --print-tag nonsense 2>/dev/null; then
         echo "ERROR: --print-tag accepted an unknown miner"; exit 1
       fi
+      # The script needs bash: `set -o pipefail` is not POSIX, and Debian's
+      # /bin/sh is dash, which rejects it. v0.3.0-rc5 called it through `sh` and
+      # every image build died with "Illegal option -o pipefail" after the Rust
+      # build had already run. Catch that here instead.
+      echo "--- Dockerfiles call the script with bash ---"
+      bad=$(grep -n 'fetch-miners\.sh' docker/Dockerfile.* | grep -v bash | grep -v COPY | grep -v '#' || true)
+      if [ -n "$bad" ]; then
+        echo "$bad"
+        echo "ERROR: fetch-miners.sh must be invoked with bash, not sh" >&2
+        exit 1
+      fi
+      echo "ok   every invocation uses bash"
   rules:
     - if: $CI_COMMIT_TAG
       when: never
