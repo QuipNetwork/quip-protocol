@@ -69,6 +69,7 @@ fn cpu_entry(binary: String) -> LaunchEntry {
     LaunchEntry {
         miner_id: "cpu-0".into(),
         binary,
+        backend: "cpu".into(),
         configure: Configure {
             // Long idle so the miner stays connected until we shut it down.
             queue_depth: 3,
@@ -97,6 +98,8 @@ async fn runtime_serves_supervises_and_shuts_down_clean() {
         dashboard: None,
         log_level: quip_coordinator::logging::LogLevel::Info,
         funding: quip_coordinator::funding::FundingParams::default(),
+        descriptor: quip_coordinator::config::DescriptorParams::default(),
+        descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let (trigger_tx, trigger_rx) = oneshot::channel::<()>();
 
@@ -193,6 +196,8 @@ async fn feeder_tops_up_to_buffer_depth_records_salts_and_sets_target() {
             buffer_depth: 4,
             poll_interval: Duration::from_millis(50),
             funding: quip_coordinator::funding::FundingParams::default(),
+            descriptor: quip_coordinator::config::DescriptorParams::default(),
+            descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
         stop_rx,
     ));
@@ -248,6 +253,8 @@ async fn feeder_grows_window_for_drainer_and_holds_floor_for_idle() {
             buffer_depth: FLOOR,
             poll_interval: Duration::from_millis(30),
             funding: quip_coordinator::funding::FundingParams::default(),
+            descriptor: quip_coordinator::config::DescriptorParams::default(),
+            descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
         stop_rx,
     ));
@@ -309,6 +316,8 @@ async fn feeder_broadcasts_set_target_once_per_difficulty() {
             buffer_depth: 4,
             poll_interval: Duration::from_millis(50),
             funding: quip_coordinator::funding::FundingParams::default(),
+            descriptor: quip_coordinator::config::DescriptorParams::default(),
+            descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
         stop_rx,
     ));
@@ -363,6 +372,8 @@ fn feeder_params(buffer_depth: usize, poll_ms: u64) -> FeederParams {
         buffer_depth,
         poll_interval: Duration::from_millis(poll_ms),
         funding: quip_coordinator::funding::FundingParams::default(),
+        descriptor: quip_coordinator::config::DescriptorParams::default(),
+        descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
 }
 
@@ -407,21 +418,13 @@ async fn feeder_sends_requirements_before_staging_the_new_generation() {
     // First round: Topology then SetTarget. Staging is not checked between
     // those two recv calls: the feeder continues after each send, so a
     // staged-length read here races the rest of the poll.
-    let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .expect("no first outbound")
-        .expect("closed")
-        .expect("status");
+    let first = recv_coord(&mut rx).await;
     assert!(
         matches!(&first.msg, Some(coord_msg::Msg::Topology(_))),
         "first message must be Topology, got {:?}",
         first.msg
     );
-    let second = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .expect("no SetTarget")
-        .expect("closed")
-        .expect("status");
+    let second = recv_coord(&mut rx).await;
     assert!(
         matches!(&second.msg, Some(coord_msg::Msg::SetTarget(_))),
         "second message must be SetTarget, got {:?}",
@@ -448,11 +451,7 @@ async fn feeder_sends_requirements_before_staging_the_new_generation() {
     let mut saw_topology = false;
     let mut saw_target = false;
     for _ in 0..8 {
-        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("reseed went silent")
-            .expect("closed")
-            .expect("status");
+        let msg = recv_coord(&mut rx).await;
         match &msg.msg {
             Some(coord_msg::Msg::Cancel(c)) => {
                 assert!(
@@ -702,6 +701,16 @@ async fn feeder_re_runs_sync_and_funding_on_every_round() {
         .expect("feeder task panicked");
 }
 
+async fn recv_coord(
+    rx: &mut mpsc::Receiver<Result<quip_proto::v1::CoordMsg, tonic::Status>>,
+) -> quip_proto::v1::CoordMsg {
+    tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("no outbound")
+        .expect("closed")
+        .expect("status")
+}
+
 async fn wait_generation(state: &Arc<Mutex<CoordinatorState>>, generation: u64) -> bool {
     for _ in 0..40 {
         tokio::time::sleep(Duration::from_millis(40)).await;
@@ -834,6 +843,185 @@ async fn feeder_keeps_mining_when_participation_pallet_errors() {
         "DescriptorRequired must not block mining"
     );
     assert_eq!(chain.participation_calls(), 3);
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+}
+
+fn named_feeder_params(buffer_depth: usize, poll_ms: u64) -> FeederParams {
+    let mut params = feeder_params(buffer_depth, poll_ms);
+    params.descriptor = quip_coordinator::config::DescriptorParams {
+        node_name: Some("Tesla".into()),
+        public_host: Some("96.233.112.201".into()),
+        rpc_endpoints: vec!["ws://127.0.0.1:9944".into()],
+        miners: vec![
+            quip_coordinator::chain::MinerSpecScale {
+                kind: quip_coordinator::chain::MinerKind::Cpu,
+                label: Some(b"cpu-0".to_vec()),
+                backend: Some(b"cpu".to_vec()),
+                device_id: None,
+            },
+            quip_coordinator::chain::MinerSpecScale {
+                kind: quip_coordinator::chain::MinerKind::Metal,
+                label: Some(b"metal-0".to_vec()),
+                backend: Some(b"metal".to_vec()),
+                device_id: None,
+            },
+        ],
+        ..quip_coordinator::config::DescriptorParams::default()
+    };
+    params
+}
+
+/// Two rounds in one process file the descriptor once.
+#[tokio::test]
+async fn feeder_files_descriptor_once_across_two_rounds() {
+    let chain = Arc::new(FakeChain::new(snapshot_with_head([1u8; 32]), None));
+    chain.set_qblock_id(Some(10));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    state
+        .lock()
+        .await
+        .router
+        .register_miner("cpu-0", ising_caps());
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        named_feeder_params(1, 40),
+        stop_rx,
+    ));
+
+    assert!(wait_generation(&state, 1).await, "first round never staged");
+    chain.set_snapshot(Some(snapshot_with_head([2u8; 32])));
+    assert!(
+        wait_generation(&state, 2).await,
+        "second round never staged"
+    );
+    assert_eq!(chain.descriptor_calls(), 1);
+    let filed = chain.take_descriptors();
+    let desc = filed.first().expect("one descriptor");
+    assert_eq!(desc.node_name, b"Tesla");
+    assert_eq!(
+        desc.miners.iter().map(|m| m.kind).collect::<Vec<_>>(),
+        vec![
+            quip_coordinator::chain::MinerKind::Cpu,
+            quip_coordinator::chain::MinerKind::Metal
+        ]
+    );
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+}
+
+/// Missing `[miner].node_name` files nothing and still starts mining.
+#[tokio::test]
+async fn feeder_reaches_mining_when_node_name_is_missing() {
+    let chain = Arc::new(FakeChain::new(snapshot_with_head([1u8; 32]), None));
+    chain.set_qblock_id(Some(10));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    state
+        .lock()
+        .await
+        .router
+        .register_miner("cpu-0", ising_caps());
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        feeder_params(1, 40),
+        stop_rx,
+    ));
+
+    assert!(
+        wait_generation(&state, 1).await,
+        "missing node_name must not block mining"
+    );
+    assert_eq!(chain.descriptor_calls(), 0);
+    assert_eq!(chain.participation_calls(), 1);
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+}
+
+/// Transient descriptor or participation errors must not hold off mining.
+#[tokio::test]
+async fn feeder_keeps_mining_when_descriptor_or_participation_is_transient() {
+    let chain = Arc::new(FakeChain::new(snapshot_with_head([1u8; 32]), None));
+    chain.set_qblock_id(Some(10));
+    chain.set_descriptor_result(Err(quip_coordinator::chain::ChainError::Unavailable(
+        "rpc down".into(),
+    )));
+    chain.set_participation_result(Err(quip_coordinator::chain::ChainError::Unavailable(
+        "rpc down".into(),
+    )));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    state
+        .lock()
+        .await
+        .router
+        .register_miner("cpu-0", ising_caps());
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        named_feeder_params(1, 40),
+        stop_rx,
+    ));
+
+    assert!(
+        wait_generation(&state, 1).await,
+        "transient errors must not block mining"
+    );
+    assert_eq!(chain.descriptor_calls(), 3);
+    assert_eq!(chain.participation_calls(), 3);
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+}
+
+/// Pallet rejection of the descriptor must not hold off mining.
+#[tokio::test]
+async fn feeder_keeps_mining_when_descriptor_is_rejected() {
+    let chain = Arc::new(FakeChain::new(snapshot_with_head([1u8; 32]), None));
+    chain.set_qblock_id(Some(10));
+    chain.set_descriptor_result(Ok(quip_coordinator::chain::DescriptorOutcome::Rejected));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    state
+        .lock()
+        .await
+        .router
+        .register_miner("cpu-0", ising_caps());
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        named_feeder_params(1, 40),
+        stop_rx,
+    ));
+
+    assert!(
+        wait_generation(&state, 1).await,
+        "descriptor rejection must not block mining"
+    );
+    assert_eq!(chain.descriptor_calls(), 1);
+    assert_eq!(chain.participation_calls(), 1);
 
     let _ = stop_tx.send(true);
     tokio::time::timeout(Duration::from_secs(2), feeder)

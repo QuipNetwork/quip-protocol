@@ -205,8 +205,29 @@ pub const SUBMIT_PROOF_CALL_INDEX: u8 = 4;
 
 /// Pallet index of `MinerRegistry` in the runtime construct.
 pub const MINER_REGISTRY_PALLET_INDEX: u8 = 13;
+/// Call index of `set_descriptor` within `MinerRegistry`.
+pub const SET_DESCRIPTOR_CALL_INDEX: u8 = 0;
 /// Call index of `participate` within `MinerRegistry`.
 pub const PARTICIPATE_CALL_INDEX: u8 = 2;
+
+/// Pallet `MaxNodeIdBytes`.
+pub const MAX_NODE_ID_BYTES: usize = 64;
+/// Pallet `MaxNodeNameBytes`.
+pub const MAX_NODE_NAME_BYTES: usize = 64;
+/// Pallet `MaxPublicHostBytes`.
+pub const MAX_PUBLIC_HOST_BYTES: usize = 253;
+/// Pallet `MaxRpcEndpointBytes`.
+pub const MAX_RPC_ENDPOINT_BYTES: usize = 256;
+/// Pallet `MaxRpcEndpoints`.
+pub const MAX_RPC_ENDPOINTS: usize = 8;
+/// Pallet `MaxMinerSpecs`.
+pub const MAX_MINER_SPECS: usize = 16;
+/// Pallet `MaxMinerLabelBytes`.
+pub const MAX_MINER_LABEL_BYTES: usize = 64;
+/// Pallet `MaxMinerBackendBytes`.
+pub const MAX_MINER_BACKEND_BYTES: usize = 32;
+/// Pallet `MaxMinerDeviceIdBytes`.
+pub const MAX_MINER_DEVICE_ID_BYTES: usize = 128;
 
 /// SCALE tag order must match `pallet_miner_registry::MinerKind`.
 #[derive(Clone, Copy, Debug, Encode, Decode, PartialEq, Eq)]
@@ -227,6 +248,124 @@ pub enum MinerKind {
     Asic,
     /// Apple Metal GPU. Last so the earlier tags stay stable.
     Metal,
+}
+
+/// SCALE tag order must match `pallet_miner_registry::LogLevel`.
+#[derive(Clone, Copy, Debug, Encode, Decode, PartialEq, Eq)]
+pub enum NodeLogLevel {
+    /// Pallet `Debug`. Also the mapping for coordinator `trace`.
+    Debug,
+    /// Pallet `Info`.
+    Info,
+    /// Pallet `Warning`. Also the mapping for coordinator `warn`.
+    Warning,
+    /// Pallet `Error`.
+    Error,
+}
+
+/// One advertised miner. `Vec<u8>` encodes like the pallet `BoundedVec`.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct MinerSpecScale {
+    /// Backend class.
+    pub kind: MinerKind,
+    /// Operator label, usually the miner id.
+    pub label: Option<Vec<u8>>,
+    /// Backend section name (`cpu`, `cuda`, `metal`, `dwave`).
+    pub backend: Option<Vec<u8>>,
+    /// Device id when the miner has one.
+    pub device_id: Option<Vec<u8>>,
+}
+
+/// Operating-system identity inside [`SystemInfoScale`].
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct OsInfoScale {
+    /// OS family.
+    pub system: Vec<u8>,
+    /// Kernel or build string.
+    pub release: Vec<u8>,
+    /// Machine architecture.
+    pub machine: Vec<u8>,
+}
+
+/// CPU identity inside [`SystemInfoScale`].
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct CpuInfoScale {
+    /// Logical core count.
+    pub logical_cores: Option<u32>,
+    /// Physical core count.
+    pub physical_cores: Option<u32>,
+    /// Brand string.
+    pub brand: Vec<u8>,
+    /// Instruction-set architecture.
+    pub arch: Vec<u8>,
+}
+
+/// One GPU inside [`SystemInfoScale`].
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct GpuInfoScale {
+    /// Enumeration index.
+    pub index: u8,
+    /// Vendor string.
+    pub vendor: Vec<u8>,
+    /// Product name.
+    pub name: Vec<u8>,
+    /// Device memory in MiB.
+    pub memory_mb: Option<u32>,
+    /// Utilization 0..=100.
+    pub utilization_pct: Option<u8>,
+}
+
+/// Optional hardware survey on a V2 descriptor.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct SystemInfoScale {
+    /// OS identity.
+    pub os: OsInfoScale,
+    /// CPU identity.
+    pub cpu: CpuInfoScale,
+    /// Host memory in MiB.
+    pub memory_mb: Option<u32>,
+    /// Attached GPUs.
+    pub gpus: Vec<GpuInfoScale>,
+}
+
+/// Optional node-software identity on a V2 descriptor.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct RuntimeInfoScale {
+    /// Python interpreter version.
+    pub python: Vec<u8>,
+    /// Node software version.
+    pub quip_version: Vec<u8>,
+    /// Protocol version number.
+    pub protocol_version: u32,
+    /// Whether the process is inside a container.
+    pub in_docker: bool,
+    /// Container image, when running in a container.
+    pub docker_image: Option<Vec<u8>>,
+}
+
+/// Caller-supplied V2 descriptor. This is the payload the coordinator files.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub struct NodeDescriptorV2Input {
+    /// Node identity bytes.
+    pub node_id: Vec<u8>,
+    /// Display name.
+    pub node_name: Vec<u8>,
+    /// Optional public host.
+    pub public_host: Option<Vec<u8>>,
+    /// Optional public port.
+    pub public_port: Option<u16>,
+    /// Validator RPC endpoints.
+    pub rpc_endpoints: Vec<Vec<u8>>,
+    /// Whether the node mines without a manual start.
+    pub auto_mine: bool,
+    /// Advertised log verbosity.
+    pub log_level: NodeLogLevel,
+    /// Miners on this node.
+    pub miners: Vec<MinerSpecScale>,
+    /// Optional hardware survey. The coordinator sends `None`.
+    pub system_info: Option<SystemInfoScale>,
+    /// Optional node-software block. The coordinator sends `None`.
+    pub runtime: Option<RuntimeInfoScale>,
 }
 
 /// SCALE-encode the `QuantumPow.submit_proof(proof)` call body.
@@ -253,6 +392,19 @@ pub fn encode_participate_call(
     out.extend(qblock_id.encode());
     out.extend(kind.encode());
     out.extend(budget_seconds.encode());
+    out
+}
+
+/// SCALE-encode `MinerRegistry.set_descriptor(V2(descriptor))`.
+///
+/// The version tag is `1` so a V1 signed extrinsic (tag `0`) still decodes.
+#[must_use]
+pub fn encode_set_descriptor_call(descriptor: &NodeDescriptorV2Input) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(MINER_REGISTRY_PALLET_INDEX);
+    out.push(SET_DESCRIPTOR_CALL_INDEX);
+    out.push(1);
+    out.extend(descriptor.encode());
     out
 }
 
@@ -348,6 +500,68 @@ mod tests {
         let decoded: Option<MiningSnapshotScale> =
             Decode::decode(&mut &encoded[..]).expect("decode");
         assert_eq!(decoded, Some(snap));
+    }
+
+    #[test]
+    fn set_descriptor_call_encodes_pallet_call_and_v2_args() {
+        let v2 = NodeDescriptorV2Input {
+            node_id: b"n".to_vec(),
+            node_name: b"N".to_vec(),
+            public_host: None,
+            public_port: None,
+            rpc_endpoints: Vec::new(),
+            auto_mine: true,
+            log_level: NodeLogLevel::Info,
+            miners: vec![MinerSpecScale {
+                kind: MinerKind::Cpu,
+                label: None,
+                backend: None,
+                device_id: None,
+            }],
+            system_info: None,
+            runtime: None,
+        };
+        let call = encode_set_descriptor_call(&v2);
+        let mut expected = vec![MINER_REGISTRY_PALLET_INDEX, SET_DESCRIPTOR_CALL_INDEX, 1];
+        expected.extend(v2.encode());
+        assert_eq!(call, expected);
+        assert_eq!(call.first().copied(), Some(MINER_REGISTRY_PALLET_INDEX));
+        assert_eq!(call.get(1).copied(), Some(SET_DESCRIPTOR_CALL_INDEX));
+        assert_eq!(call.get(2).copied(), Some(1), "V2 variant index must be 1");
+        // Compact-len 1 + b'n', compact-len 1 + b'N', three Nones / empty,
+        // auto_mine=true, log_level=Info, one Cpu miner with three Nones,
+        // system_info=None, runtime=None.
+        assert_eq!(
+            call.get(2..),
+            Some([1, 4, b'n', 4, b'N', 0, 0, 0, 1, 1, 4, 0, 0, 0, 0, 0, 0].as_slice())
+        );
+    }
+
+    #[test]
+    fn set_descriptor_option_struct_is_not_unit() {
+        // Option<SystemInfo> must not collapse to Option<()>. A Some value
+        // starts with 0x01 then the inner struct, not a single unit byte.
+        let info = SystemInfoScale {
+            os: OsInfoScale {
+                system: b"Linux".to_vec(),
+                release: Vec::new(),
+                machine: Vec::new(),
+            },
+            cpu: CpuInfoScale {
+                logical_cores: None,
+                physical_cores: None,
+                brand: b"x".to_vec(),
+                arch: b"x".to_vec(),
+            },
+            memory_mb: None,
+            gpus: Vec::new(),
+        };
+        let some = Some(info.clone()).encode();
+        let none = Option::<SystemInfoScale>::None.encode();
+        assert_eq!(none, vec![0]);
+        assert_eq!(some.first().copied(), Some(1));
+        assert_eq!(some.get(1..), Some(info.encode().as_slice()));
+        assert_ne!(some, vec![1]);
     }
 
     #[test]

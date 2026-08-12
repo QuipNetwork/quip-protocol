@@ -41,6 +41,51 @@ pub struct Proof {
     pub device_access_time_us: u64,
 }
 
+/// Outcome of a `MinerRegistry.set_descriptor` submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescriptorOutcome {
+    /// The descriptor landed (create or replace).
+    Filed,
+    /// The pallet rejected the payload. Do not retry.
+    Rejected,
+}
+
+const DESCRIPTOR_REJECT: [&str; 20] = [
+    "EmptyNodeId",
+    "EmptyNodeName",
+    "EmptyPublicHost",
+    "EmptyRpcEndpoint",
+    "EmptyMinerLabel",
+    "EmptyMinerBackend",
+    "EmptyMinerDeviceId",
+    "EmptyOsSystem",
+    "EmptyCpuBrand",
+    "EmptyCpuArch",
+    "EmptyGpuVendor",
+    "EmptyGpuName",
+    "InvalidGpuUtilization",
+    "EmptyPythonVersion",
+    "EmptyQuipVersion",
+    "EmptyDockerImage",
+    "NoMiners",
+    "InvalidPort",
+    "InsufficientBalance",
+    "LiquidityRestrictions",
+];
+
+/// Classify a `set_descriptor` pallet error. `None` is a successful dispatch.
+/// Unknown strings stay `None` so the caller can treat them as transient.
+#[must_use]
+pub fn classify_descriptor(error: Option<&str>) -> Option<DescriptorOutcome> {
+    let Some(e) = error else {
+        return Some(DescriptorOutcome::Filed);
+    };
+    if DESCRIPTOR_REJECT.iter().any(|s| e.contains(s)) {
+        return Some(DescriptorOutcome::Rejected);
+    }
+    None
+}
+
 /// Outcome of a `MinerRegistry.participate` submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParticipationOutcome {
@@ -137,6 +182,24 @@ mod tests {
             classify_receipt(Some("SomethingUnknown")),
             SubmitAction::StopFatal
         ));
+    }
+
+    #[test]
+    fn classifies_descriptor_errors() {
+        assert_eq!(classify_descriptor(None), Some(DescriptorOutcome::Filed));
+        assert_eq!(
+            classify_descriptor(Some("MinerRegistry: EmptyNodeName")),
+            Some(DescriptorOutcome::Rejected)
+        );
+        assert_eq!(
+            classify_descriptor(Some("NoMiners")),
+            Some(DescriptorOutcome::Rejected)
+        );
+        assert_eq!(
+            classify_descriptor(Some("InsufficientBalance")),
+            Some(DescriptorOutcome::Rejected)
+        );
+        assert_eq!(classify_descriptor(Some("SomethingUnknown")), None);
     }
 
     #[test]

@@ -11,11 +11,13 @@ use super::extrinsic::{
 };
 use super::proof_encode::{build_quantum_proof, ProofBuildContext};
 use super::scale_types::{
-    encode_participate_call, encode_submit_proof_call, require_set_values, CurveCScale,
-    DifficultyConfig, JobOrderScale, MinerKind, MiningSnapshotScale, OrderStatus,
+    encode_participate_call, encode_set_descriptor_call, encode_submit_proof_call,
+    require_set_values, CurveCScale, DifficultyConfig, JobOrderScale, MinerKind,
+    MiningSnapshotScale, NodeDescriptorV2Input, OrderStatus,
 };
 use super::submit::{
-    classify_participation, classify_receipt, ParticipationOutcome, Proof, SubmitAction,
+    classify_descriptor, classify_participation, classify_receipt, DescriptorOutcome,
+    ParticipationOutcome, Proof, SubmitAction,
 };
 use super::{ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot};
 use crate::decay::{
@@ -60,12 +62,14 @@ pub struct RealChainClient {
     /// so a per-call "connected" line would run to thousands an hour; this
     /// tracks reachability so only the *transitions* are reported.
     reachable: Mutex<Option<bool>>,
+    /// Kind declared on `participate`. Derived from the miners this process starts.
+    participate_kind: MinerKind,
 }
 
 impl RealChainClient {
     /// Construct a client over the given validators and signer material.
     #[must_use]
-    pub fn new(validators: Vec<String>, signer_key: String) -> Self {
+    pub fn new(validators: Vec<String>, signer_key: String, participate_kind: MinerKind) -> Self {
         Self {
             validators,
             signer_key,
@@ -74,6 +78,7 @@ impl RealChainClient {
             last_spin_spec: Mutex::new(None),
             subxt: OnceCell::new(),
             reachable: Mutex::new(None),
+            participate_kind,
         }
     }
 
@@ -738,11 +743,26 @@ impl ChainClient for RealChainClient {
         }
     }
 
+    async fn file_descriptor(
+        &self,
+        descriptor: &NodeDescriptorV2Input,
+    ) -> Result<DescriptorOutcome, ChainError> {
+        let call = encode_set_descriptor_call(descriptor);
+        match self.submit_signed_call(&call).await? {
+            SignedCallOutcome::Success { .. } => Ok(DescriptorOutcome::Filed),
+            SignedCallOutcome::DispatchFailed { error, .. }
+            | SignedCallOutcome::Invalid { message: error } => {
+                classify_descriptor(Some(&error)).ok_or(ChainError::Submit(error))
+            }
+            SignedCallOutcome::Dropped { message } => Err(ChainError::Submit(message)),
+        }
+    }
+
     async fn declare_participation(
         &self,
         qblock_id: u64,
     ) -> Result<ParticipationOutcome, ChainError> {
-        let call = encode_participate_call(qblock_id, MinerKind::Cpu, None);
+        let call = encode_participate_call(qblock_id, self.participate_kind, None);
         match self.submit_signed_call(&call).await? {
             SignedCallOutcome::Success { .. } => Ok(ParticipationOutcome::Declared),
             SignedCallOutcome::DispatchFailed { error, .. }
