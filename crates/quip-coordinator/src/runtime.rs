@@ -348,6 +348,13 @@ pub async fn feeder_loop<C: ChainClient>(
                     max_energy_milli = snap.max_energy_milli,
                     min_solutions = snap.min_solutions,
                     min_diversity_milli = snap.min_diversity_milli,
+                    // The allowed value sets define the problem the miner
+                    // samples. A model with no linear field behaves nothing
+                    // like one with a ternary field, and comparing the two
+                    // silently misreads every energy the miner reports.
+                    allowed_h_milli = ?snap.allowed_h_milli,
+                    allowed_j_milli = ?snap.allowed_j_milli,
+                    allowed_spin_milli = ?snap.allowed_spin_milli,
                     "new round"
                 );
                 let mut st = state.lock().await;
