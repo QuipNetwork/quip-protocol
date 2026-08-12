@@ -1,7 +1,10 @@
 //! Scripted chain for tests: fixed snapshot, optional mempool order, captured submits.
 
 use super::sync::{SyncSource, SyncStatus};
-use super::{ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot, Proof, SubmitAction};
+use super::{
+    ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot, ParticipationOutcome, Proof,
+    SubmitAction,
+};
 use crate::funding::BalanceSource;
 use async_trait::async_trait;
 use std::sync::Mutex;
@@ -25,6 +28,10 @@ pub struct FakeChain {
     sync: Mutex<Result<SyncStatus, String>>,
     balance_calls: Mutex<usize>,
     sync_calls: Mutex<usize>,
+    /// Captured `qblock_id` values from [`ChainClient::declare_participation`].
+    participations: Mutex<Vec<u64>>,
+    /// Scripted participate result (default `Declared`).
+    participation_result: Mutex<Result<ParticipationOutcome, ChainError>>,
 }
 
 impl FakeChain {
@@ -48,6 +55,8 @@ impl FakeChain {
             })),
             balance_calls: Mutex::new(0),
             sync_calls: Mutex::new(0),
+            participations: Mutex::new(Vec::new()),
+            participation_result: Mutex::new(Ok(ParticipationOutcome::Declared)),
         }
     }
 
@@ -194,6 +203,50 @@ impl FakeChain {
             *self.sync_calls.lock().unwrap()
         }
     }
+
+    /// Script the next `declare_participation` return value.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_participation_result(&self, result: Result<ParticipationOutcome, ChainError>) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.participation_result.lock().unwrap() = result;
+        }
+    }
+
+    /// How many times `declare_participation` has been called.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn participation_calls(&self) -> usize {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            self.participations.lock().unwrap().len()
+        }
+    }
+
+    /// Drain and return captured participation qblock ids.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn take_participations(&self) -> Vec<u64> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            std::mem::take(&mut *self.participations.lock().unwrap())
+        }
+    }
 }
 
 #[async_trait]
@@ -237,6 +290,25 @@ impl ChainClient for FakeChain {
             // reconstruct Success/Retry/etc from a stored pattern.
             match &*self.submit_result.lock().unwrap() {
                 Ok(a) => Ok(*a),
+                Err(ChainError::Unavailable(s)) => Err(ChainError::Unavailable(s.clone())),
+                Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
+                Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),
+            }
+        }
+    }
+
+    async fn declare_participation(
+        &self,
+        qblock_id: u64,
+    ) -> Result<ParticipationOutcome, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            self.participations.lock().unwrap().push(qblock_id);
+            match &*self.participation_result.lock().unwrap() {
+                Ok(o) => Ok(*o),
                 Err(ChainError::Unavailable(s)) => Err(ChainError::Unavailable(s.clone())),
                 Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
                 Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),

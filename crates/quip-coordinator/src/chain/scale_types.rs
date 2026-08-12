@@ -203,6 +203,32 @@ pub const QUANTUM_POW_PALLET_INDEX: u8 = 10;
 /// Call index of `submit_proof` within `QuantumPow`.
 pub const SUBMIT_PROOF_CALL_INDEX: u8 = 4;
 
+/// Pallet index of `MinerRegistry` in the runtime construct.
+pub const MINER_REGISTRY_PALLET_INDEX: u8 = 13;
+/// Call index of `participate` within `MinerRegistry`.
+pub const PARTICIPATE_CALL_INDEX: u8 = 2;
+
+/// SCALE tag order must match `pallet_miner_registry::MinerKind`.
+#[derive(Clone, Copy, Debug, Encode, Decode, PartialEq, Eq)]
+pub enum MinerKind {
+    /// CPU sampler.
+    Cpu,
+    /// Discrete GPU sampler.
+    Gpu,
+    /// D-Wave QPU.
+    QpuDwave,
+    /// IBM QPU.
+    QpuIbm,
+    /// `IonQ` QPU.
+    QpuIonq,
+    /// Pasqal QPU.
+    QpuPasqal,
+    /// ASIC sampler.
+    Asic,
+    /// Apple Metal GPU. Last so the earlier tags stay stable.
+    Metal,
+}
+
 /// SCALE-encode the `QuantumPow.submit_proof(proof)` call body.
 #[must_use]
 pub fn encode_submit_proof_call(proof: &QuantumProof) -> Vec<u8> {
@@ -211,6 +237,22 @@ pub fn encode_submit_proof_call(proof: &QuantumProof) -> Vec<u8> {
     out.push(SUBMIT_PROOF_CALL_INDEX);
     // Call args: single composite field `proof`.
     out.extend(proof.encode());
+    out
+}
+
+/// SCALE-encode `MinerRegistry.participate(qblock_id, kind, budget_seconds)`.
+#[must_use]
+pub fn encode_participate_call(
+    qblock_id: u64,
+    kind: MinerKind,
+    budget_seconds: Option<u32>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(MINER_REGISTRY_PALLET_INDEX);
+    out.push(PARTICIPATE_CALL_INDEX);
+    out.extend(qblock_id.encode());
+    out.extend(kind.encode());
+    out.extend(budget_seconds.encode());
     out
 }
 
@@ -306,6 +348,50 @@ mod tests {
         let decoded: Option<MiningSnapshotScale> =
             Decode::decode(&mut &encoded[..]).expect("decode");
         assert_eq!(decoded, Some(snap));
+    }
+
+    #[test]
+    fn participate_call_encodes_pallet_call_and_args() {
+        let call = encode_participate_call(5, MinerKind::Cpu, None);
+        assert_eq!(
+            call,
+            [
+                MINER_REGISTRY_PALLET_INDEX,
+                PARTICIPATE_CALL_INDEX,
+                5,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+        );
+        let with_budget = encode_participate_call(1, MinerKind::Metal, Some(30));
+        assert_eq!(
+            with_budget,
+            [
+                MINER_REGISTRY_PALLET_INDEX,
+                PARTICIPATE_CALL_INDEX,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                7,
+                1,
+                30,
+                0,
+                0,
+                0,
+            ]
+        );
     }
 
     #[test]

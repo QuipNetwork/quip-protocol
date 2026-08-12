@@ -13,7 +13,7 @@ use crate::decay::{build_decay_schedule, EnergyCurve};
 use crate::funding::{ensure_funded, BalanceSource, Faucet};
 use crate::logging::LogLevel;
 use crate::producer::derive_pow_job;
-use crate::readiness::{build_faucet, ReadinessError};
+use crate::readiness::{build_faucet, declare_round_participation, ReadinessError};
 use crate::round::{RoundEvent, RoundState};
 use crate::session::{coord, CoordinatorService, CoordinatorState};
 use crate::supervisor::{supervise_miner, BackoffPolicy};
@@ -284,6 +284,10 @@ async fn await_round_step<T>(
     clippy::too_many_lines,
     reason = "one match arm per round state plus retry"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "last_declared is walk-local state, not a sixth RoundState"
+)]
 async fn drive_to_mining<C, F>(
     mut machine: RoundState,
     chain: &C,
@@ -292,6 +296,7 @@ async fn drive_to_mining<C, F>(
     faucet: Option<&F>,
     generation: u64,
     stop: &mut watch::Receiver<bool>,
+    last_declared: &mut Option<u64>,
 ) -> Option<(MiningSnapshot, usize, usize)>
 where
     C: ChainClient + SyncSource + BalanceSource,
@@ -382,6 +387,8 @@ where
                 match result {
                     Ok(Some(s)) => {
                         snap = Some(s);
+                        declare_round_participation(chain, last_declared, params.miner_account)
+                            .await;
                         RoundEvent::Succeeded
                     }
                     Ok(None) => {
@@ -466,6 +473,7 @@ pub async fn feeder_loop<C>(
     let mut last_heartbeat = std::time::Instant::now();
     let faucet = build_faucet(params.funding.faucet_url.as_deref());
     let mut round: Option<RoundState> = None;
+    let mut last_declared: Option<u64> = None;
 
     loop {
         let (snap, state_now) = match chain
@@ -525,6 +533,7 @@ pub async fn feeder_loop<C>(
                     faucet.as_ref(),
                     generation,
                     &mut stop,
+                    &mut last_declared,
                 )
                 .await
                 else {

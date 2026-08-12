@@ -701,3 +701,143 @@ async fn feeder_re_runs_sync_and_funding_on_every_round() {
         .expect("feeder did not stop")
         .expect("feeder task panicked");
 }
+
+async fn wait_generation(state: &Arc<Mutex<CoordinatorState>>, generation: u64) -> bool {
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        if state.lock().await.generation >= generation
+            && state.lock().await.router.staged_len("cpu-0") >= 1
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Two reseeds of the same minted qblock send one participate call.
+#[tokio::test]
+async fn feeder_declares_once_for_the_same_qblock() {
+    let chain = Arc::new(FakeChain::new(snapshot_with_head([1u8; 32]), None));
+    chain.set_qblock_id(Some(10));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    state
+        .lock()
+        .await
+        .router
+        .register_miner("cpu-0", ising_caps());
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        feeder_params(1, 40),
+        stop_rx,
+    ));
+
+    assert!(wait_generation(&state, 1).await, "first round never staged");
+    chain.set_snapshot(Some(snapshot_with_head([2u8; 32])));
+    assert!(
+        wait_generation(&state, 2).await,
+        "second round never staged"
+    );
+    assert_eq!(
+        chain.participation_calls(),
+        1,
+        "same candidate must not be declared twice"
+    );
+    assert_eq!(chain.take_participations(), vec![11]);
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+}
+
+/// A new minted qblock sends a second participate call.
+#[tokio::test]
+async fn feeder_declares_again_on_a_new_qblock() {
+    let chain = Arc::new(FakeChain::new(snapshot_with_head([1u8; 32]), None));
+    chain.set_qblock_id(Some(10));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    state
+        .lock()
+        .await
+        .router
+        .register_miner("cpu-0", ising_caps());
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        feeder_params(1, 40),
+        stop_rx,
+    ));
+
+    assert!(wait_generation(&state, 1).await, "first round never staged");
+    chain.set_qblock_id(Some(11));
+    chain.set_snapshot(Some(snapshot_with_head([2u8; 32])));
+    assert!(
+        wait_generation(&state, 2).await,
+        "second round never staged"
+    );
+    assert_eq!(chain.take_participations(), vec![11, 12]);
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+}
+
+/// Pallet participation errors must not hold off mining.
+#[tokio::test]
+async fn feeder_keeps_mining_when_participation_pallet_errors() {
+    use quip_coordinator::chain::ParticipationOutcome;
+
+    let chain = Arc::new(FakeChain::new(snapshot_with_head([1u8; 32]), None));
+    chain.set_qblock_id(Some(4));
+    chain.set_participation_result(Ok(ParticipationOutcome::AlreadyDeclared));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    state
+        .lock()
+        .await
+        .router
+        .register_miner("cpu-0", ising_caps());
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        feeder_params(1, 40),
+        stop_rx,
+    ));
+
+    assert!(
+        wait_generation(&state, 1).await,
+        "DuplicateParticipation must not block mining"
+    );
+
+    chain.set_qblock_id(Some(5));
+    chain.set_participation_result(Ok(ParticipationOutcome::StaleQBlock));
+    chain.set_snapshot(Some(snapshot_with_head([2u8; 32])));
+    assert!(
+        wait_generation(&state, 2).await,
+        "InvalidQBlockId must not block mining"
+    );
+
+    chain.set_qblock_id(Some(6));
+    chain.set_participation_result(Ok(ParticipationOutcome::DescriptorMissing));
+    chain.set_snapshot(Some(snapshot_with_head([3u8; 32])));
+    assert!(
+        wait_generation(&state, 3).await,
+        "DescriptorRequired must not block mining"
+    );
+    assert_eq!(chain.participation_calls(), 3);
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+}

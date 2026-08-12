@@ -136,8 +136,7 @@ difficulty `target`, per-miner `Configure`, and the salt→job bookkeeping.
 
 ## The blockchain seam
 
-All chain access sits behind one trait, `ChainClient` (`chain/mod.rs`), with
-three methods:
+All chain access sits behind one trait, `ChainClient` (`chain/mod.rs`):
 
 - `fetch_mining_snapshot` — the mining inputs at a block: topology
   (nodes/edges, allowed h/J/spin ranges), difficulty gates
@@ -146,6 +145,9 @@ three methods:
 - `fetch_mempool_orders` — open mempool orders eligible for this miner.
 - `submit_proof` — hybrid-sign and submit a proof extrinsic, then classify the
   receipt.
+- `declare_participation` — hybrid-sign and submit
+  `MinerRegistry.participate` for one qblock, then classify the pallet
+  error.
 
 `RealChainClient` (`chain/real.rs`) is the live client over Substrate
 JSON-RPC and subxt; `FakeChain` (`chain/fake.rs`) backs the tests. Supporting
@@ -179,10 +181,41 @@ The states, in order:
    this state, and retries. It does not exit.
 4. **Requirements for the next qblock downloaded.** Topology, energy target,
    required solution count, and diversity come from a fresh snapshot after
-   sync and funding.
+   sync and funding. After the snapshot returns, the coordinator declares
+   participation for the candidate qblock. That call never holds this state.
 5. **Start mining.** The feeder always sends `Topology` and `SetTarget` for
    the new round, then stages jobs. A job of the new generation cannot leave
    before those two messages.
+
+### Participation
+
+The node manager reads `MinerRegistry::LatestParticipation` and compares it
+to `QuantumPow::QBlockCount`. The coordinator must call
+`MinerRegistry.participate` once per qblock or that check stays behind.
+
+The pallet accepts only the current candidate qblock. That id is one past
+`QuantumPowApi_latest_qblock_id`. The `new round` log line prints the last
+minted id. The declaration uses the candidate.
+
+The walk declares after the snapshot succeeds and before mining starts.
+The machine keeps five states. Participation is a declaration for the
+operator. Mining proceeds whether the declaration succeeds or fails.
+
+Pallet outcomes:
+
+| Outcome | Action |
+| --- | --- |
+| success or `DuplicateParticipation` | treat as declared. Do not retry. |
+| `InvalidQBlockId` | log at `debug`. Declare the new candidate next round. |
+| `DescriptorRequired` | log at `warn` once, name the account, keep mining |
+| transient chain error | log at `warn`. Retry next round. |
+
+The coordinator does not call `set_descriptor`. A descriptor needs the
+node identity, public host, and miner list. The coordinator does not own
+those fields. Mining still works without a descriptor. The operator must
+set one on chain before the registry can record participation.
+
+A participation failure never calls `process::exit` and never holds mining.
 
 Transitions:
 
