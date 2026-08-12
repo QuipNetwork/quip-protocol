@@ -81,6 +81,35 @@ An unreachable validator is not an error. The node manager starts the
 coordinator and its validator together, so exiting because the node is still
 booting would only crash-loop. The coordinator warns, starts, and retries.
 
+## Waiting for the validator to sync
+
+Between the compatibility check and the funding check, `chain::sync` gates
+startup on the node catching up. Every chain read resolves against the node's
+best block. While the node imports history, that block is far behind the real
+head. The miner account then reads as empty even after the faucet has paid it,
+and any snapshot describes a round that ended long ago.
+
+`wait_until_synced` polls `system_health` every 5 seconds and warns with the
+block from `system_syncState` every 30 seconds:
+
+```
+WARN validator is syncing at block 1108021 of 1240333 (132312 behind); waiting
+     before funding and mining peers=8 waited_s=0
+```
+
+The wait has no ceiling while the node reports progress, because an initial
+sync runs for hours and the funding budget is 10 minutes. Cutting it short is
+what produced the misleading "miner account is not funded" exit, which is exit
+64 and stops the supervisor respawning the coordinator.
+
+The gate opens on `isSyncing`, the same signal the node manager reports. A node
+flaps that flag near the tip, so the gate needs two consecutive clear polls once
+it has seen a sync. The first answer settles a node that was never syncing, so a
+normal start waits for nothing. When the node answers nothing at all for a
+minute, the coordinator warns, starts, and leaves the retry to the feeder. Zero
+peers on a node that expects peers draws its own warning, because that node has
+no chain to catch up to.
+
 `[miner].validators` is an ordered failover list, tried in order on every call.
 When the key is absent it defaults to `["ws://quip-validator:9944",
 "ws://127.0.0.1:9944"]`, matching v0.2. An explicit empty list stays empty.

@@ -276,6 +276,20 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
         }
     }
 
+    // Every chain read answers at the node's best block, so a node that is still
+    // importing history reports an empty miner account and a round that has
+    // already ended. Funding before that finishes drains the faucet budget and
+    // then exits "not funded", which names the wrong problem.
+    if let quip_coordinator::chain::sync::SyncOutcome::Unknown(reason) = rt.block_on(
+        quip_coordinator::chain::sync::wait_until_synced(chain.as_ref(), tokio::time::sleep),
+    ) {
+        tracing::warn!(
+            reason = %reason,
+            "cannot confirm the validator has caught up; continuing, but funding and \
+             mining may fail until it does"
+        );
+    }
+
     let state = Arc::new(Mutex::new(CoordinatorState::new()));
     // Canonical miner account (blake2_256(SCALE(account))) seeds PoW nonce
     // derivation. A live mining coordinator needs its signer key; without a

@@ -182,6 +182,25 @@ impl RealChainClient {
             .await
     }
 
+    /// Raw `system_health` response, for the startup sync gate in
+    /// [`super::sync`].
+    ///
+    /// # Errors
+    /// Returns a transport error when the validator cannot be reached.
+    pub(crate) async fn system_health_raw(&self) -> Result<Value, ChainError> {
+        self.rpc_call("system_health", Value::Array(vec![])).await
+    }
+
+    /// Raw `system_syncState` response: the block heights the sync gate reports.
+    ///
+    /// # Errors
+    /// Returns a transport error when the validator cannot be reached, or when
+    /// it does not serve this method.
+    pub(crate) async fn sync_state_raw(&self) -> Result<Value, ChainError> {
+        self.rpc_call("system_syncState", Value::Array(vec![]))
+            .await
+    }
+
     /// Read + SCALE-decode a storage value at `at_hex`. `Ok(None)` when the key
     /// is unset (null result).
     async fn read_storage<T: Decode>(

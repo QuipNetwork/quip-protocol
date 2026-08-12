@@ -10,6 +10,7 @@ pub mod real;
 pub mod scale_types;
 pub mod snapshot;
 pub mod submit;
+pub mod sync;
 
 pub use fake::FakeChain;
 pub use mempool::JobOrder;
