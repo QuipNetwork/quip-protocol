@@ -5,6 +5,7 @@
 //! Shutdown / idle timeout. Backends supply only a [`Sampler`].
 
 use crate::cli::CommonArgs;
+use crate::display::{energy_units, format_duration_ms};
 use crate::job::{
     finalize_result, miner, num_sweeps_from_toml, prepare_job, status_msg, Prepared, SessionTarget,
     TopologyCache, DEFAULT_NUM_SWEEPS,
@@ -109,9 +110,8 @@ fn log_progress(
     backend: &str,
     jobs_done: u64,
     elapsed: Duration,
-    reads: u32,
-    sweeps: u32,
     best_energy_milli: i64,
+    pending: Option<&PendingJob>,
 ) {
     let secs = elapsed.as_secs_f64();
     let rate = if secs > 0.0 {
@@ -122,11 +122,28 @@ fn log_progress(
     let best = if best_energy_milli == i64::MAX {
         "n/a".to_owned()
     } else {
-        best_energy_milli.to_string()
+        energy_units(best_energy_milli).to_string()
     };
+    let (reads, sweeps) = pending.map_or((0, 0), |p| (p.num_reads, p.num_sweeps));
+    let requirement = format_requirement(pending);
     tracing::info!(
-        "{backend} progress: {jobs_done} jobs | {rate:.1} jobs/s | reads={reads} sweeps={sweeps} | best={best} milli"
+        "[quip-miner-{backend}] progress: {jobs_done} jobs | {rate:.1} jobs/s | reads={reads} sweeps={sweeps} | best={best} | {requirement}"
     );
+}
+
+/// Requirement text shared by the progress line.
+///
+/// The per-attempt line no longer carries this. Sampling parameters stay
+/// constant for a round, so the progress interval is enough.
+fn format_requirement(pending: Option<&PendingJob>) -> String {
+    match pending.and_then(|p| p.max_energy_milli) {
+        Some(max) => format!(
+            "requires energy<={}, solutions>={}",
+            energy_units(max),
+            pending.map_or(0, |p| p.min_solutions)
+        ),
+        None => "no target set".to_owned(),
+    }
 }
 
 /// Log one finished attempt, mirroring the v0.2.1 miner's per-attempt line.
@@ -143,9 +160,14 @@ fn log_progress(
 /// still goes out, with the parameters and elapsed time reported as unknown.
 fn log_attempt(backend: &str, sr: &StreamResult, pending: Option<&PendingJob>) {
     let job = short_job_id(&sr.job_id);
-    let elapsed_ms = pending.map_or(0, |p| p.started.elapsed().as_millis());
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "attempt wall time in ms fits u64 for any realistic job"
+    )]
+    let elapsed_ms = pending.map_or(0, |p| p.started.elapsed().as_millis() as u64);
     let device_ms = sr.device_access_time_us / 1000;
-    let (reads, sweeps) = pending.map_or((0, 0), |p| (p.num_reads, p.num_sweeps));
+    let wall = format_duration_ms(elapsed_ms);
+    let device = format_duration_ms(device_ms);
 
     match &sr.outcome {
         StreamOutcome::Completed(Ok(samples)) => {
@@ -153,34 +175,26 @@ fn log_attempt(backend: &str, sr: &StreamResult, pending: Option<&PendingJob>) {
             // Solutions at or below the session threshold: the count the
             // coordinator scores the attempt on. Without a target none of them
             // qualify yet, so report the raw sample count instead.
-            let (valid, requirement) = match pending.and_then(|p| p.max_energy_milli) {
-                Some(max) => (
-                    samples.iter().filter(|r| r.energy_milli <= max).count(),
-                    format!(
-                        "requires energy<={max} milli, solutions>={}",
-                        pending.map_or(0, |p| p.min_solutions)
-                    ),
-                ),
-                None => (samples.len(), "no target set".to_owned()),
+            let valid = match pending.and_then(|p| p.max_energy_milli) {
+                Some(max) => samples.iter().filter(|r| r.energy_milli <= max).count(),
+                None => samples.len(),
             };
             tracing::info!(
-                "{backend} attempt {job}: energy {} milli, valid {valid}/{} \
-                 ({requirement}) | reads={reads} sweeps={sweeps} \
-                 | {elapsed_ms} ms wall, {device_ms} ms device",
-                best.map_or_else(|| "n/a".to_owned(), |e| e.to_string()),
+                "[quip-miner-{backend}] attempt {job}: energy {}, valid {valid}/{} \
+                 | {wall} wall, {device} device",
+                best.map_or_else(|| "n/a".to_owned(), |e| energy_units(e).to_string()),
                 samples.len(),
             );
         }
         StreamOutcome::Completed(Err(reason)) => {
             tracing::warn!(
-                "{backend} attempt {job}: rejected {} | reads={reads} sweeps={sweeps} \
-                 | {elapsed_ms} ms wall",
+                "[quip-miner-{backend}] attempt {job}: rejected {} | {wall} wall",
                 reason.as_str_name(),
             );
         }
         // Expected on every reseed, so this is not a degraded condition.
         StreamOutcome::Cancelled => {
-            tracing::debug!("{backend} attempt {job}: cancelled after {elapsed_ms} ms");
+            tracing::debug!("[quip-miner-{backend}] attempt {job}: cancelled after {wall}");
         }
     }
 }
@@ -320,9 +334,8 @@ async fn run_session<S: Sampler>(
                                 backend,
                                 done,
                                 session_start.elapsed(),
-                                reads,
-                                sweeps,
                                 best_energy_milli,
+                                entry.as_ref(),
                             );
                         }
                     }

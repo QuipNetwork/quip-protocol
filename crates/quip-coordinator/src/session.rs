@@ -110,6 +110,21 @@ fn log_liveness(miner_id: &str, qblock: Option<u64>, event: &crate::liveness::Li
     }
 }
 
+/// Render the leading bytes of a job id the way the miner does.
+///
+/// Eight bytes plus `..` is enough to correlate a stash decision with the
+/// miner's per-attempt line.
+fn short_job_id(job_id: &[u8]) -> String {
+    let mut s = String::with_capacity(18);
+    for b in job_id.iter().take(8) {
+        let _ = write!(s, "{b:02x}");
+    }
+    if job_id.len() > 8 {
+        s.push_str("..");
+    }
+    s
+}
+
 /// How many top candidates the win-time stash retains per generation.
 const WIN_STASH_K: usize = 8;
 
@@ -632,6 +647,26 @@ async fn run_session<C: ChainClient>(
                                     device_access_time_us: device_us,
                                     submitted: false,
                                 });
+                                let decision = if stash_changed {
+                                    "stashed"
+                                } else {
+                                    "discarded"
+                                };
+                                let stash_txt = match st.stash.summary().retained_band_milli() {
+                                    None => "empty".to_owned(),
+                                    Some((worst, best)) => format!(
+                                        "{} -> {}",
+                                        crate::logging::energy_units(worst),
+                                        crate::logging::energy_units(best)
+                                    ),
+                                };
+                                let target_txt = crate::logging::display_energy(
+                                    st.target.as_ref().map(|t| t.max_energy_milli),
+                                );
+                                tracing::info!(
+                                    "[quip-miner-{miner_id}] attempt {}: {decision} (stash: {stash_txt}, target <= {target_txt})",
+                                    short_job_id(&result.job_id),
+                                );
                             }
 
                             let attempt = crate::attempt::AttemptRecord::new(

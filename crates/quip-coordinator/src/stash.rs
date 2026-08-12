@@ -193,6 +193,19 @@ pub struct StashSummary {
     pub candidates: Vec<CandidateSummary>,
 }
 
+impl StashSummary {
+    /// Worst and best retained energies, in milli-units.
+    ///
+    /// A new candidate must beat the worst to displace it once the stash is
+    /// full. `None` when the stash holds nothing.
+    #[must_use]
+    pub fn retained_band_milli(&self) -> Option<(i64, i64)> {
+        let best = self.candidates.first()?.best_energy_milli;
+        let worst = self.candidates.last()?.best_energy_milli;
+        Some((worst, best))
+    }
+}
+
 /// One candidate's annotation in the stash summary.
 #[derive(Debug, Clone, Serialize)]
 pub struct CandidateSummary {
@@ -321,6 +334,17 @@ mod tests {
         assert!(s.is_empty());
         assert_eq!(s.generation(), 2);
         assert_eq!(s.viability_block(-39_000), Some(210));
+    }
+
+    #[test]
+    fn retained_band_is_worst_then_best_or_empty() {
+        let empty = stash_with(vec![-50_000, -48_000, -46_000], 100, 10, 4);
+        assert!(empty.summary().retained_band_milli().is_none());
+
+        let mut s = stash_with(vec![-50_000, -48_000, -46_000], 100, 10, 4);
+        let _ = s.insert(cand(1, -49_000));
+        let _ = s.insert(cand(2, -47_000));
+        assert_eq!(s.summary().retained_band_milli(), Some((-47_000, -49_000)));
     }
 
     #[test]

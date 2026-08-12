@@ -220,6 +220,60 @@ fn salt_from_counter(ctr: u64) -> [u8; 32] {
     salt
 }
 
+/// A state that is held this long is no longer a healthy walk.
+const SLOW_STATE: Duration = Duration::from_secs(10);
+
+/// Per-entry timer so a slow or retrying state warns once, not every poll.
+struct StateHold {
+    entered: std::time::Instant,
+    warned: bool,
+}
+
+impl StateHold {
+    fn new() -> Self {
+        Self {
+            entered: std::time::Instant::now(),
+            warned: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.entered = std::time::Instant::now();
+        self.warned = false;
+    }
+
+    fn warn_once(&mut self, machine: RoundState, generation: u64) {
+        if self.warned {
+            return;
+        }
+        machine.log_unhealthy(generation);
+        self.warned = true;
+    }
+}
+
+/// Wait for `work`. Warn once if this state stays active longer than 10 seconds.
+/// Returns `None` when shutdown is requested.
+async fn await_round_step<T>(
+    machine: RoundState,
+    generation: u64,
+    hold: &mut StateHold,
+    stop: &mut watch::Receiver<bool>,
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::pin!(work);
+    loop {
+        let remaining = SLOW_STATE.saturating_sub(hold.entered.elapsed());
+        tokio::select! {
+            biased;
+            _ = stop.changed() => return None,
+            () = tokio::time::sleep(remaining), if !hold.warned => {
+                hold.warn_once(machine, generation);
+            }
+            out = &mut work => return Some(out),
+        }
+    }
+}
+
 /// Drive [`RoundState`] from `machine` until [`RoundState::StartMining`].
 ///
 /// The caller logs the entry into the first state and bumps `generation`.
@@ -246,6 +300,7 @@ where
     let mut cancelled_jobs = 0usize;
     let mut miners_told = 0usize;
     let mut snap: Option<MiningSnapshot> = None;
+    let mut hold = StateHold::new();
 
     loop {
         let event = match machine {
@@ -268,88 +323,85 @@ where
                 RoundEvent::Succeeded
             }
             RoundState::ValidatorSynced => {
-                tokio::select! {
-                    biased;
-                    _ = stop.changed() => {
-                        let _ = machine.transition(RoundEvent::Shutdown);
-                        return None;
-                    }
-                    outcome = wait_until_synced(chain, tokio::time::sleep) => {
-                        match outcome {
-                            SyncOutcome::Synced => RoundEvent::Succeeded,
-                            SyncOutcome::Unknown(reason) => {
-                                tracing::warn!(
-                                    reason = %reason,
-                                    "cannot confirm the validator has caught up; continuing, but funding and \
-                                     mining may fail until it does"
-                                );
-                                RoundEvent::Succeeded
-                            }
-                        }
+                let outcome = await_round_step(
+                    machine,
+                    generation,
+                    &mut hold,
+                    stop,
+                    wait_until_synced(chain, tokio::time::sleep),
+                )
+                .await?;
+                match outcome {
+                    SyncOutcome::Synced => RoundEvent::Succeeded,
+                    SyncOutcome::Unknown(reason) => {
+                        tracing::warn!(
+                            reason = %reason,
+                            "cannot confirm the validator has caught up; continuing, but funding and \
+                             mining may fail until it does"
+                        );
+                        RoundEvent::Succeeded
                     }
                 }
             }
             RoundState::AccountFunded => {
-                tokio::select! {
-                    biased;
-                    _ = stop.changed() => {
-                        let _ = machine.transition(RoundEvent::Shutdown);
-                        return None;
-                    }
-                    result = ensure_funded(
+                let result = await_round_step(
+                    machine,
+                    generation,
+                    &mut hold,
+                    stop,
+                    ensure_funded(
                         chain,
                         faucet,
                         params.miner_account,
                         &params.funding,
                         tokio::time::sleep,
-                    ) => match result {
-                        Ok(_) => RoundEvent::Succeeded,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %ReadinessError::Funding(e),
-                                generation,
-                                "round readiness failed; holding off mining"
-                            );
-                            RoundEvent::Failed
-                        }
-                    },
+                    ),
+                )
+                .await?;
+                match result {
+                    Ok(_) => RoundEvent::Succeeded,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %ReadinessError::Funding(e),
+                            generation,
+                            "round readiness failed; holding off mining"
+                        );
+                        RoundEvent::Failed
+                    }
                 }
             }
             RoundState::RequirementsDownloaded => {
-                tokio::select! {
-                    biased;
-                    _ = stop.changed() => {
-                        let _ = machine.transition(RoundEvent::Shutdown);
-                        return None;
+                let result = await_round_step(
+                    machine,
+                    generation,
+                    &mut hold,
+                    stop,
+                    chain.fetch_mining_snapshot(None, params.miner_account, None),
+                )
+                .await?;
+                match result {
+                    Ok(Some(s)) => {
+                        snap = Some(s);
+                        RoundEvent::Succeeded
                     }
-                    result = chain.fetch_mining_snapshot(
-                        None,
-                        params.miner_account,
-                        None,
-                    ) => match result {
-                        Ok(Some(s)) => {
-                            snap = Some(s);
-                            RoundEvent::Succeeded
-                        }
-                        Ok(None) => {
-                            tracing::warn!(
-                                error = %ReadinessError::Snapshot(
-                                    "chain has no mining snapshot".into()
-                                ),
-                                generation,
-                                "round readiness failed; holding off mining"
-                            );
-                            RoundEvent::Failed
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %ReadinessError::Snapshot(e.to_string()),
-                                generation,
-                                "round readiness failed; holding off mining"
-                            );
-                            RoundEvent::Failed
-                        }
-                    },
+                    Ok(None) => {
+                        tracing::warn!(
+                            error = %ReadinessError::Snapshot(
+                                "chain has no mining snapshot".into()
+                            ),
+                            generation,
+                            "round readiness failed; holding off mining"
+                        );
+                        RoundEvent::Failed
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %ReadinessError::Snapshot(e.to_string()),
+                            generation,
+                            "round readiness failed; holding off mining"
+                        );
+                        RoundEvent::Failed
+                    }
                 }
             }
             RoundState::StartMining => {
@@ -358,6 +410,7 @@ where
         };
 
         if event == RoundEvent::Failed {
+            hold.warn_once(machine, generation);
             tokio::select! {
                 () = tokio::time::sleep(params.poll_interval) => {}
                 _ = stop.changed() => {
@@ -370,6 +423,7 @@ where
         let next = machine.transition(event)?;
         if next != machine {
             next.log_entry(generation);
+            hold.reset();
         }
         machine = next;
     }
@@ -535,14 +589,14 @@ pub async fn feeder_loop<C>(
                 );
                 tracing::info!(
                     generation,
-                    qblock_id = ?qblock_id,
+                    qblock_id = %crate::logging::display_option(qblock_id),
                     block = snap.block_number,
                     cancelled_jobs,
                     miners_told,
                     topology = %crate::chain::extrinsic::hex_encode(&snap.topology_hash),
                     nodes = snap.nodes.len(),
                     edges = snap.edges.len(),
-                    max_energy_milli = target.max_energy_milli,
+                    max_energy = crate::logging::energy_units(target.max_energy_milli),
                     min_solutions = target.min_solutions,
                     min_diversity_milli = target.min_diversity_milli,
                     allowed_h_milli = ?snap.allowed_h_milli,
@@ -579,7 +633,7 @@ pub async fn feeder_loop<C>(
                 // Difficulty eases every block via the decay ratchet, so this is
                 // debug: at info it would fire nearly every poll.
                 tracing::debug!(
-                    max_energy_milli = key.0,
+                    max_energy = crate::logging::energy_units(key.0),
                     min_solutions = key.1,
                     min_diversity_milli = key.2,
                     "difficulty target changed; broadcasting to miners"
@@ -698,7 +752,7 @@ pub async fn feeder_loop<C>(
                     block = current_block,
                     generation,
                     results_validated = validated,
-                    best_energy_milli = ?best,
+                    best_energy = %crate::logging::display_energy(best),
                     "coordinator alive"
                 );
                 last_heartbeat = std::time::Instant::now();

@@ -178,7 +178,7 @@ impl RealChainClient {
             spec_name = %info.spec_name,
             spec_version = info.spec_version,
             transaction_version = info.transaction_version,
-            quantum_pow_api = ?info.quantum_pow_api,
+            quantum_pow_api = %crate::logging::display_option(info.quantum_pow_api),
             "validator runtime"
         );
 

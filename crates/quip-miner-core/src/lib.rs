@@ -11,6 +11,7 @@ pub mod beta;
 pub mod cli;
 pub mod config;
 pub mod csr;
+mod display;
 pub mod ising;
 mod job;
 pub mod logging;

@@ -82,8 +82,17 @@ impl RoundState {
     }
 
     /// Log this state once, when the machine enters it.
+    ///
+    /// A healthy walk leaves each state without a retry in well under a
+    /// second. That is `trace`. A retry, or a state held more than 10
+    /// seconds, uses [`Self::log_unhealthy`].
     pub(crate) fn log_entry(self, generation: u64) {
-        tracing::info!(state = %self, generation, "{}", self.reason());
+        tracing::trace!(state = %self, generation, "{}", self.reason());
+    }
+
+    /// Warn once for a state that is retrying or has been held too long.
+    pub(crate) fn log_unhealthy(self, generation: u64) {
+        tracing::warn!(state = %self, generation, "{}", self.reason());
     }
 }
 

@@ -266,7 +266,7 @@ where
                 last_balance = Some(balance);
                 if balance >= params.min_balance {
                     if attempt == 1 {
-                        tracing::info!(balance, "miner account already funded");
+                        tracing::trace!(balance, "miner account already funded");
                     } else {
                         tracing::info!(balance, attempt, "miner account is now funded");
                     }
@@ -318,7 +318,7 @@ where
         }
         tracing::warn!(
             attempt,
-            balance = ?last_balance,
+            balance = %crate::logging::display_option(last_balance),
             threshold = params.min_balance,
             retry_in_s = backoff.as_secs(),
             note = %last_note,

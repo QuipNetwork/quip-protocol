@@ -13,6 +13,29 @@ use std::fmt;
 use std::io::IsTerminal as _;
 use tracing_subscriber::EnvFilter;
 
+/// Floor-divide a milli-energy to whole units for an operator log.
+///
+/// Rust `/` truncates toward zero. Negative energies would then look better
+/// than they are. Euclid division floors.
+#[must_use]
+pub(crate) fn energy_units(milli: i64) -> i64 {
+    milli.div_euclid(1000)
+}
+
+/// Render an optional value as the bare value, or `none` when empty.
+///
+/// Operator logs must not print `Some(...)` or `None`.
+#[must_use]
+pub(crate) fn display_option<T: fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "none".to_owned(), |v| v.to_string())
+}
+
+/// Render an optional milli-energy as whole units, or `none`.
+#[must_use]
+pub(crate) fn display_energy(milli: Option<i64>) -> String {
+    display_option(milli.map(energy_units))
+}
+
 /// Verbosity for the default filter, mirroring the `--log-level` values the
 /// v0.2.1 miner CLI accepted.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,5 +194,23 @@ mod tests {
     fn level_display_round_trips_to_directive_text() {
         assert_eq!(LogLevel::Warn.to_string(), "warn");
         assert!(tracing::Level::from_str(LogLevel::Trace.as_str()).is_ok());
+    }
+
+    #[test]
+    fn energy_units_floors_the_spec_table() {
+        assert_eq!(energy_units(-14_369_000), -14_369);
+        assert_eq!(energy_units(-14_535_322), -14_536);
+        assert_eq!(energy_units(-14_536_604), -14_537);
+        assert_eq!(energy_units(-14_513_000), -14_513);
+        assert_eq!(energy_units(0), 0);
+        assert_eq!(energy_units(1_500), 1);
+    }
+
+    #[test]
+    fn display_option_prints_none_not_debug() {
+        assert_eq!(display_option(Some(10_132_u64)), "10132");
+        assert_eq!(display_option(None::<u64>), "none");
+        assert_eq!(display_energy(Some(-14_536_604)), "-14537");
+        assert_eq!(display_energy(None), "none");
     }
 }

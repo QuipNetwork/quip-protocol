@@ -260,7 +260,7 @@ pub async fn supervise_miner(
         tracing::info!(
             miner = %entry.miner_id,
             binary = %entry.binary,
-            pid = ?child.id(),
+            pid = %crate::logging::display_option(child.id()),
             "miner spawned"
         );
 
