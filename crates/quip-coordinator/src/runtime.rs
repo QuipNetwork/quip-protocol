@@ -453,6 +453,12 @@ pub async fn feeder_loop<C: ChainClient>(
                         break; // not capable for this shape — stop topping up
                     }
                 }
+                // Wake the dispatcher now that work is staged. A miner grants
+                // its credits when it starts, which is normally before the
+                // first snapshot arrives, so that grant drained an empty queue
+                // and the dispatcher parked. Without this the miner waits for a
+                // job and the coordinator waits for a request, forever.
+                st.wake_dispatcher(&id);
                 stats.push((id.clone(), consumed_raw, depth, st.router.staged_len(&id)));
             }
             if stats.is_empty() {

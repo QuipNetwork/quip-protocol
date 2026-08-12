@@ -46,6 +46,13 @@ async fn dispatch_granted(
             st.dispatch_inflight(miner_id, job.clone());
             jobs.push(job);
         }
+        tracing::debug!(
+            miner = %miner_id,
+            added = credits,
+            dispatched = jobs.len(),
+            staged = st.router.staged_len(miner_id),
+            "dispatch drain"
+        );
         jobs
     };
     for job in jobs {
@@ -133,6 +140,13 @@ pub struct CoordinatorState {
     /// `Shutdown`/cancel to a running session. Registered on handshake success,
     /// removed when the session ends.
     pub outbound: HashMap<String, mpsc::Sender<Result<CoordMsg, Status>>>,
+    /// Live per-miner dispatcher wakeups. A miner grants its credits as soon as
+    /// it starts, which is usually before the first chain snapshot arrives, so
+    /// the grant drains an empty queue and the dispatcher parks. Staging alone
+    /// does not wake it, and the miner sends no further `JobRequest` until a
+    /// job completes. The feeder sends a zero-credit grant here after it stages
+    /// work, which re-runs the drain without changing the credit balance.
+    pub wakeups: HashMap<String, mpsc::Sender<u32>>,
     /// `job_id` (nonce) → the 32-byte salt it was derived from, so the winning
     /// `Proof` carries the salt live submit requires. Recorded when the feeder
     /// stages a job, consumed on its `Result`, cleared on reseed.
@@ -176,6 +190,7 @@ impl CoordinatorState {
             inflight: HashMap::new(),
             inflight_owner: HashMap::new(),
             outbound: HashMap::new(),
+            wakeups: HashMap::new(),
             salts: HashMap::new(),
             current_best_milli: None,
             results_validated: 0,
@@ -263,9 +278,28 @@ impl CoordinatorState {
         let _ = self.outbound.insert(miner_id.to_string(), tx);
     }
 
+    /// Register a live session's dispatcher wakeup channel.
+    pub fn register_wakeup(&mut self, miner_id: &str, grants: mpsc::Sender<u32>) {
+        let _ = self.wakeups.insert(miner_id.to_string(), grants);
+    }
+
+    /// Wake a miner's dispatcher so it drains newly staged work against credits
+    /// the miner already granted.
+    ///
+    /// The send is non-blocking on purpose. A full channel already holds an
+    /// unread wakeup, and one wakeup drains the whole queue, so dropping this
+    /// one loses nothing. Blocking here would stall the feeder for every other
+    /// miner.
+    pub fn wake_dispatcher(&self, miner_id: &str) {
+        if let Some(grants) = self.wakeups.get(miner_id) {
+            let _ = grants.try_send(0);
+        }
+    }
+
     /// Drop a session's outbound channel when it ends.
     pub fn deregister_outbound(&mut self, miner_id: &str) {
         let _ = self.outbound.remove(miner_id);
+        let _ = self.wakeups.remove(miner_id);
     }
 }
 
@@ -419,6 +453,8 @@ async fn run_session<C: ChainClient>(
     state.lock().await.register_outbound(&miner_id, tx.clone());
 
     let seed_credits = configure_queue_depth.max(1);
+    // Declared before the dispatcher so the wakeup sender can be registered
+    // alongside it; see `wake_dispatcher`.
     // Dispatcher task: the only writer of `Job`s for this session.
     //
     // Job sends must not happen on the read path. `tx.send().await` blocks once
@@ -427,6 +463,7 @@ async fn run_session<C: ChainClient>(
     // would free the miner's credits, while the miner (symmetrically blocked
     // writing those results) stops reading jobs. Both peers park permanently.
     let (grants, mut grant_rx) = mpsc::channel::<u32>(GRANT_CHANNEL_DEPTH);
+    state.lock().await.register_wakeup(&miner_id, grants.clone());
     let _dispatcher = {
         let state = Arc::clone(&state);
         let tx = tx.clone();
@@ -451,11 +488,13 @@ async fn run_session<C: ChainClient>(
             // completing a job). Routed through the dispatcher like every other
             // grant, so it never sends on the read path.
             Some(miner_msg::Msg::Ready(_)) => {
+                tracing::debug!(miner = %miner_id, credits = seed_credits, "miner ready; seeding credits");
                 if grants.send(seed_credits).await.is_err() {
                     break 'session;
                 }
             }
             Some(miner_msg::Msg::JobRequest(req)) => {
+                tracing::debug!(miner = %miner_id, credits = req.credits, "miner requested work");
                 if grants.send(req.credits).await.is_err() {
                     break 'session;
                 }
@@ -631,7 +670,33 @@ async fn run_session<C: ChainClient>(
                     log_liveness(&miner_id, qblock, ev);
                 }
             }
-            Some(miner_msg::Msg::Fatal(_) | miner_msg::Msg::Hello(_)) | None => {}
+            // A miner that gives up says so here. Dropping this silently is how
+            // a backend failure reads as an idle miner: the process stays
+            // alive, the supervisor sees no exit, and the queue never drains.
+            Some(miner_msg::Msg::Fatal(f)) => {
+                tracing::error!(
+                    miner = %miner_id,
+                    exit_code = f.exit_code,
+                    restart_required = f.restart_required,
+                    reason = %f.reason,
+                    "miner reported a fatal error"
+                );
+            }
+            // The handshake already consumed one Hello. A second one means the
+            // miner restarted its session without reconnecting.
+            Some(miner_msg::Msg::Hello(_)) => {
+                tracing::warn!(miner = %miner_id, "miner sent Hello mid-session; ignoring");
+            }
+            // An empty `msg` is a message this build cannot name: either a
+            // field number the miner uses and this coordinator does not, or the
+            // reverse. Version skew between the two arrives here and nowhere
+            // else, so it must not be silent.
+            None => {
+                tracing::warn!(
+                    miner = %miner_id,
+                    "unrecognized message from miner; check the miner and coordinator protocol versions"
+                );
+            }
         }
     }
 
@@ -1291,5 +1356,58 @@ mod tests {
         assert!(st.outbound.contains_key("cpu-0"));
         st.deregister_outbound("cpu-0");
         assert!(!st.outbound.contains_key("cpu-0"));
+    }
+
+    /// A miner that grants its credits before any job is staged must still
+    /// receive work once the feeder stages it. The grant drains an empty queue,
+    /// so only the feeder's wakeup can start the dispatch. Without that wakeup
+    /// the miner waits for a job and the coordinator waits for a request, and
+    /// neither side ever moves.
+    #[tokio::test]
+    async fn credits_granted_before_staging_still_dispatch() {
+        let state = Arc::new(Mutex::new(CoordinatorState::new()));
+        let (tx, mut rx) = mpsc::channel::<Result<CoordMsg, Status>>(8);
+        let (grants, mut grant_rx) = mpsc::channel::<u32>(GRANT_CHANNEL_DEPTH);
+        {
+            let mut st = state.lock().await;
+            st.router.register_miner("cpu-0", caps());
+            st.register_wakeup("cpu-0", grants);
+        }
+
+        // The miner grants credits first. Nothing is staged, so nothing is sent.
+        assert!(dispatch_granted(&state, "cpu-0", 32, &tx).await);
+        assert!(rx.try_recv().is_err(), "no job exists yet, so none can dispatch");
+
+        // The feeder stages work and wakes the dispatcher.
+        {
+            let mut st = state.lock().await;
+            assert!(st.router.stage_on("cpu-0", job(b"late")));
+            st.wake_dispatcher("cpu-0");
+        }
+
+        // The wakeup carries no credits: the balance from the first grant stands.
+        assert_eq!(grant_rx.try_recv().expect("wakeup was queued"), 0);
+        assert!(dispatch_granted(&state, "cpu-0", 0, &tx).await);
+        let sent = rx.try_recv().expect("the staged job dispatches on the wakeup");
+        let Ok(CoordMsg { msg: Some(coord_msg::Msg::Job(j)) }) = sent else {
+            panic!("expected a Job message");
+        };
+        assert_eq!(j.job_id, b"late".to_vec());
+    }
+
+    #[tokio::test]
+    async fn waking_an_unregistered_miner_is_harmless() {
+        let st = CoordinatorState::new();
+        st.wake_dispatcher("nobody");
+    }
+
+    #[tokio::test]
+    async fn ending_a_session_drops_its_wakeup() {
+        let mut st = CoordinatorState::new();
+        let (grants, _rx) = mpsc::channel::<u32>(1);
+        st.register_wakeup("cpu-0", grants);
+        assert!(st.wakeups.contains_key("cpu-0"));
+        st.deregister_outbound("cpu-0");
+        assert!(!st.wakeups.contains_key("cpu-0"), "a dead session must not be woken");
     }
 }
