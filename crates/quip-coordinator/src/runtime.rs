@@ -6,11 +6,14 @@
 //! stash) is layered on top by the live-mining epic; a coordinator built from
 //! this alone serves sessions and supervises miners but stages no work yet.
 
+use crate::chain::sync::SyncSource;
 use crate::chain::{ChainClient, MiningSnapshot};
 use crate::config::LaunchEntry;
 use crate::decay::{build_decay_schedule, EnergyCurve};
+use crate::funding::BalanceSource;
 use crate::logging::LogLevel;
 use crate::producer::derive_pow_job;
+use crate::readiness::{build_faucet, prepare_round};
 use crate::session::{coord, CoordinatorService, CoordinatorState};
 use crate::supervisor::{supervise_miner, BackoffPolicy};
 use crate::topology::Topology;
@@ -50,6 +53,8 @@ pub struct RuntimeParams {
     /// coordinator stdio, so their own subscriber needs this flag to match
     /// coordinator verbosity.
     pub log_level: LogLevel,
+    /// Account-funding knobs reused on every round, not only at process start.
+    pub funding: crate::funding::FundingParams,
 }
 
 /// Inputs to the feeder loop.
@@ -62,6 +67,8 @@ pub struct FeederParams {
     pub buffer_depth: usize,
     /// How often the feeder polls the chain head and tops up buffers.
     pub poll_interval: Duration,
+    /// Account-funding knobs reused on every round, not only at process start.
+    pub funding: crate::funding::FundingParams,
 }
 
 /// EMA smoothing for the per-miner consumption signal. Lower reacts slower but
@@ -186,12 +193,14 @@ async fn broadcast_topology(state: &Arc<Mutex<CoordinatorState>>, topo: quip_pro
 /// Fan out a protocol `Cancel(max_generation)` to every live miner on reseed so
 /// they abandon stale-generation work promptly. Belt-and-suspenders with the
 /// miner-side cooperative-cancel guard and the cleared salts (which already make
-/// a late stale-generation result unsubmittable).
-async fn broadcast_cancel(state: &Arc<Mutex<CoordinatorState>>, max_generation: u64) {
+/// a late stale-generation result unsubmittable). Returns how many miners were
+/// told.
+async fn broadcast_cancel(state: &Arc<Mutex<CoordinatorState>>, max_generation: u64) -> usize {
     let senders: Vec<_> = {
         let st = state.lock().await;
         st.outbound.values().cloned().collect()
     };
+    let n = senders.len();
     for tx in senders {
         let _ = tx
             .send(Ok(coord(coord_msg::Msg::Cancel(quip_proto::v1::Cancel {
@@ -199,6 +208,7 @@ async fn broadcast_cancel(state: &Arc<Mutex<CoordinatorState>>, max_generation: 
             }))))
             .await;
     }
+    n
 }
 
 /// A unique 32-byte salt from a monotonic counter: distinct salts derive
@@ -212,20 +222,23 @@ fn salt_from_counter(ctr: u64) -> [u8; 32] {
 /// The replenished `PoW` feeder: follow the chain head, and keep each registered
 /// miner's staged queue topped up to `buffer_depth` with fresh-salt jobs.
 ///
-/// On a new `last_proof_block_hash` it reseeds — bump the generation, cancel the
-/// prior generation's staged jobs, refresh topology + difficulty target, and
-/// drop stale salts — then refills under the new seed. Runs until `stop` flips.
-/// `pub` so it can be exercised directly in tests without a gRPC server.
+/// On a new `last_proof_block_hash` it reseeds: stop mining, wait until the
+/// validator is synced, confirm the miner account can pay fees, download the
+/// next qblock's requirements, then refill under the new seed. Runs until
+/// `stop` flips. `pub` so it can be exercised directly in tests without a
+/// gRPC server.
 #[expect(
     clippy::too_many_lines,
     reason = "single feeder loop: reseed, top-up, win-time submit"
 )]
-pub async fn feeder_loop<C: ChainClient>(
+pub async fn feeder_loop<C>(
     chain: Arc<C>,
     state: Arc<Mutex<CoordinatorState>>,
     params: FeederParams,
     mut stop: watch::Receiver<bool>,
-) {
+) where
+    C: ChainClient + SyncSource + BalanceSource,
+{
     let mut current_head: Option<[u8; 32]> = None;
     let mut generation: u64 = 0;
     let mut salt_ctr: u64 = 0;
@@ -233,16 +246,15 @@ pub async fn feeder_loop<C: ChainClient>(
     let start = std::time::Instant::now();
     // Per-miner smoothed jobs-consumed-per-poll, driving the adaptive window.
     let mut consumption_ema: HashMap<String, f64> = HashMap::new();
-    // Last difficulty triple broadcast to miners, so we only re-push on change.
+    // Last difficulty triple broadcast to miners, so we only re-push on change
+    // within a round. A reseed always pushes Topology and SetTarget again.
     let mut last_broadcast: Option<(i64, u32, u32)> = None;
-    // Last topology hash pushed to miners, so we re-push only when it changes
-    // (including first availability), not on every per-block reseed.
-    let mut last_topology_hash: Option<Vec<u8>> = None;
 
     // Last snapshot-poll outcome, so the feeder narrates transitions instead of
     // one line per poll. `None` until the first poll completes.
     let mut feed_state: Option<FeedState> = None;
     let mut last_heartbeat = std::time::Instant::now();
+    let faucet = build_faucet(params.funding.faucet_url.as_deref());
 
     loop {
         let (snap, state_now) = match chain
@@ -281,12 +293,60 @@ pub async fn feeder_loop<C: ChainClient>(
             feed_state = Some(state_now);
         }
 
-        if let Some(snap) = snap.as_ref() {
+        if let Some(mut snap) = snap {
             let head = snap.last_proof_block_hash;
             if current_head != Some(head) {
-                // Reseed on a new head.
-                current_head = Some(head);
+                // Stop mining first. The rest of the readiness walk may wait
+                // on sync or funding; miners must not keep grinding the
+                // round that just ended.
                 generation = generation.saturating_add(1);
+                let cancelled_jobs = {
+                    let mut st = state.lock().await;
+                    st.generation = generation;
+                    st.current_best_milli = None;
+                    st.stash.reset(generation, Vec::new(), 0, 0);
+                    let dropped = st.router.cancel(generation.saturating_sub(1));
+                    let _ = st.cancel_inflight(generation.saturating_sub(1));
+                    st.clear_salts();
+                    dropped
+                };
+                let miners_told = if generation > 1 {
+                    broadcast_cancel(&state, generation.saturating_sub(1)).await
+                } else {
+                    0
+                };
+
+                // Steps 2–4: synced validator, funded account, next-round
+                // requirements. Hold off staging until this succeeds. A
+                // failure is not fatal: warn, wait one poll, retry.
+                let fresh = loop {
+                    tokio::select! {
+                        biased;
+                        _ = stop.changed() => return,
+                        ready = prepare_round(
+                            chain.as_ref(),
+                            faucet.as_ref(),
+                            params.miner_account,
+                            &params.funding,
+                            tokio::time::sleep,
+                        ) => match ready {
+                            Ok(s) => break s,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    generation,
+                                    "round readiness failed; holding off mining"
+                                );
+                                tokio::select! {
+                                    () = tokio::time::sleep(params.poll_interval) => {}
+                                    _ = stop.changed() => return,
+                                }
+                            }
+                        },
+                    }
+                };
+                snap = fresh;
+
                 let topo = Topology::from_nodes_edges(
                     snap.nodes.clone(),
                     snap.edges.clone(),
@@ -294,9 +354,6 @@ pub async fn feeder_loop<C: ChainClient>(
                     &snap.allowed_j_milli,
                     &snap.allowed_spin_milli,
                 );
-                // Refresh the chain qblock id + decay-projection inputs for the
-                // attempt logs and win-time stash (best-effort; fetched before
-                // locking so we never await under the state lock).
                 let qblock_id = match chain.fetch_latest_qblock_id().await {
                     Ok(id) => id,
                     Err(e) => {
@@ -314,7 +371,6 @@ pub async fn feeder_loop<C: ChainClient>(
                     },
                     Err(_) => None,
                 };
-                // Project the per-generation decay schedule for the stash.
                 let (schedule, last_proof_block, epoch_length) = match &decay {
                     Some(dp) => {
                         let curve = EnergyCurve::from_topology(
@@ -339,61 +395,49 @@ pub async fn feeder_loop<C: ChainClient>(
                     None => (Vec::new(), 0, 0),
                 };
                 let topo_proto = topo.to_proto();
-                let topology_changed =
-                    last_topology_hash.as_deref() != Some(snap.topology_hash.as_slice());
-                // The round transition: the single most useful operational line
-                // there is, and what tells an operator mining is actually live.
+                let target = target_from_snapshot(&snap);
+                let target_key = (
+                    target.max_energy_milli,
+                    target.min_solutions,
+                    target.min_diversity_milli,
+                );
                 tracing::info!(
                     generation,
                     qblock_id = ?qblock_id,
                     block = snap.block_number,
+                    cancelled_jobs,
+                    miners_told,
                     topology = %crate::chain::extrinsic::hex_encode(&snap.topology_hash),
                     nodes = snap.nodes.len(),
                     edges = snap.edges.len(),
-                    max_energy_milli = snap.max_energy_milli,
-                    min_solutions = snap.min_solutions,
-                    min_diversity_milli = snap.min_diversity_milli,
-                    // The allowed value sets define the problem the miner
-                    // samples. A model with no linear field behaves nothing
-                    // like one with a ternary field, and comparing the two
-                    // silently misreads every energy the miner reports.
+                    max_energy_milli = target.max_energy_milli,
+                    min_solutions = target.min_solutions,
+                    min_diversity_milli = target.min_diversity_milli,
                     allowed_h_milli = ?snap.allowed_h_milli,
                     allowed_j_milli = ?snap.allowed_j_milli,
                     allowed_spin_milli = ?snap.allowed_spin_milli,
                     "new round"
                 );
-                let mut st = state.lock().await;
-                st.set_topology(Some(topo));
-                st.target = Some(target_from_snapshot(snap));
-                st.generation = generation;
-                st.qblock_id = qblock_id;
-                // Each generation is an independent PoW problem (new nonce/model),
-                // so best energies are not comparable across generations. Reset
-                // the best or later generations would have to beat a historical
-                // minimum and never submit (the chain clears its block-best too).
-                st.current_best_milli = None;
-                st.stash
-                    .reset(generation, schedule, last_proof_block, epoch_length);
-                st.router.cancel(generation - 1); // drop the prior generation's staged jobs
-                st.clear_salts();
-                drop(st);
-                // Fan out the reseed to live miners, off-lock. Cancel the prior
-                // generation's work (skip the first reseed: generation 0 has none).
-                if generation > 1 {
-                    broadcast_cancel(&state, generation - 1).await;
+                {
+                    let mut st = state.lock().await;
+                    st.set_topology(Some(topo));
+                    st.target = Some(target);
+                    st.qblock_id = qblock_id;
+                    st.stash
+                        .reset(generation, schedule, last_proof_block, epoch_length);
                 }
-                // Push topology only when it changed (incl. first availability),
-                // so a miner that connected before it was cached can resolve
-                // hash-based jobs — without re-sending an identical graph each block.
-                if topology_changed {
-                    broadcast_topology(&state, topo_proto).await;
-                    last_topology_hash = Some(snap.topology_hash.clone());
-                }
+                // Requirements before any new-generation Job: Topology and
+                // SetTarget go out on every reseed, even when the values match
+                // the last round. Staging happens only after these sends.
+                broadcast_topology(&state, topo_proto).await;
+                broadcast_set_target(&state, target).await;
+                last_broadcast = Some(target_key);
+                current_head = Some(snap.last_proof_block_hash);
             }
 
             // Push the refreshed difficulty to live miners when it changed, so
             // they adapt their sampling budget as the chain difficulty moves.
-            let target = target_from_snapshot(snap);
+            let target = target_from_snapshot(&snap);
             let key = (
                 target.max_energy_milli,
                 target.min_solutions,
@@ -446,7 +490,7 @@ pub async fn feeder_loop<C: ChainClient>(
                 while st.router.staged_len(&id) < depth {
                     salt_ctr = salt_ctr.saturating_add(1);
                     let salt = salt_from_counter(salt_ctr);
-                    let job = match derive_pow_job(snap, params.miner_account, salt, generation, 0)
+                    let job = match derive_pow_job(&snap, params.miner_account, salt, generation, 0)
                     {
                         Ok(job) => job,
                         Err(e) => {
@@ -610,7 +654,7 @@ pub async fn run_runtime<C, S>(
     shutdown: S,
 ) -> std::io::Result<()>
 where
-    C: ChainClient + 'static,
+    C: ChainClient + SyncSource + BalanceSource + 'static,
     S: Future<Output = ()>,
 {
     let _ = std::fs::remove_file(&params.sock_path);
@@ -674,6 +718,7 @@ where
             miner_account: params.miner_account,
             buffer_depth: params.buffer_depth,
             poll_interval: Duration::from_millis(params.poll_interval_ms),
+            funding: params.funding,
         },
         stop_rx.clone(),
     ));

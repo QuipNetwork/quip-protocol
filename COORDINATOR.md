@@ -83,11 +83,11 @@ booting would only crash-loop. The coordinator warns, starts, and retries.
 
 ## Waiting for the validator to sync
 
-Between the compatibility check and the funding check, `chain::sync` gates
-startup on the node catching up. Every chain read resolves against the node's
-best block. While the node imports history, that block is far behind the real
-head. The miner account then reads as empty even after the faucet has paid it,
-and any snapshot describes a round that ended long ago.
+`readiness::prepare_round` gates both startup and every later round on the
+node catching up. Every chain read resolves against the node's best block. While
+the node imports history, that block is far behind the real head. The miner
+account then reads as empty even after the faucet has paid it, and any snapshot
+describes a round that ended long ago.
 
 `wait_until_synced` polls `system_health` every 5 seconds and warns with the
 block from `system_syncState` every 30 seconds:
@@ -156,21 +156,34 @@ plus `proof_encode` and `scale_types` for SCALE codec. Nothing outside
 
 ## Job production — the feeder
 
-`feeder_loop` (in `runtime.rs`) runs one poll every `poll_interval_ms`:
+`feeder_loop` (in `runtime.rs`) runs one poll every `poll_interval_ms`
+(1000 ms in production). A win is visible on the next poll, so the worst-case
+delay before `Cancel` is one poll interval plus the snapshot RPC.
 
-- **Follow the head.** It fetches the snapshot. When `last_proof_block_hash`
-  changes, a new round has started: it bumps a generation counter, cancels the
-  prior generation's staged jobs, refreshes the topology and difficulty target
-  in `CoordinatorState`, and clears the salt map.
-- **Stage PoW work.** For each registered miner it derives fresh jobs
-  (`producer::derive_pow_job`) from the snapshot, the miner account, and a
-  unique salt per attempt, and stages them until the miner's queue reaches its
-  adaptive depth. Each distinct salt derives a distinct nonce, so every attempt
-  is a fresh draw.
+When `last_proof_block_hash` changes, the feeder walks the same readiness
+sequence that startup uses (`readiness::prepare_round`):
 
-Mempool jobs carry generation `0` (`producer::mempool::job_order_to_job`) and
-are preserved across reseeds; PoW jobs carry the live generation and are
-dropped when their round ends.
+1. **Stop mining.** It bumps the generation, drops staged and in-flight PoW
+   jobs of the dead generation, and broadcasts `Cancel{max_generation}`.
+   Miners stay connected and idle. The gRPC server is not blocked.
+2. **Wait until the validator has caught up** (`wait_until_synced`).
+3. **Confirm the miner account can pay submit fees** (`ensure_funded`). One
+   balance read is the common case. A mid-run failure is not fatal: the feeder
+   warns, holds off staging, and retries. It does not exit.
+4. **Download the next qblock's requirements.** Topology, energy target,
+   required solution count, and diversity come from a fresh snapshot after
+   sync and funding.
+5. **Start mining.** The feeder always sends `Topology` and `SetTarget` for
+   the new round, then stages jobs. A job of the new generation cannot leave
+   before those two messages.
+
+One `info` line names the new generation, the cancelled staged-job count, the
+miner count, and the refreshed target.
+
+Mempool jobs carry generation `0` (`producer::mempool::job_order_to_job`).
+Reseeds keep those jobs. PoW jobs carry the live generation. The feeder drops
+them when their round ends. A cancelled in-flight job is not re-queued, not
+scored, and not submitted. The miner refunds its credit with `JobRequest{1}`.
 
 ### Adaptive staging window
 

@@ -159,52 +159,6 @@ fn run_keygen_cli(args: &KeygenArgs) -> StdExitCode {
     }
 }
 
-/// Bring the miner account up to the configured balance floor, topping up
-/// through the faucet when one is set.
-///
-/// A coordinator that cannot pay transaction fees mines normally and then fails
-/// every submit, which reads as a mining bug rather than an empty wallet, so
-/// this settles the question before the runtime starts.
-fn fund_account(
-    rt: &tokio::runtime::Runtime,
-    chain: &Arc<RealChainClient>,
-    miner_account: [u8; 32],
-    cfg: &quip_coordinator::config::CoordinatorConfig,
-) -> Result<(), quip_coordinator::funding::FundingError> {
-    use quip_coordinator::funding::{ensure_funded, FundingParams, HttpFaucet};
-
-    let params = FundingParams {
-        faucet_url: cfg.faucet_url.clone(),
-        min_balance: cfg.min_balance_plancks,
-        top_up: cfg.faucet_top_up_plancks,
-        timeout: std::time::Duration::from_secs(cfg.funding_timeout_s),
-    };
-    rt.block_on(async {
-        // A faucet URL that will not even build a client is reported and then
-        // treated as absent, so the failure surfaces as "underfunded, no
-        // faucet" rather than a silent skip.
-        let faucet = match params.faucet_url.as_deref() {
-            Some(url) => match HttpFaucet::new(url) {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    tracing::error!(url = %url, error = %e, "cannot build faucet client");
-                    None
-                }
-            },
-            None => None,
-        };
-        ensure_funded(
-            chain.as_ref(),
-            faucet.as_ref(),
-            miner_account,
-            &params,
-            tokio::time::sleep,
-        )
-        .await
-        .map(|_| ())
-    })
-}
-
 fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode {
     // --help is handled by clap (exit 0). Missing/invalid config → exit 64.
     let Some(config_path) = config else {
@@ -276,20 +230,6 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
         }
     }
 
-    // Every chain read answers at the node's best block, so a node that is still
-    // importing history reports an empty miner account and a round that has
-    // already ended. Funding before that finishes drains the faucet budget and
-    // then exits "not funded", which names the wrong problem.
-    if let quip_coordinator::chain::sync::SyncOutcome::Unknown(reason) = rt.block_on(
-        quip_coordinator::chain::sync::wait_until_synced(chain.as_ref(), tokio::time::sleep),
-    ) {
-        tracing::warn!(
-            reason = %reason,
-            "cannot confirm the validator has caught up; continuing, but funding and \
-             mining may fail until it does"
-        );
-    }
-
     let state = Arc::new(Mutex::new(CoordinatorState::new()));
     // Canonical miner account (blake2_256(SCALE(account))) seeds PoW nonce
     // derivation. A live mining coordinator needs its signer key; without a
@@ -305,9 +245,35 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
             [0u8; 32]
         }
     };
-    if let Err(e) = fund_account(&rt, &chain, miner_account, &cfg) {
-        tracing::error!(error = %e, "miner account is not funded; refusing to start");
-        return StdExitCode::from(ExitCode::ConfigInvalid as u8);
+
+    let funding = quip_coordinator::funding::FundingParams {
+        faucet_url: cfg.faucet_url.clone(),
+        min_balance: cfg.min_balance_plancks,
+        top_up: cfg.faucet_top_up_plancks,
+        timeout: std::time::Duration::from_secs(cfg.funding_timeout_s),
+    };
+    let faucet = quip_coordinator::readiness::build_faucet(funding.faucet_url.as_deref());
+    // Same readiness walk the feeder re-runs on every later round. Funding
+    // failure is still fatal at startup (exit 64). A missing snapshot is not:
+    // the feeder retries once miners are connected.
+    match rt.block_on(quip_coordinator::readiness::prepare_round(
+        chain.as_ref(),
+        faucet.as_ref(),
+        miner_account,
+        &funding,
+        tokio::time::sleep,
+    )) {
+        Ok(_) => {}
+        Err(quip_coordinator::readiness::ReadinessError::Funding(e)) => {
+            tracing::error!(error = %e, "miner account is not funded; refusing to start");
+            return StdExitCode::from(ExitCode::ConfigInvalid as u8);
+        }
+        Err(quip_coordinator::readiness::ReadinessError::Snapshot(e)) => {
+            tracing::warn!(
+                error = %e,
+                "no mining snapshot at startup; feeder will retry"
+            );
+        }
     }
 
     let params = RuntimeParams {
@@ -325,6 +291,7 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
             .as_ref()
             .map(|d| (d.listen.clone(), PathBuf::from(&d.data_dir))),
         log_level,
+        funding,
     };
     tracing::info!(
         miners = cfg.launch.len(),

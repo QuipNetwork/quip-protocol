@@ -1,6 +1,8 @@
 //! Scripted chain for tests: fixed snapshot, optional mempool order, captured submits.
 
+use super::sync::{SyncSource, SyncStatus};
 use super::{ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot, Proof, SubmitAction};
+use crate::funding::BalanceSource;
 use async_trait::async_trait;
 use std::sync::Mutex;
 
@@ -16,6 +18,13 @@ pub struct FakeChain {
     qblock_id: Mutex<Option<u64>>,
     /// Scripted `fetch_decay_params` (default `None`).
     decay_params: Mutex<Option<DecayParams>>,
+    /// Scripted free balance. Defaults to a funded account so existing feeder
+    /// tests keep mining without extra setup.
+    balance: Mutex<Result<u128, String>>,
+    /// Scripted sync status. Defaults to a caught-up validator.
+    sync: Mutex<Result<SyncStatus, String>>,
+    balance_calls: Mutex<usize>,
+    sync_calls: Mutex<usize>,
 }
 
 impl FakeChain {
@@ -29,6 +38,16 @@ impl FakeChain {
             submit_result: Mutex::new(Ok(SubmitAction::Success)),
             qblock_id: Mutex::new(None),
             decay_params: Mutex::new(None),
+            balance: Mutex::new(Ok(u128::MAX)),
+            sync: Mutex::new(Ok(SyncStatus {
+                is_syncing: false,
+                peers: 0,
+                should_have_peers: false,
+                current_block: Some(1),
+                highest_block: Some(1),
+            })),
+            balance_calls: Mutex::new(0),
+            sync_calls: Mutex::new(0),
         }
     }
 
@@ -117,6 +136,64 @@ impl FakeChain {
             std::mem::take(&mut *self.submitted.lock().unwrap())
         }
     }
+
+    /// Script the next `free_balance` return value.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_balance(&self, balance: Result<u128, String>) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.balance.lock().unwrap() = balance;
+        }
+    }
+
+    /// Script the next `sync_status` return value.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_sync(&self, status: Result<SyncStatus, String>) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.sync.lock().unwrap() = status;
+        }
+    }
+
+    /// How many times `free_balance` has been called.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn balance_calls(&self) -> usize {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.balance_calls.lock().unwrap()
+        }
+    }
+
+    /// How many times `sync_status` has been called.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn sync_calls(&self) -> usize {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.sync_calls.lock().unwrap()
+        }
+    }
 }
 
 #[async_trait]
@@ -187,6 +264,38 @@ impl ChainClient for FakeChain {
         )]
         {
             Ok(self.decay_params.lock().unwrap().clone())
+        }
+    }
+}
+
+#[async_trait]
+impl BalanceSource for FakeChain {
+    async fn free_balance(&self, _account: [u8; 32]) -> Result<u128, String> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.balance_calls.lock().unwrap() += 1;
+            self.balance.lock().unwrap().clone()
+        }
+    }
+}
+
+#[async_trait]
+impl SyncSource for FakeChain {
+    async fn sync_status(&self) -> Result<SyncStatus, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.sync_calls.lock().unwrap() += 1;
+            self.sync
+                .lock()
+                .unwrap()
+                .clone()
+                .map_err(ChainError::Unavailable)
         }
     }
 }

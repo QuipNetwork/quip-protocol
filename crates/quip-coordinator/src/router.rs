@@ -167,12 +167,17 @@ impl Router {
     }
 
     /// Drop staged `PoW` jobs where `0 < generation <= max_generation`.
-    /// Mempool jobs (`generation == 0`) are preserved.
-    pub fn cancel(&mut self, max_generation: u64) {
+    /// Mempool jobs (`generation == 0`) are preserved. Returns how many jobs
+    /// were dropped.
+    pub fn cancel(&mut self, max_generation: u64) -> usize {
+        let mut dropped = 0;
         for q in self.miners.values_mut() {
+            let before = q.staged.len();
             q.staged
                 .retain(|j| j.generation == 0 || j.generation > max_generation);
+            dropped += before.saturating_sub(q.staged.len());
         }
+        dropped
     }
 
     /// Return all outstanding + staged jobs for a miner (e.g. on crash re-queue).
@@ -358,7 +363,7 @@ mod tests {
         let _ = r.route(make_job(3, JobKind::IsingSample));
         let _ = r.route(make_job(5, JobKind::IsingSample));
         let _ = r.route(make_job(6, JobKind::IsingSample));
-        r.cancel(5);
+        assert_eq!(r.cancel(5), 2);
         // keep gen 0 and gen 6
         assert_eq!(r.staged_len("cpu-0"), 2);
         let mut gens: Vec<u64> = Vec::new();

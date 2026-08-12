@@ -232,6 +232,25 @@ impl CoordinatorState {
         self.salts.clear();
     }
 
+    /// Drop in-flight `PoW` jobs whose generation is at most `max_generation`.
+    /// Mempool jobs (`generation == 0`) stay. Returns how many jobs were dropped.
+    ///
+    /// A late `Result` for a dropped id then sees `complete_inflight` return
+    /// `None`, so the coordinator neither scores nor submits it.
+    pub fn cancel_inflight(&mut self, max_generation: u64) -> usize {
+        let ids: Vec<Vec<u8>> = self
+            .inflight
+            .iter()
+            .filter(|(_, job)| job.generation != 0 && job.generation <= max_generation)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let n = ids.len();
+        for id in ids {
+            let _ = self.complete_inflight(&id);
+        }
+        n
+    }
+
     /// Record a dispatched job as in-flight, attributing it to `miner_id`.
     pub fn dispatch_inflight(&mut self, miner_id: &str, job: quip_proto::v1::Job) {
         let _ = self
@@ -1238,7 +1257,7 @@ impl<C: ChainClient + 'static> MinerService for DriveService<C> {
                                                 cancel_sent = true;
                                                 {
                                                     let mut st = state.lock().await;
-                                                    st.router.cancel(max_gen);
+                                                    let _ = st.router.cancel(max_gen);
                                                 }
                                                 let _ = tx
                                                     .send(Ok(coord(coord_msg::Msg::Cancel(
@@ -1349,6 +1368,29 @@ mod tests {
         assert!(!st.inflight_owner.contains_key(&b"a"[..]));
         assert!(st.inflight.contains_key(&b"c"[..]));
         assert_eq!(st.router.staged_len("cpu-0"), 0);
+    }
+
+    fn job_with_generation(id: &[u8], generation: u64) -> Job {
+        let mut j = job(id);
+        j.generation = generation;
+        j.provenance = Some(Provenance {
+            is_pow: generation != 0,
+            order_id: vec![],
+        });
+        j
+    }
+
+    #[test]
+    fn cancel_inflight_drops_pow_keeps_mempool_and_newer() {
+        let mut st = CoordinatorState::new();
+        st.dispatch_inflight("cpu-0", job_with_generation(b"mempool", 0));
+        st.dispatch_inflight("cpu-0", job_with_generation(b"old", 3));
+        st.dispatch_inflight("cpu-0", job_with_generation(b"live", 5));
+        assert_eq!(st.cancel_inflight(4), 1);
+        assert!(st.inflight.contains_key(&b"mempool"[..]));
+        assert!(!st.inflight.contains_key(&b"old"[..]));
+        assert!(st.inflight.contains_key(&b"live"[..]));
+        assert!(st.complete_inflight(b"old").is_none());
     }
 
     #[test]
