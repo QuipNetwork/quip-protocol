@@ -19,6 +19,11 @@ pub enum ConfigError {
         /// coordinator finds no backends.
         looks_like_v0_2: bool,
     },
+    /// A required `[miner]` key is missing or unusable (blank host, port 0).
+    MissingMinerKey {
+        /// Key name, e.g. `public_host`.
+        key: &'static str,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -26,6 +31,7 @@ impl std::fmt::Display for ConfigError {
         match self {
             Self::MissingMiner => write!(f, "missing [miner] section"),
             Self::BadToml(e) => write!(f, "bad toml: {e}"),
+            Self::MissingMinerKey { key } => write!(f, "missing [miner].{key}"),
             Self::NoBackends { looks_like_v0_2 } => {
                 write!(
                     f,
@@ -74,10 +80,10 @@ pub struct CoordinatorConfig {
     pub node_id: Option<String>,
     /// Display name for `set_descriptor`. Required to file a descriptor.
     pub node_name: Option<String>,
-    /// Optional public host advertised in the descriptor.
-    pub public_host: Option<String>,
-    /// Optional public port advertised in the descriptor.
-    pub public_port: Option<u16>,
+    /// Public host advertised in the descriptor. Required at parse.
+    pub public_host: String,
+    /// Public port advertised in the descriptor. Required at parse. Non-zero.
+    pub public_port: u16,
     /// Whether the node advertises auto-mine. Defaults to `true`.
     pub auto_mine: bool,
     /// Log level advertised in the descriptor. Defaults to `Info`.
@@ -204,8 +210,8 @@ impl DescriptorParams {
         Self {
             node_id: cfg.node_id.clone(),
             node_name: cfg.node_name.clone(),
-            public_host: cfg.public_host.clone(),
-            public_port: cfg.public_port,
+            public_host: Some(cfg.public_host.clone()),
+            public_port: Some(cfg.public_port),
             auto_mine: cfg.auto_mine,
             log_level: cfg.node_log_level,
             rpc_endpoints: cfg.validators.clone(),
@@ -284,8 +290,8 @@ fn entry(miner_id: &str, backend: &str, table: &toml::Table) -> LaunchEntry {
 struct MinerIdentity {
     node_id: Option<String>,
     node_name: Option<String>,
-    public_host: Option<String>,
-    public_port: Option<u16>,
+    public_host: String,
+    public_port: u16,
     auto_mine: bool,
     node_log_level: NodeLogLevel,
 }
@@ -349,23 +355,26 @@ fn parse_dashboard(root: &toml::Table) -> Option<DashboardConfig> {
         })
 }
 
-fn parse_miner_identity(miner: &toml::Table) -> MinerIdentity {
+fn parse_miner_identity(miner: &toml::Table) -> Result<MinerIdentity, ConfigError> {
+    let public_host = optional_str(miner, "public_host")
+        .ok_or(ConfigError::MissingMinerKey { key: "public_host" })?;
     let public_port = miner
         .get("public_port")
         .and_then(toml::Value::as_integer)
-        .and_then(|i| u16::try_from(i).ok().filter(|&p| p > 0));
+        .and_then(|i| u16::try_from(i).ok().filter(|&p| p > 0))
+        .ok_or(ConfigError::MissingMinerKey { key: "public_port" })?;
     let auto_mine = miner
         .get("auto_mine")
         .and_then(toml::Value::as_bool)
         .unwrap_or(true);
-    MinerIdentity {
+    Ok(MinerIdentity {
         node_id: optional_str(miner, "node_id"),
         node_name: optional_str(miner, "node_name"),
-        public_host: optional_str(miner, "public_host"),
+        public_host,
         public_port,
         auto_mine,
         node_log_level: parse_node_log_level(miner.get("log_level").and_then(toml::Value::as_str)),
-    }
+    })
 }
 
 /// Parse a coordinator TOML config into validators, signer, and launch plan.
@@ -375,7 +384,9 @@ fn parse_miner_identity(miner: &toml::Table) -> MinerIdentity {
 ///
 /// # Errors
 /// Returns [`ConfigError::MissingMiner`] when the `[miner]` section is absent,
-/// or [`ConfigError::BadToml`] when the input is not valid TOML.
+/// [`ConfigError::MissingMinerKey`] when a required `[miner]` identity key is
+/// missing or unusable, or [`ConfigError::BadToml`] when the input is not
+/// valid TOML.
 pub fn parse_config(toml_text: &str) -> Result<CoordinatorConfig, ConfigError> {
     let root: toml::Table =
         toml::from_str(toml_text).map_err(|e| ConfigError::BadToml(e.to_string()))?;
@@ -449,7 +460,7 @@ pub fn parse_config(toml_text: &str) -> Result<CoordinatorConfig, ConfigError> {
         return Err(ConfigError::NoBackends { looks_like_v0_2 });
     }
 
-    let identity = parse_miner_identity(miner);
+    let identity = parse_miner_identity(miner)?;
 
     Ok(CoordinatorConfig {
         validators,
@@ -477,6 +488,8 @@ mod tests {
 [miner]
 validators = ["ws://127.0.0.1:9944"]
 signer_key = "//Alice"
+public_host = "203.0.113.10"
+public_port = 20050
 
 [cpu]
 binary = "quip-cpu-gibbs"
@@ -599,14 +612,19 @@ rest_port = 8086
     /// fallback the coordinator starts with nowhere to connect and never mines.
     #[test]
     fn omitted_validators_fall_back_to_the_v0_2_pair() {
-        let cfg = parse_config("[miner]\nsigner_key = \"//Alice\"\n\n[cpu]\n").unwrap();
+        let cfg = parse_config(
+            "[miner]\nsigner_key = \"//Alice\"\n\
+             public_host = \"203.0.113.10\"\npublic_port = 20050\n\n[cpu]\n",
+        )
+        .unwrap();
         assert_eq!(cfg.validators, DEFAULT_VALIDATORS.to_vec());
     }
 
     #[test]
     fn explicit_validators_win_over_the_fallback() {
         let cfg = parse_config(
-            "[miner]\nvalidators = [\"ws://example:9944\"]\nsigner_key = \"//Alice\"\n\n[cpu]\n",
+            "[miner]\nvalidators = [\"ws://example:9944\"]\nsigner_key = \"//Alice\"\n\
+             public_host = \"203.0.113.10\"\npublic_port = 20050\n\n[cpu]\n",
         )
         .unwrap();
         assert_eq!(cfg.validators, vec!["ws://example:9944".to_string()]);
@@ -615,8 +633,11 @@ rest_port = 8086
     #[test]
     fn explicit_empty_validators_stay_empty() {
         // An explicit `[]` is a deliberate choice, not an omission.
-        let cfg =
-            parse_config("[miner]\nvalidators = []\nsigner_key = \"//Alice\"\n\n[cpu]\n").unwrap();
+        let cfg = parse_config(
+            "[miner]\nvalidators = []\nsigner_key = \"//Alice\"\n\
+             public_host = \"203.0.113.10\"\npublic_port = 20050\n\n[cpu]\n",
+        )
+        .unwrap();
         assert!(cfg.validators.is_empty());
     }
 
@@ -638,6 +659,7 @@ rest_port = 8086
     #[test]
     fn funding_keys_are_parsed_and_overridable() {
         let text = "[miner]\nsigner_key = \"//Alice\"\n\
+                    public_host = \"203.0.113.10\"\npublic_port = 20050\n\
                     faucet_url = \"https://f.example\"\n\
                     min_balance_plancks = 5\nfaucet_top_up_plancks = 50\n\
                     funding_timeout_s = 30\n\n[cpu]\n";
@@ -652,8 +674,11 @@ rest_port = 8086
     #[test]
     fn blank_faucet_url_disables_auto_funding() {
         for blank in ["\"\"", "\"   \""] {
-            let text =
-                format!("[miner]\nsigner_key = \"//Alice\"\nfaucet_url = {blank}\n\n[cpu]\n");
+            let text = format!(
+                "[miner]\nsigner_key = \"//Alice\"\n\
+                 public_host = \"203.0.113.10\"\npublic_port = 20050\n\
+                 faucet_url = {blank}\n\n[cpu]\n"
+            );
             assert_eq!(parse_config(&text).unwrap().faucet_url, None, "{blank}");
         }
     }
@@ -668,6 +693,7 @@ rest_host = "127.0.0.1"
 rest_port = 20100
 node_name = "Tesla"
 public_host = "96.233.112.201"
+public_port = 20050
 log_level = "info"
 
 [cpu]
@@ -686,10 +712,10 @@ idle_after_s = 600
     fn live_config_reads_descriptor_keys_from_miner() {
         let c = parse_config(LIVE).unwrap();
         assert_eq!(c.node_name.as_deref(), Some("Tesla"));
-        assert_eq!(c.public_host.as_deref(), Some("96.233.112.201"));
+        assert_eq!(c.public_host, "96.233.112.201");
         assert_eq!(c.node_log_level, NodeLogLevel::Info);
         assert_eq!(c.node_id, None);
-        assert_eq!(c.public_port, None);
+        assert_eq!(c.public_port, 20050);
         assert!(c.auto_mine);
         let ids: Vec<&str> = c.launch.iter().map(|e| e.miner_id.as_str()).collect();
         assert_eq!(ids, vec!["cpu-0", "metal-0"]);
@@ -700,12 +726,17 @@ idle_after_s = 600
     #[test]
     fn rest_port_is_not_the_descriptor_public_port() {
         let c = parse_config(LIVE).unwrap();
-        assert_eq!(c.public_port, None);
+        assert_eq!(c.public_port, 20050);
+        assert_ne!(c.public_port, 20100);
     }
 
     #[test]
     fn metal_section_is_metal_kind() {
-        let c = parse_config("[miner]\nsigner_key = \"//Alice\"\n\n[metal]\n").unwrap();
+        let c = parse_config(
+            "[miner]\nsigner_key = \"//Alice\"\n\
+             public_host = \"203.0.113.10\"\npublic_port = 20050\n\n[metal]\n",
+        )
+        .unwrap();
         let metal = c.launch.first().expect("one metal entry");
         assert_eq!(metal.backend, "metal");
         assert_eq!(metal.miner_kind(), MinerKind::Metal);
@@ -729,11 +760,13 @@ idle_after_s = 600
     fn descriptor_optional_keys_parse_when_present() {
         let text = "[miner]\nsigner_key = \"//Alice\"\n\
                     node_id = \"tesla-1\"\nnode_name = \"Tesla\"\n\
+                    public_host = \"203.0.113.10\"\n\
                     public_port = 20050\nauto_mine = false\nlog_level = \"debug\"\n\n[cpu]\n";
         let c = parse_config(text).unwrap();
         assert_eq!(c.node_id.as_deref(), Some("tesla-1"));
         assert_eq!(c.node_name.as_deref(), Some("Tesla"));
-        assert_eq!(c.public_port, Some(20050));
+        assert_eq!(c.public_host, "203.0.113.10");
+        assert_eq!(c.public_port, 20050);
         assert!(!c.auto_mine);
         assert_eq!(c.node_log_level, NodeLogLevel::Debug);
     }
@@ -743,10 +776,85 @@ idle_after_s = 600
         let c = parse_config(SAMPLE).unwrap();
         assert_eq!(c.node_id, None);
         assert_eq!(c.node_name, None);
-        assert_eq!(c.public_host, None);
-        assert_eq!(c.public_port, None);
+        assert_eq!(c.public_host, "203.0.113.10");
+        assert_eq!(c.public_port, 20050);
         assert!(c.auto_mine);
         assert_eq!(c.node_log_level, NodeLogLevel::Info);
+    }
+
+    fn miner_cpu(extra: &str) -> String {
+        format!("[miner]\nsigner_key = \"//Alice\"\n{extra}\n[cpu]\n")
+    }
+
+    #[test]
+    fn public_host_and_public_port_parse_when_both_present() {
+        let c = parse_config(&miner_cpu(
+            "public_host = \"203.0.113.10\"\npublic_port = 20050\n",
+        ))
+        .unwrap();
+        assert_eq!(c.public_host, "203.0.113.10");
+        assert_eq!(c.public_port, 20050);
+    }
+
+    #[test]
+    fn missing_public_host_is_a_config_error_naming_the_key() {
+        let Err(err) = parse_config(&miner_cpu("public_port = 20050\n")) else {
+            panic!("missing public_host must not parse");
+        };
+        assert!(matches!(
+            err,
+            ConfigError::MissingMinerKey { key: "public_host" }
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("public_host"), "{msg}");
+        assert!(msg.contains("[miner]"), "{msg}");
+    }
+
+    #[test]
+    fn missing_public_port_is_a_config_error_naming_the_key() {
+        let Err(err) = parse_config(&miner_cpu("public_host = \"203.0.113.10\"\n")) else {
+            panic!("missing public_port must not parse");
+        };
+        assert!(matches!(
+            err,
+            ConfigError::MissingMinerKey { key: "public_port" }
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("public_port"), "{msg}");
+        assert!(msg.contains("[miner]"), "{msg}");
+    }
+
+    #[test]
+    fn blank_public_host_is_rejected_as_missing() {
+        for blank in ["\"\"", "\"   \""] {
+            let text = miner_cpu(&format!("public_host = {blank}\npublic_port = 20050\n"));
+            let Err(err) = parse_config(&text) else {
+                panic!("blank public_host {blank} must not parse");
+            };
+            assert!(
+                matches!(err, ConfigError::MissingMinerKey { key: "public_host" }),
+                "{blank}: {err}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("public_host"), "{blank}: {msg}");
+            assert!(msg.contains("[miner]"), "{blank}: {msg}");
+        }
+    }
+
+    #[test]
+    fn zero_public_port_is_rejected() {
+        let Err(err) = parse_config(&miner_cpu(
+            "public_host = \"203.0.113.10\"\npublic_port = 0\n",
+        )) else {
+            panic!("public_port = 0 must not parse");
+        };
+        assert!(matches!(
+            err,
+            ConfigError::MissingMinerKey { key: "public_port" }
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("public_port"), "{msg}");
+        assert!(msg.contains("[miner]"), "{msg}");
     }
 
     /// The shipped v0.3 template must survive its own parser.

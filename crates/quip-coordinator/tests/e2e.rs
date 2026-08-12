@@ -148,6 +148,8 @@ fn config_maps_mock_miner_launch() {
 [miner]
 validators = ["ws://127.0.0.1:9944"]
 signer_key = "//Alice"
+public_host = "203.0.113.10"
+public_port = 20050
 
 [cpu]
 binary = "quip-mock-miner"

@@ -9,6 +9,13 @@
 [miner]
 validators = ["ws://127.0.0.1:9944"]
 signer_key = "//Alice"
+# Host a peer uses to reach this node from outside the host. Required.
+# An empty string is not a host.
+public_host = "203.0.113.10"
+# Port a peer uses to reach this node from outside the host. Required.
+# This is the public front door, not the validator peer port and not
+# the dashboard port. Zero is not a valid port.
+public_port = 20050
 
 # CPU miner. Default binary: quip-cpu-sa. Use the chromatic Gibbs variant:
 [cpu]

@@ -209,8 +209,8 @@ Values come from `[miner]`:
 | --- | --- | --- |
 | `node_id` | `[miner].node_id` | 64-char hex of the miner account |
 | `node_name` | `[miner].node_name` | none. Required to file. |
-| `public_host` | `[miner].public_host` | none |
-| `public_port` | `[miner].public_port` | none |
+| `public_host` | `[miner].public_host` | required |
+| `public_port` | `[miner].public_port` | required |
 | `rpc_endpoints` | `[miner].validators` | the validator list the coordinator already reads |
 | `auto_mine` | `[miner].auto_mine` | `true` |
 | `log_level` | `[miner].log_level` | `info` |
@@ -223,6 +223,12 @@ coordinator verbosity. Use `--log-level` or `RUST_LOG` for that.
 
 `rest_host` and `rest_port` are v0.2 keys. The coordinator does not map
 `rest_port` to `public_port`.
+
+You must set `public_host` and `public_port`. `parse_config` rejects a
+missing key. It also rejects a blank host and a port of 0.
+`public_port` is the port a peer uses to reach this node from outside the
+host. In the reference deployment that is the public front door, not the
+validator peer port and not the dashboard port.
 
 If `[miner].node_name` is missing, the coordinator warns once and names that
 key. It does not file a descriptor. Mining still starts.
@@ -361,10 +367,10 @@ the grace period (`grace_ms`).
 ## Config to launch plan
 
 `parse_config` (`config.rs`) turns `config.toml` into a `CoordinatorConfig`:
-the `[miner]` section gives `validators`, `signer_key`, and the node
-descriptor keys (`node_name`, `public_host`, `log_level`, and the optional
-`node_id`, `public_port`, `auto_mine`). Each backend section becomes one
-`LaunchEntry`. Section names map to miner ids `[cpu]`→`cpu-0`,
+the `[miner]` section gives `validators`, `signer_key`, the required
+descriptor keys (`public_host`, `public_port`), and the optional keys
+(`node_name`, `log_level`, `node_id`, `auto_mine`). Each backend section
+becomes one `LaunchEntry`. Section names map to miner ids `[cpu]`→`cpu-0`,
 `[cuda.N]`→`cuda-N`, `[metal]`→`metal-0`, `[dwave]`/`[qpu]`→`qpu-0`. The
 backend name stays on the entry so the coordinator can derive `MinerKind`.
 
