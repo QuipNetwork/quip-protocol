@@ -48,7 +48,7 @@ A binary calls `run(id, common, open)` (in `session.rs`):
 - `open: impl FnOnce() -> Result<S, OpenError>` — opens the device and builds
   the `Sampler`.
 
-`run` dispatches on the flags:
+`run` installs the log subscriber first, then dispatches on the flags:
 
 - `--capabilities` prints the capabilities JSON and exits without opening the
   device.
@@ -57,6 +57,35 @@ A binary calls `run(id, common, open)` (in `session.rs`):
 - otherwise it enters session mode: it needs `--quip-coordinator <uri>`,
   defaults the miner id to `<backend>-0`, opens the device, starts a Tokio
   runtime, and runs `run_session`. Errors map to the shared exit codes.
+
+## Logging
+
+`logging.rs` installs the subscriber, and `run` calls it before anything else.
+The `tracing` macros only dispatch to an installed subscriber, so without that
+call every log statement in the miner does nothing, including the fatal-error
+paths.
+
+Verbosity comes from `--log-level {trace,debug,info,warn,error}`, default
+`info`, which the coordinator passes to every miner it spawns. A non-empty
+`RUST_LOG` overrides the flag. A miner inherits the coordinator's environment,
+so `RUST_LOG` reaches the children too. A level outside that set fails at
+startup instead of falling back to a default. `EnvFilter` reads an unknown word as
+a target name, so a typo would otherwise parse cleanly and silence the miner.
+
+Output goes to stderr. A supervised miner inherits the coordinator's streams,
+so the coordinator's log receives its lines with no forwarding step. Stdout
+carries only the `--capabilities` JSON.
+
+What each level carries:
+
+- `info` — one line per finished attempt: best energy, how many solutions clear
+  the session target, the target itself, the resolved reads and sweeps, and
+  wall and device time. The miner logs a losing attempt the same as a winning
+  one, which separates a healthy miner that is not winning from a stalled one.
+  A progress line follows every ten jobs.
+- `debug` — one line per job received (size and resolved parameters), and
+  cancellations.
+- `warn` — rejects, with the reject reason.
 
 ## The session loop
 

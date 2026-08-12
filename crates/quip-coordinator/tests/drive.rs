@@ -79,6 +79,7 @@ async fn drives_two_entry_list_end_to_end() {
         jobs,
         utilization: None,
         yielding: false,
+        log_level: quip_coordinator::logging::LogLevel::Info,
     })
     .await;
 

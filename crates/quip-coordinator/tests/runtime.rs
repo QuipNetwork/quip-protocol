@@ -95,6 +95,7 @@ async fn runtime_serves_supervises_and_shuts_down_clean() {
         buffer_depth: 0,
         poll_interval_ms: 200,
         dashboard: None,
+        log_level: quip_coordinator::logging::LogLevel::Info,
     };
     let (trigger_tx, trigger_rx) = oneshot::channel::<()>();
 

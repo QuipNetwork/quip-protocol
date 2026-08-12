@@ -13,6 +13,7 @@ pub mod config;
 pub mod csr;
 pub mod ising;
 mod job;
+pub mod logging;
 mod session;
 
 pub use cli::CommonArgs;

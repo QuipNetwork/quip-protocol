@@ -170,14 +170,22 @@ pub fn parse_config(toml_text: &str) -> Result<CoordinatorConfig, ConfigError> {
         .ok_or(ConfigError::MissingMiner)?;
     // Absent key → the v0.2 fallback pair. A present-but-empty array is an
     // explicit "no validators" and is left alone.
-    let validators: Vec<String> = miner.get("validators").and_then(|v| v.as_array()).map_or_else(
-        || DEFAULT_VALIDATORS.iter().map(|s| (*s).to_string()).collect(),
-        |a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(String::from))
-                .collect()
-        },
-    );
+    let validators: Vec<String> = miner
+        .get("validators")
+        .and_then(|v| v.as_array())
+        .map_or_else(
+            || {
+                DEFAULT_VALIDATORS
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect()
+            },
+            |a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            },
+        );
     let signer_key = miner
         .get("signer_key")
         .and_then(|v| v.as_str())
@@ -203,8 +211,10 @@ pub fn parse_config(toml_text: &str) -> Result<CoordinatorConfig, ConfigError> {
         "min_balance_plancks",
         crate::funding::DEFAULT_MIN_BALANCE_PLANCKS,
     );
-    let faucet_top_up_plancks =
-        plancks_of("faucet_top_up_plancks", crate::funding::DEFAULT_TOP_UP_PLANCKS);
+    let faucet_top_up_plancks = plancks_of(
+        "faucet_top_up_plancks",
+        crate::funding::DEFAULT_TOP_UP_PLANCKS,
+    );
     let funding_timeout_s = miner
         .get("funding_timeout_s")
         .and_then(toml::Value::as_integer)

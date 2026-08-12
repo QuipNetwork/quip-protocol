@@ -231,7 +231,10 @@ mod tests {
     fn rv_with(api: Option<u32>) -> Value {
         let mut apis = vec![json!(["0xdf6acb689907609b", 5])];
         if let Some(v) = api {
-            apis.push(json!([format!("0x{}", hex_lower(&api_id(QUANTUM_POW_API))), v]));
+            apis.push(json!([
+                format!("0x{}", hex_lower(&api_id(QUANTUM_POW_API))),
+                v
+            ]));
         }
         json!({
             "specName": "quip-runtime",
@@ -264,7 +267,9 @@ mod tests {
     #[test]
     fn v0_2_2_rc4_runtime_is_accepted() {
         let info = parse_runtime_version(&rv_with(Some(2))).unwrap();
-        assert!(info.quantum_pow_api.is_some_and(|v| v >= MIN_QUANTUM_POW_API));
+        assert!(info
+            .quantum_pow_api
+            .is_some_and(|v| v >= MIN_QUANTUM_POW_API));
     }
 
     #[test]

@@ -97,6 +97,7 @@ async fn clean_exit_reclaims_and_reroutes_inflight() {
         Arc::clone(&state),
         policy,
         200,
+        quip_coordinator::logging::LogLevel::Info,
         stop_rx,
     ));
 

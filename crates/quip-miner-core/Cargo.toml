@@ -20,6 +20,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.2"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 quip-mock-coordinator = { path = "../quip-mock-coordinator" }

@@ -51,14 +51,10 @@ impl fmt::Display for LogLevel {
 /// Targets whose events are the coordinator's own operational narration. Third
 /// party crates (jsonrpsee, subxt, tonic, hyper) stay at `warn` under the
 /// default filter so `--log-level debug` stays readable; `RUST_LOG` is the
-/// escape hatch when their internals are what you actually need.
-const OWN_TARGETS: [&str; 4] = [
-    "quip_coordinator",
-    "quip_protocol",
-    "quip_miner_core",
-    // `supervisor` re-emits each miner's stderr under this target.
-    "miner",
-];
+/// escape hatch when their internals are what you actually need. Miner child
+/// processes inherit the coordinator stdio and emit under their own subscriber,
+/// so they are not listed here.
+const OWN_TARGETS: [&str; 3] = ["quip_coordinator", "quip_protocol", "quip_miner_core"];
 
 /// Build the default filter for `level`: third-party crates at `warn`, this
 /// coordinator's own targets at `level`.
@@ -151,8 +147,10 @@ mod tests {
         let d = default_filter(LogLevel::Debug);
         assert!(d.starts_with("warn,"), "{d}");
         assert!(d.contains("quip_coordinator=debug"), "{d}");
-        // The supervisor's re-emitted miner stderr must follow --log-level too.
-        assert!(d.contains("miner=debug"), "{d}");
+        assert!(d.contains("quip_protocol=debug"), "{d}");
+        assert!(d.contains("quip_miner_core=debug"), "{d}");
+        // Miner children write straight to the terminal; no re-emit target.
+        assert!(!d.contains("miner="), "{d}");
     }
 
     #[test]

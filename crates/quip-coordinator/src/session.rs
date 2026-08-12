@@ -463,7 +463,10 @@ async fn run_session<C: ChainClient>(
     // would free the miner's credits, while the miner (symmetrically blocked
     // writing those results) stops reading jobs. Both peers park permanently.
     let (grants, mut grant_rx) = mpsc::channel::<u32>(GRANT_CHANNEL_DEPTH);
-    state.lock().await.register_wakeup(&miner_id, grants.clone());
+    state
+        .lock()
+        .await
+        .register_wakeup(&miner_id, grants.clone());
     let _dispatcher = {
         let state = Arc::clone(&state);
         let tx = tx.clone();
@@ -1376,7 +1379,10 @@ mod tests {
 
         // The miner grants credits first. Nothing is staged, so nothing is sent.
         assert!(dispatch_granted(&state, "cpu-0", 32, &tx).await);
-        assert!(rx.try_recv().is_err(), "no job exists yet, so none can dispatch");
+        assert!(
+            rx.try_recv().is_err(),
+            "no job exists yet, so none can dispatch"
+        );
 
         // The feeder stages work and wakes the dispatcher.
         {
@@ -1388,8 +1394,13 @@ mod tests {
         // The wakeup carries no credits: the balance from the first grant stands.
         assert_eq!(grant_rx.try_recv().expect("wakeup was queued"), 0);
         assert!(dispatch_granted(&state, "cpu-0", 0, &tx).await);
-        let sent = rx.try_recv().expect("the staged job dispatches on the wakeup");
-        let Ok(CoordMsg { msg: Some(coord_msg::Msg::Job(j)) }) = sent else {
+        let sent = rx
+            .try_recv()
+            .expect("the staged job dispatches on the wakeup");
+        let Ok(CoordMsg {
+            msg: Some(coord_msg::Msg::Job(j)),
+        }) = sent
+        else {
             panic!("expected a Job message");
         };
         assert_eq!(j.job_id, b"late".to_vec());
@@ -1408,6 +1419,9 @@ mod tests {
         st.register_wakeup("cpu-0", grants);
         assert!(st.wakeups.contains_key("cpu-0"));
         st.deregister_outbound("cpu-0");
-        assert!(!st.wakeups.contains_key("cpu-0"), "a dead session must not be woken");
+        assert!(
+            !st.wakeups.contains_key("cpu-0"),
+            "a dead session must not be woken"
+        );
     }
 }

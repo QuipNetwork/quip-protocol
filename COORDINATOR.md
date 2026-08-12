@@ -37,6 +37,11 @@ All output goes to stderr, because `drive` prints its timing table to stdout.
 Color is on only when stderr is a terminal, so a captured log file stays plain
 text.
 
+Spawned miners inherit these streams and log for themselves, so miner lines
+appear alongside the coordinator's own. Both spawn paths — supervised and
+`drive` — pass `--log-level` through to the child. `MINER.md` describes what a
+miner logs at each level.
+
 What each level carries:
 
 - `info` — startup and the validator runtime, round transitions, miner spawn
@@ -184,9 +189,11 @@ specifies this contract from the miner's side.
 
 `supervise_miner` (`supervisor.rs`) owns one miner for the run. It spawns the
 binary with the session token in the `QUIP_SESSION_TOKEN` environment variable
-(never argv) and two arguments — `--quip-coordinator <socket-uri>` and
-`--miner-id <id>` — sets `kill_on_drop`, and merges the child's stderr (miners
-emit JSON log lines) into the coordinator's log tagged by miner id.
+(never argv) and three arguments — `--quip-coordinator <socket-uri>`,
+`--miner-id <id>`, and `--log-level <level>` — and sets `kill_on_drop`. The
+child inherits the coordinator's stdout and stderr, so its log lines appear
+directly in the coordinator's output. `--log-level` keeps the child's verbosity
+matched, because those bytes never pass through the coordinator's own filter.
 
 Restarts follow the child's exit code (`restart_policy`):
 

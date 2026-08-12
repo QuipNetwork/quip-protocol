@@ -164,7 +164,8 @@ impl RealChainClient {
         }
         // Every endpoint failed: report against the primary, which is the one an
         // operator will look at first.
-        let err = last.unwrap_or_else(|| ChainError::Unavailable("no validators configured".into()));
+        let err =
+            last.unwrap_or_else(|| ChainError::Unavailable("no validators configured".into()));
         if let Some(primary) = self.validators.first() {
             self.note_reachability(primary, Err(&err));
         }
@@ -227,10 +228,7 @@ fn free_from_account_info(value: &subxt::ext::scale_value::Value) -> Option<u128
 }
 
 /// Look up a named field in a composite, ignoring unnamed composites.
-fn named_field<'a>(
-    c: &'a Composite<()>,
-    want: &str,
-) -> Option<&'a subxt::ext::scale_value::Value> {
+fn named_field<'a>(c: &'a Composite<()>, want: &str) -> Option<&'a subxt::ext::scale_value::Value> {
     match c {
         Composite::Named(fields) => fields.iter().find(|(k, _)| k == want).map(|(_, v)| v),
         Composite::Unnamed(_) => None,

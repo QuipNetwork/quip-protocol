@@ -52,6 +52,11 @@ pub struct DriveManyParams<'a> {
     pub utilization: Option<u32>,
     /// Forwarded as `--yielding` to the spawned miner (GPU backends).
     pub yielding: bool,
+    /// Forwarded as `--log-level` so the miner's own subscriber matches the
+    /// verbosity the operator asked `drive` for. The miner inherits this
+    /// process's stderr, so without this its per-job lines stay at the miner
+    /// default no matter what `drive --log-level` says.
+    pub log_level: crate::logging::LogLevel,
 }
 
 /// Result of a drive-many run: per-job rows plus handshake/exit status.
@@ -571,6 +576,8 @@ pub async fn run_drive(p: DriveManyParams<'_>) -> DriveManyReport {
         .arg(&socket_uri)
         .arg("--miner-id")
         .arg(miner_id)
+        .arg("--log-level")
+        .arg(p.log_level.to_string())
         .env("QUIP_SESSION_TOKEN", p.token);
     // Mechanism A: forward governor flags to the spawned miner's own CLI
     // (cuda/metal). config.toml still overrides these via backend_toml.

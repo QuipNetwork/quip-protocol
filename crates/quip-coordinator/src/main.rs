@@ -132,9 +132,12 @@ fn main() -> StdExitCode {
         return StdExitCode::from(ExitCode::ConfigInvalid as u8);
     }
     match cli.command {
-        Some(Command::Drive(args)) => run_drive_cli(args),
+        Some(Command::Drive(args)) => run_drive_cli(args, cli.log_level.unwrap_or(LogLevel::Info)),
         Some(Command::Keygen(args)) => run_keygen_cli(&args),
-        None => run_config_path(cli.config),
+        // When --log-level is omitted the coordinator default is Info (unless
+        // RUST_LOG overrides the coordinator filter alone). Forward that same
+        // default to miner children so their verbosity matches the CLI default.
+        None => run_config_path(cli.config, cli.log_level.unwrap_or(LogLevel::Info)),
     }
 }
 
@@ -202,7 +205,7 @@ fn fund_account(
     })
 }
 
-fn run_config_path(config: Option<PathBuf>) -> StdExitCode {
+fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode {
     // --help is handled by clap (exit 0). Missing/invalid config → exit 64.
     let Some(config_path) = config else {
         tracing::error!("--config <path> is required");
@@ -307,6 +310,7 @@ fn run_config_path(config: Option<PathBuf>) -> StdExitCode {
             .dashboard
             .as_ref()
             .map(|d| (d.listen.clone(), PathBuf::from(&d.data_dir))),
+        log_level,
     };
     tracing::info!(
         miners = cfg.launch.len(),
@@ -486,7 +490,7 @@ fn preset_path(name: &str) -> Result<PathBuf, String> {
     clippy::print_stderr,
     reason = "CLI binary reports drive runtime errors to stderr"
 )]
-fn run_drive_cli(args: DriveArgs) -> StdExitCode {
+fn run_drive_cli(args: DriveArgs, log_level: LogLevel) -> StdExitCode {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -494,14 +498,14 @@ fn run_drive_cli(args: DriveArgs) -> StdExitCode {
             return StdExitCode::from(ExitCode::InternalFatal as u8);
         }
     };
-    rt.block_on(drive_main(args))
+    rt.block_on(drive_main(args, log_level))
 }
 
 #[expect(
     clippy::print_stderr,
     reason = "CLI binary reports drive run failures to stderr"
 )]
-async fn drive_main(args: DriveArgs) -> StdExitCode {
+async fn drive_main(args: DriveArgs, log_level: LogLevel) -> StdExitCode {
     // 0 => no deadline (the sentinel the miner honors); otherwise an absolute
     // wall-clock deadline `now + args.deadline_ms`.
     let deadline_ms = if args.deadline_ms == 0 {
@@ -541,6 +545,7 @@ async fn drive_main(args: DriveArgs) -> StdExitCode {
         jobs,
         utilization: args.utilization,
         yielding: args.yielding,
+        log_level,
     })
     .await;
 

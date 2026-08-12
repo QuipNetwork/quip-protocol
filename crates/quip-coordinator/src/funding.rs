@@ -424,9 +424,15 @@ mod tests {
     async fn already_funded_never_calls_the_faucet() {
         let chain = ScriptedChain::new(vec![500]);
         let faucet = ScriptedFaucet::new(vec![Ok(())]);
-        let got = ensure_funded(&chain, Some(&faucet), [0u8; 32], &params(Some("u")), no_sleep)
-            .await
-            .unwrap();
+        let got = ensure_funded(
+            &chain,
+            Some(&faucet),
+            [0u8; 32],
+            &params(Some("u")),
+            no_sleep,
+        )
+        .await
+        .unwrap();
         assert_eq!(got, 500);
         assert_eq!(faucet.calls(), 0, "must not hit the faucet when funded");
     }
@@ -458,9 +464,15 @@ mod tests {
         // Short, then funded after the request settles.
         let chain = ScriptedChain::new(vec![5, 1000]);
         let faucet = ScriptedFaucet::new(vec![Ok(())]);
-        let got = ensure_funded(&chain, Some(&faucet), [0u8; 32], &params(Some("u")), no_sleep)
-            .await
-            .unwrap();
+        let got = ensure_funded(
+            &chain,
+            Some(&faucet),
+            [0u8; 32],
+            &params(Some("u")),
+            no_sleep,
+        )
+        .await
+        .unwrap();
         assert_eq!(got, 1000);
         assert_eq!(faucet.calls(), 1);
     }
@@ -474,9 +486,15 @@ mod tests {
             Err(FaucetError::Transient("502".into())),
             Ok(()),
         ]);
-        let got = ensure_funded(&chain, Some(&faucet), [0u8; 32], &params(Some("u")), no_sleep)
-            .await
-            .unwrap();
+        let got = ensure_funded(
+            &chain,
+            Some(&faucet),
+            [0u8; 32],
+            &params(Some("u")),
+            no_sleep,
+        )
+        .await
+        .unwrap();
         assert_eq!(got, 1000);
         assert_eq!(faucet.calls(), 3);
     }
@@ -487,9 +505,15 @@ mod tests {
     async fn already_funded_response_still_defers_to_the_balance() {
         let chain = ScriptedChain::new(vec![5, 5, 1000]);
         let faucet = ScriptedFaucet::new(vec![Err(FaucetError::AlreadyFunded("403".into()))]);
-        let got = ensure_funded(&chain, Some(&faucet), [0u8; 32], &params(Some("u")), no_sleep)
-            .await
-            .unwrap();
+        let got = ensure_funded(
+            &chain,
+            Some(&faucet),
+            [0u8; 32],
+            &params(Some("u")),
+            no_sleep,
+        )
+        .await
+        .unwrap();
         assert_eq!(got, 1000);
     }
 
@@ -497,9 +521,15 @@ mod tests {
     async fn permanent_rejection_fails_without_retrying() {
         let chain = ScriptedChain::new(vec![5]);
         let faucet = ScriptedFaucet::new(vec![Err(FaucetError::Permanent("400 bad dest".into()))]);
-        let err = ensure_funded(&chain, Some(&faucet), [0u8; 32], &params(Some("u")), no_sleep)
-            .await
-            .unwrap_err();
+        let err = ensure_funded(
+            &chain,
+            Some(&faucet),
+            [0u8; 32],
+            &params(Some("u")),
+            no_sleep,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, FundingError::FaucetRejected(_)), "{err:?}");
         assert_eq!(faucet.calls(), 1, "a 400 must not be retried");
     }
@@ -508,9 +538,15 @@ mod tests {
     async fn gives_up_after_the_timeout_budget() {
         let chain = ScriptedChain::new(vec![5]); // never funds
         let faucet = ScriptedFaucet::new(vec![Ok(())]);
-        let err = ensure_funded(&chain, Some(&faucet), [0u8; 32], &params(Some("u")), no_sleep)
-            .await
-            .unwrap_err();
+        let err = ensure_funded(
+            &chain,
+            Some(&faucet),
+            [0u8; 32],
+            &params(Some("u")),
+            no_sleep,
+        )
+        .await
+        .unwrap_err();
         match err {
             FundingError::FaucetExhausted {
                 balance, threshold, ..
@@ -570,9 +606,15 @@ mod tests {
             calls: Mutex::new(0),
         };
         let faucet = ScriptedFaucet::new(vec![Ok(())]);
-        let got = ensure_funded(&chain, Some(&faucet), [0u8; 32], &params(Some("u")), no_sleep)
-            .await
-            .unwrap();
+        let got = ensure_funded(
+            &chain,
+            Some(&faucet),
+            [0u8; 32],
+            &params(Some("u")),
+            no_sleep,
+        )
+        .await
+        .unwrap();
         assert_eq!(got, 1000);
         // The faucet is never asked while the balance is unknown.
         assert_eq!(faucet.calls(), 0);
@@ -631,7 +673,10 @@ mod tests {
     #[test]
     fn backoff_doubles_then_saturates() {
         assert_eq!(next_backoff(BACKOFF_START), Duration::from_secs(4));
-        assert_eq!(next_backoff(Duration::from_secs(16)), Duration::from_secs(30));
+        assert_eq!(
+            next_backoff(Duration::from_secs(16)),
+            Duration::from_secs(30)
+        );
         assert_eq!(next_backoff(BACKOFF_MAX), BACKOFF_MAX);
     }
 

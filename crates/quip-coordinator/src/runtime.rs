@@ -9,6 +9,7 @@
 use crate::chain::{ChainClient, MiningSnapshot};
 use crate::config::LaunchEntry;
 use crate::decay::{build_decay_schedule, EnergyCurve};
+use crate::logging::LogLevel;
 use crate::producer::derive_pow_job;
 use crate::session::{coord, CoordinatorService, CoordinatorState};
 use crate::supervisor::{supervise_miner, BackoffPolicy};
@@ -45,6 +46,10 @@ pub struct RuntimeParams {
     /// Optional attempt-dashboard: `(listen_addr, data_dir)`. `None` disables
     /// recording + the REST endpoint.
     pub dashboard: Option<(String, std::path::PathBuf)>,
+    /// Log level forwarded to each miner child as `--log-level`. Children inherit
+    /// coordinator stdio, so their own subscriber needs this flag to match
+    /// coordinator verbosity.
+    pub log_level: LogLevel,
 }
 
 /// Inputs to the feeder loop.
@@ -656,6 +661,7 @@ where
             Arc::clone(&state),
             params.backoff,
             params.grace_ms,
+            params.log_level,
             stop_rx.clone(),
         )));
     }
