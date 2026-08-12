@@ -3,7 +3,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use quip_coordinator::chain::extrinsic::{load_hybrid_pair, miner_identity_bytes};
 use quip_coordinator::chain::RealChainClient;
-use quip_coordinator::config::{parse_config, LaunchEntry};
+use quip_coordinator::config::{parse_config, CoordinatorConfig, LaunchEntry};
 use quip_coordinator::drive::{
     aggregate, drain_all, parse_topology_spec, print_table, run_drive, write_jsonl,
     DriveManyParams, ListSource, RandomSource,
@@ -17,6 +17,7 @@ use quip_proto::v1::{Configure, Job};
 use quip_protocol::session::ExitCode;
 use std::path::PathBuf;
 use std::process::ExitCode as StdExitCode;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -159,27 +160,36 @@ fn run_keygen_cli(args: &KeygenArgs) -> StdExitCode {
     }
 }
 
-fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode {
-    // --help is handled by clap (exit 0). Missing/invalid config → exit 64.
+fn load_coordinator_config(
+    config: Option<PathBuf>,
+) -> Result<(PathBuf, CoordinatorConfig), StdExitCode> {
     let Some(config_path) = config else {
         tracing::error!("--config <path> is required");
-        return StdExitCode::from(ExitCode::ConfigInvalid as u8);
+        return Err(StdExitCode::from(ExitCode::ConfigInvalid as u8));
     };
 
     let text = match std::fs::read_to_string(&config_path) {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(path = %config_path.display(), error = %e, "cannot read config");
-            return StdExitCode::from(ExitCode::ConfigInvalid as u8);
+            return Err(StdExitCode::from(ExitCode::ConfigInvalid as u8));
         }
     };
 
-    let cfg = match parse_config(&text) {
-        Ok(c) => c,
+    match parse_config(&text) {
+        Ok(c) => Ok((config_path, c)),
         Err(e) => {
             tracing::error!(path = %config_path.display(), error = %e, "invalid config");
-            return StdExitCode::from(ExitCode::ConfigInvalid as u8);
+            Err(StdExitCode::from(ExitCode::ConfigInvalid as u8))
         }
+    }
+}
+
+fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode {
+    // --help is handled by clap (exit 0). Missing/invalid config → exit 64.
+    let (config_path, cfg) = match load_coordinator_config(config) {
+        Ok(v) => v,
+        Err(code) => return code,
     };
 
     // Identify the process before doing anything that can warn or fail, so the
@@ -203,6 +213,7 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
     let chain = Arc::new(RealChainClient::new(
         cfg.validators.clone(),
         cfg.signer_key.clone(),
+        quip_coordinator::config::participate_kind(&cfg.launch),
     ));
 
     // Compatibility gate. The coordinator drives the chain through mirrored
@@ -235,16 +246,7 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
     // derivation. A live mining coordinator needs its signer key; without a
     // usable one, warn and fall back to a zero account — it still serves and
     // feeds, but its proofs won't verify on-chain.
-    let miner_account = match load_hybrid_pair(&cfg.signer_key) {
-        Ok(pair) => miner_identity_bytes(&pair),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "no usable signer key; PoW proofs will not verify on-chain"
-            );
-            [0u8; 32]
-        }
-    };
+    let miner_account = miner_account_from_key(&cfg.signer_key);
 
     let funding = quip_coordinator::funding::FundingParams {
         faucet_url: cfg.faucet_url.clone(),
@@ -252,28 +254,17 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
         top_up: cfg.faucet_top_up_plancks,
         timeout: std::time::Duration::from_secs(cfg.funding_timeout_s),
     };
-    let faucet = quip_coordinator::readiness::build_faucet(funding.faucet_url.as_deref());
-    // Same readiness walk the feeder re-runs on every later round. Funding
-    // failure is still fatal at startup (exit 64). A missing snapshot is not:
-    // the feeder retries once miners are connected.
-    match rt.block_on(quip_coordinator::readiness::prepare_round(
+    let descriptor = quip_coordinator::config::DescriptorParams::from_config(&cfg);
+    let descriptor_filed = Arc::new(AtomicBool::new(false));
+    if let Some(code) = run_startup_prepare(
+        &rt,
         chain.as_ref(),
-        faucet.as_ref(),
         miner_account,
         &funding,
-        tokio::time::sleep,
-    )) {
-        Ok(_) => {}
-        Err(quip_coordinator::readiness::ReadinessError::Funding(e)) => {
-            tracing::error!(error = %e, "miner account is not funded; refusing to start");
-            return StdExitCode::from(ExitCode::ConfigInvalid as u8);
-        }
-        Err(quip_coordinator::readiness::ReadinessError::Snapshot(e)) => {
-            tracing::warn!(
-                error = %e,
-                "no mining snapshot at startup; feeder will retry"
-            );
-        }
+        &descriptor,
+        descriptor_filed.as_ref(),
+    ) {
+        return code;
     }
 
     let params = RuntimeParams {
@@ -292,6 +283,8 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
             .map(|d| (d.listen.clone(), PathBuf::from(&d.data_dir))),
         log_level,
         funding,
+        descriptor,
+        descriptor_filed,
     };
     tracing::info!(
         miners = cfg.launch.len(),
@@ -311,6 +304,56 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
         Err(e) => {
             tracing::error!(error = %e, "runtime failed");
             StdExitCode::from(ExitCode::InternalFatal as u8)
+        }
+    }
+}
+
+fn miner_account_from_key(signer_key: &str) -> [u8; 32] {
+    match load_hybrid_pair(signer_key) {
+        Ok(pair) => miner_identity_bytes(&pair),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "no usable signer key; PoW proofs will not verify on-chain"
+            );
+            [0u8; 32]
+        }
+    }
+}
+
+/// Same readiness walk the feeder re-runs on every later round.
+///
+/// Funding failure is fatal at startup (exit 64). A missing snapshot is not:
+/// the feeder retries once miners are connected.
+fn run_startup_prepare(
+    rt: &tokio::runtime::Runtime,
+    chain: &RealChainClient,
+    miner_account: [u8; 32],
+    funding: &quip_coordinator::funding::FundingParams,
+    descriptor: &quip_coordinator::config::DescriptorParams,
+    descriptor_filed: &AtomicBool,
+) -> Option<StdExitCode> {
+    let faucet = quip_coordinator::readiness::build_faucet(funding.faucet_url.as_deref());
+    match rt.block_on(quip_coordinator::readiness::prepare_round(
+        chain,
+        faucet.as_ref(),
+        miner_account,
+        funding,
+        tokio::time::sleep,
+        descriptor,
+        descriptor_filed,
+    )) {
+        Ok(_) => None,
+        Err(quip_coordinator::readiness::ReadinessError::Funding(e)) => {
+            tracing::error!(error = %e, "miner account is not funded; refusing to start");
+            Some(StdExitCode::from(ExitCode::ConfigInvalid as u8))
+        }
+        Err(quip_coordinator::readiness::ReadinessError::Snapshot(e)) => {
+            tracing::warn!(
+                error = %e,
+                "no mining snapshot at startup; feeder will retry"
+            );
+            None
         }
     }
 }
@@ -505,6 +548,7 @@ async fn drive_main(args: DriveArgs, log_level: LogLevel) -> StdExitCode {
     let entry = LaunchEntry {
         miner_id: "drive-0".into(),
         binary: args.miner.to_string_lossy().into_owned(),
+        backend: "cpu".into(),
         configure: Configure {
             queue_depth: 3,
             idle_timeout_s: 30,

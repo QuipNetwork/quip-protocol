@@ -1,5 +1,6 @@
 //! Parse `config.toml` into a per-miner launch plan.
 
+use crate::chain::{MinerKind, MinerSpecScale, NodeLogLevel};
 use quip_proto::v1::Configure;
 
 /// Errors raised while parsing a coordinator TOML config.
@@ -68,6 +69,19 @@ pub struct CoordinatorConfig {
     /// Optional mining-attempt dashboard (`[dashboard]` section). `None`
     /// disables recording + the REST endpoint.
     pub dashboard: Option<DashboardConfig>,
+    /// Optional node id for `set_descriptor`. When absent the coordinator
+    /// derives one from the miner account.
+    pub node_id: Option<String>,
+    /// Display name for `set_descriptor`. Required to file a descriptor.
+    pub node_name: Option<String>,
+    /// Optional public host advertised in the descriptor.
+    pub public_host: Option<String>,
+    /// Optional public port advertised in the descriptor.
+    pub public_port: Option<u16>,
+    /// Whether the node advertises auto-mine. Defaults to `true`.
+    pub auto_mine: bool,
+    /// Log level advertised in the descriptor. Defaults to `Info`.
+    pub node_log_level: NodeLogLevel,
 }
 
 /// `[dashboard]` config: where to serve the attempt logs and where they live.
@@ -86,6 +100,118 @@ pub struct LaunchEntry {
     pub binary: String,
     /// Handshake configure payload (queue depths, heartbeat, backend TOML).
     pub configure: Configure,
+    /// Backend section that produced this entry (`cpu`, `cuda`, `metal`, `dwave`).
+    pub backend: String,
+}
+
+impl LaunchEntry {
+    /// Pallet kind for this backend section.
+    #[must_use]
+    pub fn miner_kind(&self) -> MinerKind {
+        miner_kind_from_backend(&self.backend)
+    }
+
+    /// Descriptor miner spec for this launch entry.
+    #[must_use]
+    pub fn miner_spec(&self) -> MinerSpecScale {
+        MinerSpecScale {
+            kind: self.miner_kind(),
+            label: Some(self.miner_id.as_bytes().to_vec()),
+            backend: Some(self.backend.as_bytes().to_vec()),
+            device_id: None,
+        }
+    }
+}
+
+/// Map a backend section name to the pallet `MinerKind`.
+#[must_use]
+pub fn miner_kind_from_backend(backend: &str) -> MinerKind {
+    match backend {
+        "cuda" => MinerKind::Gpu,
+        "metal" => MinerKind::Metal,
+        "dwave" => MinerKind::QpuDwave,
+        _ => MinerKind::Cpu,
+    }
+}
+
+/// Rank used to pick one kind for `participate` from a mixed fleet.
+fn kind_rank(kind: MinerKind) -> u8 {
+    match kind {
+        MinerKind::Cpu => 0,
+        MinerKind::Gpu => 1,
+        MinerKind::Metal => 2,
+        MinerKind::Asic => 3,
+        MinerKind::QpuPasqal => 4,
+        MinerKind::QpuIonq => 5,
+        MinerKind::QpuIbm => 6,
+        MinerKind::QpuDwave => 7,
+    }
+}
+
+/// Kind a mixed fleet declares on `participate`: the highest-capability miner.
+///
+/// The pallet takes one kind. A node that runs CPU and Metal must not look
+/// like a CPU-only node. Order: QPU, then ASIC, then Metal, then GPU, then CPU.
+#[must_use]
+pub fn participate_kind(launch: &[LaunchEntry]) -> MinerKind {
+    launch
+        .iter()
+        .map(LaunchEntry::miner_kind)
+        .max_by_key(|k| kind_rank(*k))
+        .unwrap_or(MinerKind::Cpu)
+}
+
+/// Values the round machine needs to file a node descriptor.
+#[derive(Clone, Debug)]
+pub struct DescriptorParams {
+    /// Optional configured node id. When absent the account hex is used.
+    pub node_id: Option<String>,
+    /// Display name. Required to file.
+    pub node_name: Option<String>,
+    /// Optional public host.
+    pub public_host: Option<String>,
+    /// Optional public port.
+    pub public_port: Option<u16>,
+    /// Advertised auto-mine flag.
+    pub auto_mine: bool,
+    /// Advertised log level.
+    pub log_level: NodeLogLevel,
+    /// RPC endpoints, from `[miner].validators`.
+    pub rpc_endpoints: Vec<String>,
+    /// Miner specs derived from the launch plan.
+    pub miners: Vec<MinerSpecScale>,
+}
+
+impl Default for DescriptorParams {
+    fn default() -> Self {
+        Self {
+            node_id: None,
+            node_name: None,
+            public_host: None,
+            public_port: None,
+            auto_mine: true,
+            log_level: NodeLogLevel::Info,
+            rpc_endpoints: Vec::new(),
+            miners: Vec::new(),
+        }
+    }
+}
+
+impl DescriptorParams {
+    /// Build descriptor inputs from a parsed config.
+    #[must_use]
+    pub fn from_config(cfg: &CoordinatorConfig) -> Self {
+        Self {
+            node_id: cfg.node_id.clone(),
+            node_name: cfg.node_name.clone(),
+            public_host: cfg.public_host.clone(),
+            public_port: cfg.public_port,
+            auto_mine: cfg.auto_mine,
+            log_level: cfg.node_log_level,
+            rpc_endpoints: cfg.validators.clone(),
+            miners: cfg.launch.iter().map(LaunchEntry::miner_spec).collect(),
+        }
+    }
 }
 
 /// Validators used when `[miner].validators` is absent: the container-network
@@ -150,6 +276,95 @@ fn entry(miner_id: &str, backend: &str, table: &toml::Table) -> LaunchEntry {
         miner_id: miner_id.into(),
         binary,
         configure: make_configure(table),
+        backend: backend.into(),
+    }
+}
+
+/// Identity keys from `[miner]` that feed `set_descriptor`.
+struct MinerIdentity {
+    node_id: Option<String>,
+    node_name: Option<String>,
+    public_host: Option<String>,
+    public_port: Option<u16>,
+    auto_mine: bool,
+    node_log_level: NodeLogLevel,
+}
+
+fn optional_str(table: &toml::Table, key: &str) -> Option<String> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+fn parse_node_log_level(raw: Option<&str>) -> NodeLogLevel {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("debug" | "trace") => NodeLogLevel::Debug,
+        Some("warn" | "warning") => NodeLogLevel::Warning,
+        Some("error") => NodeLogLevel::Error,
+        _ => NodeLogLevel::Info,
+    }
+}
+
+fn parse_launch(root: &toml::Table) -> Vec<LaunchEntry> {
+    let mut launch = Vec::new();
+    if let Some(t) = root.get("cpu").and_then(|v| v.as_table()) {
+        launch.push(entry("cpu-0", "cpu", t));
+    }
+    if let Some(cuda) = root.get("cuda").and_then(|v| v.as_table()) {
+        let mut idxs: Vec<&String> = cuda.keys().collect();
+        idxs.sort();
+        for k in idxs {
+            if let Some(t) = cuda.get(k).and_then(|v| v.as_table()) {
+                launch.push(entry(&format!("cuda-{k}"), "cuda", t));
+            }
+        }
+    }
+    if let Some(t) = root.get("metal").and_then(|v| v.as_table()) {
+        launch.push(entry("metal-0", "metal", t));
+    }
+    // Prefer [dwave], fall back to [qpu].
+    if let Some(t) = root
+        .get("dwave")
+        .or_else(|| root.get("qpu"))
+        .and_then(|v| v.as_table())
+    {
+        launch.push(entry("qpu-0", "dwave", t));
+    }
+    launch
+}
+
+fn parse_dashboard(root: &toml::Table) -> Option<DashboardConfig> {
+    root.get("dashboard")
+        .and_then(|v| v.as_table())
+        .and_then(|t| {
+            let listen = t.get("listen").and_then(|v| v.as_str())?;
+            let data_dir = t.get("data_dir").and_then(|v| v.as_str())?;
+            Some(DashboardConfig {
+                listen: listen.to_string(),
+                data_dir: data_dir.to_string(),
+            })
+        })
+}
+
+fn parse_miner_identity(miner: &toml::Table) -> MinerIdentity {
+    let public_port = miner
+        .get("public_port")
+        .and_then(toml::Value::as_integer)
+        .and_then(|i| u16::try_from(i).ok().filter(|&p| p > 0));
+    let auto_mine = miner
+        .get("auto_mine")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true);
+    MinerIdentity {
+        node_id: optional_str(miner, "node_id"),
+        node_name: optional_str(miner, "node_name"),
+        public_host: optional_str(miner, "public_host"),
+        public_port,
+        auto_mine,
+        node_log_level: parse_node_log_level(miner.get("log_level").and_then(toml::Value::as_str)),
     }
 }
 
@@ -221,41 +436,8 @@ pub fn parse_config(toml_text: &str) -> Result<CoordinatorConfig, ConfigError> {
         .and_then(|i| u64::try_from(i).ok())
         .unwrap_or(crate::funding::DEFAULT_FUNDING_TIMEOUT.as_secs());
 
-    let mut launch = Vec::new();
-    if let Some(t) = root.get("cpu").and_then(|v| v.as_table()) {
-        launch.push(entry("cpu-0", "cpu", t));
-    }
-    if let Some(cuda) = root.get("cuda").and_then(|v| v.as_table()) {
-        let mut idxs: Vec<&String> = cuda.keys().collect();
-        idxs.sort();
-        for k in idxs {
-            if let Some(t) = cuda.get(k).and_then(|v| v.as_table()) {
-                launch.push(entry(&format!("cuda-{k}"), "cuda", t));
-            }
-        }
-    }
-    if let Some(t) = root.get("metal").and_then(|v| v.as_table()) {
-        launch.push(entry("metal-0", "metal", t));
-    }
-    // Prefer [dwave], fall back to [qpu].
-    if let Some(t) = root
-        .get("dwave")
-        .or_else(|| root.get("qpu"))
-        .and_then(|v| v.as_table())
-    {
-        launch.push(entry("qpu-0", "dwave", t));
-    }
-    let dashboard = root
-        .get("dashboard")
-        .and_then(|v| v.as_table())
-        .and_then(|t| {
-            let listen = t.get("listen").and_then(|v| v.as_str())?;
-            let data_dir = t.get("data_dir").and_then(|v| v.as_str())?;
-            Some(DashboardConfig {
-                listen: listen.to_string(),
-                data_dir: data_dir.to_string(),
-            })
-        });
+    let launch = parse_launch(&root);
+    let dashboard = parse_dashboard(&root);
 
     if launch.is_empty() {
         // Keys that only ever existed in the v0.2 `quip-miner` config. The v0.3
@@ -267,6 +449,8 @@ pub fn parse_config(toml_text: &str) -> Result<CoordinatorConfig, ConfigError> {
         return Err(ConfigError::NoBackends { looks_like_v0_2 });
     }
 
+    let identity = parse_miner_identity(miner);
+
     Ok(CoordinatorConfig {
         validators,
         signer_key,
@@ -276,6 +460,12 @@ pub fn parse_config(toml_text: &str) -> Result<CoordinatorConfig, ConfigError> {
         funding_timeout_s,
         launch,
         dashboard,
+        node_id: identity.node_id,
+        node_name: identity.node_name,
+        public_host: identity.public_host,
+        public_port: identity.public_port,
+        auto_mine: identity.auto_mine,
+        node_log_level: identity.node_log_level,
     })
 }
 
@@ -466,6 +656,97 @@ rest_port = 8086
                 format!("[miner]\nsigner_key = \"//Alice\"\nfaucet_url = {blank}\n\n[cpu]\n");
             assert_eq!(parse_config(&text).unwrap().faucet_url, None, "{blank}");
         }
+    }
+
+    /// The operator's live config: descriptor keys live under `[miner]`.
+    const LIVE: &str = r#"
+[miner]
+validators = ["ws://127.0.0.1:9944"]
+signer_key = "/Users/carback1/quip-data-3/keystore.json"
+faucet_url = "https://faucet.testnet.quip.network"
+rest_host = "127.0.0.1"
+rest_port = 20100
+node_name = "Tesla"
+public_host = "96.233.112.201"
+log_level = "info"
+
+[cpu]
+binary = "/Users/carback1/quip-data-3/bin/quip-cpu-sa"
+num_cpus = 6
+
+[metal]
+binary = "/Users/carback1/quip-data-3/bin/quip-metal-sa"
+utilization = 80
+yielding = false
+active_util = 50
+idle_after_s = 600
+"#;
+
+    #[test]
+    fn live_config_reads_descriptor_keys_from_miner() {
+        let c = parse_config(LIVE).unwrap();
+        assert_eq!(c.node_name.as_deref(), Some("Tesla"));
+        assert_eq!(c.public_host.as_deref(), Some("96.233.112.201"));
+        assert_eq!(c.node_log_level, NodeLogLevel::Info);
+        assert_eq!(c.node_id, None);
+        assert_eq!(c.public_port, None);
+        assert!(c.auto_mine);
+        let ids: Vec<&str> = c.launch.iter().map(|e| e.miner_id.as_str()).collect();
+        assert_eq!(ids, vec!["cpu-0", "metal-0"]);
+        let backends: Vec<&str> = c.launch.iter().map(|e| e.backend.as_str()).collect();
+        assert_eq!(backends, vec!["cpu", "metal"]);
+    }
+
+    #[test]
+    fn rest_port_is_not_the_descriptor_public_port() {
+        let c = parse_config(LIVE).unwrap();
+        assert_eq!(c.public_port, None);
+    }
+
+    #[test]
+    fn metal_section_is_metal_kind() {
+        let c = parse_config("[miner]\nsigner_key = \"//Alice\"\n\n[metal]\n").unwrap();
+        let metal = c.launch.first().expect("one metal entry");
+        assert_eq!(metal.backend, "metal");
+        assert_eq!(metal.miner_kind(), MinerKind::Metal);
+        assert_eq!(participate_kind(&c.launch), MinerKind::Metal);
+    }
+
+    #[test]
+    fn mixed_cpu_metal_declares_metal_on_participate() {
+        let c = parse_config(LIVE).unwrap();
+        assert_eq!(
+            c.launch
+                .iter()
+                .map(LaunchEntry::miner_kind)
+                .collect::<Vec<_>>(),
+            vec![MinerKind::Cpu, MinerKind::Metal]
+        );
+        assert_eq!(participate_kind(&c.launch), MinerKind::Metal);
+    }
+
+    #[test]
+    fn descriptor_optional_keys_parse_when_present() {
+        let text = "[miner]\nsigner_key = \"//Alice\"\n\
+                    node_id = \"tesla-1\"\nnode_name = \"Tesla\"\n\
+                    public_port = 20050\nauto_mine = false\nlog_level = \"debug\"\n\n[cpu]\n";
+        let c = parse_config(text).unwrap();
+        assert_eq!(c.node_id.as_deref(), Some("tesla-1"));
+        assert_eq!(c.node_name.as_deref(), Some("Tesla"));
+        assert_eq!(c.public_port, Some(20050));
+        assert!(!c.auto_mine);
+        assert_eq!(c.node_log_level, NodeLogLevel::Debug);
+    }
+
+    #[test]
+    fn missing_descriptor_keys_take_defaults() {
+        let c = parse_config(SAMPLE).unwrap();
+        assert_eq!(c.node_id, None);
+        assert_eq!(c.node_name, None);
+        assert_eq!(c.public_host, None);
+        assert_eq!(c.public_port, None);
+        assert!(c.auto_mine);
+        assert_eq!(c.node_log_level, NodeLogLevel::Info);
     }
 
     /// The shipped v0.3 template must survive its own parser.

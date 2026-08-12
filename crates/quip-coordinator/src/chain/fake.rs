@@ -2,8 +2,8 @@
 
 use super::sync::{SyncSource, SyncStatus};
 use super::{
-    ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot, ParticipationOutcome, Proof,
-    SubmitAction,
+    ChainClient, ChainError, DecayParams, DescriptorOutcome, JobOrder, MiningSnapshot,
+    NodeDescriptorV2Input, ParticipationOutcome, Proof, SubmitAction,
 };
 use crate::funding::BalanceSource;
 use async_trait::async_trait;
@@ -32,6 +32,10 @@ pub struct FakeChain {
     participations: Mutex<Vec<u64>>,
     /// Scripted participate result (default `Declared`).
     participation_result: Mutex<Result<ParticipationOutcome, ChainError>>,
+    /// Captured payloads from [`ChainClient::file_descriptor`].
+    descriptors: Mutex<Vec<NodeDescriptorV2Input>>,
+    /// Scripted descriptor result (default `Filed`).
+    descriptor_result: Mutex<Result<DescriptorOutcome, ChainError>>,
 }
 
 impl FakeChain {
@@ -57,6 +61,8 @@ impl FakeChain {
             sync_calls: Mutex::new(0),
             participations: Mutex::new(Vec::new()),
             participation_result: Mutex::new(Ok(ParticipationOutcome::Declared)),
+            descriptors: Mutex::new(Vec::new()),
+            descriptor_result: Mutex::new(Ok(DescriptorOutcome::Filed)),
         }
     }
 
@@ -247,6 +253,50 @@ impl FakeChain {
             std::mem::take(&mut *self.participations.lock().unwrap())
         }
     }
+
+    /// Script the next `file_descriptor` return value.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_descriptor_result(&self, result: Result<DescriptorOutcome, ChainError>) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.descriptor_result.lock().unwrap() = result;
+        }
+    }
+
+    /// How many times `file_descriptor` has been called.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn descriptor_calls(&self) -> usize {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            self.descriptors.lock().unwrap().len()
+        }
+    }
+
+    /// Drain and return captured descriptor payloads.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn take_descriptors(&self) -> Vec<NodeDescriptorV2Input> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            std::mem::take(&mut *self.descriptors.lock().unwrap())
+        }
+    }
 }
 
 #[async_trait]
@@ -290,6 +340,25 @@ impl ChainClient for FakeChain {
             // reconstruct Success/Retry/etc from a stored pattern.
             match &*self.submit_result.lock().unwrap() {
                 Ok(a) => Ok(*a),
+                Err(ChainError::Unavailable(s)) => Err(ChainError::Unavailable(s.clone())),
+                Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
+                Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),
+            }
+        }
+    }
+
+    async fn file_descriptor(
+        &self,
+        descriptor: &NodeDescriptorV2Input,
+    ) -> Result<DescriptorOutcome, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            self.descriptors.lock().unwrap().push(descriptor.clone());
+            match &*self.descriptor_result.lock().unwrap() {
+                Ok(o) => Ok(*o),
                 Err(ChainError::Unavailable(s)) => Err(ChainError::Unavailable(s.clone())),
                 Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
                 Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),

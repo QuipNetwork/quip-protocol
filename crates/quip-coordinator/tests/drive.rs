@@ -57,6 +57,7 @@ async fn drives_two_entry_list_end_to_end() {
     let entry = LaunchEntry {
         miner_id: "cpu-0".into(),
         binary: miner.clone(),
+        backend: "cpu".into(),
         configure: Configure {
             queue_depth: 3,
             idle_timeout_s: 30,

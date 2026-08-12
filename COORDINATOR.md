@@ -51,8 +51,9 @@ What each level carries:
 
 The feeder logs state changes on transition, not per poll. It polls once a
 second, so a validator that goes away logs one warning and then stays quiet
-until reachability changes. The round machine also logs each state at `info`
-on entry, once per transition, with the generation.
+until reachability changes. The round machine logs each state at `trace` on
+entry, once per transition, with the generation. A state held more than 10
+seconds warns once.
 
 ## Startup checks
 
@@ -148,6 +149,9 @@ All chain access sits behind one trait, `ChainClient` (`chain/mod.rs`):
 - `declare_participation` — hybrid-sign and submit
   `MinerRegistry.participate` for one qblock, then classify the pallet
   error.
+- `file_descriptor` — hybrid-sign and submit
+  `MinerRegistry.set_descriptor` with a V2 payload, then classify the
+  pallet error.
 
 `RealChainClient` (`chain/real.rs`) is the live client over Substrate
 JSON-RPC and subxt; `FakeChain` (`chain/fake.rs`) backs the tests. Supporting
@@ -181,11 +185,53 @@ The states, in order:
    this state, and retries. It does not exit.
 4. **Requirements for the next qblock downloaded.** Topology, energy target,
    required solution count, and diversity come from a fresh snapshot after
-   sync and funding. After the snapshot returns, the coordinator declares
-   participation for the candidate qblock. That call never holds this state.
-5. **Start mining.** The feeder always sends `Topology` and `SetTarget` for
+   sync and funding.
+5. **Descriptor filed.** On the first walk after the process starts, the
+   coordinator submits `MinerRegistry.set_descriptor` with a V2 payload.
+   Later rounds skip the submit and log at `trace`. A missing required
+   value, a pallet rejection, or three transient failures warn and advance.
+   This state never holds mining.
+6. **Participation declared.** The coordinator submits
+   `MinerRegistry.participate` for the candidate qblock. The call already
+   deduplicates per qblock. Three transient failures warn and advance. This
+   state never holds mining.
+7. **Start mining.** The feeder always sends `Topology` and `SetTarget` for
    the new round, then stages jobs. A job of the new generation cannot leave
    before those two messages.
+
+### Node descriptor
+
+`set_descriptor` is pallet 13, call 0. The coordinator files schema V2.
+
+Values come from `[miner]`:
+
+| Field | Config key | Default |
+| --- | --- | --- |
+| `node_id` | `[miner].node_id` | 64-char hex of the miner account |
+| `node_name` | `[miner].node_name` | none. Required to file. |
+| `public_host` | `[miner].public_host` | none |
+| `public_port` | `[miner].public_port` | none |
+| `rpc_endpoints` | `[miner].validators` | the validator list the coordinator already reads |
+| `auto_mine` | `[miner].auto_mine` | `true` |
+| `log_level` | `[miner].log_level` | `info` |
+| `miners` | backend sections | one spec per launched miner |
+| `system_info` | — | none |
+| `runtime` | — | none |
+
+`[miner].log_level` is the advertised node log level. It does not change
+coordinator verbosity. Use `--log-level` or `RUST_LOG` for that.
+
+`rest_host` and `rest_port` are v0.2 keys. The coordinator does not map
+`rest_port` to `public_port`.
+
+If `[miner].node_name` is missing, the coordinator warns once and names that
+key. It does not file a descriptor. Mining still starts.
+
+The pallet reserves `DescriptorDepositBase` plus
+`DescriptorDepositPerByte` times the payload length. The runtime sets those
+to 1 milliUNIT and 1 microUNIT. A typical coordinator descriptor costs about
+0.001 UNIT. The funding floor is 2 UNIT (`min_balance_plancks`). The deposit
+fits under that floor.
 
 ### Participation
 
@@ -197,9 +243,10 @@ The pallet accepts only the current candidate qblock. That id is one past
 `QuantumPowApi_latest_qblock_id`. The `new round` log line prints the last
 minted id. The declaration uses the candidate.
 
-The walk declares after the snapshot succeeds and before mining starts.
-The machine keeps five states. Participation is a declaration for the
-operator. Mining proceeds whether the declaration succeeds or fails.
+`participate` takes one `MinerKind`. The coordinator derives that kind from
+the miners it starts. A mixed fleet declares the highest-capability kind:
+QPU, then ASIC, then Metal, then GPU, then CPU. The descriptor `miners`
+list still carries every launched backend.
 
 Pallet outcomes:
 
@@ -208,14 +255,10 @@ Pallet outcomes:
 | success or `DuplicateParticipation` | treat as declared. Do not retry. |
 | `InvalidQBlockId` | log at `debug`. Declare the new candidate next round. |
 | `DescriptorRequired` | log at `warn` once, name the account, keep mining |
-| transient chain error | log at `warn`. Retry next round. |
+| transient chain error | retry up to three times in this state, then warn and advance |
 
-The coordinator does not call `set_descriptor`. A descriptor needs the
-node identity, public host, and miner list. The coordinator does not own
-those fields. Mining still works without a descriptor. The operator must
-set one on chain before the registry can record participation.
-
-A participation failure never calls `process::exit` and never holds mining.
+A descriptor or participation failure never calls `process::exit` and never
+holds mining.
 
 Transitions:
 
@@ -227,14 +270,17 @@ Transitions:
 | Stop mining | Succeeded | Validator is synced |
 | Validator is synced | Succeeded | Account is funded |
 | Account is funded | Succeeded | Requirements downloaded |
-| Requirements downloaded | Succeeded | Start mining |
+| Requirements downloaded | Succeeded | Descriptor filed |
+| Descriptor filed | Succeeded | Participation declared |
+| Participation declared | Succeeded | Start mining |
 | Start mining | Succeeded | Start mining |
 
 The feeder does the I/O. The transition function is pure. The feeder logs the
-state at `info` on each entry, once per transition, with the generation. An
-operator can read the current state and the reason that mining has not started.
+state at `trace` on each entry, once per transition, with the generation. A
+state held more than 10 seconds warns once. An operator can read the current
+state and the reason that mining has not started.
 
-Startup drives states 2 through 4. A funding failure at startup is still exit
+Startup drives states 2 through 6. A funding failure at startup is still exit
 64. A missing snapshot at startup is a warning. The feeder retries that
 download after miners connect.
 
@@ -313,9 +359,12 @@ the grace period (`grace_ms`).
 ## Config to launch plan
 
 `parse_config` (`config.rs`) turns `config.toml` into a `CoordinatorConfig`:
-the `[miner]` section gives `validators` and `signer_key`; each backend section
-becomes one `LaunchEntry`. Section names map to miner ids `[cpu]`→`cpu-0`,
-`[cuda.N]`→`cuda-N`, `[metal]`→`metal-0`, `[dwave]`/`[qpu]`→`qpu-0`.
+the `[miner]` section gives `validators`, `signer_key`, and the node
+descriptor keys (`node_name`, `public_host`, `log_level`, and the optional
+`node_id`, `public_port`, `auto_mine`). Each backend section becomes one
+`LaunchEntry`. Section names map to miner ids `[cpu]`→`cpu-0`,
+`[cuda.N]`→`cuda-N`, `[metal]`→`metal-0`, `[dwave]`/`[qpu]`→`qpu-0`. The
+backend name stays on the entry so the coordinator can derive `MinerKind`.
 
 `binary` selects the executable, defaulting to `quip-<backend>-sa` (and
 `quip-dwave-qa` for D-Wave). The coordinator-owned keys (`binary`,

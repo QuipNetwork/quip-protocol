@@ -16,6 +16,10 @@ pub(crate) enum RoundState {
     AccountFunded,
     /// Download topology, target, minimum solutions, and diversity.
     RequirementsDownloaded,
+    /// File a node descriptor. Submits only on the first walk after process start.
+    DescriptorFiled,
+    /// File a participation marker for the candidate qblock.
+    ParticipationDeclared,
     /// Broadcast the requirements and stage jobs.
     StartMining,
 }
@@ -51,7 +55,9 @@ impl RoundState {
                 Self::StopMining => Some(Self::ValidatorSynced),
                 Self::ValidatorSynced => Some(Self::AccountFunded),
                 Self::AccountFunded => Some(Self::RequirementsDownloaded),
-                Self::RequirementsDownloaded => Some(Self::StartMining),
+                Self::RequirementsDownloaded => Some(Self::DescriptorFiled),
+                Self::DescriptorFiled => Some(Self::ParticipationDeclared),
+                Self::ParticipationDeclared => Some(Self::StartMining),
                 Self::StartMining => Some(self),
             },
         }
@@ -65,6 +71,8 @@ impl RoundState {
             Self::ValidatorSynced => "validator_synced",
             Self::AccountFunded => "account_funded",
             Self::RequirementsDownloaded => "requirements_downloaded",
+            Self::DescriptorFiled => "descriptor_filed",
+            Self::ParticipationDeclared => "participation_declared",
             Self::StartMining => "start_mining",
         }
     }
@@ -77,6 +85,8 @@ impl RoundState {
             Self::ValidatorSynced => "waiting until the validator is synced",
             Self::AccountFunded => "confirming the miner account can pay submit fees",
             Self::RequirementsDownloaded => "downloading the next qblock requirements",
+            Self::DescriptorFiled => "filing the node descriptor",
+            Self::ParticipationDeclared => "declaring participation for the candidate qblock",
             Self::StartMining => "starting mining",
         }
     }
@@ -118,39 +128,30 @@ mod tests {
         }
     }
 
+    const ALL: [RoundState; 7] = [
+        RoundState::StopMining,
+        RoundState::ValidatorSynced,
+        RoundState::AccountFunded,
+        RoundState::RequirementsDownloaded,
+        RoundState::DescriptorFiled,
+        RoundState::ParticipationDeclared,
+        RoundState::StartMining,
+    ];
+
     #[test]
     fn full_round_visits_each_state_in_order() {
         let mut state = RoundState::start();
         let mut seen = vec![state];
-        state = step(state, RoundEvent::Succeeded);
-        seen.push(state);
-        state = step(state, RoundEvent::Succeeded);
-        seen.push(state);
-        state = step(state, RoundEvent::Succeeded);
-        seen.push(state);
-        state = step(state, RoundEvent::Succeeded);
-        seen.push(state);
-        assert_eq!(
-            seen,
-            [
-                RoundState::StopMining,
-                RoundState::ValidatorSynced,
-                RoundState::AccountFunded,
-                RoundState::RequirementsDownloaded,
-                RoundState::StartMining,
-            ]
-        );
+        for _ in 0..6 {
+            state = step(state, RoundEvent::Succeeded);
+            seen.push(state);
+        }
+        assert_eq!(seen, ALL);
     }
 
     #[test]
     fn failed_step_retries_the_same_state() {
-        for state in [
-            RoundState::StopMining,
-            RoundState::ValidatorSynced,
-            RoundState::AccountFunded,
-            RoundState::RequirementsDownloaded,
-            RoundState::StartMining,
-        ] {
+        for state in ALL {
             assert_eq!(
                 state.transition(RoundEvent::Failed),
                 Some(state),
@@ -175,14 +176,22 @@ mod tests {
     }
 
     #[test]
-    fn new_head_in_any_state_returns_to_stop_mining() {
+    fn new_head_from_descriptor_or_participation_returns_to_stop_mining() {
         for state in [
-            RoundState::StopMining,
-            RoundState::ValidatorSynced,
-            RoundState::AccountFunded,
-            RoundState::RequirementsDownloaded,
-            RoundState::StartMining,
+            RoundState::DescriptorFiled,
+            RoundState::ParticipationDeclared,
         ] {
+            assert_eq!(
+                state.transition(RoundEvent::NewHead),
+                Some(RoundState::StopMining),
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_head_in_any_state_returns_to_stop_mining() {
+        for state in ALL {
             assert_eq!(
                 state.transition(RoundEvent::NewHead),
                 Some(RoundState::StopMining),
@@ -194,10 +203,9 @@ mod tests {
     #[test]
     fn a_win_during_mining_restarts_the_round() {
         let mut state = RoundState::start();
-        state = step(state, RoundEvent::Succeeded);
-        state = step(state, RoundEvent::Succeeded);
-        state = step(state, RoundEvent::Succeeded);
-        state = step(state, RoundEvent::Succeeded);
+        for _ in 0..6 {
+            state = step(state, RoundEvent::Succeeded);
+        }
         assert_eq!(state, RoundState::StartMining);
         state = step(state, RoundEvent::NewHead);
         assert_eq!(state, RoundState::StopMining);
@@ -213,13 +221,7 @@ mod tests {
 
     #[test]
     fn shutdown_stops_the_machine_from_every_state() {
-        for state in [
-            RoundState::StopMining,
-            RoundState::ValidatorSynced,
-            RoundState::AccountFunded,
-            RoundState::RequirementsDownloaded,
-            RoundState::StartMining,
-        ] {
+        for state in ALL {
             assert_eq!(state.transition(RoundEvent::Shutdown), None, "{state:?}");
         }
     }

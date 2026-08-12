@@ -2,20 +2,32 @@
 //!
 //! Process start has no miners to stop and does not stage work. This module
 //! drives [`crate::round::RoundState`] through validator-synced, account-funded,
-//! and requirements-downloaded. The feeder drives the same machine, including
-//! stop-mining and start-mining, on every later round.
+//! requirements-downloaded, descriptor-filed, and participation-declared. The
+//! feeder drives the same machine, including stop-mining and start-mining, on
+//! every later round.
 //!
 //! A funding failure at startup is fatal. A missing snapshot is not: the
 //! caller warns and the feeder retries after miners connect.
 
 use crate::chain::extrinsic::hex_encode;
+use crate::chain::scale_types::{
+    MAX_NODE_ID_BYTES, MAX_NODE_NAME_BYTES, MAX_PUBLIC_HOST_BYTES, MAX_RPC_ENDPOINTS,
+    MAX_RPC_ENDPOINT_BYTES,
+};
 use crate::chain::sync::{wait_until_synced, SyncOutcome, SyncSource};
-use crate::chain::{ChainClient, MiningSnapshot, ParticipationOutcome};
+use crate::chain::{
+    ChainClient, DescriptorOutcome, MiningSnapshot, NodeDescriptorV2Input, ParticipationOutcome,
+};
+use crate::config::DescriptorParams;
 use crate::funding::{
     ensure_funded, BalanceSource, Faucet, FundingError, FundingParams, HttpFaucet,
 };
 use crate::round::{RoundEvent, RoundState};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// Bounded retries for a transient descriptor or participation submit.
+pub(crate) const SUBMIT_ATTEMPTS: u32 = 3;
 
 /// Why the coordinator is not ready to mine.
 #[derive(Debug)]
@@ -51,11 +63,11 @@ pub fn build_faucet(url: Option<&str>) -> Option<HttpFaucet> {
     }
 }
 
-/// Drive the round machine through validator-synced, account-funded, and
-/// requirements-downloaded. Used at process start. After the snapshot lands
-/// the walk declares participation for the candidate qblock. That declaration
-/// never fails the walk. The feeder walks the same states, plus stop-mining
-/// and start-mining, on every later round.
+/// Drive the round machine through validator-synced, account-funded,
+/// requirements-downloaded, descriptor-filed, and participation-declared.
+/// Used at process start. Descriptor and participation never fail the walk.
+/// The feeder walks the same states, plus stop-mining and start-mining, on
+/// every later round.
 ///
 /// `sleep` is injected so tests do not wait on the real clock. A validator
 /// that never answers sync is not a failure here: that matches startup, which
@@ -71,6 +83,8 @@ pub async fn prepare_round<C, F, S, Fut>(
     account: [u8; 32],
     funding: &FundingParams,
     sleep: S,
+    descriptor: &DescriptorParams,
+    descriptor_filed: &AtomicBool,
 ) -> Result<MiningSnapshot, ReadinessError>
 where
     C: ChainClient + SyncSource + BalanceSource,
@@ -115,10 +129,177 @@ where
         .await
         .map_err(|e| ReadinessError::Snapshot(e.to_string()))?
         .ok_or_else(|| ReadinessError::Snapshot("chain has no mining snapshot".into()))?;
+    state = match state.transition(RoundEvent::Succeeded) {
+        Some(next) => {
+            next.log_entry(0);
+            next
+        }
+        None => state,
+    };
+
+    file_round_descriptor(chain, descriptor_filed, descriptor, account).await;
+    state = match state.transition(RoundEvent::Succeeded) {
+        Some(next) => {
+            next.log_entry(0);
+            next
+        }
+        None => state,
+    };
+
     let mut last_declared = None;
-    declare_round_participation(chain, &mut last_declared, account).await;
+    for _ in 0..SUBMIT_ATTEMPTS {
+        declare_round_participation(chain, &mut last_declared, account).await;
+        if last_declared.is_some() {
+            break;
+        }
+    }
     let _ = state.transition(RoundEvent::Succeeded);
     Ok(snap)
+}
+
+/// 64-char lowercase hex of the miner account. Fits `MaxNodeIdBytes`.
+#[must_use]
+pub(crate) fn node_id_from_account(account: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in account {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Build a V2 descriptor, or `None` when a required value is missing.
+///
+/// Warns once and names the missing `[miner]` key. Does not fail the walk.
+pub(crate) fn build_descriptor_payload(
+    params: &DescriptorParams,
+    account: [u8; 32],
+) -> Option<NodeDescriptorV2Input> {
+    let Some(name) = params
+        .node_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        tracing::warn!(
+            key = "node_name",
+            section = "miner",
+            "missing [miner].node_name; not filing a node descriptor"
+        );
+        return None;
+    };
+    if name.len() > MAX_NODE_NAME_BYTES {
+        tracing::warn!(
+            key = "node_name",
+            section = "miner",
+            max = MAX_NODE_NAME_BYTES,
+            "[miner].node_name is longer than the pallet bound; not filing a node descriptor"
+        );
+        return None;
+    }
+    let node_id = params
+        .node_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| node_id_from_account(&account), str::to_string);
+    if node_id.is_empty() || node_id.len() > MAX_NODE_ID_BYTES {
+        tracing::warn!(
+            key = "node_id",
+            section = "miner",
+            "[miner].node_id is empty or longer than the pallet bound; not filing a node descriptor"
+        );
+        return None;
+    }
+    if params.miners.is_empty() {
+        tracing::warn!("launch plan has no miners; not filing a node descriptor");
+        return None;
+    }
+
+    let public_host = match params
+        .public_host
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(host) if host.len() > MAX_PUBLIC_HOST_BYTES => {
+            tracing::warn!(
+                key = "public_host",
+                section = "miner",
+                "[miner].public_host is longer than the pallet bound; not filing a node descriptor"
+            );
+            return None;
+        }
+        Some(host) => Some(host.as_bytes().to_vec()),
+        None => None,
+    };
+
+    let mut rpc_endpoints = Vec::new();
+    for endpoint in params.rpc_endpoints.iter().take(MAX_RPC_ENDPOINTS) {
+        let trimmed = endpoint.trim();
+        if trimmed.is_empty() || trimmed.len() > MAX_RPC_ENDPOINT_BYTES {
+            continue;
+        }
+        rpc_endpoints.push(trimmed.as_bytes().to_vec());
+    }
+
+    Some(NodeDescriptorV2Input {
+        node_id: node_id.into_bytes(),
+        node_name: name.as_bytes().to_vec(),
+        public_host,
+        public_port: params.public_port.filter(|&p| p > 0),
+        rpc_endpoints,
+        auto_mine: params.auto_mine,
+        log_level: params.log_level,
+        miners: params.miners.clone(),
+        system_info: None,
+        runtime: None,
+    })
+}
+
+/// File a node descriptor on the first walk after process start.
+///
+/// Later calls are a no-op. A missing required value, a pallet rejection, or
+/// three transient failures still mark the step done so mining continues.
+pub(crate) async fn file_round_descriptor<C: ChainClient>(
+    chain: &C,
+    descriptor_filed: &AtomicBool,
+    params: &DescriptorParams,
+    account: [u8; 32],
+) {
+    if descriptor_filed.load(Ordering::Relaxed) {
+        tracing::trace!("node descriptor already filed this process");
+        return;
+    }
+    let Some(payload) = build_descriptor_payload(params, account) else {
+        descriptor_filed.store(true, Ordering::Relaxed);
+        return;
+    };
+    for attempt in 1..=SUBMIT_ATTEMPTS {
+        match chain.file_descriptor(&payload).await {
+            Ok(DescriptorOutcome::Filed) => {
+                tracing::info!("filed node descriptor");
+                descriptor_filed.store(true, Ordering::Relaxed);
+                return;
+            }
+            Ok(DescriptorOutcome::Rejected) => {
+                tracing::warn!("pallet rejected the node descriptor; mining continues without one");
+                descriptor_filed.store(true, Ordering::Relaxed);
+                return;
+            }
+            Err(e) => {
+                if attempt == SUBMIT_ATTEMPTS {
+                    tracing::warn!(
+                        error = %e,
+                        attempts = SUBMIT_ATTEMPTS,
+                        "descriptor submit failed; mining continues without one"
+                    );
+                    descriptor_filed.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Candidate qblock id the pallet accepts: one past the last minted qblock.
@@ -181,10 +362,18 @@ pub(crate) async fn declare_round_participation<C: ChainClient>(
 
 #[cfg(test)]
 mod tests {
-    use super::{candidate_qblock_id, declare_round_participation, prepare_round, HttpFaucet};
-    use crate::chain::{ChainError, FakeChain, MiningSnapshot, ParticipationOutcome};
+    use super::{
+        candidate_qblock_id, declare_round_participation, file_round_descriptor, prepare_round,
+        HttpFaucet,
+    };
+    use crate::chain::{
+        ChainError, DescriptorOutcome, FakeChain, MinerKind, MinerSpecScale, MiningSnapshot,
+        ParticipationOutcome,
+    };
+    use crate::config::DescriptorParams;
     use crate::funding::FundingParams;
     use std::io::{self, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tracing_subscriber::fmt::MakeWriter;
@@ -218,6 +407,15 @@ mod tests {
         assert_eq!(candidate_qblock_id(Some(4581)), 4582);
     }
 
+    #[test]
+    fn default_node_id_is_account_hex_without_prefix() {
+        let id = super::node_id_from_account(&account());
+        assert_eq!(id.len(), 64);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!id.starts_with("0x"));
+        assert_eq!(id, "ab".repeat(32));
+    }
+
     #[tokio::test]
     async fn same_qblock_declares_once() {
         let chain = FakeChain::new(snap(), None);
@@ -242,6 +440,29 @@ mod tests {
         assert_eq!(chain.take_participations(), vec![11, 12]);
     }
 
+    fn named_descriptor() -> DescriptorParams {
+        DescriptorParams {
+            node_name: Some("Tesla".into()),
+            public_host: Some("96.233.112.201".into()),
+            rpc_endpoints: vec!["ws://127.0.0.1:9944".into()],
+            miners: vec![
+                MinerSpecScale {
+                    kind: MinerKind::Cpu,
+                    label: Some(b"cpu-0".to_vec()),
+                    backend: Some(b"cpu".to_vec()),
+                    device_id: None,
+                },
+                MinerSpecScale {
+                    kind: MinerKind::Metal,
+                    label: Some(b"metal-0".to_vec()),
+                    backend: Some(b"metal".to_vec()),
+                    device_id: None,
+                },
+            ],
+            ..DescriptorParams::default()
+        }
+    }
+
     #[tokio::test]
     async fn prepare_round_declares_the_candidate() {
         let chain = FakeChain::new(snap(), None);
@@ -252,11 +473,97 @@ mod tests {
             account(),
             &FundingParams::default(),
             no_sleep,
+            &DescriptorParams::default(),
+            &AtomicBool::new(false),
         )
         .await
         .expect("prepare_round");
         assert_eq!(chain.participation_calls(), 1);
         assert_eq!(chain.take_participations(), vec![21]);
+        assert_eq!(chain.descriptor_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn prepare_round_files_a_v2_descriptor_once() {
+        let chain = FakeChain::new(snap(), None);
+        chain.set_qblock_id(Some(20));
+        let filed = AtomicBool::new(false);
+        let params = named_descriptor();
+        let _snap = prepare_round(
+            &chain,
+            None::<&HttpFaucet>,
+            account(),
+            &FundingParams::default(),
+            no_sleep,
+            &params,
+            &filed,
+        )
+        .await
+        .expect("prepare_round");
+        assert!(filed.load(Ordering::Relaxed));
+        assert_eq!(chain.descriptor_calls(), 1);
+        let filed_payload = chain.take_descriptors();
+        let desc = filed_payload.first().expect("one descriptor");
+        assert_eq!(
+            desc.node_id,
+            super::node_id_from_account(&account()).into_bytes()
+        );
+        assert_eq!(desc.node_name, b"Tesla");
+        assert_eq!(
+            desc.public_host.as_deref(),
+            Some(b"96.233.112.201".as_slice())
+        );
+        assert_eq!(desc.public_port, None);
+        assert!(desc.auto_mine);
+        assert_eq!(desc.miners.len(), 2);
+        assert_eq!(desc.miners.get(1).map(|m| m.kind), Some(MinerKind::Metal));
+        assert!(desc.system_info.is_none());
+        assert!(desc.runtime.is_none());
+        file_round_descriptor(&chain, &filed, &params, account()).await;
+        assert_eq!(chain.descriptor_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_node_name_files_nothing_and_names_the_key() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(Capture(Arc::clone(&buf)))
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let chain = FakeChain::new(snap(), None);
+        let filed = AtomicBool::new(false);
+        file_round_descriptor(&chain, &filed, &DescriptorParams::default(), account()).await;
+        assert_eq!(chain.descriptor_calls(), 0);
+        assert!(filed.load(Ordering::Relaxed));
+        let text = drain(&buf);
+        assert!(
+            text.contains("[miner].node_name"),
+            "must name the missing key, got {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn descriptor_transient_error_retries_then_marks_done() {
+        let chain = FakeChain::new(snap(), None);
+        chain.set_descriptor_result(Err(ChainError::Unavailable("rpc down".into())));
+        let filed = AtomicBool::new(false);
+        file_round_descriptor(&chain, &filed, &named_descriptor(), account()).await;
+        assert_eq!(chain.descriptor_calls(), 3);
+        assert!(filed.load(Ordering::Relaxed));
+        file_round_descriptor(&chain, &filed, &named_descriptor(), account()).await;
+        assert_eq!(chain.descriptor_calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn descriptor_pallet_rejection_does_not_retry() {
+        let chain = FakeChain::new(snap(), None);
+        chain.set_descriptor_result(Ok(DescriptorOutcome::Rejected));
+        let filed = AtomicBool::new(false);
+        file_round_descriptor(&chain, &filed, &named_descriptor(), account()).await;
+        assert_eq!(chain.descriptor_calls(), 1);
+        assert!(filed.load(Ordering::Relaxed));
     }
 
     #[derive(Clone)]

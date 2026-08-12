@@ -425,7 +425,11 @@ async fn devnet_submit_proof_end_to_end() {
     let alice_acct = account_id_from_public(&alice.public());
     let alice_bytes: [u8; 32] = *AsRef::<[u8; 32]>::as_ref(&alice_acct);
 
-    let client = RealChainClient::new(vec![url.clone()], "//Alice".to_string());
+    let client = RealChainClient::new(
+        vec![url.clone()],
+        "//Alice".to_string(),
+        quip_coordinator::chain::MinerKind::Cpu,
+    );
 
     // ---------------- Milestone 1: read path ----------------
     let snap = client
@@ -687,7 +691,11 @@ async fn devnet_mempool_job_proposed_end_to_end() {
     let alice = HybridPair::from_string("//Alice", None).expect("//Alice");
     let alice_acct = account_id_from_public(&alice.public());
     let alice_bytes: [u8; 32] = *AsRef::<[u8; 32]>::as_ref(&alice_acct);
-    let client = RealChainClient::new(vec![url.clone()], "//Alice".to_string());
+    let client = RealChainClient::new(
+        vec![url.clone()],
+        "//Alice".to_string(),
+        quip_coordinator::chain::MinerKind::Cpu,
+    );
 
     // The canonical default plain-Ising spec is seeded at genesis; propose
     // against it so no root-gated spec registration is needed.

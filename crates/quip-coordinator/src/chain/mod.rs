@@ -15,9 +15,11 @@ pub mod sync;
 pub use fake::FakeChain;
 pub use mempool::JobOrder;
 pub use real::RealChainClient;
+pub use scale_types::{MinerKind, MinerSpecScale, NodeDescriptorV2Input, NodeLogLevel};
 pub use snapshot::{head_state_key, DecayParams, MiningSnapshot};
 pub use submit::{
-    classify_participation, classify_receipt, ParticipationOutcome, Proof, SubmitAction,
+    classify_descriptor, classify_participation, classify_receipt, DescriptorOutcome,
+    ParticipationOutcome, Proof, SubmitAction,
 };
 
 use async_trait::async_trait;
@@ -64,6 +66,12 @@ pub trait ChainClient: Send + Sync {
 
     /// Hybrid-sign and submit a proof extrinsic; classify the receipt.
     async fn submit_proof(&self, proof: &Proof) -> Result<SubmitAction, ChainError>;
+
+    /// Hybrid-sign and submit `MinerRegistry.set_descriptor`.
+    async fn file_descriptor(
+        &self,
+        descriptor: &NodeDescriptorV2Input,
+    ) -> Result<DescriptorOutcome, ChainError>;
 
     /// Hybrid-sign and submit `MinerRegistry.participate` for `qblock_id`.
     async fn declare_participation(

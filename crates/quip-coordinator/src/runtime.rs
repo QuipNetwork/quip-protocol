@@ -8,12 +8,15 @@
 
 use crate::chain::sync::{wait_until_synced, SyncOutcome, SyncSource};
 use crate::chain::{ChainClient, MiningSnapshot};
-use crate::config::LaunchEntry;
+use crate::config::{DescriptorParams, LaunchEntry};
 use crate::decay::{build_decay_schedule, EnergyCurve};
 use crate::funding::{ensure_funded, BalanceSource, Faucet};
 use crate::logging::LogLevel;
 use crate::producer::derive_pow_job;
-use crate::readiness::{build_faucet, declare_round_participation, ReadinessError};
+use crate::readiness::{
+    build_faucet, declare_round_participation, file_round_descriptor, ReadinessError,
+    SUBMIT_ATTEMPTS,
+};
 use crate::round::{RoundEvent, RoundState};
 use crate::session::{coord, CoordinatorService, CoordinatorState};
 use crate::supervisor::{supervise_miner, BackoffPolicy};
@@ -23,6 +26,7 @@ use quip_proto::v1::{coord_msg, SetTarget};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UnixListener;
@@ -56,6 +60,10 @@ pub struct RuntimeParams {
     pub log_level: LogLevel,
     /// Account-funding knobs reused on every round, not only at process start.
     pub funding: crate::funding::FundingParams,
+    /// Node identity and miner list for `set_descriptor`.
+    pub descriptor: DescriptorParams,
+    /// Set after the first `DescriptorFiled` walk in this process.
+    pub descriptor_filed: Arc<AtomicBool>,
 }
 
 /// Inputs to the feeder loop.
@@ -70,6 +78,10 @@ pub struct FeederParams {
     pub poll_interval: Duration,
     /// Account-funding knobs reused on every round, not only at process start.
     pub funding: crate::funding::FundingParams,
+    /// Node identity and miner list for `set_descriptor`.
+    pub descriptor: DescriptorParams,
+    /// Set after the first `DescriptorFiled` walk in this process.
+    pub descriptor_filed: Arc<AtomicBool>,
 }
 
 /// EMA smoothing for the per-miner consumption signal. Lower reacts slower but
@@ -387,8 +399,6 @@ where
                 match result {
                     Ok(Some(s)) => {
                         snap = Some(s);
-                        declare_round_participation(chain, last_declared, params.miner_account)
-                            .await;
                         RoundEvent::Succeeded
                     }
                     Ok(None) => {
@@ -410,6 +420,25 @@ where
                         RoundEvent::Failed
                     }
                 }
+            }
+            RoundState::DescriptorFiled => {
+                file_round_descriptor(
+                    chain,
+                    params.descriptor_filed.as_ref(),
+                    &params.descriptor,
+                    params.miner_account,
+                )
+                .await;
+                RoundEvent::Succeeded
+            }
+            RoundState::ParticipationDeclared => {
+                for _ in 0..SUBMIT_ATTEMPTS {
+                    declare_round_participation(chain, last_declared, params.miner_account).await;
+                    if last_declared.is_some() {
+                        break;
+                    }
+                }
+                RoundEvent::Succeeded
             }
             RoundState::StartMining => {
                 return snap.map(|s| (s, cancelled_jobs, miners_told));
@@ -441,9 +470,10 @@ where
 ///
 /// On a new `last_proof_block_hash` it drives the round state machine: stop
 /// mining, wait until the validator is synced, confirm the miner account can
-/// pay fees, download the next qblock's requirements, then start mining under
-/// the new seed. Runs until `stop` flips. `pub` so it can be exercised
-/// directly in tests without a gRPC server.
+/// pay fees, download the next qblock's requirements, file a node descriptor
+/// on the first walk, declare participation, then start mining under the new
+/// seed. Runs until `stop` flips. `pub` so it can be exercised directly in
+/// tests without a gRPC server.
 #[expect(
     clippy::too_many_lines,
     reason = "single feeder loop: reseed, top-up, win-time submit"
@@ -919,6 +949,8 @@ where
             buffer_depth: params.buffer_depth,
             poll_interval: Duration::from_millis(params.poll_interval_ms),
             funding: params.funding,
+            descriptor: params.descriptor,
+            descriptor_filed: params.descriptor_filed,
         },
         stop_rx.clone(),
     ));
