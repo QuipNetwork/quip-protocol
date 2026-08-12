@@ -86,10 +86,11 @@ const WINDOW_HEADROOM: f64 = 2.0;
 const DECAY_HORIZON_STEPS: usize = 256;
 
 /// Adaptive staging depth for one miner from its smoothed drain rate. The
-/// `buffer_depth` floor keeps a small reserve for idle/slow miners. `ema` is
-/// anchored to real completions, so depth self-bounds to ~headroom × actual
-/// throughput; the feeder additionally clamps it to [`stage_ceiling`] so a fast
-/// miner on a large topology can't stage an unbounded-memory reserve.
+/// `buffer_depth` floor keeps a small reserve for idle/slow miners. `ema`
+/// tracks dispatches per poll (`Router::take_consumed`): a job leaves the
+/// staged queue at dispatch, so that is the drain signal the feeder sizes
+/// against. The feeder additionally clamps the depth to [`stage_ceiling`] so a
+/// fast miner on a large topology cannot stage an unbounded-memory reserve.
 fn adaptive_depth(ema: f64, floor: usize) -> usize {
     #[expect(
         clippy::cast_possible_truncation,
@@ -471,6 +472,10 @@ pub async fn feeder_loop<C>(
     // one line per poll. `None` until the first poll completes.
     let mut feed_state: Option<FeedState> = None;
     let mut last_heartbeat = std::time::Instant::now();
+    // Completions printed on the last heartbeat, per miner. The next
+    // heartbeat reports the delta from this map so the line does not
+    // depend on which poll it lands on.
+    let mut last_completed: HashMap<String, u64> = HashMap::new();
     let faucet = build_faucet(params.funding.faucet_url.as_deref());
     let mut round: Option<RoundState> = None;
     let mut last_declared: Option<u64> = None;
@@ -663,8 +668,9 @@ pub async fn feeder_loop<C>(
             // (harder) gate and under-accept solutions viable at the eased one.
             st.target = Some(target);
             // Per-miner drain/staging stats for the heartbeat, collected here
-            // and emitted off-lock below.
-            let mut stats: Vec<(String, u32, usize, usize)> = Vec::new();
+            // and emitted off-lock below. The completion pair is (window,
+            // total): window is completions since the last heartbeat.
+            let mut stats: Vec<(String, u64, u64, usize, usize)> = Vec::new();
             for id in st.router.miner_ids() {
                 let consumed_raw = st.router.take_consumed(&id);
                 let consumed = f64::from(consumed_raw);
@@ -710,7 +716,16 @@ pub async fn feeder_loop<C>(
                 // and the dispatcher parked. Without this the miner waits for a
                 // job and the coordinator waits for a request, forever.
                 st.wake_dispatcher(&id);
-                stats.push((id.clone(), consumed_raw, depth, st.router.staged_len(&id)));
+                let completed_total = st.router.jobs_completed(&id);
+                let completed_window =
+                    completed_total.saturating_sub(last_completed.get(&id).copied().unwrap_or(0));
+                stats.push((
+                    id.clone(),
+                    completed_window,
+                    completed_total,
+                    depth,
+                    st.router.staged_len(&id),
+                ));
             }
             if stats.is_empty() {
                 // Miners are configured but none has completed a handshake, so
@@ -748,14 +763,16 @@ pub async fn feeder_loop<C>(
                 "feeder: poll"
             );
             if last_heartbeat.elapsed() >= FEEDER_HEARTBEAT {
-                for (id, consumed, depth, staged) in &stats {
+                for (id, completed, completed_total, depth, staged) in &stats {
                     tracing::info!(
                         miner = %id,
-                        jobs_consumed = consumed,
+                        jobs_completed = completed,
+                        jobs_completed_total = completed_total,
                         staged = staged,
                         window = depth,
                         "miner throughput"
                     );
+                    let _ = last_completed.insert(id.clone(), *completed_total);
                 }
                 tracing::info!(
                     block = current_block,

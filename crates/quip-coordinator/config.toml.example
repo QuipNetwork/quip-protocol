@@ -15,6 +15,12 @@ signer_key = "//Alice"
 binary = "quip-cpu-sa"        # or "quip-cpu-gibbs"
 queue_depth = 3
 idle_timeout_s = 300
+# Core budget for the sampler. Absent, the miner uses host parallelism.
+# A larger value is clamped to the host. Zero or a negative value is
+# refused at handshake. For SA this is the stream worker count. For
+# Gibbs the miner divides it by --gibbs-workers so the product stays
+# at or below this budget.
+# num_cpus = 6
 
 # One CUDA miner per device (amd64 only). Default binary: quip-cuda-sa.
 [cuda.0]

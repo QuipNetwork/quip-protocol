@@ -249,13 +249,15 @@ scored, and not submitted. The miner refunds its credit with `JobRequest{1}`.
 ### Adaptive staging window
 
 The staged depth per miner tracks how fast that miner drains work, so a
-many-core backend stays saturated while a slow one doesn't hoard jobs. Each
-poll samples the miner's jobs-consumed counter (`Router::take_consumed`,
+many-core backend stays saturated while a slow one does not hoard jobs. Each
+poll samples the miner's dispatch counter (`Router::take_consumed`,
 read-and-reset), smooths it with an EMA (`α = 0.3`), and sizes the window to
 `ceil(ema × 2.0)` — about two poll-intervals of drain — with `buffer_depth` as
-the floor and no ceiling. The EMA is anchored to real completions, so the depth
-self-bounds to roughly headroom × actual throughput. The default floor is 256
-(`main.rs`), generous enough to keep every miner fed from the first poll.
+the floor and no ceiling. The EMA tracks queue drain. A job leaves the staged
+queue at dispatch, so that is the signal the feeder sizes against. The default
+floor is 256 (`main.rs`), generous enough to keep every miner fed from the
+first poll. The one-minute heartbeat reports completions, not this dispatch
+counter.
 
 ## Routing and credits
 

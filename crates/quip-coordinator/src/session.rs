@@ -540,6 +540,9 @@ async fn run_session<C: ChainClient>(
                 let (job, salt, topo, best, gates) = {
                     let mut st = state.lock().await;
                     let job = st.complete_inflight(&result.job_id);
+                    if job.is_some() {
+                        st.router.record_completion(&miner_id);
+                    }
                     let salt = st.take_salt(&result.job_id);
                     let topo = Arc::clone(&st.resolved_topo);
                     let best = st.current_best_milli;
@@ -705,6 +708,7 @@ async fn run_session<C: ChainClient>(
                 // miner's reject path), so the coordinator only re-routes the
                 // job to a capable miner; an unknown job_id needs nothing.
                 if let Some(job) = st.complete_inflight(&rej.job_id) {
+                    st.router.record_completion(&miner_id);
                     st.router.on_reject(&miner_id, job, rej.reason);
                 }
             }
