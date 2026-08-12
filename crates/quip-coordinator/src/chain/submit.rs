@@ -41,6 +41,38 @@ pub struct Proof {
     pub device_access_time_us: u64,
 }
 
+/// Outcome of a `MinerRegistry.participate` submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParticipationOutcome {
+    /// The declaration landed.
+    Declared,
+    /// This account already declared this qblock. Treat as success.
+    AlreadyDeclared,
+    /// The candidate qblock moved under the call.
+    StaleQBlock,
+    /// No descriptor is stored for this account.
+    DescriptorMissing,
+}
+
+/// Classify a `participate` pallet error. `None` is a successful dispatch.
+/// Unknown strings stay `None` so the caller can treat them as transient.
+#[must_use]
+pub fn classify_participation(error: Option<&str>) -> Option<ParticipationOutcome> {
+    let Some(e) = error else {
+        return Some(ParticipationOutcome::Declared);
+    };
+    if e.contains("DuplicateParticipation") {
+        return Some(ParticipationOutcome::AlreadyDeclared);
+    }
+    if e.contains("InvalidQBlockId") {
+        return Some(ParticipationOutcome::StaleQBlock);
+    }
+    if e.contains("DescriptorRequired") {
+        return Some(ParticipationOutcome::DescriptorMissing);
+    }
+    None
+}
+
 /// Classify a pallet/dispatch error string into a fire-loop action.
 ///
 /// Mirrors `substrate/submitter.py:_classify_receipt`. Unknown → fail loud.
@@ -105,5 +137,26 @@ mod tests {
             classify_receipt(Some("SomethingUnknown")),
             SubmitAction::StopFatal
         ));
+    }
+
+    #[test]
+    fn classifies_participation_errors() {
+        assert_eq!(
+            classify_participation(None),
+            Some(ParticipationOutcome::Declared)
+        );
+        assert_eq!(
+            classify_participation(Some("MinerRegistry: DuplicateParticipation")),
+            Some(ParticipationOutcome::AlreadyDeclared)
+        );
+        assert_eq!(
+            classify_participation(Some("InvalidQBlockId")),
+            Some(ParticipationOutcome::StaleQBlock)
+        );
+        assert_eq!(
+            classify_participation(Some("DescriptorRequired")),
+            Some(ParticipationOutcome::DescriptorMissing)
+        );
+        assert_eq!(classify_participation(Some("SomethingUnknown")), None);
     }
 }

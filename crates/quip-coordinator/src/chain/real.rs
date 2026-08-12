@@ -11,10 +11,12 @@ use super::extrinsic::{
 };
 use super::proof_encode::{build_quantum_proof, ProofBuildContext};
 use super::scale_types::{
-    encode_submit_proof_call, require_set_values, CurveCScale, DifficultyConfig, JobOrderScale,
-    MiningSnapshotScale, OrderStatus,
+    encode_participate_call, encode_submit_proof_call, require_set_values, CurveCScale,
+    DifficultyConfig, JobOrderScale, MinerKind, MiningSnapshotScale, OrderStatus,
 };
-use super::submit::{classify_receipt, Proof, SubmitAction};
+use super::submit::{
+    classify_participation, classify_receipt, ParticipationOutcome, Proof, SubmitAction,
+};
 use super::{ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot};
 use crate::decay::{
     DEFAULT_BASE_MAX_ENERGY_MILLI, DEFAULT_C_EASY_MILLI, DEFAULT_C_HARD_MILLI,
@@ -225,6 +227,135 @@ impl RealChainClient {
             .map(Some)
             .map_err(|e| ChainError::Decode(e.to_string()))
     }
+
+    /// Nonce, genesis hash, and runtime versions for a signed extrinsic.
+    async fn signed_extension_context(
+        &self,
+        pair: &HybridPair,
+    ) -> Result<SignedExtensionContext, ChainError> {
+        let account_ss58 =
+            quip_transaction_crypto::account_id_from_public(&pair.public()).to_ss58check();
+        let nonce_val = self
+            .rpc_call(
+                "system_accountNextIndex",
+                Value::Array(vec![Value::String(account_ss58)]),
+            )
+            .await?;
+        let account_nonce = u32::try_from(
+            nonce_val
+                .as_u64()
+                .ok_or_else(|| ChainError::Decode("system_accountNextIndex not a u64".into()))?,
+        )
+        .map_err(|_| ChainError::Decode("account nonce exceeds u32".into()))?;
+
+        let genesis = self
+            .rpc_call(
+                "chain_getBlockHash",
+                Value::Array(vec![Value::Number(0.into())]),
+            )
+            .await?;
+        let genesis_hex = genesis
+            .as_str()
+            .ok_or_else(|| ChainError::Decode("genesis hash not a string".into()))?;
+        let genesis_bytes = hex_decode(genesis_hex).map_err(ChainError::Decode)?;
+        let mut genesis_hash = [0u8; 32];
+        if genesis_bytes.len() != 32 {
+            return Err(ChainError::Decode("genesis hash length".into()));
+        }
+        genesis_hash.copy_from_slice(&genesis_bytes);
+
+        let rv = self
+            .rpc_call("state_getRuntimeVersion", Value::Array(vec![]))
+            .await?;
+        let spec_version = u32::try_from(
+            rv.get("specVersion")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    ChainError::Decode("runtime specVersion missing/not a u64".into())
+                })?,
+        )
+        .map_err(|_| ChainError::Decode("specVersion exceeds u32".into()))?;
+        let transaction_version = u32::try_from(
+            rv.get("transactionVersion")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    ChainError::Decode("runtime transactionVersion missing/not a u64".into())
+                })?,
+        )
+        .map_err(|_| ChainError::Decode("transactionVersion exceeds u32".into()))?;
+
+        Ok(SignedExtensionContext {
+            account_nonce,
+            genesis_hash,
+            spec_version,
+            transaction_version,
+            tip: 0,
+        })
+    }
+
+    /// Hybrid-sign `call` and watch inclusion. Callers classify the outcome.
+    ///
+    /// Submits via subxt's `author_submitAndWatchExtrinsic` and CONFIRMS the
+    /// on-chain outcome, rather than treating pool acceptance as success. The
+    /// status stream is watched to in-best-block, not to finality, to stay
+    /// responsive: a re-org after that point is rare on the local validator,
+    /// and the per-generation `current_best` reset bounds any wrong advance.
+    async fn submit_signed_call(&self, call: &[u8]) -> Result<SignedCallOutcome, ChainError> {
+        let pair = self.pair()?;
+        let signed_ctx = self.signed_extension_context(&pair).await?;
+        let ext = build_hybrid_signed_extrinsic(&pair, call, &signed_ctx);
+
+        let client = self.subxt_client().await?;
+        let tx_client = client
+            .tx()
+            .await
+            .map_err(|e| ChainError::Unavailable(format!("subxt tx client: {e}")))?;
+        let mut progress = tx_client
+            .from_bytes(ext)
+            .submit_and_watch()
+            .await
+            .map_err(|e| ChainError::Submit(format!("submit_and_watch: {e}")))?;
+        loop {
+            let status = progress
+                .next()
+                .await
+                .ok_or_else(|| ChainError::Unavailable("tx status stream ended".into()))?
+                .map_err(|e| ChainError::Unavailable(format!("tx progress: {e}")))?;
+            match status {
+                TransactionStatus::InBestBlock(in_block)
+                | TransactionStatus::InFinalizedBlock(in_block) => {
+                    let block = in_block.block_hash().to_string();
+                    return match in_block.wait_for_success().await {
+                        Ok(_events) => Ok(SignedCallOutcome::Success { block }),
+                        Err(e) => {
+                            let error = match &e {
+                                subxt::error::TransactionEventsError::ExtrinsicFailed(
+                                    subxt::error::DispatchError::Module(m),
+                                ) => m.details_string(),
+                                other => other.to_string(),
+                            };
+                            Ok(SignedCallOutcome::DispatchFailed { error })
+                        }
+                    };
+                }
+                TransactionStatus::Invalid { message } => {
+                    return Ok(SignedCallOutcome::Invalid { message });
+                }
+                TransactionStatus::Dropped { message } | TransactionStatus::Error { message } => {
+                    return Ok(SignedCallOutcome::Dropped { message });
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// On-chain result of a hybrid-signed extrinsic, before pallet-specific classify.
+enum SignedCallOutcome {
+    Success { block: String },
+    DispatchFailed { error: String },
+    Invalid { message: String },
+    Dropped { message: String },
 }
 
 /// Pull `data.free` out of a decoded `System.Account` value.
@@ -545,10 +676,6 @@ impl ChainClient for RealChainClient {
         Ok(orders)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "hybrid sign + RPC submit path is one linear procedure"
-    )]
     async fn submit_proof(&self, proof: &Proof) -> Result<SubmitAction, ChainError> {
         let pair = self.pair()?;
         let snap = self
@@ -591,134 +718,38 @@ impl ChainClient for RealChainClient {
             .map_err(|e| ChainError::Submit(format!("encode proof: {e}")))?;
         let call = encode_submit_proof_call(&quantum);
 
-        // Chain state for signed extensions. `system_accountNextIndex` expects
-        // an SS58-encoded address (the node rejects a hex account with a
-        // "Base 58 requirement is violated" param error), so encode the
-        // derived account with the default SS58 prefix.
-        let account_ss58 =
-            quip_transaction_crypto::account_id_from_public(&pair.public()).to_ss58check();
-        let nonce_val = self
-            .rpc_call(
-                "system_accountNextIndex",
-                Value::Array(vec![Value::String(account_ss58)]),
-            )
-            .await?;
-        let account_nonce = u32::try_from(
-            nonce_val
-                .as_u64()
-                .ok_or_else(|| ChainError::Decode("system_accountNextIndex not a u64".into()))?,
-        )
-        .map_err(|_| ChainError::Decode("account nonce exceeds u32".into()))?;
-
-        let genesis = self
-            .rpc_call(
-                "chain_getBlockHash",
-                Value::Array(vec![Value::Number(0.into())]),
-            )
-            .await?;
-        let genesis_hex = genesis
-            .as_str()
-            .ok_or_else(|| ChainError::Decode("genesis hash not a string".into()))?;
-        let genesis_bytes = hex_decode(genesis_hex).map_err(ChainError::Decode)?;
-        let mut genesis_hash = [0u8; 32];
-        if genesis_bytes.len() != 32 {
-            return Err(ChainError::Decode("genesis hash length".into()));
-        }
-        genesis_hash.copy_from_slice(&genesis_bytes);
-
-        let rv = self
-            .rpc_call("state_getRuntimeVersion", Value::Array(vec![]))
-            .await?;
-        let spec_version = u32::try_from(
-            rv.get("specVersion")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    ChainError::Decode("runtime specVersion missing/not a u64".into())
-                })?,
-        )
-        .map_err(|_| ChainError::Decode("specVersion exceeds u32".into()))?;
-        let transaction_version = u32::try_from(
-            rv.get("transactionVersion")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    ChainError::Decode("runtime transactionVersion missing/not a u64".into())
-                })?,
-        )
-        .map_err(|_| ChainError::Decode("transactionVersion exceeds u32".into()))?;
-
-        let signed_ctx = SignedExtensionContext {
-            account_nonce,
-            genesis_hash,
-            spec_version,
-            transaction_version,
-            tip: 0,
-        };
-        let ext = build_hybrid_signed_extrinsic(&pair, &call, &signed_ctx);
-
-        // Submit via subxt's `author_submitAndWatchExtrinsic` and CONFIRM the
-        // on-chain outcome, rather than treating pool acceptance as success.
-        // We watch the status stream to in-best-block (not finality, to stay
-        // responsive — a re-org after this is rare on the local validator and
-        // the per-generation `current_best` reset bounds any wrong advance),
-        // then check the extrinsic's own events: `ExtrinsicSuccess` -> Success,
-        // `ExtrinsicFailed` -> classify the pallet error via `classify_receipt`.
-        let client = self.subxt_client().await?;
-        let tx_client = client
-            .tx()
-            .await
-            .map_err(|e| ChainError::Unavailable(format!("subxt tx client: {e}")))?;
-        let mut progress = tx_client
-            .from_bytes(ext)
-            .submit_and_watch()
-            .await
-            .map_err(|e| ChainError::Submit(format!("submit_and_watch: {e}")))?;
-        loop {
-            let status = progress
-                .next()
-                .await
-                .ok_or_else(|| ChainError::Unavailable("tx status stream ended".into()))?
-                .map_err(|e| ChainError::Unavailable(format!("tx progress: {e}")))?;
-            match status {
-                TransactionStatus::InBestBlock(in_block)
-                | TransactionStatus::InFinalizedBlock(in_block) => {
-                    return match in_block.wait_for_success().await {
-                        Ok(_events) => {
-                            tracing::info!(
-                                block = %in_block.block_hash(),
-                                "proof included and dispatched successfully"
-                            );
-                            Ok(SubmitAction::Success)
-                        }
-                        Err(e) => {
-                            // Included, but the pallet dispatch failed
-                            // (`ExtrinsicFailed`). Extract the `Pallet::Variant`
-                            // name for a precise classification (e.g. InvalidNonce
-                            // -> StopRoundStale/retry, not the default Fatal);
-                            // fall back to the Display string otherwise.
-                            let msg = match &e {
-                                subxt::error::TransactionEventsError::ExtrinsicFailed(
-                                    subxt::error::DispatchError::Module(m),
-                                ) => m.details_string(),
-                                other => other.to_string(),
-                            };
-                            tracing::warn!(error = %msg, "proof included but ExtrinsicFailed");
-                            Ok(classify_receipt(Some(&msg)))
-                        }
-                    };
-                }
-                TransactionStatus::Invalid { message } => {
-                    // Bad nonce / signature: stale for this round.
-                    tracing::warn!(%message, "proof rejected as invalid before inclusion");
-                    return Ok(classify_receipt(Some(&message)));
-                }
-                TransactionStatus::Dropped { message } | TransactionStatus::Error { message } => {
-                    // Pool drop / transient node error: retry the candidate.
-                    tracing::warn!(%message, "proof dropped by node before inclusion");
-                    return Ok(SubmitAction::Retry);
-                }
-                // Validated / Broadcasted / NoLongerInBestBlock: keep watching.
-                _ => {}
+        match self.submit_signed_call(&call).await? {
+            SignedCallOutcome::Success { block } => {
+                tracing::info!(block = %block, "proof included and dispatched successfully");
+                Ok(SubmitAction::Success)
             }
+            SignedCallOutcome::DispatchFailed { error, .. } => {
+                tracing::warn!(error = %error, "proof included but ExtrinsicFailed");
+                Ok(classify_receipt(Some(&error)))
+            }
+            SignedCallOutcome::Invalid { message } => {
+                tracing::warn!(%message, "proof rejected as invalid before inclusion");
+                Ok(classify_receipt(Some(&message)))
+            }
+            SignedCallOutcome::Dropped { message } => {
+                tracing::warn!(%message, "proof dropped by node before inclusion");
+                Ok(SubmitAction::Retry)
+            }
+        }
+    }
+
+    async fn declare_participation(
+        &self,
+        qblock_id: u64,
+    ) -> Result<ParticipationOutcome, ChainError> {
+        let call = encode_participate_call(qblock_id, MinerKind::Cpu, None);
+        match self.submit_signed_call(&call).await? {
+            SignedCallOutcome::Success { .. } => Ok(ParticipationOutcome::Declared),
+            SignedCallOutcome::DispatchFailed { error, .. }
+            | SignedCallOutcome::Invalid { message: error } => {
+                classify_participation(Some(&error)).ok_or(ChainError::Submit(error))
+            }
+            SignedCallOutcome::Dropped { message } => Err(ChainError::Submit(message)),
         }
     }
 }

@@ -16,7 +16,9 @@ pub use fake::FakeChain;
 pub use mempool::JobOrder;
 pub use real::RealChainClient;
 pub use snapshot::{head_state_key, DecayParams, MiningSnapshot};
-pub use submit::{classify_receipt, Proof, SubmitAction};
+pub use submit::{
+    classify_participation, classify_receipt, ParticipationOutcome, Proof, SubmitAction,
+};
 
 use async_trait::async_trait;
 
@@ -62,6 +64,12 @@ pub trait ChainClient: Send + Sync {
 
     /// Hybrid-sign and submit a proof extrinsic; classify the receipt.
     async fn submit_proof(&self, proof: &Proof) -> Result<SubmitAction, ChainError>;
+
+    /// Hybrid-sign and submit `MinerRegistry.participate` for `qblock_id`.
+    async fn declare_participation(
+        &self,
+        qblock_id: u64,
+    ) -> Result<ParticipationOutcome, ChainError>;
 
     /// Current quantum-block id (`QuantumPowApi_latest_qblock_id`). `None` when
     /// the chain hasn't started a round or doesn't expose one; used to key the
