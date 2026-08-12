@@ -1,21 +1,19 @@
-//! The readiness walk used at startup and at every round transition.
+//! Startup driver for the round state machine.
 //!
-//! Winning a qblock returns the coordinator to the same not-yet-mining state
-//! it has at process start. Before it mines again it must:
+//! Process start has no miners to stop and does not stage work. This module
+//! drives [`crate::round::RoundState`] through validator-synced, account-funded,
+//! and requirements-downloaded. The feeder drives the same machine, including
+//! stop-mining and start-mining, on every later round.
 //!
-//! 1. Stop mining (the caller broadcasts `Cancel` and drops staged work).
-//! 2. Wait until the validator is synced with the chain head.
-//! 3. Confirm the miner account can pay submit fees.
-//! 4. Download the next qblock's requirements.
-//!
-//! Only after this returns [`Ok`] does the caller stage new work. A mid-run
-//! failure is not fatal: the caller warns, holds off mining, and retries.
+//! A funding failure at startup is fatal. A missing snapshot is not: the
+//! caller warns and the feeder retries after miners connect.
 
 use crate::chain::sync::{wait_until_synced, SyncOutcome, SyncSource};
 use crate::chain::{ChainClient, MiningSnapshot};
 use crate::funding::{
     ensure_funded, BalanceSource, Faucet, FundingError, FundingParams, HttpFaucet,
 };
+use crate::round::{RoundEvent, RoundState};
 use std::time::Duration;
 
 /// Why the coordinator is not ready to mine.
@@ -52,9 +50,9 @@ pub fn build_faucet(url: Option<&str>) -> Option<HttpFaucet> {
     }
 }
 
-/// Steps 2–4 of the readiness walk: validator synced, account funded, next
-/// qblock requirements loaded. The caller stops mining before this and
-/// starts mining only after this returns the snapshot.
+/// Drive the round machine through validator-synced, account-funded, and
+/// requirements-downloaded. Used at process start. The feeder walks the same
+/// states, plus stop-mining and start-mining, on every later round.
 ///
 /// `sleep` is injected so tests do not wait on the real clock. A validator
 /// that never answers sync is not a failure here: that matches startup, which
@@ -77,6 +75,9 @@ where
     S: FnMut(Duration) -> Fut + Send + Clone,
     Fut: std::future::Future<Output = ()> + Send,
 {
+    let mut state = RoundState::ValidatorSynced;
+    state.log_entry(0);
+
     match wait_until_synced(chain, sleep.clone()).await {
         SyncOutcome::Synced => {}
         SyncOutcome::Unknown(reason) => {
@@ -87,12 +88,30 @@ where
             );
         }
     }
+    state = match state.transition(RoundEvent::Succeeded) {
+        Some(next) => {
+            next.log_entry(0);
+            next
+        }
+        None => state,
+    };
+
     let _ = ensure_funded(chain, faucet, account, funding, sleep)
         .await
         .map_err(ReadinessError::Funding)?;
-    chain
+    state = match state.transition(RoundEvent::Succeeded) {
+        Some(next) => {
+            next.log_entry(0);
+            next
+        }
+        None => state,
+    };
+
+    let snap = chain
         .fetch_mining_snapshot(None, account, None)
         .await
         .map_err(|e| ReadinessError::Snapshot(e.to_string()))?
-        .ok_or_else(|| ReadinessError::Snapshot("chain has no mining snapshot".into()))
+        .ok_or_else(|| ReadinessError::Snapshot("chain has no mining snapshot".into()))?;
+    let _ = state.transition(RoundEvent::Succeeded);
+    Ok(snap)
 }

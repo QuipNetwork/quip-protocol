@@ -6,14 +6,15 @@
 //! stash) is layered on top by the live-mining epic; a coordinator built from
 //! this alone serves sessions and supervises miners but stages no work yet.
 
-use crate::chain::sync::SyncSource;
+use crate::chain::sync::{wait_until_synced, SyncOutcome, SyncSource};
 use crate::chain::{ChainClient, MiningSnapshot};
 use crate::config::LaunchEntry;
 use crate::decay::{build_decay_schedule, EnergyCurve};
-use crate::funding::BalanceSource;
+use crate::funding::{ensure_funded, BalanceSource, Faucet};
 use crate::logging::LogLevel;
 use crate::producer::derive_pow_job;
-use crate::readiness::{build_faucet, prepare_round};
+use crate::readiness::{build_faucet, ReadinessError};
+use crate::round::{RoundEvent, RoundState};
 use crate::session::{coord, CoordinatorService, CoordinatorState};
 use crate::supervisor::{supervise_miner, BackoffPolicy};
 use crate::topology::Topology;
@@ -219,14 +220,169 @@ fn salt_from_counter(ctr: u64) -> [u8; 32] {
     salt
 }
 
+/// Drive [`RoundState`] from `machine` until [`RoundState::StartMining`].
+///
+/// The caller logs the entry into the first state and bumps `generation`.
+/// This function does the I/O for each state, applies the pure transition,
+/// and logs each new state once. A failed step stays in that state and
+/// retries after `poll_interval`. Returns `None` when shutdown is requested.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match arm per round state plus retry"
+)]
+async fn drive_to_mining<C, F>(
+    mut machine: RoundState,
+    chain: &C,
+    coord: &Arc<Mutex<CoordinatorState>>,
+    params: &FeederParams,
+    faucet: Option<&F>,
+    generation: u64,
+    stop: &mut watch::Receiver<bool>,
+) -> Option<(MiningSnapshot, usize, usize)>
+where
+    C: ChainClient + SyncSource + BalanceSource,
+    F: Faucet + ?Sized,
+{
+    let mut cancelled_jobs = 0usize;
+    let mut miners_told = 0usize;
+    let mut snap: Option<MiningSnapshot> = None;
+
+    loop {
+        let event = match machine {
+            RoundState::StopMining => {
+                cancelled_jobs = {
+                    let mut st = coord.lock().await;
+                    st.generation = generation;
+                    st.current_best_milli = None;
+                    st.stash.reset(generation, Vec::new(), 0, 0);
+                    let dropped = st.router.cancel(generation.saturating_sub(1));
+                    let _ = st.cancel_inflight(generation.saturating_sub(1));
+                    st.clear_salts();
+                    dropped
+                };
+                miners_told = if generation > 1 {
+                    broadcast_cancel(coord, generation.saturating_sub(1)).await
+                } else {
+                    0
+                };
+                RoundEvent::Succeeded
+            }
+            RoundState::ValidatorSynced => {
+                tokio::select! {
+                    biased;
+                    _ = stop.changed() => {
+                        let _ = machine.transition(RoundEvent::Shutdown);
+                        return None;
+                    }
+                    outcome = wait_until_synced(chain, tokio::time::sleep) => {
+                        match outcome {
+                            SyncOutcome::Synced => RoundEvent::Succeeded,
+                            SyncOutcome::Unknown(reason) => {
+                                tracing::warn!(
+                                    reason = %reason,
+                                    "cannot confirm the validator has caught up; continuing, but funding and \
+                                     mining may fail until it does"
+                                );
+                                RoundEvent::Succeeded
+                            }
+                        }
+                    }
+                }
+            }
+            RoundState::AccountFunded => {
+                tokio::select! {
+                    biased;
+                    _ = stop.changed() => {
+                        let _ = machine.transition(RoundEvent::Shutdown);
+                        return None;
+                    }
+                    result = ensure_funded(
+                        chain,
+                        faucet,
+                        params.miner_account,
+                        &params.funding,
+                        tokio::time::sleep,
+                    ) => match result {
+                        Ok(_) => RoundEvent::Succeeded,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %ReadinessError::Funding(e),
+                                generation,
+                                "round readiness failed; holding off mining"
+                            );
+                            RoundEvent::Failed
+                        }
+                    },
+                }
+            }
+            RoundState::RequirementsDownloaded => {
+                tokio::select! {
+                    biased;
+                    _ = stop.changed() => {
+                        let _ = machine.transition(RoundEvent::Shutdown);
+                        return None;
+                    }
+                    result = chain.fetch_mining_snapshot(
+                        None,
+                        params.miner_account,
+                        None,
+                    ) => match result {
+                        Ok(Some(s)) => {
+                            snap = Some(s);
+                            RoundEvent::Succeeded
+                        }
+                        Ok(None) => {
+                            tracing::warn!(
+                                error = %ReadinessError::Snapshot(
+                                    "chain has no mining snapshot".into()
+                                ),
+                                generation,
+                                "round readiness failed; holding off mining"
+                            );
+                            RoundEvent::Failed
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %ReadinessError::Snapshot(e.to_string()),
+                                generation,
+                                "round readiness failed; holding off mining"
+                            );
+                            RoundEvent::Failed
+                        }
+                    },
+                }
+            }
+            RoundState::StartMining => {
+                return snap.map(|s| (s, cancelled_jobs, miners_told));
+            }
+        };
+
+        if event == RoundEvent::Failed {
+            tokio::select! {
+                () = tokio::time::sleep(params.poll_interval) => {}
+                _ = stop.changed() => {
+                    let _ = machine.transition(RoundEvent::Shutdown);
+                    return None;
+                }
+            }
+        }
+
+        let next = machine.transition(event)?;
+        if next != machine {
+            next.log_entry(generation);
+        }
+        machine = next;
+    }
+}
+
 /// The replenished `PoW` feeder: follow the chain head, and keep each registered
 /// miner's staged queue topped up to `buffer_depth` with fresh-salt jobs.
 ///
-/// On a new `last_proof_block_hash` it reseeds: stop mining, wait until the
-/// validator is synced, confirm the miner account can pay fees, download the
-/// next qblock's requirements, then refill under the new seed. Runs until
-/// `stop` flips. `pub` so it can be exercised directly in tests without a
-/// gRPC server.
+/// On a new `last_proof_block_hash` it drives the round state machine: stop
+/// mining, wait until the validator is synced, confirm the miner account can
+/// pay fees, download the next qblock's requirements, then start mining under
+/// the new seed. Runs until `stop` flips. `pub` so it can be exercised
+/// directly in tests without a gRPC server.
 #[expect(
     clippy::too_many_lines,
     reason = "single feeder loop: reseed, top-up, win-time submit"
@@ -255,6 +411,7 @@ pub async fn feeder_loop<C>(
     let mut feed_state: Option<FeedState> = None;
     let mut last_heartbeat = std::time::Instant::now();
     let faucet = build_faucet(params.funding.faucet_url.as_deref());
+    let mut round: Option<RoundState> = None;
 
     loop {
         let (snap, state_now) = match chain
@@ -296,56 +453,31 @@ pub async fn feeder_loop<C>(
         if let Some(mut snap) = snap {
             let head = snap.last_proof_block_hash;
             if current_head != Some(head) {
-                // Stop mining first. The rest of the readiness walk may wait
-                // on sync or funding; miners must not keep grinding the
-                // round that just ended.
+                let next = match round {
+                    Some(s) => s.transition(RoundEvent::NewHead),
+                    None => Some(RoundState::start()),
+                };
+                let Some(machine) = next else {
+                    return;
+                };
                 generation = generation.saturating_add(1);
-                let cancelled_jobs = {
-                    let mut st = state.lock().await;
-                    st.generation = generation;
-                    st.current_best_milli = None;
-                    st.stash.reset(generation, Vec::new(), 0, 0);
-                    let dropped = st.router.cancel(generation.saturating_sub(1));
-                    let _ = st.cancel_inflight(generation.saturating_sub(1));
-                    st.clear_salts();
-                    dropped
-                };
-                let miners_told = if generation > 1 {
-                    broadcast_cancel(&state, generation.saturating_sub(1)).await
-                } else {
-                    0
-                };
+                machine.log_entry(generation);
 
-                // Steps 2–4: synced validator, funded account, next-round
-                // requirements. Hold off staging until this succeeds. A
-                // failure is not fatal: warn, wait one poll, retry.
-                let fresh = loop {
-                    tokio::select! {
-                        biased;
-                        _ = stop.changed() => return,
-                        ready = prepare_round(
-                            chain.as_ref(),
-                            faucet.as_ref(),
-                            params.miner_account,
-                            &params.funding,
-                            tokio::time::sleep,
-                        ) => match ready {
-                            Ok(s) => break s,
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    generation,
-                                    "round readiness failed; holding off mining"
-                                );
-                                tokio::select! {
-                                    () = tokio::time::sleep(params.poll_interval) => {}
-                                    _ = stop.changed() => return,
-                                }
-                            }
-                        },
-                    }
+                let Some((fresh, cancelled_jobs, miners_told)) = drive_to_mining(
+                    machine,
+                    chain.as_ref(),
+                    &state,
+                    &params,
+                    faucet.as_ref(),
+                    generation,
+                    &mut stop,
+                )
+                .await
+                else {
+                    return;
                 };
                 snap = fresh;
+                round = Some(RoundState::StartMining);
 
                 let topo = Topology::from_nodes_edges(
                     snap.nodes.clone(),
@@ -633,7 +765,12 @@ pub async fn feeder_loop<C>(
 
         tokio::select! {
             () = tokio::time::sleep(params.poll_interval) => {}
-            _ = stop.changed() => break,
+            _ = stop.changed() => {
+                if let Some(s) = round {
+                    let _ = s.transition(RoundEvent::Shutdown);
+                }
+                break;
+            }
         }
     }
 }

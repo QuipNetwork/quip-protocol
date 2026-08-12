@@ -51,7 +51,8 @@ What each level carries:
 
 The feeder logs state changes on transition, not per poll. It polls once a
 second, so a validator that goes away logs one warning and then stays quiet
-until reachability changes.
+until reachability changes. The round machine also logs each state at `info`
+on entry, once per transition, with the generation.
 
 ## Startup checks
 
@@ -83,11 +84,11 @@ booting would only crash-loop. The coordinator warns, starts, and retries.
 
 ## Waiting for the validator to sync
 
-`readiness::prepare_round` gates both startup and every later round on the
-node catching up. Every chain read resolves against the node's best block. While
-the node imports history, that block is far behind the real head. The miner
-account then reads as empty even after the faucet has paid it, and any snapshot
-describes a round that ended long ago.
+State 2 of the round machine waits until the node catches up. Every chain read
+resolves against the node's best block. While the node imports history, that
+block is far behind the real head. The miner account then reads as empty even
+after the faucet has paid it, and any snapshot describes a round that ended
+long ago.
 
 `wait_until_synced` polls `system_health` every 5 seconds and warns with the
 block from `system_syncState` every 30 seconds:
@@ -160,22 +161,49 @@ plus `proof_encode` and `scale_types` for SCALE codec. Nothing outside
 (1000 ms in production). A win is visible on the next poll, so the worst-case
 delay before `Cancel` is one poll interval plus the snapshot RPC.
 
-When `last_proof_block_hash` changes, the feeder walks the same readiness
-sequence that startup uses (`readiness::prepare_round`):
+When `last_proof_block_hash` changes, the feeder drives the round state
+machine. Startup drives the same machine. Mining is the last state. A new
+qblock head in any state returns the machine to the first state.
 
-1. **Stop mining.** It bumps the generation, drops staged and in-flight PoW
-   jobs of the dead generation, and broadcasts `Cancel{max_generation}`.
-   Miners stay connected and idle. The gRPC server is not blocked.
-2. **Wait until the validator has caught up** (`wait_until_synced`).
-3. **Confirm the miner account can pay submit fees** (`ensure_funded`). One
-   balance read is the common case. A mid-run failure is not fatal: the feeder
-   warns, holds off staging, and retries. It does not exit.
-4. **Download the next qblock's requirements.** Topology, energy target,
+### Round state machine
+
+The states, in order:
+
+1. **Stop mining.** The feeder raises the generation, drops staged and
+   in-flight PoW jobs of the dead generation, and broadcasts
+   `Cancel{max_generation}`. Miners stay connected and idle. The gRPC server
+   is not blocked.
+2. **Validator is synced.** The feeder calls `wait_until_synced`.
+3. **Account is funded.** The feeder calls `ensure_funded`. One balance read
+   is the common case. A mid-run failure is not fatal. The feeder warns, holds
+   this state, and retries. It does not exit.
+4. **Requirements for the next qblock downloaded.** Topology, energy target,
    required solution count, and diversity come from a fresh snapshot after
    sync and funding.
 5. **Start mining.** The feeder always sends `Topology` and `SetTarget` for
    the new round, then stages jobs. A job of the new generation cannot leave
    before those two messages.
+
+Transitions:
+
+| Current state | Event | Next state |
+| --- | --- | --- |
+| any | Shutdown | stop the machine |
+| any | NewHead | Stop mining |
+| any | Failed | same state (retry) |
+| Stop mining | Succeeded | Validator is synced |
+| Validator is synced | Succeeded | Account is funded |
+| Account is funded | Succeeded | Requirements downloaded |
+| Requirements downloaded | Succeeded | Start mining |
+| Start mining | Succeeded | Start mining |
+
+The feeder does the I/O. The transition function is pure. The feeder logs the
+state at `info` on each entry, once per transition, with the generation. An
+operator can read the current state and the reason that mining has not started.
+
+Startup drives states 2 through 4. A funding failure at startup is still exit
+64. A missing snapshot at startup is a warning. The feeder retries that
+download after miners connect.
 
 One `info` line names the new generation, the cancelled staged-job count, the
 miner count, and the refreshed target.

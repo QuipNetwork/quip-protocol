@@ -14,6 +14,7 @@ pub mod logging;
 /// `PoW` and mempool job construction helpers.
 pub mod producer;
 pub mod readiness;
+pub mod round;
 pub mod router;
 pub mod runtime;
 pub mod session;
