@@ -21,6 +21,65 @@ how they fit together. For build and run commands, see `AGENTS.md`.
   miner and feeds it generated or replayed problems with no chain and no submit.
   Used for benchmarking and matched-condition parity runs.
 
+## Logging
+
+`logging.rs` installs the subscriber, and `main` calls it first. The `tracing`
+macros only dispatch to an installed subscriber. Without that call every log
+statement in the process does nothing and `RUST_LOG` has no effect.
+
+Verbosity comes from `--log-level {trace,debug,info,warn,error}`, default
+`info`. An explicit flag wins over `RUST_LOG`. When the flag is absent,
+`RUST_LOG` applies. The default filter holds third-party crates at
+`warn` and this crate's targets at the chosen level, so `--log-level debug`
+stays readable. Use `RUST_LOG` when you need jsonrpsee or subxt internals.
+
+All output goes to stderr, because `drive` prints its timing table to stdout.
+Color is on only when stderr is a terminal, so a captured log file stays plain
+text.
+
+What each level carries:
+
+- `info` — startup and the validator runtime, round transitions, miner spawn
+  and registration, submit outcomes, and a one-minute throughput heartbeat.
+- `debug` — per-poll feeder detail, difficulty changes, validator failover.
+- `trace` — every RPC call.
+
+The feeder logs state changes on transition, not per poll. It polls once a
+second, so a validator that goes away logs one warning and then stays quiet
+until reachability changes.
+
+## Startup checks
+
+`main` refuses to start on three operator errors, all exit 64:
+
+- **No backend section.** A config with no `[cpu]`, `[cuda.N]`, `[metal]`, or
+  `[dwave]`/`[qpu]` launches no miners and can never mine. The error names the
+  v0.2 `quip-miner` format when it sees that format's keys, because the two
+  configs are not interchangeable.
+- **An incompatible validator.** `chain::preflight` reads the runtime version
+  and checks `QuantumPowApi`. The coordinator drives version 2 or newer, which
+  is the first version whose `mining_snapshot` takes a topology selector.
+- **An unfunded miner account.** `funding.rs` reads the account balance and,
+  when the balance is below `min_balance_plancks` (2 UNIT), requests a top up
+  from `faucet_url`. It retries with backoff for `funding_timeout_s` (10
+  minutes by default), then gives up. An account that cannot pay transaction
+  fees mines normally and fails every submit, which reads as a mining bug
+  rather than an empty wallet.
+
+The on-chain balance is the source of truth for funding, not the faucet's
+reply. A faucet that answers 403 (already at its cap) or rate-limits is not a
+failure by itself. Only HTTP 400 is permanent, because retrying a malformed
+request cannot help. Set `faucet_url = ""` to turn autofunding off and fund
+the account yourself.
+
+An unreachable validator is not an error. The node manager starts the
+coordinator and its validator together, so exiting because the node is still
+booting would only crash-loop. The coordinator warns, starts, and retries.
+
+`[miner].validators` is an ordered failover list, tried in order on every call.
+When the key is absent it defaults to `["ws://quip-validator:9944",
+"ws://127.0.0.1:9944"]`, matching v0.2. An explicit empty list stays empty.
+
 ## Runtime wiring
 
 `run_runtime` (in `runtime.rs`) is the production entry point. It:

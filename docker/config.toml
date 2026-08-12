@@ -9,8 +9,27 @@
 [miner]
 # Ordered chain endpoints; live-rotated on disconnect.
 validators = ["ws://quip-validator:9944", "ws://127.0.0.1:9944"]
-# Hybrid sr25519 + ML-DSA-44 signer. Provide via a mounted keystore/secret.
-signer_key = ""
+# Faucet for auto-funding the miner account at startup. A miner that cannot pay
+# transaction fees mines normally and then fails every submit, so the
+# coordinator tops the account up here and refuses to start if it cannot.
+# Defaults to the public testnet faucet, which is correct for Quip Testnet and
+# wrong for mainnet — set it to your own faucet, or to "" to disable, when you
+# fund the account yourself. Empty means no auto-funding.
+faucet_url = "https://faucet.testnet.quip.network"
+
+# Balance floor in plancks (2 UNIT). Below this the coordinator asks the faucet.
+# min_balance_plancks = 2000000000000
+# Amount requested per faucet attempt, in plancks (10 UNIT).
+# faucet_top_up_plancks = 10000000000000
+# How long to keep retrying the faucet before giving up, in seconds.
+# funding_timeout_s = 600
+
+# Hybrid sr25519 + ML-DSA-44 signer. The entrypoint generates a keystore at
+# exactly this path on first run when the file is missing, so a bare
+# `docker run` produces a miner whose proofs verify. Mount your own keystore
+# over /data/keystore.json to bring an existing key. BACK IT UP — the chain
+# key lives here.
+signer_key = "/data/keystore.json"
 
 # CPU miner (bundled: quip-cpu-sa, quip-cpu-gibbs).
 [cpu]

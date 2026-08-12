@@ -7,8 +7,10 @@ pub mod config;
 pub mod dashboard;
 pub mod decay;
 pub mod drive;
+pub mod funding;
 pub mod keygen;
 pub mod liveness;
+pub mod logging;
 /// `PoW` and mempool job construction helpers.
 pub mod producer;
 pub mod router;

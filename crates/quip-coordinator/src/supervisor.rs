@@ -258,10 +258,16 @@ pub async fn supervise_miner(
         let mut child = match spawn_supervised_child(&entry, &token, &sock_uri) {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!(miner = %entry.miner_id, "spawn failed: {e}");
+                tracing::error!(miner = %entry.miner_id, binary = %entry.binary, error = %e, "miner spawn failed");
                 break;
             }
         };
+        tracing::info!(
+            miner = %entry.miner_id,
+            binary = %entry.binary,
+            pid = ?child.id(),
+            "miner spawned"
+        );
         if let Some(stderr) = child.stderr.take() {
             // Detach the stderr pump; it ends when the child closes the pipe.
             drop(tokio::spawn(merge_stderr(entry.miner_id.clone(), stderr)));
@@ -290,6 +296,13 @@ pub async fn supervise_miner(
         };
 
         let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
+        // A miner dying is never routine: exit 0 is a clean stop, anything else
+        // cost this coordinator a backend.
+        if code == 0 {
+            tracing::info!(miner = %entry.miner_id, "miner exited cleanly");
+        } else {
+            tracing::warn!(miner = %entry.miner_id, code, "miner exited");
+        }
 
         // Self-exit (crash or clean): return this miner's in-flight + staged
         // jobs to the router. A clean exit (code 0) can still leave in-flight
@@ -319,6 +332,7 @@ pub async fn supervise_miner(
                 }
             }
             RestartAction::Backoff(delay) => {
+                tracing::info!(miner = %entry.miner_id, delay_ms = delay, "restarting miner after backoff");
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_millis(delay)) => {}
                     _ = stop.changed() => break,

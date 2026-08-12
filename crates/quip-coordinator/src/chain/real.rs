@@ -53,6 +53,11 @@ pub struct RealChainClient {
     last_spin_spec: Mutex<Option<AllowedValueSpec<Vec<i32>>>>,
     /// Lazily-connected subxt client for mempool `JobProposed` event decoding.
     subxt: OnceCell<SubxtClient>,
+    /// Whether the last RPC round-trip reached the validator. `None` before the
+    /// first call. Every RPC builds a fresh client (see `rpc_http` / `rpc_ws`),
+    /// so a per-call "connected" line would run to thousands an hour; this
+    /// tracks reachability so only the *transitions* are reported.
+    reachable: Mutex<Option<bool>>,
 }
 
 impl RealChainClient {
@@ -66,7 +71,32 @@ impl RealChainClient {
             last_snapshot: Mutex::new(None),
             last_spin_spec: Mutex::new(None),
             subxt: OnceCell::new(),
+            reachable: Mutex::new(None),
         }
+    }
+
+    /// Record the outcome of one RPC round-trip and log reachability changes.
+    ///
+    /// A validator that goes away (or comes back) is the single most common
+    /// reason a coordinator stops mining, and v0.2.1 narrated it on every
+    /// reconnect. Reporting only the edges keeps that signal without the
+    /// per-call volume.
+    fn note_reachability(&self, url: &str, outcome: Result<(), &ChainError>) {
+        let now = outcome.is_ok();
+        // Poisoned lock: reachability is advisory, never fail an RPC over it.
+        let Ok(mut guard) = self.reachable.lock() else {
+            return;
+        };
+        if *guard == Some(now) {
+            return;
+        }
+        match outcome {
+            Ok(()) => tracing::info!(url = %url, "validator RPC reachable"),
+            Err(e) => {
+                tracing::warn!(url = %url, error = %e, "validator RPC unreachable");
+            }
+        }
+        *guard = Some(now);
     }
 
     /// Lazily connect the read-only subxt client to the primary validator.
@@ -104,9 +134,51 @@ impl RealChainClient {
             .ok_or_else(|| ChainError::Unavailable("no validators configured".into()))
     }
 
+    /// Issue `method` against the configured validators in order, returning the
+    /// first success.
+    ///
+    /// `validators` is documented as an ordered failover list, and the default
+    /// pair leads with a container-network name that does not resolve on a host
+    /// install. Trying only the first entry makes that default unusable off
+    /// Docker, so every entry gets a turn before the call is called failed.
     async fn rpc_call(&self, method: &str, params: Value) -> Result<Value, ChainError> {
-        let url = self.primary_url()?;
-        rpc_request(url, method, params).await
+        if self.validators.is_empty() {
+            return Err(ChainError::Unavailable("no validators configured".into()));
+        }
+        let mut last: Option<ChainError> = None;
+        for url in &self.validators {
+            let out = rpc_request(url, method, params.clone()).await;
+            tracing::trace!(url = %url, method = %method, ok = out.is_ok(), "rpc call");
+            match out {
+                Ok(v) => {
+                    // Lock only after the await: `reachable` is a std Mutex and
+                    // must never be held across a suspension point.
+                    self.note_reachability(url, Ok(()));
+                    return Ok(v);
+                }
+                Err(e) => {
+                    tracing::debug!(url = %url, method = %method, error = %e, "validator failed; trying next");
+                    last = Some(e);
+                }
+            }
+        }
+        // Every endpoint failed: report against the primary, which is the one an
+        // operator will look at first.
+        let err = last.unwrap_or_else(|| ChainError::Unavailable("no validators configured".into()));
+        if let Some(primary) = self.validators.first() {
+            self.note_reachability(primary, Err(&err));
+        }
+        Err(err)
+    }
+
+    /// Raw `state_getRuntimeVersion` response, for the startup compatibility
+    /// check in [`super::preflight`].
+    ///
+    /// # Errors
+    /// Returns a transport error when the validator cannot be reached.
+    pub(crate) async fn runtime_version_raw(&self) -> Result<Value, ChainError> {
+        self.rpc_call("state_getRuntimeVersion", Value::Array(vec![]))
+            .await
     }
 
     /// Read + SCALE-decode a storage value at `at_hex`. `Ok(None)` when the key
@@ -132,6 +204,65 @@ impl RealChainClient {
         T::decode(&mut &bytes[..])
             .map(Some)
             .map_err(|e| ChainError::Decode(e.to_string()))
+    }
+}
+
+/// Pull `data.free` out of a decoded `System.Account` value.
+///
+/// `AccountInfo`'s field layout has changed across Substrate releases, so this
+/// walks the metadata-decoded value by name instead of assuming a SCALE shape.
+fn free_from_account_info(value: &subxt::ext::scale_value::Value) -> Option<u128> {
+    let ValueDef::Composite(outer) = &value.value else {
+        return None;
+    };
+    let data = named_field(outer, "data")?;
+    let ValueDef::Composite(inner) = &data.value else {
+        return None;
+    };
+    let free = named_field(inner, "free")?;
+    match &free.value {
+        ValueDef::Primitive(Primitive::U128(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+/// Look up a named field in a composite, ignoring unnamed composites.
+fn named_field<'a>(
+    c: &'a Composite<()>,
+    want: &str,
+) -> Option<&'a subxt::ext::scale_value::Value> {
+    match c {
+        Composite::Named(fields) => fields.iter().find(|(k, _)| k == want).map(|(_, v)| v),
+        Composite::Unnamed(_) => None,
+    }
+}
+
+#[async_trait]
+impl crate::funding::BalanceSource for RealChainClient {
+    async fn free_balance(&self, account: [u8; 32]) -> Result<u128, String> {
+        use subxt::ext::scale_value::Value as SValue;
+
+        let client = self.subxt_client().await.map_err(|e| e.to_string())?;
+        let at = client
+            .at_current_block()
+            .await
+            .map_err(|e| format!("at_current_block: {e}"))?;
+        let addr = subxt::dynamic::storage("System", "Account");
+        let found = at
+            .storage()
+            .try_fetch(addr, vec![SValue::from_bytes(account)])
+            .await
+            .map_err(|e| format!("fetch System.Account: {e}"))?;
+        // No entry means the account has never been touched on chain, which is
+        // a zero balance rather than a read failure.
+        let Some(entry) = found else {
+            return Ok(0);
+        };
+        let value = entry
+            .decode()
+            .map_err(|e| format!("decode System.Account: {e}"))?;
+        free_from_account_info(&value)
+            .ok_or_else(|| "System.Account has no data.free field".to_string())
     }
 }
 
@@ -674,8 +805,67 @@ fn rpc_params_from_value(params: Value) -> jsonrpsee::core::params::ArrayParams 
 
 #[cfg(test)]
 mod tests {
-    use super::order_id_from_fields;
+    use super::{free_from_account_info, order_id_from_fields};
     use subxt::ext::scale_value::{Composite, Value};
+
+    /// `AccountInfo` as recent Substrate runtimes shape it. The reader walks by
+    /// field name, so extra fields and field order must not matter.
+    fn account_info(free: u128) -> Value {
+        Value::named_composite(vec![
+            ("nonce".to_string(), Value::u128(7)),
+            ("consumers".to_string(), Value::u128(0)),
+            ("providers".to_string(), Value::u128(1)),
+            ("sufficients".to_string(), Value::u128(0)),
+            (
+                "data".to_string(),
+                Value::named_composite(vec![
+                    ("free".to_string(), Value::u128(free)),
+                    ("reserved".to_string(), Value::u128(0)),
+                    ("frozen".to_string(), Value::u128(0)),
+                ]),
+            ),
+        ])
+    }
+
+    #[test]
+    fn reads_free_balance_from_account_info() {
+        assert_eq!(free_from_account_info(&account_info(42)), Some(42));
+        assert_eq!(free_from_account_info(&account_info(0)), Some(0));
+    }
+
+    #[test]
+    fn free_balance_survives_extra_and_reordered_fields() {
+        // A runtime upgrade that adds a field or reorders must not break this.
+        let v = Value::named_composite(vec![
+            (
+                "data".to_string(),
+                Value::named_composite(vec![
+                    ("flags".to_string(), Value::u128(9)),
+                    ("free".to_string(), Value::u128(500)),
+                ]),
+            ),
+            ("nonce".to_string(), Value::u128(1)),
+        ]);
+        assert_eq!(free_from_account_info(&v), Some(500));
+    }
+
+    #[test]
+    fn missing_or_malformed_account_info_reads_as_none() {
+        // No `data` field.
+        let no_data = Value::named_composite(vec![("nonce".to_string(), Value::u128(1))]);
+        assert_eq!(free_from_account_info(&no_data), None);
+        // `data` present but no `free`.
+        let no_free = Value::named_composite(vec![(
+            "data".to_string(),
+            Value::named_composite(vec![("reserved".to_string(), Value::u128(1))]),
+        )]);
+        assert_eq!(free_from_account_info(&no_free), None);
+        // Unnamed composite: not the shape we can read by name.
+        assert_eq!(
+            free_from_account_info(&Value::unnamed_composite(vec![Value::u128(1)])),
+            None
+        );
+    }
 
     #[test]
     fn order_id_from_named_ignores_other_fields() {

@@ -33,6 +33,14 @@ jsonrpsee = { version = "0.24", features = [
 subxt = "0.50.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Faucet auto-funding is a plain HTTPS POST with a JSON body. jsonrpsee only
+# speaks JSON-RPC and hyper has no TLS layer wired here, so there is no existing
+# client to reuse. rustls-tls keeps OpenSSL out of the slim runtime image and
+# reuses the rustls already in Cargo.lock.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+] }
 tonic = { workspace = true }
 prost = { workspace = true }
 tokio = { workspace = true, features = [

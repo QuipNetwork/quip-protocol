@@ -348,6 +348,15 @@ async fn run_session<C: ChainClient>(
 
     if !token_ok || !protocol_ok {
         // Drop the stream; well-behaved miners exit 77 on handshake failure.
+        // Say why: a rejected miner is otherwise invisible from both sides —
+        // the coordinator drops the stream and the miner only sees EOF.
+        tracing::warn!(
+            miner = %miner_id,
+            token_ok,
+            protocol_ok,
+            offered_protocol = hello.protocol_version,
+            "miner handshake rejected; dropping session"
+        );
         return;
     }
 
@@ -364,6 +373,14 @@ async fn run_session<C: ChainClient>(
             },
         );
     }
+    tracing::info!(
+        miner = %miner_id,
+        backend = %hello.backend,
+        algorithm = %hello.algorithm,
+        max_nodes = hello.max_nodes,
+        max_edges = hello.max_edges,
+        "miner registered"
+    );
 
     // 2. Welcome + Configure (+ Topology if cached)
     if tx

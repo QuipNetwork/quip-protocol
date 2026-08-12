@@ -98,6 +98,26 @@ const MAX_STAGE_BYTES_PER_MINER: usize = 64 * 1024 * 1024; // 64 MiB
 /// Periodic liveness ping interval for [`crate::liveness::liveness_loop`].
 const LIVENESS_PING_INTERVAL: Duration = Duration::from_secs(15);
 
+/// How often the feeder emits its steady-state throughput line. The loop polls
+/// once per `poll_interval` (1s in production), so narrating every poll at
+/// `info` would bury everything else; the per-poll detail sits at `debug`.
+const FEEDER_HEARTBEAT: Duration = Duration::from_mins(1);
+
+/// Outcome of one snapshot poll. The feeder logs *transitions* between these
+/// at `info`/`warn` rather than one line per poll, so a coordinator that cannot
+/// mine says so once and loudly instead of either spamming or staying silent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeedState {
+    /// The chain returned a usable mining snapshot.
+    Ready,
+    /// The chain answered, but has no mining snapshot: no default topology is
+    /// registered, or none is mineable yet. Nothing can be staged.
+    Empty,
+    /// The snapshot fetch itself failed (RPC down, runtime API absent, decode
+    /// mismatch). Nothing can be staged.
+    Failed,
+}
+
 /// Estimated materialized-model bytes for one staged job on this topology: one
 /// i32 field per node (`h`) and one per edge (`j`). The 32-byte `topology_hash`
 /// and `job_id` are negligible next to these. Floored at 1 to avoid a zero
@@ -214,18 +234,47 @@ pub async fn feeder_loop<C: ChainClient>(
     // (including first availability), not on every per-block reseed.
     let mut last_topology_hash: Option<Vec<u8>> = None;
 
+    // Last snapshot-poll outcome, so the feeder narrates transitions instead of
+    // one line per poll. `None` until the first poll completes.
+    let mut feed_state: Option<FeedState> = None;
+    let mut last_heartbeat = std::time::Instant::now();
+
     loop {
-        let snap = match chain
+        let (snap, state_now) = match chain
             .fetch_mining_snapshot(None, params.miner_account, None)
             .await
         {
-            Ok(Some(s)) => Some(s),
-            Ok(None) => None,
+            Ok(Some(s)) => (Some(s), FeedState::Ready),
+            Ok(None) => (None, FeedState::Empty),
             Err(e) => {
-                tracing::warn!("feeder: snapshot fetch failed: {e}");
-                None
+                // Repeat the detail every poll at debug: the transition line
+                // below carries it once, but a changing error matters while
+                // diagnosing (e.g. RPC refused → runtime API missing).
+                tracing::debug!(error = %e, "feeder: snapshot fetch failed");
+                if feed_state != Some(FeedState::Failed) {
+                    tracing::warn!(
+                        error = %e,
+                        "feeder: cannot fetch mining snapshot; staging nothing until this clears"
+                    );
+                }
+                (None, FeedState::Failed)
             }
         };
+
+        // Narrate the transition. Without this, a coordinator that never mines
+        // is indistinguishable from one that mines fine.
+        if feed_state != Some(state_now) {
+            match state_now {
+                FeedState::Ready => tracing::info!("feeder: mining snapshot available"),
+                FeedState::Empty => tracing::warn!(
+                    "feeder: chain has no mining snapshot (no registered/mineable topology); \
+                     staging nothing"
+                ),
+                // Already reported above, with the error attached.
+                FeedState::Failed => {}
+            }
+            feed_state = Some(state_now);
+        }
 
         if let Some(snap) = snap.as_ref() {
             let head = snap.last_proof_block_hash;
@@ -287,6 +336,20 @@ pub async fn feeder_loop<C: ChainClient>(
                 let topo_proto = topo.to_proto();
                 let topology_changed =
                     last_topology_hash.as_deref() != Some(snap.topology_hash.as_slice());
+                // The round transition: the single most useful operational line
+                // there is, and what tells an operator mining is actually live.
+                tracing::info!(
+                    generation,
+                    qblock_id = ?qblock_id,
+                    block = snap.block_number,
+                    topology = %crate::chain::extrinsic::hex_encode(&snap.topology_hash),
+                    nodes = snap.nodes.len(),
+                    edges = snap.edges.len(),
+                    max_energy_milli = snap.max_energy_milli,
+                    min_solutions = snap.min_solutions,
+                    min_diversity_milli = snap.min_diversity_milli,
+                    "new round"
+                );
                 let mut st = state.lock().await;
                 st.set_topology(Some(topo));
                 st.target = Some(target_from_snapshot(snap));
@@ -325,6 +388,14 @@ pub async fn feeder_loop<C: ChainClient>(
                 target.min_diversity_milli,
             );
             if last_broadcast != Some(key) {
+                // Difficulty eases every block via the decay ratchet, so this is
+                // debug: at info it would fire nearly every poll.
+                tracing::debug!(
+                    max_energy_milli = key.0,
+                    min_solutions = key.1,
+                    min_diversity_milli = key.2,
+                    "difficulty target changed; broadcasting to miners"
+                );
                 broadcast_set_target(&state, target).await;
                 last_broadcast = Some(key);
             }
@@ -340,8 +411,12 @@ pub async fn feeder_loop<C: ChainClient>(
             // without this, `st.target` would stay pinned at the last reseed's
             // (harder) gate and under-accept solutions viable at the eased one.
             st.target = Some(target);
+            // Per-miner drain/staging stats for the heartbeat, collected here
+            // and emitted off-lock below.
+            let mut stats: Vec<(String, u32, usize, usize)> = Vec::new();
             for id in st.router.miner_ids() {
-                let consumed = f64::from(st.router.take_consumed(&id));
+                let consumed_raw = st.router.take_consumed(&id);
+                let consumed = f64::from(consumed_raw);
                 let ema = match consumption_ema.get(&id) {
                     Some(&prev) => {
                         CONSUMPTION_EMA_ALPHA * consumed + (1.0 - CONSUMPTION_EMA_ALPHA) * prev
@@ -378,6 +453,12 @@ pub async fn feeder_loop<C: ChainClient>(
                         break; // not capable for this shape — stop topping up
                     }
                 }
+                stats.push((id.clone(), consumed_raw, depth, st.router.staged_len(&id)));
+            }
+            if stats.is_empty() {
+                // Miners are configured but none has completed a handshake, so
+                // there is nowhere to stage work. Silent otherwise.
+                tracing::debug!("feeder: no registered miners; nothing to stage");
             }
 
             // Win-time submission: observe the head for block estimation, pick
@@ -397,7 +478,37 @@ pub async fn feeder_loop<C: ChainClient>(
                 .unwrap_or(snap.block_number);
             let best = st.current_best_milli;
             let due = st.stash.due_improving(current_block, best).cloned();
+            let validated = st.results_validated;
             drop(st);
+
+            // Steady-state narration. Every poll at debug for diagnosis; once a
+            // minute at info so an operator watching the log sees the
+            // coordinator is alive and how fast each miner is draining work.
+            tracing::debug!(
+                block = current_block,
+                generation,
+                miners = ?stats,
+                "feeder: poll"
+            );
+            if last_heartbeat.elapsed() >= FEEDER_HEARTBEAT {
+                for (id, consumed, depth, staged) in &stats {
+                    tracing::info!(
+                        miner = %id,
+                        jobs_consumed = consumed,
+                        staged = staged,
+                        window = depth,
+                        "miner throughput"
+                    );
+                }
+                tracing::info!(
+                    block = current_block,
+                    generation,
+                    results_validated = validated,
+                    best_energy_milli = ?best,
+                    "coordinator alive"
+                );
+                last_heartbeat = std::time::Instant::now();
+            }
 
             if let Some(cand) = due {
                 use crate::chain::SubmitAction;

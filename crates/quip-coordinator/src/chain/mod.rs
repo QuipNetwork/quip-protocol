@@ -4,6 +4,7 @@
 pub mod extrinsic;
 pub mod fake;
 pub mod mempool;
+pub mod preflight;
 pub mod proof_encode;
 pub mod real;
 pub mod scale_types;

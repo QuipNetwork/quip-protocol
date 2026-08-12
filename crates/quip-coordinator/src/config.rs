@@ -9,6 +9,15 @@ pub enum ConfigError {
     MissingMiner,
     /// TOML parse failure (message from the parser).
     BadToml(String),
+    /// No backend section, so there is nothing to launch. A coordinator with an
+    /// empty launch plan binds its socket, follows the chain, and mines nothing
+    /// — the failure this variant exists to make loud instead of silent.
+    NoBackends {
+        /// True when the config carries `[miner]` keys that only ever existed
+        /// in the v0.2 `quip-miner` format, which is the usual reason a v0.3
+        /// coordinator finds no backends.
+        looks_like_v0_2: bool,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -16,6 +25,23 @@ impl std::fmt::Display for ConfigError {
         match self {
             Self::MissingMiner => write!(f, "missing [miner] section"),
             Self::BadToml(e) => write!(f, "bad toml: {e}"),
+            Self::NoBackends { looks_like_v0_2 } => {
+                write!(
+                    f,
+                    "no miner backend section: add at least one of [cpu], [cuda.N], \
+                     [metal], [dwave]/[qpu]"
+                )?;
+                if *looks_like_v0_2 {
+                    write!(
+                        f,
+                        ". This config carries v0.2 quip-miner keys (faucet_url / \
+                         rest_host / rest_port); the v0.3 coordinator uses a different \
+                         format, where each backend gets its own section (see \
+                         docker/config.toml)"
+                    )?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -28,6 +54,15 @@ pub struct CoordinatorConfig {
     pub validators: Vec<String>,
     /// Signer key URI or keystore path.
     pub signer_key: String,
+    /// Faucet base URL for auto-funding the miner account. `None` disables it,
+    /// and an underfunded account then fails startup with no way to recover.
+    pub faucet_url: Option<String>,
+    /// Balance floor in plancks, below which the coordinator funds or refuses.
+    pub min_balance_plancks: u128,
+    /// Amount requested per faucet attempt, in plancks.
+    pub faucet_top_up_plancks: u128,
+    /// How long to keep trying the faucet before giving up.
+    pub funding_timeout_s: u64,
     /// One entry per supervised miner subprocess.
     pub launch: Vec<LaunchEntry>,
     /// Optional mining-attempt dashboard (`[dashboard]` section). `None`
@@ -52,6 +87,16 @@ pub struct LaunchEntry {
     /// Handshake configure payload (queue depths, heartbeat, backend TOML).
     pub configure: Configure,
 }
+
+/// Validators used when `[miner].validators` is absent: the container-network
+/// name first, then a node on this host.
+///
+/// The v0.2 `quip-miner` applied exactly this fallback, and its shipped config
+/// template ships the key commented out on the strength of it. Without the
+/// fallback such a config yields an empty validator list, and every chain read
+/// fails with "no validators configured" — a coordinator that runs and never
+/// mines. An explicit empty list is still honored as an explicit choice.
+pub const DEFAULT_VALIDATORS: [&str; 2] = ["ws://quip-validator:9944", "ws://127.0.0.1:9944"];
 
 fn make_configure(table: &toml::Table) -> Configure {
     let u32_of = |k: &str, d: u32| {
@@ -123,20 +168,48 @@ pub fn parse_config(toml_text: &str) -> Result<CoordinatorConfig, ConfigError> {
         .get("miner")
         .and_then(|v| v.as_table())
         .ok_or(ConfigError::MissingMiner)?;
-    let validators = miner
-        .get("validators")
-        .and_then(|v| v.as_array())
-        .map(|a| {
+    // Absent key → the v0.2 fallback pair. A present-but-empty array is an
+    // explicit "no validators" and is left alone.
+    let validators: Vec<String> = miner.get("validators").and_then(|v| v.as_array()).map_or_else(
+        || DEFAULT_VALIDATORS.iter().map(|s| (*s).to_string()).collect(),
+        |a| {
             a.iter()
                 .filter_map(|x| x.as_str().map(String::from))
                 .collect()
-        })
-        .unwrap_or_default();
+        },
+    );
     let signer_key = miner
         .get("signer_key")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+
+    // Auto-funding. A blank `faucet_url` reads as "disabled" so an operator can
+    // switch it off by emptying the value instead of deleting the line.
+    let faucet_url = miner
+        .get("faucet_url")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let plancks_of = |key: &str, default: u128| -> u128 {
+        miner
+            .get(key)
+            .and_then(toml::Value::as_integer)
+            .and_then(|i| u128::try_from(i).ok())
+            .unwrap_or(default)
+    };
+    let min_balance_plancks = plancks_of(
+        "min_balance_plancks",
+        crate::funding::DEFAULT_MIN_BALANCE_PLANCKS,
+    );
+    let faucet_top_up_plancks =
+        plancks_of("faucet_top_up_plancks", crate::funding::DEFAULT_TOP_UP_PLANCKS);
+    let funding_timeout_s = miner
+        .get("funding_timeout_s")
+        .and_then(toml::Value::as_integer)
+        .and_then(|i| u64::try_from(i).ok())
+        .unwrap_or(crate::funding::DEFAULT_FUNDING_TIMEOUT.as_secs());
 
     let mut launch = Vec::new();
     if let Some(t) = root.get("cpu").and_then(|v| v.as_table()) {
@@ -174,9 +247,23 @@ pub fn parse_config(toml_text: &str) -> Result<CoordinatorConfig, ConfigError> {
             })
         });
 
+    if launch.is_empty() {
+        // Keys that only ever existed in the v0.2 `quip-miner` config. The v0.3
+        // coordinator reads a different file, and silently ignoring the rest of
+        // it would leave an operator with a running process that never mines.
+        let looks_like_v0_2 = ["faucet_url", "rest_host", "rest_port"]
+            .iter()
+            .any(|k| miner.contains_key(*k));
+        return Err(ConfigError::NoBackends { looks_like_v0_2 });
+    }
+
     Ok(CoordinatorConfig {
         validators,
         signer_key,
+        faucet_url,
+        min_balance_plancks,
+        faucet_top_up_plancks,
+        funding_timeout_s,
         launch,
         dashboard,
     })
@@ -267,5 +354,128 @@ budget_cap = "5m"
         // erroring, so a partial config still boots.
         let partial = format!("{SAMPLE}\n[dashboard]\nlisten = \"127.0.0.1:9090\"\n");
         assert!(parse_config(&partial).unwrap().dashboard.is_none());
+    }
+
+    #[test]
+    fn config_without_any_backend_is_rejected() {
+        let no_backend =
+            "[miner]\nvalidators = [\"ws://127.0.0.1:9944\"]\nsigner_key = \"//Alice\"\n";
+        assert!(matches!(
+            parse_config(no_backend),
+            Err(ConfigError::NoBackends {
+                looks_like_v0_2: false
+            })
+        ));
+    }
+
+    /// The exact failure seen on a live node-manager stack: a v0.2.1 `quip-miner`
+    /// config handed to the v0.3 coordinator. It parses as valid TOML and has a
+    /// `[miner]` section, so nothing rejected it — it just launched no miners.
+    #[test]
+    fn v0_2_miner_config_is_rejected_with_a_format_hint() {
+        let v0_2 = r#"
+[miner]
+signer_key = "/data/keystore.json"
+faucet_url = "https://faucet.testnet.quip.network"
+rest_host = "0.0.0.0"
+rest_port = 8086
+"#;
+        let Err(err) = parse_config(v0_2) else {
+            panic!("a v0.2 miner config must not parse as a v0.3 coordinator config");
+        };
+        assert!(matches!(
+            err,
+            ConfigError::NoBackends {
+                looks_like_v0_2: true
+            }
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("[cpu]"), "{msg}");
+        assert!(msg.contains("v0.2"), "{msg}");
+    }
+
+    /// v0.2 parity: a config that omits `validators` must still reach a chain.
+    /// The node-manager template ships the key commented out, so without the
+    /// fallback the coordinator starts with nowhere to connect and never mines.
+    #[test]
+    fn omitted_validators_fall_back_to_the_v0_2_pair() {
+        let cfg = parse_config("[miner]\nsigner_key = \"//Alice\"\n\n[cpu]\n").unwrap();
+        assert_eq!(cfg.validators, DEFAULT_VALIDATORS.to_vec());
+    }
+
+    #[test]
+    fn explicit_validators_win_over_the_fallback() {
+        let cfg = parse_config(
+            "[miner]\nvalidators = [\"ws://example:9944\"]\nsigner_key = \"//Alice\"\n\n[cpu]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.validators, vec!["ws://example:9944".to_string()]);
+    }
+
+    #[test]
+    fn explicit_empty_validators_stay_empty() {
+        // An explicit `[]` is a deliberate choice, not an omission.
+        let cfg =
+            parse_config("[miner]\nvalidators = []\nsigner_key = \"//Alice\"\n\n[cpu]\n").unwrap();
+        assert!(cfg.validators.is_empty());
+    }
+
+    #[test]
+    fn funding_defaults_apply_when_keys_are_absent() {
+        let cfg = parse_config(SAMPLE).unwrap();
+        assert_eq!(cfg.faucet_url, None);
+        assert_eq!(
+            cfg.min_balance_plancks,
+            crate::funding::DEFAULT_MIN_BALANCE_PLANCKS
+        );
+        assert_eq!(
+            cfg.faucet_top_up_plancks,
+            crate::funding::DEFAULT_TOP_UP_PLANCKS
+        );
+        assert_eq!(cfg.funding_timeout_s, 600);
+    }
+
+    #[test]
+    fn funding_keys_are_parsed_and_overridable() {
+        let text = "[miner]\nsigner_key = \"//Alice\"\n\
+                    faucet_url = \"https://f.example\"\n\
+                    min_balance_plancks = 5\nfaucet_top_up_plancks = 50\n\
+                    funding_timeout_s = 30\n\n[cpu]\n";
+        let cfg = parse_config(text).unwrap();
+        assert_eq!(cfg.faucet_url.as_deref(), Some("https://f.example"));
+        assert_eq!(cfg.min_balance_plancks, 5);
+        assert_eq!(cfg.faucet_top_up_plancks, 50);
+        assert_eq!(cfg.funding_timeout_s, 30);
+    }
+
+    /// Emptying the value is how an operator opts out without deleting the key.
+    #[test]
+    fn blank_faucet_url_disables_auto_funding() {
+        for blank in ["\"\"", "\"   \""] {
+            let text =
+                format!("[miner]\nsigner_key = \"//Alice\"\nfaucet_url = {blank}\n\n[cpu]\n");
+            assert_eq!(parse_config(&text).unwrap().faucet_url, None, "{blank}");
+        }
+    }
+
+    /// The shipped v0.3 template must survive its own parser.
+    #[test]
+    fn shipped_docker_template_parses() {
+        let text = include_str!("../../../docker/config.toml");
+        let cfg = parse_config(text).expect("docker/config.toml must parse");
+        assert!(
+            !cfg.launch.is_empty(),
+            "shipped template must declare a backend"
+        );
+        // The image must self-fund out of the box: a bare `docker run` has no
+        // way to hand the account money otherwise.
+        assert!(
+            cfg.faucet_url.is_some(),
+            "shipped template must configure a faucet"
+        );
+        assert!(
+            !cfg.signer_key.is_empty(),
+            "shipped template must point at a keystore path"
+        );
     }
 }
