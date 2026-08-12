@@ -31,6 +31,14 @@ faucet_url = "https://faucet.testnet.quip.network"
 # key lives here.
 signer_key = "/data/keystore.json"
 
+# Host a peer uses to reach this node from outside the host. Required.
+# An empty string is not a host. Set this to the address peers can reach.
+public_host = "203.0.113.10"
+# Port a peer uses to reach this node from outside the host. Required.
+# This is the public front door, not the validator peer port (9944) and
+# not the dashboard port (9090). Zero is not a valid port.
+public_port = 20050
+
 # CPU miner (bundled: quip-cpu-sa, quip-cpu-gibbs).
 [cpu]
 binary = "quip-cpu-sa"   # or "quip-cpu-gibbs"
