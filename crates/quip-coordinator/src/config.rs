@@ -92,7 +92,7 @@ pub struct CoordinatorConfig {
 
 /// `[dashboard]` config: where to serve the attempt logs and where they live.
 pub struct DashboardConfig {
-    /// HTTP listen address, e.g. `127.0.0.1:9090`.
+    /// HTTP listen address, e.g. `0.0.0.0:20100` (Caddy `/api/v1/*` proxy).
     pub listen: String,
     /// Root directory for `<qblock_id>/attempts.jsonl` files.
     pub data_dir: String,

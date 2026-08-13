@@ -59,10 +59,15 @@ binary = "quip-cpu-sa"   # or "quip-cpu-gibbs"
 # min_block_budget = "90s"  # start threshold; default min(90s, daily_budget)
 # budget_cap = "5m"         # max pool size; default uncapped
 
-# Mining-attempt dashboard. Records every solved model as JSONL under
-# data_dir/<qblock_id>/attempts.jsonl and serves them read-only over HTTP
-# (GET /<qblock_id>/attempts.jsonl, GET /qblocks, GET /healthz). Omit to
-# disable. Use the mounted /data volume so history survives restarts.
-# [dashboard]
-# listen = "0.0.0.0:9090"
-# data_dir = "/data/attempts"
+# Mining-attempt dashboard and indexer REST surface. Records every solved
+# model as JSONL under data_dir/<qblock_id>/attempts.jsonl and serves:
+#   GET /healthz, GET /qblocks, GET /<qblock_id>/attempts.jsonl
+#   GET /api/v1/status, GET /api/v1/stats, GET /api/v1/mining/attempts
+# Listen on 0.0.0.0:20100 so host.docker.internal:20100 matches the Caddy
+# reverse_proxy for /api/v1/* (see
+# quip-node-manager/vendor/nodes.quip.network/caddy/Caddyfile — the miner's
+# rest_port default). Use the mounted /data volume so history survives
+# restarts. Omit the section to disable.
+[dashboard]
+listen = "0.0.0.0:20100"
+data_dir = "/data/attempts"

@@ -381,6 +381,26 @@ fields of the `Configure` message; every other key passes through verbatim in
 `Configure.backend_toml`, which the coordinator forwards to the miner. This is
 how a backend receives its own settings without the coordinator knowing them.
 
+## Dashboard and REST surface
+
+The optional `[dashboard]` section starts a read-only HTTP server. `listen`
+gives the bind address. `data_dir` gives the directory that holds the
+mining-attempt records. The coordinator writes every solved model as JSONL
+under `data_dir/<qblock_id>/attempts.jsonl`. Omit the section to turn the
+server off.
+
+| Route | Response |
+|-------|----------|
+| `GET /healthz` | `ok` |
+| `GET /qblocks` | JSON array of the available qblock ids |
+| `GET /api/v1/status` | indexer status envelope |
+| `GET /api/v1/stats` | indexer stats envelope |
+| `GET /api/v1/mining/attempts?solution_number=N` | submission and attempts for one solution |
+| anything else | static files under `data_dir` |
+
+The server serves reads only. It exposes no control endpoint. Bind it to an
+address the operator trusts, because it applies no authentication.
+
 ## Drive mode
 
 `quip-coordinator drive` (the `drive` module and `DriveService` in `session.rs`)

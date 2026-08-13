@@ -1,23 +1,41 @@
-//! REST dashboard endpoint (agm.4).
+//! REST dashboard and indexer `/api/v1` surface (agm.4).
 //!
-//! Static file serving of the per-qblock attempt logs the [`crate::attempt`]
-//! writer appends, plus a small index of available qblocks. No query or DB
-//! work: `tower_http::ServeDir` serves the JSONL files directly, so the
-//! coordinator carries no request-time overhead beyond a file read.
+//! Serves the per-qblock attempt logs the [`crate::attempt`] writer appends,
+//! plus the three endpoints the dashboard indexer polls:
+//! `GET /api/v1/status`, `GET /api/v1/stats`, and
+//! `GET /api/v1/mining/attempts?solution_number=N`.
+//!
+//! Static files under `data_dir` remain available via the fallback service
+//! (`GET /<qblock_id>/attempts.jsonl`). The attempts JSONL is also the data
+//! source for the `/api/v1/mining/attempts` envelope: `solution_number` maps
+//! to the directory name under `data_dir`.
 
-use axum::{extract::State, routing::get, Json, Router};
-use std::path::PathBuf;
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Json, Router};
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tower_http::services::ServeDir;
 
 /// Build the dashboard router rooted at `data_dir`:
 /// - `GET /qblocks` → JSON array of available qblock ids (directory names)
 /// - `GET /healthz` → `ok`
+/// - `GET /api/v1/status` → indexer status envelope
+/// - `GET /api/v1/stats` → indexer stats envelope
+/// - `GET /api/v1/mining/attempts?solution_number=N` → submission + attempts
 /// - everything else → static files under `data_dir`, e.g.
 ///   `GET /<qblock_id>/attempts.jsonl`.
 pub fn router(data_dir: PathBuf) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/qblocks", get(list_qblocks))
+        .route("/api/v1/status", get(api_status))
+        .route("/api/v1/stats", get(api_stats))
+        .route("/api/v1/mining/attempts", get(api_mining_attempts))
         .fallback_service(ServeDir::new(&data_dir))
         .with_state(data_dir)
 }
@@ -27,7 +45,7 @@ async fn healthz() -> &'static str {
 }
 
 /// List the qblock directories under the data root (sorted). Returns an empty
-/// list if the root doesn't exist yet.
+/// list if the root does not exist yet.
 async fn list_qblocks(State(data_dir): State<PathBuf>) -> Json<Vec<String>> {
     let mut ids = Vec::new();
     if let Ok(mut rd) = tokio::fs::read_dir(&data_dir).await {
@@ -44,7 +62,7 @@ async fn list_qblocks(State(data_dir): State<PathBuf>) -> Json<Vec<String>> {
     Json(ids)
 }
 
-/// Serve the dashboard on `listen` (e.g. `127.0.0.1:9090`) until the task is
+/// Serve the dashboard on `listen` (e.g. `0.0.0.0:20100`) until the task is
 /// aborted. A bind failure is logged and the task exits without taking down the
 /// coordinator.
 pub async fn serve(listen: String, data_dir: PathBuf) {
@@ -64,12 +82,375 @@ pub async fn serve(listen: String, data_dir: PathBuf) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Response envelope (matches v0.2 telemetry process + indexer client)
+// ---------------------------------------------------------------------------
+
+fn unix_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn success_envelope(data: &Value) -> Response {
+    Json(json!({
+        "success": true,
+        "data": data,
+        "timestamp": unix_ts(),
+    }))
+    .into_response()
+}
+
+fn error_envelope(status: StatusCode, message: &str, code: &str) -> Response {
+    (
+        status,
+        Json(json!({
+            "success": false,
+            "error": message,
+            "code": code,
+            "timestamp": unix_ts(),
+        })),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/status
+// ---------------------------------------------------------------------------
+
+/// Indexer status probe. Identity and chain fields have no live source in the
+/// file-backed dashboard yet, so they return empty / zero values the client
+/// already tolerates (see report: Blocked / needs decision).
+async fn api_status() -> Response {
+    success_envelope(&json!({
+        "ss58_address": "",
+        "account_id_hex": "",
+        "node_id": "",
+        "is_mining": false,
+        "uptime_seconds": 0,
+        "chain": {
+            "head_hash": "",
+            "head_number": 0,
+        },
+        "miner_registered": false,
+        "miner_info": null,
+        "miners": [],
+        "modes": {},
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/stats
+// ---------------------------------------------------------------------------
+
+/// Indexer stats probe. Controller counters are not tracked by the dashboard
+/// writer; zeros keep the envelope parseable until a live counter source is
+/// wired.
+async fn api_stats() -> Response {
+    success_envelope(&json!({
+        "controller": {
+            "heads_observed": 0,
+            "contexts_dispatched": 0,
+            "results_received": 0,
+            "proofs_submitted": 0,
+            "stale_drops": 0,
+            "submission_errors": 0,
+            "duplicate_result_drops": 0,
+        }
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/mining/attempts?solution_number=N
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct AttemptsQuery {
+    /// Global solution number; maps to `data_dir/<solution_number>/`.
+    solution_number: Option<String>,
+}
+
+async fn api_mining_attempts(
+    State(data_dir): State<PathBuf>,
+    Query(query): Query<AttemptsQuery>,
+) -> Response {
+    let Some(raw) = query.solution_number.as_deref() else {
+        return error_envelope(
+            StatusCode::BAD_REQUEST,
+            "supply ?solution_number=N",
+            "BAD_PARAM",
+        );
+    };
+    let Ok(solution_number) = raw.parse::<u64>() else {
+        return error_envelope(
+            StatusCode::BAD_REQUEST,
+            "solution_number must be an integer",
+            "BAD_PARAM",
+        );
+    };
+    match load_attempts_envelope(&data_dir, solution_number) {
+        Ok(data) => success_envelope(&data),
+        Err(AttemptsLoadError::NotFound) => error_envelope(
+            StatusCode::NOT_FOUND,
+            &format!("solution_number {solution_number} not found"),
+            "NOT_FOUND",
+        ),
+        Err(AttemptsLoadError::Io(e)) => {
+            tracing::warn!(
+                solution_number,
+                error = %e,
+                "dashboard: failed to read attempts for solution_number"
+            );
+            error_envelope(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read attempts",
+                "INTERNAL_ERROR",
+            )
+        }
+    }
+}
+
+enum AttemptsLoadError {
+    NotFound,
+    Io(std::io::Error),
+}
+
+/// Read `data_dir/<solution_number>/attempts.jsonl` and build the
+/// `{ submission, attempts }` envelope the indexer parser expects.
+fn load_attempts_envelope(
+    data_dir: &Path,
+    solution_number: u64,
+) -> Result<Value, AttemptsLoadError> {
+    let dir = data_dir.join(solution_number.to_string());
+    if !dir.is_dir() {
+        return Err(AttemptsLoadError::NotFound);
+    }
+    let path = dir.join("attempts.jsonl");
+    let body = match std::fs::read_to_string(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AttemptsLoadError::NotFound);
+        }
+        Err(e) => return Err(AttemptsLoadError::Io(e)),
+    };
+
+    let mut records: Vec<Map<String, Value>> = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        records.push(obj);
+    }
+    if records.is_empty() {
+        return Err(AttemptsLoadError::NotFound);
+    }
+
+    let attempts = records
+        .iter()
+        .enumerate()
+        .map(|(i, rec)| attempt_from_record(rec, i + 1, solution_number))
+        .collect::<Vec<_>>();
+
+    let submission = submission_from_records(&records, solution_number);
+    Ok(json!({
+        "submission": submission,
+        "attempts": attempts,
+    }))
+}
+
+/// Map one v0.3 [`crate::attempt::AttemptRecord`] JSON object onto the v0.2
+/// attempt wire shape the indexer parser reads.
+fn attempt_from_record(rec: &Map<String, Value>, iter: usize, solution_number: u64) -> Value {
+    let best_energy_milli = i64_field(rec, "best_energy_milli").unwrap_or(0);
+    let result_kind = result_kind_of(rec);
+    let miner_id = string_field(rec, "miner_id").unwrap_or_default();
+    let ts_ns = ts_ns_of(rec);
+    // Map device access time onto the QPU field the indexer sums. CPU/GPU
+    // miners also record this; the indexer treats the sum as QPU compute.
+    let qpu_access_time_us = match u64_field(rec, "device_access_time_us") {
+        Some(us) if us > 0 => Value::from(us),
+        _ => Value::Null,
+    };
+    // AttemptRecord has no backend type; empty string is the indexer default.
+    json!({
+        "type": "attempt",
+        "ts_ns": ts_ns,
+        "miner_id": miner_id,
+        "miner_type": "",
+        "solution_number": solution_number,
+        "iter": iter,
+        "best_energy_milli": best_energy_milli,
+        "result_kind": result_kind,
+        "num_valid": u64_field(rec, "n_valid"),
+        "diversity_milli": u64_field(rec, "diversity_milli"),
+        "qpu_access_time_us": qpu_access_time_us,
+        "job_id": string_field(rec, "job_id"),
+        "accepted": bool_field(rec, "accepted"),
+        "submitted": bool_field(rec, "submitted"),
+    })
+}
+
+/// Build a submission object from the attempt trail. v0.3 does not write
+/// `submission.json`; the indexer still requires the submission object.
+///
+/// Fields with no v0.3 source:
+/// - `threshold_milli` → `0`
+/// - `last_proof_block_hash` → `"0x0"` (non-empty so the parser accepts it)
+/// - `extrinsic_hash`, `chain_block_hash`, `chain_block_number`, `pow_sequence`
+///   → `null`
+/// - `miner_type` → `""`
+fn submission_from_records(records: &[Map<String, Value>], solution_number: u64) -> Value {
+    // Prefer the last submitted attempt; else the last accepted; else the last.
+    // Caller guarantees `records` is non-empty; fall back to an empty map only
+    // so this helper never panics if that invariant is broken.
+    let empty = Map::new();
+    let chosen = records
+        .iter()
+        .rev()
+        .find(|r| bool_field(r, "submitted") == Some(true))
+        .or_else(|| {
+            records
+                .iter()
+                .rev()
+                .find(|r| bool_field(r, "accepted") == Some(true))
+        })
+        .or_else(|| records.last())
+        .unwrap_or(&empty);
+
+    let miner_id = string_field(chosen, "miner_id").unwrap_or_else(|| "unknown".into());
+    let energy_milli = i64_field(chosen, "best_energy_milli").unwrap_or(0);
+    let diversity_milli = u64_field(chosen, "diversity_milli").unwrap_or(0);
+    let num_valid = u64_field(chosen, "n_valid");
+    let ts_ns = ts_ns_of(chosen);
+
+    let any_submitted = records
+        .iter()
+        .any(|r| bool_field(r, "submitted") == Some(true));
+    let any_accepted = records
+        .iter()
+        .any(|r| bool_field(r, "accepted") == Some(true));
+    let outcome = if any_submitted {
+        "submitted"
+    } else if any_accepted {
+        "stored"
+    } else {
+        "rejected"
+    };
+
+    json!({
+        "type": "submission",
+        "ts_ns": ts_ns,
+        "solution_number": solution_number,
+        "miner_id": miner_id,
+        "miner_type": "",
+        "energy_milli": energy_milli,
+        "diversity_milli": diversity_milli,
+        // No max-energy / threshold is stored on AttemptRecord.
+        "threshold_milli": 0,
+        "num_valid": num_valid,
+        // No last-proof block hash is stored on AttemptRecord.
+        "last_proof_block_hash": "0x0",
+        "extrinsic_hash": null,
+        "chain_block_hash": null,
+        "chain_block_number": null,
+        "pow_sequence": null,
+        "outcome": outcome,
+    })
+}
+
+fn result_kind_of(rec: &Map<String, Value>) -> &'static str {
+    if bool_field(rec, "submitted") == Some(true) {
+        "submitted"
+    } else if bool_field(rec, "accepted") == Some(true) {
+        "stored"
+    } else {
+        "rejected"
+    }
+}
+
+fn ts_ns_of(rec: &Map<String, Value>) -> u128 {
+    // AttemptRecord records wall time in milliseconds; the wire shape uses ns.
+    match u64_field(rec, "ts_ms") {
+        Some(ms) => u128::from(ms).saturating_mul(1_000_000),
+        None => 0,
+    }
+}
+
+fn string_field(rec: &Map<String, Value>, key: &str) -> Option<String> {
+    rec.get(key).and_then(|v| match v {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    })
+}
+
+fn bool_field(rec: &Map<String, Value>, key: &str) -> Option<bool> {
+    rec.get(key).and_then(Value::as_bool)
+}
+
+fn i64_field(rec: &Map<String, Value>, key: &str) -> Option<i64> {
+    rec.get(key).and_then(|v| match v {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    })
+}
+
+fn u64_field(rec: &Map<String, Value>, key: &str) -> Option<u64> {
+    rec.get(key).and_then(|v| match v {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt; // oneshot
+
+    fn attempt_line(
+        miner_id: &str,
+        best_energy_milli: i64,
+        diversity_milli: u32,
+        n_valid: u32,
+        accepted: bool,
+        submitted: bool,
+        device_access_time_us: u64,
+    ) -> String {
+        serde_json::json!({
+            "ts_ms": 1_700_000_000_000_u64,
+            "qblock_id": 42,
+            "generation": 1,
+            "miner_id": miner_id,
+            "job_id": "ab",
+            "is_pow": true,
+            "order_id": "",
+            "best_energy_milli": best_energy_milli,
+            "diversity_milli": diversity_milli,
+            "n_valid": n_valid,
+            "accepted": accepted,
+            "submitted": submitted,
+            "device_access_time_us": device_access_time_us,
+        })
+        .to_string()
+    }
+
+    async fn body_json(resp: Response) -> Value {
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn at<'a>(v: &'a Value, path: &str) -> &'a Value {
+        v.pointer(path).unwrap_or(&Value::Null)
+    }
 
     #[tokio::test]
     async fn serves_attempts_file_and_lists_qblocks() {
@@ -116,5 +497,149 @@ mod tests {
             .unwrap();
         let ids: Vec<String> = serde_json::from_slice(&body).unwrap();
         assert_eq!(ids, vec!["42".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn status_returns_success_envelope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = router(tmp.path().to_path_buf());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(at(&v, "/success"), &json!(true));
+        assert!(at(&v, "/data").is_object());
+        assert!(at(&v, "/data/ss58_address").is_string());
+        assert!(at(&v, "/data/chain").is_object());
+        assert!(at(&v, "/data/miners").is_array());
+        assert!(at(&v, "/timestamp").is_number());
+    }
+
+    #[tokio::test]
+    async fn stats_returns_controller_counters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = router(tmp.path().to_path_buf());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(at(&v, "/success"), &json!(true));
+        assert_eq!(at(&v, "/data/controller/heads_observed"), &json!(0));
+        assert_eq!(at(&v, "/data/controller/contexts_dispatched"), &json!(0));
+        assert_eq!(at(&v, "/data/controller/results_received"), &json!(0));
+        assert_eq!(at(&v, "/data/controller/proofs_submitted"), &json!(0));
+        assert_eq!(at(&v, "/data/controller/stale_drops"), &json!(0));
+        assert_eq!(at(&v, "/data/controller/submission_errors"), &json!(0));
+        assert_eq!(at(&v, "/data/controller/duplicate_result_drops"), &json!(0));
+    }
+
+    #[tokio::test]
+    async fn mining_attempts_happy_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("7");
+        std::fs::create_dir_all(&dir).unwrap();
+        let line1 = attempt_line("cpu-0", -14_000, 200, 3, true, false, 0);
+        let line2 = attempt_line("cpu-0", -14_200, 250, 6, true, true, 12_000);
+        std::fs::write(dir.join("attempts.jsonl"), format!("{line1}\n{line2}\n")).unwrap();
+
+        let app = router(tmp.path().to_path_buf());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/mining/attempts?solution_number=7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(at(&v, "/success"), &json!(true));
+        assert_eq!(at(&v, "/data/submission/solution_number"), &json!(7));
+        assert_eq!(at(&v, "/data/submission/miner_id"), &json!("cpu-0"));
+        assert_eq!(at(&v, "/data/submission/energy_milli"), &json!(-14_200));
+        assert_eq!(at(&v, "/data/submission/diversity_milli"), &json!(250));
+        assert_eq!(at(&v, "/data/submission/outcome"), &json!("submitted"));
+        assert_eq!(at(&v, "/data/submission/num_valid"), &json!(6));
+        let attempts = at(&v, "/data/attempts").as_array().unwrap();
+        assert_eq!(attempts.len(), 2);
+        let a0 = attempts.first().unwrap();
+        let a1 = attempts.get(1).unwrap();
+        assert_eq!(at(a0, "/iter"), &json!(1));
+        assert_eq!(at(a0, "/result_kind"), &json!("stored"));
+        assert_eq!(at(a1, "/iter"), &json!(2));
+        assert_eq!(at(a1, "/result_kind"), &json!("submitted"));
+        assert_eq!(at(a1, "/qpu_access_time_us"), &json!(12_000));
+    }
+
+    #[tokio::test]
+    async fn mining_attempts_unknown_solution_number_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = router(tmp.path().to_path_buf());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/mining/attempts?solution_number=999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let v = body_json(resp).await;
+        assert_eq!(at(&v, "/success"), &json!(false));
+        assert_eq!(at(&v, "/code"), &json!("NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn mining_attempts_missing_query_is_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = router(tmp.path().to_path_buf());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/mining/attempts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp).await;
+        assert_eq!(at(&v, "/success"), &json!(false));
+        assert_eq!(at(&v, "/code"), &json!("BAD_PARAM"));
+    }
+
+    #[tokio::test]
+    async fn mining_attempts_malformed_query_is_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = router(tmp.path().to_path_buf());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/mining/attempts?solution_number=not-a-number")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp).await;
+        assert_eq!(at(&v, "/success"), &json!(false));
+        assert_eq!(at(&v, "/code"), &json!("BAD_PARAM"));
     }
 }
