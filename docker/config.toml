@@ -24,6 +24,13 @@ faucet_url = "https://faucet.testnet.quip.network"
 # How long to keep retrying the faucet before giving up, in seconds.
 # funding_timeout_s = 600
 
+# Consecutive failed submissions of one proof, inside one quantum block, before
+# the coordinator stops retrying it and reports loudly. Submit outcome comes
+# from chain state, which reports that a proof did not land but not why, so this
+# bound is what turns a permanently rejected proof into a visible stop rather
+# than an endless retry.
+# max_submit_attempts = 5
+
 # Hybrid sr25519 + ML-DSA-44 signer. The entrypoint generates a keystore at
 # exactly this path on first run when the file is missing, so a bare
 # `docker run` produces a miner whose proofs verify. Mount your own keystore

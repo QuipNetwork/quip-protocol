@@ -1,26 +1,45 @@
 //! Chain access behind `ChainClient`. Real impl talks Substrate JSON-RPC;
 //! tests use `FakeChain`.
 
+pub mod account;
+pub mod dryrun;
 pub mod extrinsic;
 pub mod fake;
 pub mod mempool;
+pub mod orders;
+pub mod outcome;
 pub mod preflight;
 pub mod proof_encode;
 pub mod real;
 pub mod scale_types;
+pub mod seed;
 pub mod snapshot;
 pub mod submit;
 pub mod sync;
+pub mod transport;
+pub mod transport_jsonrpsee;
+pub mod watch;
 
+pub use account::{free_from_account_bytes, system_account_storage_key};
+pub use dryrun::{decode_dispatch_error, describe_module_error, ModuleError};
 pub use fake::FakeChain;
 pub use mempool::JobOrder;
+pub use orders::{job_orders_prefix, order_id_from_key};
+pub use outcome::{SubmitLedger, QBLOCK_RETENTION};
 pub use real::RealChainClient;
 pub use scale_types::{MinerKind, MinerSpecScale, NodeDescriptorV2Input, NodeLogLevel};
+pub use seed::{
+    encode_register_topology, encode_set_difficulty, seed_chain, SeedParams, SeedReport,
+    SeedTopology, DEFAULT_SEED_DIFFICULTY,
+};
 pub use snapshot::{head_state_key, DecayParams, MiningSnapshot};
 pub use submit::{
     classify_descriptor, classify_participation, classify_receipt, DescriptorOutcome,
     ParticipationOutcome, Proof, SubmitAction,
 };
+pub use transport::{BoxStream, RpcTransport};
+pub use transport_jsonrpsee::JsonrpseeTransport;
+pub use watch::{parse_tx_status, TxStatus};
 
 use async_trait::async_trait;
 

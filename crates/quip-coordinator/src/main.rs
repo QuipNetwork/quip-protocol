@@ -1,14 +1,18 @@
 //! quip-coordinator binary: CLI, runtime wiring, graceful shutdown.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use quip_coordinator::chain::extrinsic::{load_hybrid_pair, miner_identity_bytes};
-use quip_coordinator::chain::RealChainClient;
+use quip_coordinator::chain::extrinsic::{hex_encode, load_hybrid_pair, miner_identity_bytes};
+use quip_coordinator::chain::scale_types::DifficultyConfig;
+use quip_coordinator::chain::{
+    seed_chain, RealChainClient, SeedParams, SeedReport, SeedTopology, DEFAULT_SEED_DIFFICULTY,
+};
 use quip_coordinator::config::{parse_config, CoordinatorConfig, LaunchEntry};
 use quip_coordinator::drive::{
     aggregate, drain_all, parse_topology_spec, print_table, run_drive, write_jsonl,
     DriveManyParams, ListSource, RandomSource,
 };
 use quip_coordinator::logging::LogLevel;
+use quip_coordinator::presets::preset_spec;
 use quip_coordinator::runtime::{run_runtime, RuntimeParams};
 use quip_coordinator::session::{gen_session_token, CoordinatorState};
 use quip_coordinator::supervisor::BackoffPolicy;
@@ -47,6 +51,8 @@ enum Command {
     Drive(DriveArgs),
     /// Create a signer keystore at --out. Refuses to overwrite.
     Keygen(KeygenArgs),
+    /// Seed a fresh chain: register the default topology and set its difficulty.
+    SeedChain(SeedChainArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -54,6 +60,39 @@ struct KeygenArgs {
     /// Destination path for the keystore JSON.
     #[arg(long)]
     out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+struct SeedChainArgs {
+    /// Validator RPC endpoint.
+    #[arg(long, default_value = "ws://quip-validator:9944")]
+    validator: String,
+    /// Sudo signer: a dev URI (//Alice), a BIP39 mnemonic, a 32-byte hex master
+    /// seed, or a keystore path. Mutually exclusive with --mnemonic-file.
+    #[arg(long, conflicts_with = "mnemonic_file")]
+    sudo_key: Option<String>,
+    /// Path to a file holding a BIP39 mnemonic phrase. Mount it read-only.
+    #[arg(long)]
+    mnemonic_file: Option<PathBuf>,
+    /// Built-in topology by name. Mutually exclusive with --topology.
+    #[arg(
+        long,
+        default_value = "advantage2-system1",
+        conflicts_with = "topology"
+    )]
+    topology_preset: String,
+    /// Topology spec JSON path.
+    #[arg(long)]
+    topology: Option<PathBuf>,
+    /// Minimum valid solutions a proof must carry.
+    #[arg(long, default_value_t = DEFAULT_SEED_DIFFICULTY.min_solutions)]
+    min_solutions: u32,
+    /// Energy ceiling in milli units; solutions must be strictly below it.
+    #[arg(long, default_value_t = DEFAULT_SEED_DIFFICULTY.max_energy_milli)]
+    max_energy_milli: i64,
+    /// Minimum solution-set diversity in milli units.
+    #[arg(long, default_value_t = DEFAULT_SEED_DIFFICULTY.min_diversity_milli)]
+    min_diversity_milli: u32,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -75,9 +114,8 @@ struct DriveArgs {
     /// given. For `--source list`, needed only if the list has a nonce-ref entry.
     #[arg(long)]
     topology: Option<PathBuf>,
-    /// Built-in topology by name (`advantage2-system1`, `smoke`), resolved to a
-    /// committed fixture under `fixtures/drive/`. Mutually exclusive with
-    /// `--topology`.
+    /// Built-in topology by name (`advantage2-system1`, `smoke`), embedded in
+    /// the binary. Mutually exclusive with `--topology`.
     #[arg(long)]
     topology_preset: Option<String>,
     /// Number of problems to draw (`--source random`).
@@ -135,6 +173,7 @@ fn main() -> StdExitCode {
     match cli.command {
         Some(Command::Drive(args)) => run_drive_cli(args, cli.log_level.unwrap_or(LogLevel::Info)),
         Some(Command::Keygen(args)) => run_keygen_cli(&args),
+        Some(Command::SeedChain(args)) => run_seed_chain_cli(args),
         // When --log-level is omitted the coordinator default is Info (unless
         // RUST_LOG overrides the coordinator filter alone). Forward that same
         // default to miner children so their verbosity matches the CLI default.
@@ -158,6 +197,78 @@ fn run_keygen_cli(args: &KeygenArgs) -> StdExitCode {
             StdExitCode::from(ExitCode::ConfigInvalid as u8)
         }
     }
+}
+
+#[expect(
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "CLI binary reports seed-chain errors to stderr"
+)]
+fn run_seed_chain_cli(args: SeedChainArgs) -> StdExitCode {
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("seed-chain: tokio runtime: {e}");
+            return StdExitCode::FAILURE;
+        }
+    };
+    match rt.block_on(seed_chain_inner(args)) {
+        Ok(report) => {
+            println!(
+                "seeded topology {} ({} nodes, {} edges)",
+                hex_encode(&report.topology_hash),
+                report.nodes,
+                report.edges
+            );
+            println!("  register_topology included in {}", report.register_block);
+            println!(
+                "  set_difficulty    included in {}",
+                report.difficulty_block
+            );
+            StdExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("seed-chain: {e}");
+            StdExitCode::FAILURE
+        }
+    }
+}
+
+async fn seed_chain_inner(args: SeedChainArgs) -> Result<SeedReport, String> {
+    let sudo_key = match (&args.sudo_key, &args.mnemonic_file) {
+        (Some(k), None) => k.clone(),
+        (None, Some(p)) => {
+            let phrase = std::fs::read_to_string(p)
+                .map_err(|e| format!("read mnemonic file {}: {e}", p.display()))?;
+            let phrase = phrase.trim().to_string();
+            if phrase.is_empty() {
+                return Err(format!("mnemonic file is empty: {}", p.display()));
+            }
+            phrase
+        }
+        _ => return Err("give exactly one of --sudo-key or --mnemonic-file".into()),
+    };
+
+    let text = match &args.topology {
+        Some(p) => {
+            std::fs::read_to_string(p).map_err(|e| format!("read topology {}: {e}", p.display()))?
+        }
+        None => preset_spec(&args.topology_preset)?.to_string(),
+    };
+    let spec = parse_topology_spec(&text).map_err(|e| format!("{e:?}"))?;
+
+    seed_chain(SeedParams {
+        validator: args.validator,
+        sudo_key,
+        topology: SeedTopology::from_spec(&spec),
+        difficulty: DifficultyConfig {
+            min_solutions: args.min_solutions,
+            max_energy_milli: args.max_energy_milli,
+            min_diversity_milli: args.min_diversity_milli,
+        },
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 fn load_coordinator_config(
@@ -434,13 +545,11 @@ fn set_target_from_spec(
 /// nonce-ref list entries is consumed inside `ListSource::load` and is not
 /// returned: drive mode has no chain to wire it into.
 fn build_jobs(args: &DriveArgs, deadline_ms: u64) -> Result<BuiltJobs, String> {
-    let topo_path = resolve_topology_path(args)?;
+    let topo_text = resolve_topology_text(args)?;
     match args.source {
         DriveSourceKind::Random => {
-            let topo_path =
-                topo_path.ok_or("--source random requires --topology or --topology-preset")?;
-            let text = std::fs::read_to_string(&topo_path)
-                .map_err(|e| format!("cannot read topology spec {}: {e}", topo_path.display()))?;
+            let text =
+                topo_text.ok_or("--source random requires --topology or --topology-preset")?;
             let spec = parse_topology_spec(&text).map_err(|e| e.to_string())?;
             let miner_account = [0u8; 32];
             let mut src =
@@ -454,11 +563,9 @@ fn build_jobs(args: &DriveArgs, deadline_ms: u64) -> Result<BuiltJobs, String> {
                 .list
                 .as_ref()
                 .ok_or("--source list requires --list <models.jsonl>")?;
-            let (topology, snapshot, target) = match &topo_path {
-                Some(p) => {
-                    let text = std::fs::read_to_string(p)
-                        .map_err(|e| format!("cannot read topology spec {}: {e}", p.display()))?;
-                    let spec = parse_topology_spec(&text).map_err(|e| e.to_string())?;
+            let (topology, snapshot, target) = match &topo_text {
+                Some(text) => {
+                    let spec = parse_topology_spec(text).map_err(|e| e.to_string())?;
                     let target = set_target_from_spec(&spec, args);
                     (
                         Some(spec.topology.clone()),
@@ -479,35 +586,25 @@ fn build_jobs(args: &DriveArgs, deadline_ms: u64) -> Result<BuiltJobs, String> {
 /// Default preset used by `--source random` when no topology is specified.
 const DEFAULT_PRESET: &str = "advantage2-system1";
 
-/// Resolve the topology spec path from `--topology` / `--topology-preset`.
+/// Resolve the topology spec text from `--topology` / `--topology-preset`.
 /// `--source random` falls back to [`DEFAULT_PRESET`]; `--source list` returns
 /// `None` (a nonce-ref list supplies its own topology or needs none).
-fn resolve_topology_path(args: &DriveArgs) -> Result<Option<PathBuf>, String> {
+fn resolve_topology_text(args: &DriveArgs) -> Result<Option<String>, String> {
     if args.topology.is_some() && args.topology_preset.is_some() {
         return Err("--topology and --topology-preset are mutually exclusive".into());
     }
     if let Some(p) = &args.topology {
-        return Ok(Some(p.clone()));
+        return std::fs::read_to_string(p)
+            .map(Some)
+            .map_err(|e| format!("read topology {}: {e}", p.display()));
     }
     if let Some(name) = &args.topology_preset {
-        return Ok(Some(preset_path(name)?));
+        return preset_spec(name).map(|s| Some(s.to_string()));
     }
     match args.source {
-        DriveSourceKind::Random => Ok(Some(preset_path(DEFAULT_PRESET)?)),
+        DriveSourceKind::Random => preset_spec(DEFAULT_PRESET).map(|s| Some(s.to_string())),
         DriveSourceKind::List => Ok(None),
     }
-}
-
-/// Map a preset name to its committed fixture under `fixtures/drive/`, resolved
-/// relative to the crate. Rejects names outside `[A-Za-z0-9-]` so a preset
-/// can never escape the fixture directory.
-fn preset_path(name: &str) -> Result<PathBuf, String> {
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return Err(format!("invalid topology preset name: {name:?}"));
-    }
-    Ok(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/drive")
-        .join(format!("{name}.spec.json")))
 }
 
 #[expect(
@@ -632,35 +729,28 @@ mod tests {
         let mut a = drive_args(DriveSourceKind::Random);
         a.topology = Some(PathBuf::from("t.json"));
         a.topology_preset = Some("smoke".into());
-        assert!(resolve_topology_path(&a).is_err());
+        assert!(resolve_topology_text(&a).is_err());
     }
 
     #[test]
-    fn random_defaults_to_advantage2_preset() {
+    fn random_source_defaults_to_the_advantage2_preset() {
         let a = drive_args(DriveSourceKind::Random);
-        let p = resolve_topology_path(&a).unwrap().unwrap();
-        assert!(p.ends_with("fixtures/drive/advantage2-system1.spec.json"));
+        let text = resolve_topology_text(&a).unwrap().unwrap();
+        let spec = parse_topology_spec(&text).unwrap();
+        assert_eq!(spec.topology.nodes.len(), 4577);
     }
 
     #[test]
     fn list_defaults_to_no_topology() {
         let a = drive_args(DriveSourceKind::List);
-        assert!(resolve_topology_path(&a).unwrap().is_none());
+        assert!(resolve_topology_text(&a).unwrap().is_none());
     }
 
     #[test]
-    fn explicit_preset_resolves_to_fixture() {
+    fn named_preset_resolves_to_its_embedded_spec() {
         let mut a = drive_args(DriveSourceKind::Random);
         a.topology_preset = Some("smoke".into());
-        let p = resolve_topology_path(&a).unwrap().unwrap();
-        assert!(p.ends_with("fixtures/drive/smoke.spec.json"));
-    }
-
-    #[test]
-    fn preset_name_rejects_path_traversal() {
-        assert!(preset_path("../etc/passwd").is_err());
-        assert!(preset_path("a/b").is_err());
-        assert!(preset_path("").is_err());
-        assert!(preset_path("smoke").is_ok());
+        let text = resolve_topology_text(&a).unwrap().unwrap();
+        assert!(parse_topology_spec(&text).is_ok());
     }
 }

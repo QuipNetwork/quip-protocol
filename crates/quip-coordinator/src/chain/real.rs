@@ -5,9 +5,9 @@
 //! Methods return transport errors when no validator is reachable.
 
 use super::extrinsic::{
-    build_hybrid_signed_extrinsic, difficulties_storage_key, hex_decode, hex_encode,
-    job_orders_storage_key, last_proof_block_storage_key, load_hybrid_pair, miner_identity_bytes,
-    topology_curve_c_storage_key, SignedExtensionContext,
+    build_hybrid_signed_extrinsic, default_topology_storage_key, difficulties_storage_key,
+    hex_decode, hex_encode, job_orders_storage_key, last_proof_block_storage_key, load_hybrid_pair,
+    miner_identity_bytes, topology_curve_c_storage_key, SignedExtensionContext,
 };
 use super::proof_encode::{build_quantum_proof, ProofBuildContext};
 use super::scale_types::{
@@ -19,6 +19,7 @@ use super::submit::{
     classify_descriptor, classify_participation, classify_receipt, DescriptorOutcome,
     ParticipationOutcome, Proof, SubmitAction,
 };
+use super::transport_jsonrpsee::{rpc_request, RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT};
 use super::{ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot};
 use crate::decay::{
     DEFAULT_BASE_MAX_ENERGY_MILLI, DEFAULT_C_EASY_MILLI, DEFAULT_C_HARD_MILLI,
@@ -33,36 +34,42 @@ use sp_core::crypto::Ss58Codec;
 use sp_core::Pair as _;
 use std::sync::Mutex;
 use std::time::Duration;
-use subxt::config::substrate::H256;
-use subxt::ext::scale_value::{Composite, Primitive, ValueDef};
+use subxt::rpcs::client::reconnecting_rpc_client::{ExponentialBackoff, PingConfig};
+use subxt::rpcs::client::ReconnectingRpcClient;
 use subxt::transactions::TransactionStatus;
 use tokio::sync::OnceCell;
 
-/// Budget for opening a session to one validator (TCP connect + WS handshake).
+/// Interval between WebSocket pings on the cached subxt client.
 ///
-/// A wedged peer that accepts TCP and never speaks used to block the ordered
-/// failover list forever. Five seconds is long enough for a slow host path and
-/// short enough that the next endpoint is tried before the coordinator looks
-/// hung at startup.
-const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// A half-open socket, which a NAT or firewall idle timeout produces, raises
+/// no error. Without a ping the coordinator does not learn the link is dead
+/// until something tries to use it. Ten seconds is frequent enough to notice
+/// a drop long before a later submit needs the socket. The builder default
+/// also enables a ping, but that default is not ours to depend on.
+const RPC_WS_PING_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Budget for one JSON-RPC method after the client is up.
+/// Time without a pong before the reconnecting client treats the socket as dead.
 ///
-/// The jsonrpsee default is 60s, which multiplies badly across a validator list
-/// when a peer is silent. Fifteen seconds still covers a loaded but working
-/// node; it does not wait a full minute before moving on.
-const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// This must stay well above [`RPC_WS_PING_INTERVAL`] so one slow pong does
+/// not force a needless reconnect. Thirty seconds gives the peer two extra
+/// ping intervals after the first miss. `max_failures` stays at its default
+/// of 1.
+const RPC_WS_PING_INACTIVE_LIMIT: Duration = Duration::from_secs(30);
 
-/// subxt client for read-only, metadata-aware event decoding. Submit stays on
-/// the hybrid-signed jsonrpsee path — subxt is used only to decode mempool
-/// `JobProposed` events, which needs the runtime type registry.
+/// Keys requested per `state_getKeysPaged` call when walking the order map.
+///
+/// The mempool holds tens of orders in practice. A page of 200 fetches them in
+/// one round trip while staying far below any node response limit.
+const ORDER_PAGE_SIZE: u32 = 200;
+
+/// Cached subxt client. Submit still uses it for `submit_and_watch`.
 type SubxtClient = subxt::OnlineClient<subxt::SubstrateConfig>;
 
 /// Production chain client (RPC + hybrid-signed submit).
 pub struct RealChainClient {
     /// Validator WebSocket / HTTP RPC URLs (primary first).
     pub validators: Vec<String>,
-    /// Hybrid keystore path, `//DevUri`, or 32-byte hex seed.
+    /// Hybrid keystore path, any substrate secret URI, or 32-byte hex seed.
     pub signer_key: String,
     /// Cached hybrid pair (loaded lazily from `signer_key`).
     pair: Mutex<Option<HybridPair>>,
@@ -71,7 +78,7 @@ pub struct RealChainClient {
     last_snapshot: Mutex<Option<MiningSnapshot>>,
     /// Last `allowed_spin` spec (full `AllowedValueSpec`, not just Set values).
     last_spin_spec: Mutex<Option<AllowedValueSpec<Vec<i32>>>>,
-    /// Lazily-connected subxt client for mempool `JobProposed` event decoding.
+    /// Lazily-connected subxt client for `submit_and_watch`.
     subxt: OnceCell<SubxtClient>,
     /// Whether the last RPC round-trip reached the validator. `None` before the
     /// first call. Every RPC builds a fresh client (see `rpc_http` / `rpc_ws`),
@@ -122,12 +129,33 @@ impl RealChainClient {
         *guard = Some(now);
     }
 
-    /// Lazily connect the read-only subxt client to the primary validator.
+    /// Return the cached subxt client, connecting on the first call.
+    ///
+    /// The client sits on a reconnecting WebSocket. The socket reopens after
+    /// a validator restart. Runtime metadata stays cached in the `OnceCell`.
+    ///
+    /// Method calls resume on the new socket. Subscriptions do not replay.
+    /// A `submit_and_watch` that is in flight when the socket drops fails
+    /// that one submission. The caller retries on the next round.
     async fn subxt_client(&self) -> Result<&SubxtClient, ChainError> {
         let url = self.primary_url()?.to_string();
         self.subxt
             .get_or_try_init(|| async move {
-                SubxtClient::from_url(&url)
+                let rpc = ReconnectingRpcClient::builder()
+                    .retry_policy(
+                        ExponentialBackoff::from_millis(200).max_delay(Duration::from_secs(10)),
+                    )
+                    .connection_timeout(RPC_CONNECT_TIMEOUT)
+                    .request_timeout(RPC_REQUEST_TIMEOUT)
+                    .enable_ws_ping(
+                        PingConfig::new()
+                            .ping_interval(RPC_WS_PING_INTERVAL)
+                            .inactive_limit(RPC_WS_PING_INACTIVE_LIMIT),
+                    )
+                    .build(&url)
+                    .await
+                    .map_err(|e| ChainError::Unavailable(format!("subxt connect: {e}")))?;
+                SubxtClient::from_rpc_client(rpc)
                     .await
                     .map_err(|e| ChainError::Unavailable(format!("subxt connect: {e}")))
             })
@@ -249,6 +277,25 @@ impl RealChainClient {
             .map_err(|e| ChainError::Decode(e.to_string()))
     }
 
+    /// Read `QuantumPow.DefaultTopology` at the current head.
+    ///
+    /// `Ok(None)` means no topology is registered, which is the state a fresh
+    /// chain starts in and the only state the seed path accepts.
+    ///
+    /// # Errors
+    /// Returns a transport error when the validator cannot be reached, or a
+    /// decode error when the stored value is not a 32-byte hash.
+    pub(crate) async fn default_topology(&self) -> Result<Option<[u8; 32]>, ChainError> {
+        let head = self
+            .rpc_call("chain_getBlockHash", Value::Array(vec![]))
+            .await?;
+        let at = head
+            .as_str()
+            .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?;
+        self.read_storage::<[u8; 32]>(&default_topology_storage_key(), at)
+            .await
+    }
+
     /// Nonce, genesis hash, and runtime versions for a signed extrinsic.
     async fn signed_extension_context(
         &self,
@@ -321,7 +368,10 @@ impl RealChainClient {
     /// status stream is watched to in-best-block, not to finality, to stay
     /// responsive: a re-org after that point is rare on the local validator,
     /// and the per-generation `current_best` reset bounds any wrong advance.
-    async fn submit_signed_call(&self, call: &[u8]) -> Result<SignedCallOutcome, ChainError> {
+    pub(crate) async fn submit_signed_call(
+        &self,
+        call: &[u8],
+    ) -> Result<SignedCallOutcome, ChainError> {
         let pair = self.pair()?;
         let signed_ctx = self.signed_extension_context(&pair).await?;
         let ext = build_hybrid_signed_extrinsic(&pair, call, &signed_ctx);
@@ -372,66 +422,45 @@ impl RealChainClient {
 }
 
 /// On-chain result of a hybrid-signed extrinsic, before pallet-specific classify.
-enum SignedCallOutcome {
+pub(crate) enum SignedCallOutcome {
+    /// Included and the dispatch succeeded.
     Success { block: String },
+    /// Included but the dispatch failed.
     DispatchFailed { error: String },
+    /// The transaction pool rejected the extrinsic.
     Invalid { message: String },
+    /// Dropped or errored before inclusion.
     Dropped { message: String },
-}
-
-/// Pull `data.free` out of a decoded `System.Account` value.
-///
-/// `AccountInfo`'s field layout has changed across Substrate releases, so this
-/// walks the metadata-decoded value by name instead of assuming a SCALE shape.
-fn free_from_account_info(value: &subxt::ext::scale_value::Value) -> Option<u128> {
-    let ValueDef::Composite(outer) = &value.value else {
-        return None;
-    };
-    let data = named_field(outer, "data")?;
-    let ValueDef::Composite(inner) = &data.value else {
-        return None;
-    };
-    let free = named_field(inner, "free")?;
-    match &free.value {
-        ValueDef::Primitive(Primitive::U128(n)) => Some(*n),
-        _ => None,
-    }
-}
-
-/// Look up a named field in a composite, ignoring unnamed composites.
-fn named_field<'a>(c: &'a Composite<()>, want: &str) -> Option<&'a subxt::ext::scale_value::Value> {
-    match c {
-        Composite::Named(fields) => fields.iter().find(|(k, _)| k == want).map(|(_, v)| v),
-        Composite::Unnamed(_) => None,
-    }
 }
 
 #[async_trait]
 impl crate::funding::BalanceSource for RealChainClient {
     async fn free_balance(&self, account: [u8; 32]) -> Result<u128, String> {
-        use subxt::ext::scale_value::Value as SValue;
-
-        let client = self.subxt_client().await.map_err(|e| e.to_string())?;
-        let at = client
-            .at_current_block()
+        let key = super::account::system_account_storage_key(&account);
+        let head = self
+            .rpc_call("chain_getBlockHash", Value::Array(vec![]))
             .await
-            .map_err(|e| format!("at_current_block: {e}"))?;
-        let addr = subxt::dynamic::storage("System", "Account");
-        let found = at
-            .storage()
-            .try_fetch(addr, vec![SValue::from_bytes(account)])
+            .map_err(|e| e.to_string())?;
+        let at = head
+            .as_str()
+            .ok_or_else(|| "chain_getBlockHash did not return a string".to_string())?;
+        let raw = self
+            .rpc_call(
+                "state_getStorage",
+                Value::Array(vec![
+                    Value::String(hex_encode(&key)),
+                    Value::String(at.to_string()),
+                ]),
+            )
             .await
-            .map_err(|e| format!("fetch System.Account: {e}"))?;
-        // No entry means the account has never been touched on chain, which is
-        // a zero balance rather than a read failure.
-        let Some(entry) = found else {
+            .map_err(|e| e.to_string())?;
+        // A null result means the account has never been touched on chain,
+        // which is a zero balance rather than a read failure.
+        let Some(hex) = raw.as_str() else {
             return Ok(0);
         };
-        let value = entry
-            .decode()
-            .map_err(|e| format!("decode System.Account: {e}"))?;
-        free_from_account_info(&value)
-            .ok_or_else(|| "System.Account has no data.free field".to_string())
+        let bytes = hex_decode(hex)?;
+        super::account::free_from_account_bytes(&bytes)
     }
 }
 
@@ -608,8 +637,8 @@ impl ChainClient for RealChainClient {
         &self,
         _miner_account: [u8; 32],
     ) -> Result<Vec<JobOrder>, ChainError> {
-        // Discover recent order ids from system events at head, then storage-read
-        // each JobOrders(order_id). Without a live node this returns transport
+        // Discover order ids by walking the JobOrders map at head, then
+        // storage-read each order. Without a live node this returns transport
         // errors; with a node, empty open-order sets yield Ok(vec![]).
         let head = self
             .rpc_call("chain_getBlockHash", Value::Array(vec![]))
@@ -618,12 +647,6 @@ impl ChainClient for RealChainClient {
             .as_str()
             .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?;
 
-        // Decode System.Events at head via subxt (metadata-aware) and collect
-        // the order_id of every QuantumComputeMempool::JobProposed. This finds
-        // orders proposed in the head block; still-open orders from earlier
-        // blocks are re-surfaced as they are re-proposed or by the storage-status
-        // filter below. Matches the Python reference (get_events_at → filter
-        // module_id/event_id → attributes.order_id).
         let head_bytes = hex_decode(head_hex).map_err(ChainError::Decode)?;
         if head_bytes.len() != 32 {
             return Err(ChainError::Decode(format!(
@@ -631,30 +654,47 @@ impl ChainClient for RealChainClient {
                 head_bytes.len()
             )));
         }
-        let head_hash = H256::from_slice(&head_bytes);
 
-        let client = self.subxt_client().await?;
-        let at = client
-            .at_block(head_hash)
-            .await
-            .map_err(|e| ChainError::Unavailable(format!("subxt at_block: {e}")))?;
-        let events = at
-            .events()
-            .fetch()
-            .await
-            .map_err(|e| ChainError::Unavailable(format!("subxt events fetch: {e}")))?;
-
+        // Walk the JobOrders map rather than decoding JobProposed events. The
+        // map holds every open order, not only those proposed in the head
+        // block, and it needs no runtime metadata.
+        let prefix = hex_encode(&super::orders::job_orders_prefix());
         let mut order_ids: Vec<u64> = Vec::new();
-        for ev in events.iter() {
-            let ev = ev.map_err(|e| ChainError::Decode(format!("event decode: {e}")))?;
-            if ev.pallet_name() != "QuantumComputeMempool" || ev.event_name() != "JobProposed" {
-                continue;
+        let mut start_key: Option<String> = None;
+        loop {
+            let mut params = vec![
+                Value::String(prefix.clone()),
+                Value::Number(ORDER_PAGE_SIZE.into()),
+            ];
+            // state_getKeysPaged takes the previous page's last key as the
+            // resume point. The block hash is always the final argument, so a
+            // missing start key must still be sent as null.
+            params.push(match &start_key {
+                Some(k) => Value::String(k.clone()),
+                None => Value::Null,
+            });
+            params.push(Value::String(head_hex.to_string()));
+
+            let page = self
+                .rpc_call("state_getKeysPaged", Value::Array(params))
+                .await?;
+            let Some(keys) = page.as_array() else {
+                break;
+            };
+            if keys.is_empty() {
+                break;
             }
-            let fields = ev
-                .decode_fields_unchecked_as::<Composite<()>>()
-                .map_err(|e| ChainError::Decode(format!("JobProposed fields: {e}")))?;
-            if let Some(oid) = order_id_from_fields(&fields) {
-                order_ids.push(oid);
+            for k in keys {
+                let Some(hex) = k.as_str() else { continue };
+                let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
+                if let Some(oid) = super::orders::order_id_from_key(&bytes) {
+                    order_ids.push(oid);
+                }
+            }
+            let full_page = keys.len() == ORDER_PAGE_SIZE as usize;
+            start_key = keys.last().and_then(|k| k.as_str()).map(String::from);
+            if !full_page {
+                break;
             }
         }
 
@@ -813,110 +853,13 @@ fn parse_block_number(header: &Value) -> Result<u64, ChainError> {
     Err(ChainError::Decode("header.number unparseable".into()))
 }
 
-/// Extract the `order_id` (u64) from a decoded `QuantumComputeMempool::
-/// JobProposed` event's fields. Prefers the named `order_id` field (matching
-/// the pallet's named event attributes); falls back to the first field of an
-/// unnamed composite. `None` if absent or not an unsigned primitive. Extra
-/// fields (proposer, reward, …) are ignored, so it survives event-shape growth.
-fn order_id_from_fields(fields: &Composite<()>) -> Option<u64> {
-    let value = match fields {
-        Composite::Named(named) => named
-            .iter()
-            .find(|(name, _)| name == "order_id")
-            .map(|(_, v)| v),
-        Composite::Unnamed(vals) => vals.first(),
-    }?;
-    match &value.value {
-        ValueDef::Primitive(Primitive::U128(n)) => u64::try_from(*n).ok(),
-        _ => None,
-    }
-}
-
-async fn rpc_request(url: &str, method: &str, params: Value) -> Result<Value, ChainError> {
-    // Support both ws:// and http(s):// via jsonrpsee.
-    if url.starts_with("ws://") || url.starts_with("wss://") {
-        rpc_ws(url, method, params).await
-    } else {
-        rpc_http(url, method, params).await
-    }
-}
-
-async fn rpc_http(url: &str, method: &str, params: Value) -> Result<Value, ChainError> {
-    use jsonrpsee::core::client::ClientT;
-    use jsonrpsee::http_client::HttpClientBuilder;
-
-    // HttpClientBuilder has no separate connection_timeout. request_timeout
-    // wraps the full transport send (connect + response), so one budget covers
-    // both phases and surfaces as Unavailable for failover.
-    let client = HttpClientBuilder::default()
-        .request_timeout(RPC_REQUEST_TIMEOUT)
-        .build(url)
-        .map_err(|e| ChainError::Unavailable(format!("http client: {e}")))?;
-    let result: Value = client
-        .request(method, rpc_params_from_value(params))
-        .await
-        .map_err(|e| ChainError::Unavailable(format!("rpc {method}: {e}")))?;
-    Ok(result)
-}
-
-async fn rpc_ws(url: &str, method: &str, params: Value) -> Result<Value, ChainError> {
-    use jsonrpsee::core::client::ClientT;
-    use jsonrpsee::ws_client::WsClientBuilder;
-
-    // connection_timeout only bounds TCP connect inside jsonrpsee. A peer that
-    // accepts and never completes the WebSocket handshake still hangs build(),
-    // so the whole build is wrapped in the same connect budget.
-    let build = WsClientBuilder::default()
-        .connection_timeout(RPC_CONNECT_TIMEOUT)
-        .request_timeout(RPC_REQUEST_TIMEOUT)
-        .build(url);
-    let client = match tokio::time::timeout(RPC_CONNECT_TIMEOUT, build).await {
-        Ok(Ok(client)) => client,
-        Ok(Err(e)) => {
-            return Err(ChainError::Unavailable(format!("ws client: {e}")));
-        }
-        Err(_) => {
-            return Err(ChainError::Unavailable(format!(
-                "ws connect timed out after {}s",
-                RPC_CONNECT_TIMEOUT.as_secs()
-            )));
-        }
-    };
-    let result: Value = client
-        .request(method, rpc_params_from_value(params))
-        .await
-        .map_err(|e| ChainError::Unavailable(format!("rpc {method}: {e}")))?;
-    Ok(result)
-}
-
-fn rpc_params_from_value(params: Value) -> jsonrpsee::core::params::ArrayParams {
-    match params {
-        Value::Array(arr) => {
-            let mut p = jsonrpsee::core::params::ArrayParams::new();
-            for v in arr {
-                let _ = p.insert(v);
-            }
-            p
-        }
-        other => {
-            let mut p = jsonrpsee::core::params::ArrayParams::new();
-            let _ = p.insert(other);
-            p
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        free_from_account_info, order_id_from_fields, rpc_request, RealChainClient,
-        RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT,
-    };
+    use super::{rpc_request, RealChainClient, RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT};
     use crate::chain::scale_types::MinerKind;
     use crate::chain::ChainError;
     use serde_json::Value as JsonValue;
     use std::time::{Duration, Instant};
-    use subxt::ext::scale_value::{Composite, Value};
     use tokio::net::TcpListener;
 
     /// Accept connections and never write a response byte. Models a wedged peer
@@ -958,100 +901,6 @@ mod tests {
             .saturating_mul(3)
             .saturating_add(RPC_REQUEST_TIMEOUT)
             .saturating_add(Duration::from_secs(5))
-    }
-
-    /// `AccountInfo` as recent Substrate runtimes shape it. The reader walks by
-    /// field name, so extra fields and field order must not matter.
-    fn account_info(free: u128) -> Value {
-        Value::named_composite(vec![
-            ("nonce".to_string(), Value::u128(7)),
-            ("consumers".to_string(), Value::u128(0)),
-            ("providers".to_string(), Value::u128(1)),
-            ("sufficients".to_string(), Value::u128(0)),
-            (
-                "data".to_string(),
-                Value::named_composite(vec![
-                    ("free".to_string(), Value::u128(free)),
-                    ("reserved".to_string(), Value::u128(0)),
-                    ("frozen".to_string(), Value::u128(0)),
-                ]),
-            ),
-        ])
-    }
-
-    #[test]
-    fn reads_free_balance_from_account_info() {
-        assert_eq!(free_from_account_info(&account_info(42)), Some(42));
-        assert_eq!(free_from_account_info(&account_info(0)), Some(0));
-    }
-
-    #[test]
-    fn free_balance_survives_extra_and_reordered_fields() {
-        // A runtime upgrade that adds a field or reorders must not break this.
-        let v = Value::named_composite(vec![
-            (
-                "data".to_string(),
-                Value::named_composite(vec![
-                    ("flags".to_string(), Value::u128(9)),
-                    ("free".to_string(), Value::u128(500)),
-                ]),
-            ),
-            ("nonce".to_string(), Value::u128(1)),
-        ]);
-        assert_eq!(free_from_account_info(&v), Some(500));
-    }
-
-    #[test]
-    fn missing_or_malformed_account_info_reads_as_none() {
-        // No `data` field.
-        let no_data = Value::named_composite(vec![("nonce".to_string(), Value::u128(1))]);
-        assert_eq!(free_from_account_info(&no_data), None);
-        // `data` present but no `free`.
-        let no_free = Value::named_composite(vec![(
-            "data".to_string(),
-            Value::named_composite(vec![("reserved".to_string(), Value::u128(1))]),
-        )]);
-        assert_eq!(free_from_account_info(&no_free), None);
-        // Unnamed composite: not the shape we can read by name.
-        assert_eq!(
-            free_from_account_info(&Value::unnamed_composite(vec![Value::u128(1)])),
-            None
-        );
-    }
-
-    #[test]
-    fn order_id_from_named_ignores_other_fields() {
-        // Real JobProposed carries more than order_id (proposer, reward, …);
-        // the named lookup must pick order_id regardless of position.
-        let fields = Composite::Named(vec![
-            ("proposer".to_string(), Value::u128(999)),
-            ("order_id".to_string(), Value::u128(42)),
-            ("reward".to_string(), Value::u128(7)),
-        ]);
-        assert_eq!(order_id_from_fields(&fields), Some(42));
-    }
-
-    #[test]
-    fn order_id_from_unnamed_takes_first() {
-        let fields = Composite::Unnamed(vec![Value::u128(7), Value::u128(99)]);
-        assert_eq!(order_id_from_fields(&fields), Some(7));
-    }
-
-    #[test]
-    fn order_id_absent_wrong_type_or_empty_is_none() {
-        // No order_id field.
-        assert_eq!(
-            order_id_from_fields(&Composite::Named(vec![("x".to_string(), Value::u128(1))])),
-            None
-        );
-        // order_id present but not an unsigned primitive.
-        let nested = Value::named_composite(vec![("inner".to_string(), Value::u128(1))]);
-        assert_eq!(
-            order_id_from_fields(&Composite::Named(vec![("order_id".to_string(), nested)])),
-            None
-        );
-        // Empty unnamed composite.
-        assert_eq!(order_id_from_fields(&Composite::Unnamed(vec![])), None);
     }
 
     #[tokio::test]

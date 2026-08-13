@@ -56,6 +56,8 @@ use quip_coordinator::chain::scale_types::{
 };
 use quip_coordinator::chain::submit::SubmitAction;
 use quip_coordinator::chain::{ChainClient, JobOrder, RealChainClient};
+use quip_coordinator::drive::parse_topology_spec;
+use quip_coordinator::presets::preset_spec;
 use quip_proto::v1::Solution;
 use quip_protocol::wire::encode_spins;
 use quip_transaction_crypto::{account_id_from_public, HybridPair};
@@ -446,10 +448,21 @@ async fn devnet_submit_proof_end_to_end() {
         snap.min_diversity_milli,
         hex_encode(&snap.last_proof_block_hash),
     );
-    assert!(
-        (4000..5000).contains(&snap.nodes.len()),
-        "expected ~4578 nodes, got {}",
-        snap.nodes.len()
+    // The devnet is seeded from the `advantage2-system1` preset, so the
+    // snapshot must report that graph exactly. Deriving the counts from the
+    // preset rather than hard-coding them keeps this assertion correct if the
+    // fixture ever changes, and catches a devnet seeded with the wrong graph.
+    let seeded = parse_topology_spec(preset_spec("advantage2-system1").expect("preset resolves"))
+        .expect("preset parses");
+    assert_eq!(
+        snap.nodes.len(),
+        seeded.topology.nodes.len(),
+        "node count must match the advantage2-system1 preset"
+    );
+    assert_eq!(
+        snap.edges.len(),
+        seeded.topology.edges.0.len(),
+        "edge count must match the advantage2-system1 preset"
     );
     // Difficulty parameters are chain-state-dependent (they ratchet/decay and are
     // reconfigured), so assert decode sanity rather than pinning volatile values.

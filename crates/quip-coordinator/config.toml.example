@@ -17,6 +17,13 @@ public_host = "203.0.113.10"
 # the dashboard port. Zero is not a valid port.
 public_port = 20050
 
+# Consecutive failed submissions of one proof, inside one quantum block, before
+# the coordinator stops retrying it and reports loudly. Submit outcome comes
+# from chain state, which reports that a proof did not land but not why, so this
+# bound is what turns a permanently rejected proof into a visible stop rather
+# than an endless retry.
+max_submit_attempts = 5
+
 # CPU miner. Default binary: quip-cpu-sa. Use the chromatic Gibbs variant:
 [cpu]
 binary = "quip-cpu-sa"        # or "quip-cpu-gibbs"

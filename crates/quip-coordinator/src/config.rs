@@ -70,6 +70,9 @@ pub struct CoordinatorConfig {
     pub faucet_top_up_plancks: u128,
     /// How long to keep trying the faucet before giving up.
     pub funding_timeout_s: u64,
+    /// Consecutive failed submissions of one proof, inside one quantum block,
+    /// before the coordinator stops retrying it.
+    pub max_submit_attempts: u32,
     /// One entry per supervised miner subprocess.
     pub launch: Vec<LaunchEntry>,
     /// Optional mining-attempt dashboard (`[dashboard]` section). `None`
@@ -446,6 +449,11 @@ pub fn parse_config(toml_text: &str) -> Result<CoordinatorConfig, ConfigError> {
         .and_then(toml::Value::as_integer)
         .and_then(|i| u64::try_from(i).ok())
         .unwrap_or(crate::funding::DEFAULT_FUNDING_TIMEOUT.as_secs());
+    let max_submit_attempts = miner
+        .get("max_submit_attempts")
+        .and_then(toml::Value::as_integer)
+        .and_then(|i| u32::try_from(i).ok())
+        .unwrap_or(5);
 
     let launch = parse_launch(&root);
     let dashboard = parse_dashboard(&root);
@@ -469,6 +477,7 @@ pub fn parse_config(toml_text: &str) -> Result<CoordinatorConfig, ConfigError> {
         min_balance_plancks,
         faucet_top_up_plancks,
         funding_timeout_s,
+        max_submit_attempts,
         launch,
         dashboard,
         node_id: identity.node_id,
@@ -668,6 +677,19 @@ rest_port = 8086
         assert_eq!(cfg.min_balance_plancks, 5);
         assert_eq!(cfg.faucet_top_up_plancks, 50);
         assert_eq!(cfg.funding_timeout_s, 30);
+    }
+
+    #[test]
+    fn max_submit_attempts_defaults_and_overrides() {
+        let cfg = parse_config(SAMPLE).unwrap();
+        assert_eq!(cfg.max_submit_attempts, 5);
+        let cfg = parse_config(
+            "[miner]\nvalidators = [\"ws://x\"]\nsigner_key = \"//Alice\"\n\
+             public_host = \"203.0.113.10\"\npublic_port = 20050\n\
+             max_submit_attempts = 2\n\n[cpu]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.max_submit_attempts, 2);
     }
 
     /// Emptying the value is how an operator opts out without deleting the key.
