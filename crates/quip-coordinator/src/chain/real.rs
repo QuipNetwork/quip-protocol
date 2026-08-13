@@ -5,9 +5,9 @@
 //! Methods return transport errors when no validator is reachable.
 
 use super::extrinsic::{
-    build_hybrid_signed_extrinsic, difficulties_storage_key, hex_decode, hex_encode,
-    job_orders_storage_key, last_proof_block_storage_key, load_hybrid_pair, miner_identity_bytes,
-    topology_curve_c_storage_key, SignedExtensionContext,
+    build_hybrid_signed_extrinsic, default_topology_storage_key, difficulties_storage_key,
+    hex_decode, hex_encode, job_orders_storage_key, last_proof_block_storage_key, load_hybrid_pair,
+    miner_identity_bytes, topology_curve_c_storage_key, SignedExtensionContext,
 };
 use super::proof_encode::{build_quantum_proof, ProofBuildContext};
 use super::scale_types::{
@@ -69,7 +69,7 @@ type SubxtClient = subxt::OnlineClient<subxt::SubstrateConfig>;
 pub struct RealChainClient {
     /// Validator WebSocket / HTTP RPC URLs (primary first).
     pub validators: Vec<String>,
-    /// Hybrid keystore path, `//DevUri`, or 32-byte hex seed.
+    /// Hybrid keystore path, any substrate secret URI, or 32-byte hex seed.
     pub signer_key: String,
     /// Cached hybrid pair (loaded lazily from `signer_key`).
     pair: Mutex<Option<HybridPair>>,
@@ -277,6 +277,25 @@ impl RealChainClient {
             .map_err(|e| ChainError::Decode(e.to_string()))
     }
 
+    /// Read `QuantumPow.DefaultTopology` at the current head.
+    ///
+    /// `Ok(None)` means no topology is registered, which is the state a fresh
+    /// chain starts in and the only state the seed path accepts.
+    ///
+    /// # Errors
+    /// Returns a transport error when the validator cannot be reached, or a
+    /// decode error when the stored value is not a 32-byte hash.
+    pub(crate) async fn default_topology(&self) -> Result<Option<[u8; 32]>, ChainError> {
+        let head = self
+            .rpc_call("chain_getBlockHash", Value::Array(vec![]))
+            .await?;
+        let at = head
+            .as_str()
+            .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?;
+        self.read_storage::<[u8; 32]>(&default_topology_storage_key(), at)
+            .await
+    }
+
     /// Nonce, genesis hash, and runtime versions for a signed extrinsic.
     async fn signed_extension_context(
         &self,
@@ -349,7 +368,10 @@ impl RealChainClient {
     /// status stream is watched to in-best-block, not to finality, to stay
     /// responsive: a re-org after that point is rare on the local validator,
     /// and the per-generation `current_best` reset bounds any wrong advance.
-    async fn submit_signed_call(&self, call: &[u8]) -> Result<SignedCallOutcome, ChainError> {
+    pub(crate) async fn submit_signed_call(
+        &self,
+        call: &[u8],
+    ) -> Result<SignedCallOutcome, ChainError> {
         let pair = self.pair()?;
         let signed_ctx = self.signed_extension_context(&pair).await?;
         let ext = build_hybrid_signed_extrinsic(&pair, call, &signed_ctx);
@@ -400,10 +422,14 @@ impl RealChainClient {
 }
 
 /// On-chain result of a hybrid-signed extrinsic, before pallet-specific classify.
-enum SignedCallOutcome {
+pub(crate) enum SignedCallOutcome {
+    /// Included and the dispatch succeeded.
     Success { block: String },
+    /// Included but the dispatch failed.
     DispatchFailed { error: String },
+    /// The transaction pool rejected the extrinsic.
     Invalid { message: String },
+    /// Dropped or errored before inclusion.
     Dropped { message: String },
 }
 

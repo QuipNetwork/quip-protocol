@@ -7,12 +7,15 @@
 //! `MineableTopologies` whitelist entry itself when no default exists yet, so
 //! those two calls are the whole sequence.
 //!
-//! This module encodes the calls. It does not submit them.
+//! This module encodes the calls and drives the two-call seed sequence.
 
+use super::real::{RealChainClient, SignedCallOutcome};
 use super::scale_types::{
-    DifficultyConfig, QUANTUM_POW_PALLET_INDEX, REGISTER_TOPOLOGY_CALL_INDEX,
+    DifficultyConfig, MinerKind, QUANTUM_POW_PALLET_INDEX, REGISTER_TOPOLOGY_CALL_INDEX,
     SET_DIFFICULTY_CALL_INDEX, SUDO_CALL_INDEX, SUDO_PALLET_INDEX,
 };
+use super::ChainError;
+use crate::drive::TopologySpec;
 use crate::topology::topology_hash_sets;
 use parity_scale_codec::Encode;
 use quantum_validation::AllowedValueSpec;
@@ -89,6 +92,156 @@ pub fn encode_set_difficulty(topology_hash: [u8; 32], difficulty: &DifficultyCon
     call.extend_from_slice(&topology_hash);
     difficulty.encode_to(&mut call);
     call
+}
+
+/// The difficulty a fresh chain starts at. These are the values the public
+/// testnet was seeded with. They are deliberately loose: a chain with no
+/// proof history has no difficulty curve to sit on, and a CPU miner has to be
+/// able to land the first proof.
+pub const DEFAULT_SEED_DIFFICULTY: DifficultyConfig = DifficultyConfig {
+    min_solutions: 5,
+    max_energy_milli: -2_500_000,
+    min_diversity_milli: 200,
+};
+
+impl SeedTopology {
+    /// Build a seed topology from a parsed topology spec.
+    #[must_use]
+    pub fn from_spec(spec: &TopologySpec) -> Self {
+        Self {
+            nodes: spec.topology.nodes.clone(),
+            edges: spec.topology.edge_pairs(),
+            allowed_h_milli: spec.allowed_h_milli.clone(),
+            allowed_j_milli: spec.allowed_j_milli.clone(),
+            allowed_spin_milli: spec.allowed_spin_milli.clone(),
+        }
+    }
+}
+
+/// Everything `seed_chain` needs.
+#[derive(Clone, Debug)]
+pub struct SeedParams {
+    /// Validator RPC endpoint.
+    pub validator: String,
+    /// Sudo signer material, in any form `load_hybrid_pair` accepts.
+    pub sudo_key: String,
+    /// The topology to register as the chain default.
+    pub topology: SeedTopology,
+    /// The difficulty to set for that topology.
+    pub difficulty: DifficultyConfig,
+}
+
+/// What `seed_chain` did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeedReport {
+    /// The registered topology hash, confirmed by reading it back.
+    pub topology_hash: [u8; 32],
+    /// Node count in the registered graph.
+    pub nodes: usize,
+    /// Edge count in the registered graph.
+    pub edges: usize,
+    /// Block that included `register_topology`.
+    pub register_block: String,
+    /// Block that included `set_difficulty`.
+    pub difficulty_block: String,
+}
+
+/// Register `params.topology` as the chain default and set its difficulty.
+///
+/// Refuses to run when `DefaultTopology` is already set. The pallet writes that
+/// value only when it is empty (`register_topology`), and a second registration
+/// would land a topology that no miner selects, so a chain that is already
+/// seeded has to be wiped rather than re-seeded.
+///
+/// # Errors
+/// Returns an error when the validator is unreachable, when a topology is
+/// already registered, when either call fails to dispatch, or when the hash the
+/// chain stored does not match the hash computed locally.
+pub async fn seed_chain(params: SeedParams) -> Result<SeedReport, ChainError> {
+    let client = RealChainClient::new(
+        vec![params.validator.clone()],
+        params.sudo_key.clone(),
+        MinerKind::Cpu,
+    );
+
+    if let Some(existing) = client.default_topology().await? {
+        return Err(ChainError::Submit(format!(
+            "DefaultTopology is already set to 0x{}; a chain can only be seeded \
+             once, so wipe the chain data and restart the validator first",
+            hex_lower(&existing)
+        )));
+    }
+
+    let expected = params.topology.topology_hash();
+    let register_block = dispatch(
+        &client,
+        &encode_register_topology(&params.topology),
+        "register_topology",
+    )
+    .await?;
+
+    // Confirm the chain stored the hash computed locally. This checks the whole
+    // encoding chain in one comparison: argument order, bounded-vector
+    // mirroring, allowed-value variant bytes, and canonical ordering.
+    let stored = client.default_topology().await?.ok_or_else(|| {
+        ChainError::Submit(
+            "register_topology was included but DefaultTopology is still unset; \
+             the call failed inner validation"
+                .into(),
+        )
+    })?;
+    if stored != expected {
+        return Err(ChainError::Submit(format!(
+            "chain registered topology 0x{} but this build computed 0x{}; \
+             the call encoding and the hash function disagree",
+            hex_lower(&stored),
+            hex_lower(&expected)
+        )));
+    }
+
+    let difficulty_block = dispatch(
+        &client,
+        &encode_set_difficulty(expected, &params.difficulty),
+        "set_difficulty",
+    )
+    .await?;
+
+    Ok(SeedReport {
+        topology_hash: expected,
+        nodes: params.topology.nodes.len(),
+        edges: params.topology.edges.len(),
+        register_block,
+        difficulty_block,
+    })
+}
+
+/// Submit one call and return the block that included it.
+async fn dispatch(client: &RealChainClient, call: &[u8], what: &str) -> Result<String, ChainError> {
+    tracing::info!(call = what, "submitting sudo call");
+    match client.submit_signed_call(call).await? {
+        SignedCallOutcome::Success { block } => {
+            tracing::info!(call = what, block = %block, "sudo call included");
+            Ok(block)
+        }
+        SignedCallOutcome::DispatchFailed { error } => Err(ChainError::Submit(format!(
+            "{what} was included but the dispatch failed: {error}"
+        ))),
+        SignedCallOutcome::Invalid { message } => Err(ChainError::Submit(format!(
+            "{what} was rejected by the transaction pool: {message}"
+        ))),
+        SignedCallOutcome::Dropped { message } => Err(ChainError::Submit(format!(
+            "{what} was dropped before inclusion: {message}"
+        ))),
+    }
+}
+
+/// Lower-case hex without a prefix, for error text.
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 #[cfg(test)]
@@ -196,5 +349,34 @@ mod tests {
             reordered.topology_hash(),
             "the chain hash canonicalizes node and edge order"
         );
+    }
+
+    #[test]
+    fn the_default_difficulty_matches_the_values_the_testnet_was_seeded_with() {
+        assert_eq!(DEFAULT_SEED_DIFFICULTY.min_solutions, 5);
+        assert_eq!(DEFAULT_SEED_DIFFICULTY.max_energy_milli, -2_500_000);
+        assert_eq!(DEFAULT_SEED_DIFFICULTY.min_diversity_milli, 200);
+    }
+
+    #[test]
+    fn a_topology_spec_converts_to_a_seed_topology() {
+        let text = crate::presets::preset_spec("smoke").unwrap();
+        let spec = crate::drive::parse_topology_spec(text).unwrap();
+        let seed = SeedTopology::from_spec(&spec);
+        assert_eq!(seed.nodes, spec.topology.nodes);
+        assert_eq!(seed.edges, spec.topology.edge_pairs());
+        assert_eq!(seed.allowed_h_milli, spec.allowed_h_milli);
+        assert_eq!(seed.allowed_spin_milli, spec.allowed_spin_milli);
+    }
+
+    #[test]
+    fn the_seed_topology_hash_matches_the_spec_topology_hash() {
+        // parse_topology_spec builds Topology::hash through the same canonical
+        // hash function. If these ever disagree, the confirmation read in
+        // seed_chain would compare against the wrong value.
+        let text = crate::presets::preset_spec("advantage2-system1").unwrap();
+        let spec = crate::drive::parse_topology_spec(text).unwrap();
+        let seed = SeedTopology::from_spec(&spec);
+        assert_eq!(seed.topology_hash().to_vec(), spec.topology.hash);
     }
 }
