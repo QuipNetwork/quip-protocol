@@ -1678,6 +1678,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "finito"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2384245d85162258a14b43567a9ee3598f5ae746a1581fb5d3d2cb780f0dbf95"
+dependencies = [
+ "futures-timer",
+ "pin-project",
+]
+
+[[package]]
 name = "fips204"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5383,6 +5393,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c239a933407ae77306be8b6db72db1594c3295ba39781a0668c340e3d909160f"
 dependencies = [
  "derive-where",
+ "finito",
  "frame-metadata",
  "futures",
  "hex",
@@ -5394,6 +5405,7 @@ dependencies = [
  "serde_json",
  "subxt-lightclient",
  "thiserror 2.0.19",
+ "tokio",
  "tokio-util",
  "tracing",
  "url",

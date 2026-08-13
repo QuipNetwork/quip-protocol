@@ -35,6 +35,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 use subxt::config::substrate::H256;
 use subxt::ext::scale_value::{Composite, Primitive, ValueDef};
+use subxt::rpcs::client::reconnecting_rpc_client::ExponentialBackoff;
+use subxt::rpcs::client::ReconnectingRpcClient;
 use subxt::transactions::TransactionStatus;
 use tokio::sync::OnceCell;
 
@@ -122,12 +124,28 @@ impl RealChainClient {
         *guard = Some(now);
     }
 
-    /// Lazily connect the read-only subxt client to the primary validator.
+    /// Return the cached subxt client, connecting on the first call.
+    ///
+    /// The client sits on a reconnecting WebSocket. The socket reopens after
+    /// a validator restart. Runtime metadata stays cached in the `OnceCell`.
+    ///
+    /// Method calls resume on the new socket. Subscriptions do not replay.
+    /// A `submit_and_watch` that is in flight when the socket drops fails
+    /// that one submission. The caller retries on the next round.
     async fn subxt_client(&self) -> Result<&SubxtClient, ChainError> {
         let url = self.primary_url()?.to_string();
         self.subxt
             .get_or_try_init(|| async move {
-                SubxtClient::from_url(&url)
+                let rpc = ReconnectingRpcClient::builder()
+                    .retry_policy(
+                        ExponentialBackoff::from_millis(200).max_delay(Duration::from_secs(10)),
+                    )
+                    .connection_timeout(RPC_CONNECT_TIMEOUT)
+                    .request_timeout(RPC_REQUEST_TIMEOUT)
+                    .build(&url)
+                    .await
+                    .map_err(|e| ChainError::Unavailable(format!("subxt connect: {e}")))?;
+                SubxtClient::from_rpc_client(rpc)
                     .await
                     .map_err(|e| ChainError::Unavailable(format!("subxt connect: {e}")))
             })
