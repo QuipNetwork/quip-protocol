@@ -34,8 +34,6 @@ use sp_core::crypto::Ss58Codec;
 use sp_core::Pair as _;
 use std::sync::Mutex;
 use std::time::Duration;
-use subxt::config::substrate::H256;
-use subxt::ext::scale_value::{Composite, Primitive, ValueDef};
 use subxt::rpcs::client::reconnecting_rpc_client::{ExponentialBackoff, PingConfig};
 use subxt::rpcs::client::ReconnectingRpcClient;
 use subxt::transactions::TransactionStatus;
@@ -58,9 +56,13 @@ const RPC_WS_PING_INTERVAL: Duration = Duration::from_secs(10);
 /// of 1.
 const RPC_WS_PING_INACTIVE_LIMIT: Duration = Duration::from_secs(30);
 
-/// subxt client for read-only, metadata-aware event decoding. Submit stays on
-/// the hybrid-signed jsonrpsee path — subxt is used only to decode mempool
-/// `JobProposed` events, which needs the runtime type registry.
+/// Keys requested per `state_getKeysPaged` call when walking the order map.
+///
+/// The mempool holds tens of orders in practice. A page of 200 fetches them in
+/// one round trip while staying far below any node response limit.
+const ORDER_PAGE_SIZE: u32 = 200;
+
+/// Cached subxt client. Submit still uses it for `submit_and_watch`.
 type SubxtClient = subxt::OnlineClient<subxt::SubstrateConfig>;
 
 /// Production chain client (RPC + hybrid-signed submit).
@@ -76,7 +78,7 @@ pub struct RealChainClient {
     last_snapshot: Mutex<Option<MiningSnapshot>>,
     /// Last `allowed_spin` spec (full `AllowedValueSpec`, not just Set values).
     last_spin_spec: Mutex<Option<AllowedValueSpec<Vec<i32>>>>,
-    /// Lazily-connected subxt client for mempool `JobProposed` event decoding.
+    /// Lazily-connected subxt client for `submit_and_watch`.
     subxt: OnceCell<SubxtClient>,
     /// Whether the last RPC round-trip reached the validator. `None` before the
     /// first call. Every RPC builds a fresh client (see `rpc_http` / `rpc_ws`),
@@ -609,8 +611,8 @@ impl ChainClient for RealChainClient {
         &self,
         _miner_account: [u8; 32],
     ) -> Result<Vec<JobOrder>, ChainError> {
-        // Discover recent order ids from system events at head, then storage-read
-        // each JobOrders(order_id). Without a live node this returns transport
+        // Discover order ids by walking the JobOrders map at head, then
+        // storage-read each order. Without a live node this returns transport
         // errors; with a node, empty open-order sets yield Ok(vec![]).
         let head = self
             .rpc_call("chain_getBlockHash", Value::Array(vec![]))
@@ -619,12 +621,6 @@ impl ChainClient for RealChainClient {
             .as_str()
             .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?;
 
-        // Decode System.Events at head via subxt (metadata-aware) and collect
-        // the order_id of every QuantumComputeMempool::JobProposed. This finds
-        // orders proposed in the head block; still-open orders from earlier
-        // blocks are re-surfaced as they are re-proposed or by the storage-status
-        // filter below. Matches the Python reference (get_events_at → filter
-        // module_id/event_id → attributes.order_id).
         let head_bytes = hex_decode(head_hex).map_err(ChainError::Decode)?;
         if head_bytes.len() != 32 {
             return Err(ChainError::Decode(format!(
@@ -632,30 +628,47 @@ impl ChainClient for RealChainClient {
                 head_bytes.len()
             )));
         }
-        let head_hash = H256::from_slice(&head_bytes);
 
-        let client = self.subxt_client().await?;
-        let at = client
-            .at_block(head_hash)
-            .await
-            .map_err(|e| ChainError::Unavailable(format!("subxt at_block: {e}")))?;
-        let events = at
-            .events()
-            .fetch()
-            .await
-            .map_err(|e| ChainError::Unavailable(format!("subxt events fetch: {e}")))?;
-
+        // Walk the JobOrders map rather than decoding JobProposed events. The
+        // map holds every open order, not only those proposed in the head
+        // block, and it needs no runtime metadata.
+        let prefix = hex_encode(&super::orders::job_orders_prefix());
         let mut order_ids: Vec<u64> = Vec::new();
-        for ev in events.iter() {
-            let ev = ev.map_err(|e| ChainError::Decode(format!("event decode: {e}")))?;
-            if ev.pallet_name() != "QuantumComputeMempool" || ev.event_name() != "JobProposed" {
-                continue;
+        let mut start_key: Option<String> = None;
+        loop {
+            let mut params = vec![
+                Value::String(prefix.clone()),
+                Value::Number(ORDER_PAGE_SIZE.into()),
+            ];
+            // state_getKeysPaged takes the previous page's last key as the
+            // resume point. The block hash is always the final argument, so a
+            // missing start key must still be sent as null.
+            params.push(match &start_key {
+                Some(k) => Value::String(k.clone()),
+                None => Value::Null,
+            });
+            params.push(Value::String(head_hex.to_string()));
+
+            let page = self
+                .rpc_call("state_getKeysPaged", Value::Array(params))
+                .await?;
+            let Some(keys) = page.as_array() else {
+                break;
+            };
+            if keys.is_empty() {
+                break;
             }
-            let fields = ev
-                .decode_fields_unchecked_as::<Composite<()>>()
-                .map_err(|e| ChainError::Decode(format!("JobProposed fields: {e}")))?;
-            if let Some(oid) = order_id_from_fields(&fields) {
-                order_ids.push(oid);
+            for k in keys {
+                let Some(hex) = k.as_str() else { continue };
+                let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
+                if let Some(oid) = super::orders::order_id_from_key(&bytes) {
+                    order_ids.push(oid);
+                }
+            }
+            let full_page = keys.len() == ORDER_PAGE_SIZE as usize;
+            start_key = keys.last().and_then(|k| k.as_str()).map(String::from);
+            if !full_page {
+                break;
             }
         }
 
@@ -814,36 +827,13 @@ fn parse_block_number(header: &Value) -> Result<u64, ChainError> {
     Err(ChainError::Decode("header.number unparseable".into()))
 }
 
-/// Extract the `order_id` (u64) from a decoded `QuantumComputeMempool::
-/// JobProposed` event's fields. Prefers the named `order_id` field (matching
-/// the pallet's named event attributes); falls back to the first field of an
-/// unnamed composite. `None` if absent or not an unsigned primitive. Extra
-/// fields (proposer, reward, …) are ignored, so it survives event-shape growth.
-fn order_id_from_fields(fields: &Composite<()>) -> Option<u64> {
-    let value = match fields {
-        Composite::Named(named) => named
-            .iter()
-            .find(|(name, _)| name == "order_id")
-            .map(|(_, v)| v),
-        Composite::Unnamed(vals) => vals.first(),
-    }?;
-    match &value.value {
-        ValueDef::Primitive(Primitive::U128(n)) => u64::try_from(*n).ok(),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        order_id_from_fields, rpc_request, RealChainClient, RPC_CONNECT_TIMEOUT,
-        RPC_REQUEST_TIMEOUT,
-    };
+    use super::{rpc_request, RealChainClient, RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT};
     use crate::chain::scale_types::MinerKind;
     use crate::chain::ChainError;
     use serde_json::Value as JsonValue;
     use std::time::{Duration, Instant};
-    use subxt::ext::scale_value::{Composite, Value};
     use tokio::net::TcpListener;
 
     /// Accept connections and never write a response byte. Models a wedged peer
@@ -885,41 +875,6 @@ mod tests {
             .saturating_mul(3)
             .saturating_add(RPC_REQUEST_TIMEOUT)
             .saturating_add(Duration::from_secs(5))
-    }
-
-    #[test]
-    fn order_id_from_named_ignores_other_fields() {
-        // Real JobProposed carries more than order_id (proposer, reward, …);
-        // the named lookup must pick order_id regardless of position.
-        let fields = Composite::Named(vec![
-            ("proposer".to_string(), Value::u128(999)),
-            ("order_id".to_string(), Value::u128(42)),
-            ("reward".to_string(), Value::u128(7)),
-        ]);
-        assert_eq!(order_id_from_fields(&fields), Some(42));
-    }
-
-    #[test]
-    fn order_id_from_unnamed_takes_first() {
-        let fields = Composite::Unnamed(vec![Value::u128(7), Value::u128(99)]);
-        assert_eq!(order_id_from_fields(&fields), Some(7));
-    }
-
-    #[test]
-    fn order_id_absent_wrong_type_or_empty_is_none() {
-        // No order_id field.
-        assert_eq!(
-            order_id_from_fields(&Composite::Named(vec![("x".to_string(), Value::u128(1))])),
-            None
-        );
-        // order_id present but not an unsigned primitive.
-        let nested = Value::named_composite(vec![("inner".to_string(), Value::u128(1))]);
-        assert_eq!(
-            order_id_from_fields(&Composite::Named(vec![("order_id".to_string(), nested)])),
-            None
-        );
-        // Empty unnamed composite.
-        assert_eq!(order_id_from_fields(&Composite::Unnamed(vec![])), None);
     }
 
     #[tokio::test]
