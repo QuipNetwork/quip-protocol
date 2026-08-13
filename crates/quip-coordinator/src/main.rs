@@ -1,8 +1,11 @@
 //! quip-coordinator binary: CLI, runtime wiring, graceful shutdown.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use quip_coordinator::chain::extrinsic::{load_hybrid_pair, miner_identity_bytes};
-use quip_coordinator::chain::RealChainClient;
+use quip_coordinator::chain::extrinsic::{hex_encode, load_hybrid_pair, miner_identity_bytes};
+use quip_coordinator::chain::scale_types::DifficultyConfig;
+use quip_coordinator::chain::{
+    seed_chain, RealChainClient, SeedParams, SeedReport, SeedTopology, DEFAULT_SEED_DIFFICULTY,
+};
 use quip_coordinator::config::{parse_config, CoordinatorConfig, LaunchEntry};
 use quip_coordinator::drive::{
     aggregate, drain_all, parse_topology_spec, print_table, run_drive, write_jsonl,
@@ -48,6 +51,8 @@ enum Command {
     Drive(DriveArgs),
     /// Create a signer keystore at --out. Refuses to overwrite.
     Keygen(KeygenArgs),
+    /// Seed a fresh chain: register the default topology and set its difficulty.
+    SeedChain(SeedChainArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -55,6 +60,39 @@ struct KeygenArgs {
     /// Destination path for the keystore JSON.
     #[arg(long)]
     out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+struct SeedChainArgs {
+    /// Validator RPC endpoint.
+    #[arg(long, default_value = "ws://quip-validator:9944")]
+    validator: String,
+    /// Sudo signer: a dev URI (//Alice), a BIP39 mnemonic, a 32-byte hex master
+    /// seed, or a keystore path. Mutually exclusive with --mnemonic-file.
+    #[arg(long, conflicts_with = "mnemonic_file")]
+    sudo_key: Option<String>,
+    /// Path to a file holding a BIP39 mnemonic phrase. Mount it read-only.
+    #[arg(long)]
+    mnemonic_file: Option<PathBuf>,
+    /// Built-in topology by name. Mutually exclusive with --topology.
+    #[arg(
+        long,
+        default_value = "advantage2-system1",
+        conflicts_with = "topology"
+    )]
+    topology_preset: String,
+    /// Topology spec JSON path.
+    #[arg(long)]
+    topology: Option<PathBuf>,
+    /// Minimum valid solutions a proof must carry.
+    #[arg(long, default_value_t = DEFAULT_SEED_DIFFICULTY.min_solutions)]
+    min_solutions: u32,
+    /// Energy ceiling in milli units; solutions must be strictly below it.
+    #[arg(long, default_value_t = DEFAULT_SEED_DIFFICULTY.max_energy_milli)]
+    max_energy_milli: i64,
+    /// Minimum solution-set diversity in milli units.
+    #[arg(long, default_value_t = DEFAULT_SEED_DIFFICULTY.min_diversity_milli)]
+    min_diversity_milli: u32,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -136,6 +174,7 @@ fn main() -> StdExitCode {
     match cli.command {
         Some(Command::Drive(args)) => run_drive_cli(args, cli.log_level.unwrap_or(LogLevel::Info)),
         Some(Command::Keygen(args)) => run_keygen_cli(&args),
+        Some(Command::SeedChain(args)) => run_seed_chain_cli(args),
         // When --log-level is omitted the coordinator default is Info (unless
         // RUST_LOG overrides the coordinator filter alone). Forward that same
         // default to miner children so their verbosity matches the CLI default.
@@ -159,6 +198,78 @@ fn run_keygen_cli(args: &KeygenArgs) -> StdExitCode {
             StdExitCode::from(ExitCode::ConfigInvalid as u8)
         }
     }
+}
+
+#[expect(
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "CLI binary reports seed-chain errors to stderr"
+)]
+fn run_seed_chain_cli(args: SeedChainArgs) -> StdExitCode {
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("seed-chain: tokio runtime: {e}");
+            return StdExitCode::FAILURE;
+        }
+    };
+    match rt.block_on(seed_chain_inner(args)) {
+        Ok(report) => {
+            println!(
+                "seeded topology {} ({} nodes, {} edges)",
+                hex_encode(&report.topology_hash),
+                report.nodes,
+                report.edges
+            );
+            println!("  register_topology included in {}", report.register_block);
+            println!(
+                "  set_difficulty    included in {}",
+                report.difficulty_block
+            );
+            StdExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("seed-chain: {e}");
+            StdExitCode::FAILURE
+        }
+    }
+}
+
+async fn seed_chain_inner(args: SeedChainArgs) -> Result<SeedReport, String> {
+    let sudo_key = match (&args.sudo_key, &args.mnemonic_file) {
+        (Some(k), None) => k.clone(),
+        (None, Some(p)) => {
+            let phrase = std::fs::read_to_string(p)
+                .map_err(|e| format!("read mnemonic file {}: {e}", p.display()))?;
+            let phrase = phrase.trim().to_string();
+            if phrase.is_empty() {
+                return Err(format!("mnemonic file is empty: {}", p.display()));
+            }
+            phrase
+        }
+        _ => return Err("give exactly one of --sudo-key or --mnemonic-file".into()),
+    };
+
+    let text = match &args.topology {
+        Some(p) => {
+            std::fs::read_to_string(p).map_err(|e| format!("read topology {}: {e}", p.display()))?
+        }
+        None => preset_spec(&args.topology_preset)?.to_string(),
+    };
+    let spec = parse_topology_spec(&text).map_err(|e| format!("{e:?}"))?;
+
+    seed_chain(SeedParams {
+        validator: args.validator,
+        sudo_key,
+        topology: SeedTopology::from_spec(&spec),
+        difficulty: DifficultyConfig {
+            min_solutions: args.min_solutions,
+            max_energy_milli: args.max_energy_milli,
+            min_diversity_milli: args.min_diversity_milli,
+        },
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 fn load_coordinator_config(

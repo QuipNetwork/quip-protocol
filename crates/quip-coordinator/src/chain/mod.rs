@@ -28,7 +28,10 @@ pub use orders::{job_orders_prefix, order_id_from_key};
 pub use outcome::{SubmitLedger, QBLOCK_RETENTION};
 pub use real::RealChainClient;
 pub use scale_types::{MinerKind, MinerSpecScale, NodeDescriptorV2Input, NodeLogLevel};
-pub use seed::{encode_register_topology, encode_set_difficulty, SeedTopology};
+pub use seed::{
+    encode_register_topology, encode_set_difficulty, seed_chain, SeedParams, SeedReport,
+    SeedTopology, DEFAULT_SEED_DIFFICULTY,
+};
 pub use snapshot::{head_state_key, DecayParams, MiningSnapshot};
 pub use submit::{
     classify_descriptor, classify_participation, classify_receipt, DescriptorOutcome,
