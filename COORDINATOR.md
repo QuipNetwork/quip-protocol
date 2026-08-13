@@ -9,7 +9,7 @@ never see the chain.
 The crate is `crates/quip-coordinator`. This document describes the modules and
 how they fit together. For build and run commands, see `AGENTS.md`.
 
-## Two run modes
+## Run modes
 
 `main.rs` parses one CLI:
 
@@ -20,6 +20,9 @@ how they fit together. For build and run commands, see `AGENTS.md`.
 - `quip-coordinator drive …` — a synthetic driver (`drive` module). Spawns one
   miner and feeds it generated or replayed problems with no chain and no submit.
   Used for benchmarking and matched-condition parity runs.
+- `quip-coordinator seed-chain …` — registers a default topology and sets its
+  difficulty on a fresh chain. You can seed a chain only once. Wipe the chain
+  data and restart the validator if `DefaultTopology` is already set.
 
 ## Logging
 
@@ -405,9 +408,12 @@ address the operator trusts, because it applies no authentication.
 
 `quip-coordinator drive` (the `drive` module and `DriveService` in `session.rs`)
 spawns one miner and feeds it synthetic work with no chain and no submit. Jobs
-come from a golden random draw (`--source random`, optionally against a topology
-preset under `crates/quip-coordinator/fixtures/drive/`) or a JSONL replay
-(`--source list`). It reports per-job and aggregate timing, and can pin
+come from a golden random draw (`--source random`, optionally with a topology
+preset embedded in the binary) or a JSONL replay (`--source list`). Drive reports
+per-job and total timing, and can pin
 `num_reads`/`num_sweeps` through the `SetTarget` control-plane override to run
 matched-condition throughput and parity comparisons. This is the path used for
 CPU-versus-CUDA benchmarking.
+
+The preset JSON stays under `crates/quip-coordinator/fixtures/drive/` as the
+readable source. The binary copies each file in at compile time.
