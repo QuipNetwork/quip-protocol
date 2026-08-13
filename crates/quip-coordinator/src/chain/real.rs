@@ -32,10 +32,26 @@ use serde_json::Value;
 use sp_core::crypto::Ss58Codec;
 use sp_core::Pair as _;
 use std::sync::Mutex;
+use std::time::Duration;
 use subxt::config::substrate::H256;
 use subxt::ext::scale_value::{Composite, Primitive, ValueDef};
 use subxt::transactions::TransactionStatus;
 use tokio::sync::OnceCell;
+
+/// Budget for opening a session to one validator (TCP connect + WS handshake).
+///
+/// A wedged peer that accepts TCP and never speaks used to block the ordered
+/// failover list forever. Five seconds is long enough for a slow host path and
+/// short enough that the next endpoint is tried before the coordinator looks
+/// hung at startup.
+const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Budget for one JSON-RPC method after the client is up.
+///
+/// The jsonrpsee default is 60s, which multiplies badly across a validator list
+/// when a peer is silent. Fifteen seconds still covers a loaded but working
+/// node; it does not wait a full minute before moving on.
+const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// subxt client for read-only, metadata-aware event decoding. Submit stays on
 /// the hybrid-signed jsonrpsee path — subxt is used only to decode mempool
@@ -829,7 +845,11 @@ async fn rpc_http(url: &str, method: &str, params: Value) -> Result<Value, Chain
     use jsonrpsee::core::client::ClientT;
     use jsonrpsee::http_client::HttpClientBuilder;
 
+    // HttpClientBuilder has no separate connection_timeout. request_timeout
+    // wraps the full transport send (connect + response), so one budget covers
+    // both phases and surfaces as Unavailable for failover.
     let client = HttpClientBuilder::default()
+        .request_timeout(RPC_REQUEST_TIMEOUT)
         .build(url)
         .map_err(|e| ChainError::Unavailable(format!("http client: {e}")))?;
     let result: Value = client
@@ -843,10 +863,25 @@ async fn rpc_ws(url: &str, method: &str, params: Value) -> Result<Value, ChainEr
     use jsonrpsee::core::client::ClientT;
     use jsonrpsee::ws_client::WsClientBuilder;
 
-    let client = WsClientBuilder::default()
-        .build(url)
-        .await
-        .map_err(|e| ChainError::Unavailable(format!("ws client: {e}")))?;
+    // connection_timeout only bounds TCP connect inside jsonrpsee. A peer that
+    // accepts and never completes the WebSocket handshake still hangs build(),
+    // so the whole build is wrapped in the same connect budget.
+    let build = WsClientBuilder::default()
+        .connection_timeout(RPC_CONNECT_TIMEOUT)
+        .request_timeout(RPC_REQUEST_TIMEOUT)
+        .build(url);
+    let client = match tokio::time::timeout(RPC_CONNECT_TIMEOUT, build).await {
+        Ok(Ok(client)) => client,
+        Ok(Err(e)) => {
+            return Err(ChainError::Unavailable(format!("ws client: {e}")));
+        }
+        Err(_) => {
+            return Err(ChainError::Unavailable(format!(
+                "ws connect timed out after {}s",
+                RPC_CONNECT_TIMEOUT.as_secs()
+            )));
+        }
+    };
     let result: Value = client
         .request(method, rpc_params_from_value(params))
         .await
@@ -873,8 +908,57 @@ fn rpc_params_from_value(params: Value) -> jsonrpsee::core::params::ArrayParams 
 
 #[cfg(test)]
 mod tests {
-    use super::{free_from_account_info, order_id_from_fields};
+    use super::{
+        free_from_account_info, order_id_from_fields, rpc_request, RealChainClient,
+        RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT,
+    };
+    use crate::chain::scale_types::MinerKind;
+    use crate::chain::ChainError;
+    use serde_json::Value as JsonValue;
+    use std::time::{Duration, Instant};
     use subxt::ext::scale_value::{Composite, Value};
+    use tokio::net::TcpListener;
+
+    /// Accept connections and never write a response byte. Models a wedged peer
+    /// that passes TCP but blocks the client forever without timeouts.
+    async fn spawn_blackhole_listener() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole listener");
+        let addr = listener.local_addr().expect("blackhole local addr");
+        drop(tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                // Hold the accepted socket open and never write. The peer must
+                // time out on its own; that is the behaviour under test.
+                drop(tokio::spawn(async move {
+                    let _sock = sock;
+                    std::future::pending::<()>().await;
+                }));
+            }
+        }));
+        format!("{addr}")
+    }
+
+    /// Upper bound for a single-endpoint blackhole: connect budget plus slack
+    /// for scheduler jitter on a loaded CI host. Must stay well under the
+    /// test's outer timeout so a hang fails the test, not the harness.
+    fn single_endpoint_budget() -> Duration {
+        RPC_CONNECT_TIMEOUT
+            .saturating_mul(2)
+            .saturating_add(Duration::from_secs(5))
+    }
+
+    /// Upper bound when the first endpoint blackholes and the second refuses:
+    /// one connect timeout plus a refused connect, with CI slack.
+    fn failover_budget() -> Duration {
+        RPC_CONNECT_TIMEOUT
+            .saturating_mul(3)
+            .saturating_add(RPC_REQUEST_TIMEOUT)
+            .saturating_add(Duration::from_secs(5))
+    }
 
     /// `AccountInfo` as recent Substrate runtimes shape it. The reader walks by
     /// field name, so extra fields and field order must not matter.
@@ -968,5 +1052,101 @@ mod tests {
         );
         // Empty unnamed composite.
         assert_eq!(order_id_from_fields(&Composite::Unnamed(vec![])), None);
+    }
+
+    #[tokio::test]
+    async fn ws_blackhole_endpoint_errors_within_connect_budget() {
+        let addr = spawn_blackhole_listener().await;
+        let url = format!("ws://{addr}");
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            single_endpoint_budget(),
+            rpc_request(&url, "system_health", JsonValue::Array(vec![])),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "ws blackhole call hung past {:?}",
+            single_endpoint_budget()
+        );
+        let err = outcome
+            .expect("outer timeout")
+            .expect_err("blackhole must not succeed");
+        assert!(
+            matches!(err, ChainError::Unavailable(_)),
+            "timeout must classify as Unavailable for failover, got {err}"
+        );
+        assert!(
+            started.elapsed() < single_endpoint_budget(),
+            "elapsed {:?} exceeds budget",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn http_blackhole_endpoint_errors_within_request_budget() {
+        let addr = spawn_blackhole_listener().await;
+        let url = format!("http://{addr}");
+        // HTTP has no separate connect timeout; request_timeout covers the hang.
+        let budget = RPC_REQUEST_TIMEOUT.saturating_add(Duration::from_secs(10));
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            budget,
+            rpc_request(&url, "system_health", JsonValue::Array(vec![])),
+        )
+        .await;
+        assert!(outcome.is_ok(), "http blackhole call hung past {budget:?}");
+        let err = outcome
+            .expect("outer timeout")
+            .expect_err("blackhole must not succeed");
+        assert!(
+            matches!(err, ChainError::Unavailable(_)),
+            "timeout must classify as Unavailable for failover, got {err}"
+        );
+        assert!(
+            started.elapsed() < budget,
+            "elapsed {:?} exceeds budget",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_call_fails_over_past_blackhole_first_validator() {
+        let addr = spawn_blackhole_listener().await;
+        // Primary accepts and stays silent. Secondary refuses immediately so
+        // the call ends after one connect timeout plus a fast connection error.
+        let client = RealChainClient::new(
+            vec![format!("ws://{addr}"), "ws://127.0.0.1:1".to_string()],
+            "//Alice".to_string(),
+            MinerKind::Cpu,
+        );
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(failover_budget(), client.runtime_version_raw()).await;
+        assert!(
+            outcome.is_ok(),
+            "failover hung past {:?}",
+            failover_budget()
+        );
+        let err = outcome
+            .expect("outer timeout")
+            .expect_err("no working validator in the list");
+        assert!(
+            matches!(err, ChainError::Unavailable(_)),
+            "all-endpoint failure must be Unavailable, got {err}"
+        );
+        // Must have left the blackhole: elapsed is under one connect budget
+        // times a small factor, not an unbounded hang.
+        assert!(
+            started.elapsed() < failover_budget(),
+            "elapsed {:?} exceeds failover budget",
+            started.elapsed()
+        );
+        // And it must have waited long enough that the connect timeout fired
+        // (not instant success / skip). A refused-only pair would be near 0.
+        assert!(
+            started.elapsed() >= RPC_CONNECT_TIMEOUT,
+            "expected at least one connect timeout ({RPC_CONNECT_TIMEOUT:?}), got {:?}",
+            started.elapsed()
+        );
     }
 }
