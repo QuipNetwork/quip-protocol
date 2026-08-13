@@ -276,6 +276,16 @@ pub fn blake2_128(data: &[u8]) -> [u8; 16] {
     out
 }
 
+/// Hash of a submitted extrinsic, as the node reports it in a block body.
+///
+/// Substrate hashes the full SCALE-encoded extrinsic, length prefix included,
+/// with Blake2-256. Inclusion is confirmed by matching this against the
+/// extrinsics in the block the status stream named.
+#[must_use]
+pub fn extrinsic_hash(ext: &[u8]) -> [u8; 32] {
+    blake2_256(ext)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +354,13 @@ mod tests {
         assert_eq!(id.len(), 32);
         // Deterministic.
         assert_eq!(id, miner_identity_bytes(&pair));
+    }
+
+    #[test]
+    fn the_extrinsic_hash_is_blake2_256_of_the_whole_blob() {
+        let ext = vec![1u8, 2, 3, 4];
+        assert_eq!(extrinsic_hash(&ext), blake2_256(&ext));
+        assert_ne!(extrinsic_hash(&ext), extrinsic_hash(&[1u8, 2, 3, 5]));
     }
 
     fn compact_len_bytes(first: u8) -> usize {

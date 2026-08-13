@@ -16,6 +16,7 @@ pub mod submit;
 pub mod sync;
 pub mod transport;
 pub mod transport_jsonrpsee;
+pub mod watch;
 
 pub use account::{free_from_account_bytes, system_account_storage_key};
 pub use dryrun::{decode_dispatch_error, describe_module_error, ModuleError};
@@ -31,6 +32,7 @@ pub use submit::{
 };
 pub use transport::{BoxStream, RpcTransport};
 pub use transport_jsonrpsee::JsonrpseeTransport;
+pub use watch::{parse_tx_status, TxStatus};
 
 use async_trait::async_trait;
 
