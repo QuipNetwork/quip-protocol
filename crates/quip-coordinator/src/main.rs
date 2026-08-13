@@ -9,6 +9,7 @@ use quip_coordinator::drive::{
     DriveManyParams, ListSource, RandomSource,
 };
 use quip_coordinator::logging::LogLevel;
+use quip_coordinator::presets::preset_spec;
 use quip_coordinator::runtime::{run_runtime, RuntimeParams};
 use quip_coordinator::session::{gen_session_token, CoordinatorState};
 use quip_coordinator::supervisor::BackoffPolicy;
@@ -434,13 +435,11 @@ fn set_target_from_spec(
 /// nonce-ref list entries is consumed inside `ListSource::load` and is not
 /// returned: drive mode has no chain to wire it into.
 fn build_jobs(args: &DriveArgs, deadline_ms: u64) -> Result<BuiltJobs, String> {
-    let topo_path = resolve_topology_path(args)?;
+    let topo_text = resolve_topology_text(args)?;
     match args.source {
         DriveSourceKind::Random => {
-            let topo_path =
-                topo_path.ok_or("--source random requires --topology or --topology-preset")?;
-            let text = std::fs::read_to_string(&topo_path)
-                .map_err(|e| format!("cannot read topology spec {}: {e}", topo_path.display()))?;
+            let text =
+                topo_text.ok_or("--source random requires --topology or --topology-preset")?;
             let spec = parse_topology_spec(&text).map_err(|e| e.to_string())?;
             let miner_account = [0u8; 32];
             let mut src =
@@ -454,11 +453,9 @@ fn build_jobs(args: &DriveArgs, deadline_ms: u64) -> Result<BuiltJobs, String> {
                 .list
                 .as_ref()
                 .ok_or("--source list requires --list <models.jsonl>")?;
-            let (topology, snapshot, target) = match &topo_path {
-                Some(p) => {
-                    let text = std::fs::read_to_string(p)
-                        .map_err(|e| format!("cannot read topology spec {}: {e}", p.display()))?;
-                    let spec = parse_topology_spec(&text).map_err(|e| e.to_string())?;
+            let (topology, snapshot, target) = match &topo_text {
+                Some(text) => {
+                    let spec = parse_topology_spec(text).map_err(|e| e.to_string())?;
                     let target = set_target_from_spec(&spec, args);
                     (
                         Some(spec.topology.clone()),
@@ -479,35 +476,25 @@ fn build_jobs(args: &DriveArgs, deadline_ms: u64) -> Result<BuiltJobs, String> {
 /// Default preset used by `--source random` when no topology is specified.
 const DEFAULT_PRESET: &str = "advantage2-system1";
 
-/// Resolve the topology spec path from `--topology` / `--topology-preset`.
+/// Resolve the topology spec text from `--topology` / `--topology-preset`.
 /// `--source random` falls back to [`DEFAULT_PRESET`]; `--source list` returns
 /// `None` (a nonce-ref list supplies its own topology or needs none).
-fn resolve_topology_path(args: &DriveArgs) -> Result<Option<PathBuf>, String> {
+fn resolve_topology_text(args: &DriveArgs) -> Result<Option<String>, String> {
     if args.topology.is_some() && args.topology_preset.is_some() {
         return Err("--topology and --topology-preset are mutually exclusive".into());
     }
     if let Some(p) = &args.topology {
-        return Ok(Some(p.clone()));
+        return std::fs::read_to_string(p)
+            .map(Some)
+            .map_err(|e| format!("read topology {}: {e}", p.display()));
     }
     if let Some(name) = &args.topology_preset {
-        return Ok(Some(preset_path(name)?));
+        return preset_spec(name).map(|s| Some(s.to_string()));
     }
     match args.source {
-        DriveSourceKind::Random => Ok(Some(preset_path(DEFAULT_PRESET)?)),
+        DriveSourceKind::Random => preset_spec(DEFAULT_PRESET).map(|s| Some(s.to_string())),
         DriveSourceKind::List => Ok(None),
     }
-}
-
-/// Map a preset name to its committed fixture under `fixtures/drive/`, resolved
-/// relative to the crate. Rejects names outside `[A-Za-z0-9-]` so a preset
-/// can never escape the fixture directory.
-fn preset_path(name: &str) -> Result<PathBuf, String> {
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return Err(format!("invalid topology preset name: {name:?}"));
-    }
-    Ok(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/drive")
-        .join(format!("{name}.spec.json")))
 }
 
 #[expect(
@@ -632,35 +619,28 @@ mod tests {
         let mut a = drive_args(DriveSourceKind::Random);
         a.topology = Some(PathBuf::from("t.json"));
         a.topology_preset = Some("smoke".into());
-        assert!(resolve_topology_path(&a).is_err());
+        assert!(resolve_topology_text(&a).is_err());
     }
 
     #[test]
-    fn random_defaults_to_advantage2_preset() {
+    fn random_source_defaults_to_the_advantage2_preset() {
         let a = drive_args(DriveSourceKind::Random);
-        let p = resolve_topology_path(&a).unwrap().unwrap();
-        assert!(p.ends_with("fixtures/drive/advantage2-system1.spec.json"));
+        let text = resolve_topology_text(&a).unwrap().unwrap();
+        let spec = parse_topology_spec(&text).unwrap();
+        assert_eq!(spec.topology.nodes.len(), 4577);
     }
 
     #[test]
     fn list_defaults_to_no_topology() {
         let a = drive_args(DriveSourceKind::List);
-        assert!(resolve_topology_path(&a).unwrap().is_none());
+        assert!(resolve_topology_text(&a).unwrap().is_none());
     }
 
     #[test]
-    fn explicit_preset_resolves_to_fixture() {
+    fn named_preset_resolves_to_its_embedded_spec() {
         let mut a = drive_args(DriveSourceKind::Random);
         a.topology_preset = Some("smoke".into());
-        let p = resolve_topology_path(&a).unwrap().unwrap();
-        assert!(p.ends_with("fixtures/drive/smoke.spec.json"));
-    }
-
-    #[test]
-    fn preset_name_rejects_path_traversal() {
-        assert!(preset_path("../etc/passwd").is_err());
-        assert!(preset_path("a/b").is_err());
-        assert!(preset_path("").is_err());
-        assert!(preset_path("smoke").is_ok());
+        let text = resolve_topology_text(&a).unwrap().unwrap();
+        assert!(parse_topology_spec(&text).is_ok());
     }
 }

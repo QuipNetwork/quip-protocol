@@ -11,6 +11,7 @@ pub mod funding;
 pub mod keygen;
 pub mod liveness;
 pub mod logging;
+pub mod presets;
 /// `PoW` and mempool job construction helpers.
 pub mod producer;
 pub mod readiness;
