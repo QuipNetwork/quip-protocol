@@ -2,6 +2,7 @@
 //! tests use `FakeChain`.
 
 pub mod account;
+pub mod dryrun;
 pub mod extrinsic;
 pub mod fake;
 pub mod mempool;
@@ -17,6 +18,7 @@ pub mod transport;
 pub mod transport_jsonrpsee;
 
 pub use account::{free_from_account_bytes, system_account_storage_key};
+pub use dryrun::{decode_dispatch_error, describe_module_error, ModuleError};
 pub use fake::FakeChain;
 pub use mempool::JobOrder;
 pub use outcome::{SubmitLedger, QBLOCK_RETENTION};
