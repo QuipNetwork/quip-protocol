@@ -133,12 +133,17 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-/// Load a hybrid pair from a Python-compatible keystore JSON path, a raw
-/// 32-byte hex seed, or a `//DevUri` string.
+/// Load a hybrid pair from signer material.
+///
+/// Accepted forms:
+/// - a Python-compatible keystore JSON path
+/// - a 32-byte hex seed, with or without the `0x` prefix
+/// - a `//DevUri` string such as `//Alice`
+/// - any substrate secret URI, including a bare BIP39 mnemonic
 ///
 /// # Errors
-/// Returns an error when the path cannot be read/parsed, the seed is not 32
-/// bytes, or a `//` URI fails to derive a pair.
+/// Returns an error when the path cannot be read or parsed, the keystore seed
+/// is not 32 bytes, or the secret URI fails to derive a pair.
 pub fn load_hybrid_pair(signer_key: &str) -> Result<HybridPair, String> {
     let path = std::path::Path::new(signer_key);
     if path.exists() {
@@ -160,21 +165,20 @@ pub fn load_hybrid_pair(signer_key: &str) -> Result<HybridPair, String> {
         seed.copy_from_slice(&seed_bytes);
         return Ok(HybridPair::from_seed(&seed));
     }
-    if signer_key.starts_with("//") {
-        return HybridPair::from_string(signer_key, None)
-            .map_err(|e| format!("HybridPair::from_string: {e:?}"));
+    // A 32-byte hex seed, with or without the 0x prefix. Checked before the
+    // secret-URI branch because a bare hex string is also a legal URI and
+    // would derive a different key through the phrase path.
+    let hex_body = signer_key.strip_prefix("0x").unwrap_or(signer_key);
+    if hex_body.len() == 64 && hex_body.chars().all(|c| c.is_ascii_hexdigit()) {
+        let seed_bytes = hex_decode(hex_body)?;
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&seed_bytes);
+        return Ok(HybridPair::from_seed(&seed));
     }
-    // Raw hex seed.
-    let seed_bytes = hex_decode(signer_key)?;
-    if seed_bytes.len() != 32 {
-        return Err(format!(
-            "signer seed must be 32-byte hex or keystore path, got {} bytes",
-            seed_bytes.len()
-        ));
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&seed_bytes);
-    Ok(HybridPair::from_seed(&seed))
+    // Any substrate secret URI: a dev path (//Alice), a BIP39 mnemonic, or a
+    // mnemonic with derivation and password (phrase//hard/soft///password).
+    HybridPair::from_string(signer_key, None)
+        .map_err(|e| format!("cannot derive a signer from {signer_key:?}: {e:?}"))
 }
 
 /// Derive the 32-byte miner identity used in `derive_nonce`.
@@ -232,6 +236,18 @@ pub fn last_proof_block_storage_key() -> Vec<u8> {
     let mut key = Vec::with_capacity(32);
     key.extend_from_slice(&twox128(b"QuantumPow"));
     key.extend_from_slice(&twox128(b"LastProofBlock"));
+    key
+}
+
+/// Substrate storage key for the `QuantumPow.DefaultTopology` storage value.
+///
+/// A `StorageValue` has no key hasher, so the key is the two twox128 name
+/// hashes concatenated.
+#[must_use]
+pub fn default_topology_storage_key() -> Vec<u8> {
+    let mut key = Vec::with_capacity(32);
+    key.extend_from_slice(&twox128(b"QuantumPow"));
+    key.extend_from_slice(&twox128(b"DefaultTopology"));
     key
 }
 
@@ -369,6 +385,51 @@ mod tests {
             0b01 => 2,
             0b10 => 4,
             _ => 1 + ((first >> 2) as usize + 4),
+        }
+    }
+
+    #[test]
+    fn dev_phrase_with_a_derivation_path_matches_the_bare_dev_uri() {
+        // sp_core substitutes DEV_PHRASE for an empty phrase, so the full
+        // phrase plus //Alice must derive the same pair as //Alice alone.
+        // This exercises the mnemonic branch against a value we can check.
+        let uri = format!("{}//Alice", sp_core::crypto::DEV_PHRASE);
+        let from_phrase = load_hybrid_pair(&uri).expect("mnemonic URI derives");
+        let from_dev_uri = load_hybrid_pair("//Alice").expect("dev URI derives");
+        assert_eq!(
+            from_phrase.public().encode(),
+            from_dev_uri.public().encode()
+        );
+    }
+
+    #[test]
+    fn bare_dev_phrase_derives_a_pair() {
+        let pair = load_hybrid_pair(sp_core::crypto::DEV_PHRASE).expect("bare phrase derives");
+        // The root account differs from //Alice; only assert it is not that.
+        let alice = load_hybrid_pair("//Alice").expect("dev URI derives");
+        assert_ne!(pair.public().encode(), alice.public().encode());
+    }
+
+    #[test]
+    fn garbage_signer_material_is_rejected_with_the_input_named() {
+        // HybridPair is not Debug, so Result::expect_err does not compile.
+        let err = load_hybrid_pair("not a key")
+            .err()
+            .expect("garbage is rejected");
+        assert!(err.contains("not a key"), "error names the input: {err}");
+    }
+
+    #[test]
+    fn default_topology_key_is_the_two_storage_hashes() {
+        let key = default_topology_storage_key();
+        assert_eq!(key.len(), 32);
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "length is asserted to 32 bytes above"
+        )]
+        {
+            assert_eq!(&key[..16], &twox128(b"QuantumPow")[..]);
+            assert_eq!(&key[16..], &twox128(b"DefaultTopology")[..]);
         }
     }
 }
