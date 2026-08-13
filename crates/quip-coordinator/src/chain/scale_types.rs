@@ -202,6 +202,14 @@ pub struct JobOrderScale {
 pub const QUANTUM_POW_PALLET_INDEX: u8 = 10;
 /// Call index of `submit_proof` within `QuantumPow`.
 pub const SUBMIT_PROOF_CALL_INDEX: u8 = 4;
+/// `Sudo` pallet index in the runtime.
+pub const SUDO_PALLET_INDEX: u8 = 6;
+/// `pallet_sudo::Call::sudo` call index.
+pub const SUDO_CALL_INDEX: u8 = 0;
+/// `QuantumPow::register_topology` call index.
+pub const REGISTER_TOPOLOGY_CALL_INDEX: u8 = 2;
+/// `QuantumPow::set_difficulty` call index.
+pub const SET_DIFFICULTY_CALL_INDEX: u8 = 3;
 
 /// Pallet index of `MinerRegistry` in the runtime construct.
 pub const MINER_REGISTRY_PALLET_INDEX: u8 = 13;
