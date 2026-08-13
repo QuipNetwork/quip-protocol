@@ -41,6 +41,83 @@ pub struct Proof {
     pub device_access_time_us: u64,
 }
 
+/// Outcome of a `MinerRegistry.set_descriptor` submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescriptorOutcome {
+    /// The descriptor landed (create or replace).
+    Filed,
+    /// The pallet rejected the payload. Do not retry.
+    Rejected,
+}
+
+const DESCRIPTOR_REJECT: [&str; 20] = [
+    "EmptyNodeId",
+    "EmptyNodeName",
+    "EmptyPublicHost",
+    "EmptyRpcEndpoint",
+    "EmptyMinerLabel",
+    "EmptyMinerBackend",
+    "EmptyMinerDeviceId",
+    "EmptyOsSystem",
+    "EmptyCpuBrand",
+    "EmptyCpuArch",
+    "EmptyGpuVendor",
+    "EmptyGpuName",
+    "InvalidGpuUtilization",
+    "EmptyPythonVersion",
+    "EmptyQuipVersion",
+    "EmptyDockerImage",
+    "NoMiners",
+    "InvalidPort",
+    "InsufficientBalance",
+    "LiquidityRestrictions",
+];
+
+/// Classify a `set_descriptor` pallet error. `None` is a successful dispatch.
+/// Unknown strings stay `None` so the caller can treat them as transient.
+#[must_use]
+pub fn classify_descriptor(error: Option<&str>) -> Option<DescriptorOutcome> {
+    let Some(e) = error else {
+        return Some(DescriptorOutcome::Filed);
+    };
+    if DESCRIPTOR_REJECT.iter().any(|s| e.contains(s)) {
+        return Some(DescriptorOutcome::Rejected);
+    }
+    None
+}
+
+/// Outcome of a `MinerRegistry.participate` submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParticipationOutcome {
+    /// The declaration landed.
+    Declared,
+    /// This account already declared this qblock. Treat as success.
+    AlreadyDeclared,
+    /// The candidate qblock moved under the call.
+    StaleQBlock,
+    /// No descriptor is stored for this account.
+    DescriptorMissing,
+}
+
+/// Classify a `participate` pallet error. `None` is a successful dispatch.
+/// Unknown strings stay `None` so the caller can treat them as transient.
+#[must_use]
+pub fn classify_participation(error: Option<&str>) -> Option<ParticipationOutcome> {
+    let Some(e) = error else {
+        return Some(ParticipationOutcome::Declared);
+    };
+    if e.contains("DuplicateParticipation") {
+        return Some(ParticipationOutcome::AlreadyDeclared);
+    }
+    if e.contains("InvalidQBlockId") {
+        return Some(ParticipationOutcome::StaleQBlock);
+    }
+    if e.contains("DescriptorRequired") {
+        return Some(ParticipationOutcome::DescriptorMissing);
+    }
+    None
+}
+
 /// Classify a pallet/dispatch error string into a fire-loop action.
 ///
 /// Mirrors `substrate/submitter.py:_classify_receipt`. Unknown → fail loud.
@@ -105,5 +182,44 @@ mod tests {
             classify_receipt(Some("SomethingUnknown")),
             SubmitAction::StopFatal
         ));
+    }
+
+    #[test]
+    fn classifies_descriptor_errors() {
+        assert_eq!(classify_descriptor(None), Some(DescriptorOutcome::Filed));
+        assert_eq!(
+            classify_descriptor(Some("MinerRegistry: EmptyNodeName")),
+            Some(DescriptorOutcome::Rejected)
+        );
+        assert_eq!(
+            classify_descriptor(Some("NoMiners")),
+            Some(DescriptorOutcome::Rejected)
+        );
+        assert_eq!(
+            classify_descriptor(Some("InsufficientBalance")),
+            Some(DescriptorOutcome::Rejected)
+        );
+        assert_eq!(classify_descriptor(Some("SomethingUnknown")), None);
+    }
+
+    #[test]
+    fn classifies_participation_errors() {
+        assert_eq!(
+            classify_participation(None),
+            Some(ParticipationOutcome::Declared)
+        );
+        assert_eq!(
+            classify_participation(Some("MinerRegistry: DuplicateParticipation")),
+            Some(ParticipationOutcome::AlreadyDeclared)
+        );
+        assert_eq!(
+            classify_participation(Some("InvalidQBlockId")),
+            Some(ParticipationOutcome::StaleQBlock)
+        );
+        assert_eq!(
+            classify_participation(Some("DescriptorRequired")),
+            Some(ParticipationOutcome::DescriptorMissing)
+        );
+        assert_eq!(classify_participation(Some("SomethingUnknown")), None);
     }
 }

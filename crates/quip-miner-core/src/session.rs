@@ -5,6 +5,7 @@
 //! Shutdown / idle timeout. Backends supply only a [`Sampler`].
 
 use crate::cli::CommonArgs;
+use crate::display::{energy_units, format_duration_ms};
 use crate::job::{
     finalize_result, miner, num_sweeps_from_toml, prepare_job, status_msg, Prepared, SessionTarget,
     TopologyCache, DEFAULT_NUM_SWEEPS,
@@ -64,10 +65,42 @@ const PROGRESS_LOG_INTERVAL: u64 = 10;
 /// practice while still bounding memory if the peer stops reading entirely.
 const CTRL_CHANNEL_DEPTH: usize = 256;
 
-/// `job_id` → the `(num_reads, num_sweeps)` resolved for it at prepare time,
-/// shared between the session's read loop (which inserts) and its outbound
-/// writer (which removes to build `SamplerMeta`).
-type PendingParams = Arc<StdMutex<HashMap<Vec<u8>, (u32, u32)>>>;
+/// What the read loop knew about a job at prepare time, held until the writer
+/// finalizes it.
+///
+/// The sampling parameters build the outbound `SamplerMeta`. The rest exists so
+/// the completion log can report an attempt the way the v0.2.1 miner did:
+/// elapsed wall time, and the requirement the attempt was measured against.
+/// Only the read loop sees the session `SetTarget`, so it records the
+/// thresholds here rather than sharing the target with the writer.
+struct PendingJob {
+    num_reads: u32,
+    num_sweeps: u32,
+    started: std::time::Instant,
+    /// Session energy threshold, or `None` when no `SetTarget` has arrived.
+    max_energy_milli: Option<i64>,
+    min_solutions: u32,
+}
+
+/// `job_id` → its [`PendingJob`], shared between the session's read loop (which
+/// inserts) and its outbound writer (which removes).
+type PendingParams = Arc<StdMutex<HashMap<Vec<u8>, PendingJob>>>;
+
+/// Render the leading bytes of a job id for logs.
+///
+/// Job ids are opaque and long. Eight bytes is enough to correlate a completion
+/// with its dispatch in a coordinator log without wrapping the line.
+fn short_job_id(job_id: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(18);
+    for b in job_id.iter().take(8) {
+        let _ = write!(s, "{b:02x}");
+    }
+    if job_id.len() > 8 {
+        s.push_str("..");
+    }
+    s
+}
 
 #[expect(
     clippy::cast_precision_loss,
@@ -77,9 +110,8 @@ fn log_progress(
     backend: &str,
     jobs_done: u64,
     elapsed: Duration,
-    reads: u32,
-    sweeps: u32,
     best_energy_milli: i64,
+    pending: Option<&PendingJob>,
 ) {
     let secs = elapsed.as_secs_f64();
     let rate = if secs > 0.0 {
@@ -90,11 +122,81 @@ fn log_progress(
     let best = if best_energy_milli == i64::MAX {
         "n/a".to_owned()
     } else {
-        best_energy_milli.to_string()
+        energy_units(best_energy_milli).to_string()
     };
+    let (reads, sweeps) = pending.map_or((0, 0), |p| (p.num_reads, p.num_sweeps));
+    let requirement = format_requirement(pending);
     tracing::info!(
-        "{backend} progress: {jobs_done} jobs | {rate:.1} jobs/s | reads={reads} sweeps={sweeps} | best={best} milli"
+        "[quip-miner-{backend}] progress: {jobs_done} jobs | {rate:.1} jobs/s | reads={reads} sweeps={sweeps} | best={best} | {requirement}"
     );
+}
+
+/// Requirement text shared by the progress line.
+///
+/// The per-attempt line no longer carries this. Sampling parameters stay
+/// constant for a round, so the progress interval is enough.
+fn format_requirement(pending: Option<&PendingJob>) -> String {
+    match pending.and_then(|p| p.max_energy_milli) {
+        Some(max) => format!(
+            "requires energy<={}, solutions>={}",
+            energy_units(max),
+            pending.map_or(0, |p| p.min_solutions)
+        ),
+        None => "no target set".to_owned(),
+    }
+}
+
+/// Log one finished attempt, mirroring the v0.2.1 miner's per-attempt line.
+///
+/// Every terminal outcome is logged, not only the ones that clear the target.
+/// A miner that is working correctly but not winning looks identical to a
+/// wedged one unless the losing attempts are visible, which is the gap this
+/// closes: the only per-job signal before this was [`log_progress`], and it
+/// fires once per ten jobs, so a miner taking minutes per job showed nothing
+/// for the better part of an hour.
+///
+/// `pending` is `None` when the writer sees a result for a job the read loop
+/// never recorded. That is not reachable through the normal path, so the line
+/// still goes out, with the parameters and elapsed time reported as unknown.
+fn log_attempt(backend: &str, sr: &StreamResult, pending: Option<&PendingJob>) {
+    let job = short_job_id(&sr.job_id);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "attempt wall time in ms fits u64 for any realistic job"
+    )]
+    let elapsed_ms = pending.map_or(0, |p| p.started.elapsed().as_millis() as u64);
+    let device_ms = sr.device_access_time_us / 1000;
+    let wall = format_duration_ms(elapsed_ms);
+    let device = format_duration_ms(device_ms);
+
+    match &sr.outcome {
+        StreamOutcome::Completed(Ok(samples)) => {
+            let best = samples.iter().map(|r| r.energy_milli).min();
+            // Solutions at or below the session threshold: the count the
+            // coordinator scores the attempt on. Without a target none of them
+            // qualify yet, so report the raw sample count instead.
+            let valid = match pending.and_then(|p| p.max_energy_milli) {
+                Some(max) => samples.iter().filter(|r| r.energy_milli <= max).count(),
+                None => samples.len(),
+            };
+            tracing::info!(
+                "[quip-miner-{backend}] attempt {job}: energy {}, valid {valid}/{} \
+                 | {wall} wall, {device} device",
+                best.map_or_else(|| "n/a".to_owned(), |e| energy_units(e).to_string()),
+                samples.len(),
+            );
+        }
+        StreamOutcome::Completed(Err(reason)) => {
+            tracing::warn!(
+                "[quip-miner-{backend}] attempt {job}: rejected {} | {wall} wall",
+                reason.as_str_name(),
+            );
+        }
+        // Expected on every reseed, so this is not a degraded condition.
+        StreamOutcome::Cancelled => {
+            tracing::debug!("[quip-miner-{backend}] attempt {job}: cancelled after {wall}");
+        }
+    }
 }
 
 #[expect(
@@ -202,13 +304,16 @@ async fn run_session<S: Sampler>(
                     biased;
                     // Drain completed results first so a busy sampler never backs up.
                     Some(sr) = res_rx.recv() => {
-                        let (reads, sweeps) = {
+                        let entry = {
                             let mut p = match pending.lock() {
                                 Ok(p) => p,
                                 Err(poisoned) => poisoned.into_inner(),
                             };
-                            p.remove(&sr.job_id).unwrap_or((0, 0))
+                            p.remove(&sr.job_id)
                         };
+                        let (reads, sweeps) = entry
+                            .as_ref()
+                            .map_or((0, 0), |e| (e.num_reads, e.num_sweeps));
                         // A Cancelled job neither advances progress nor updates
                         // best energy; finalize_result just refunds its credit.
                         let completed = matches!(sr.outcome, StreamOutcome::Completed(_));
@@ -217,6 +322,7 @@ async fn run_session<S: Sampler>(
                                 best_energy_milli = best_energy_milli.min(e);
                             }
                         }
+                        log_attempt(backend, &sr, entry.as_ref());
                         for reply in finalize_result(sr, reads, sweeps, &mut done) {
                             if tx.send(reply).await.is_err() {
                                 return;
@@ -228,9 +334,8 @@ async fn run_session<S: Sampler>(
                                 backend,
                                 done,
                                 session_start.elapsed(),
-                                reads,
-                                sweeps,
                                 best_energy_milli,
+                                entry.as_ref(),
                             );
                         }
                     }
@@ -336,12 +441,36 @@ async fn run_session<S: Sampler>(
                             num_reads,
                             num_sweeps: ns,
                         } => {
+                            tracing::debug!(
+                                "{} received job {}: {} nodes, {} edges | reads={num_reads} sweeps={ns}",
+                                id.backend,
+                                short_job_id(&job.job_id),
+                                job.graph.num_nodes(),
+                                job.graph.edges.len(),
+                            );
                             {
                                 let mut p = match pending.lock() {
                                     Ok(p) => p,
                                     Err(poisoned) => poisoned.into_inner(),
                                 };
-                                let _ = p.insert(job.job_id.clone(), (num_reads, ns));
+                                let _ = p.insert(
+                                    job.job_id.clone(),
+                                    PendingJob {
+                                        num_reads,
+                                        num_sweeps: ns,
+                                        started: std::time::Instant::now(),
+                                        // `drive` mode sets no real threshold
+                                        // and sends `i64::MAX`. Reporting that
+                                        // as a requirement is noise.
+                                        max_energy_milli: target
+                                            .as_ref()
+                                            .map(|t| t.max_energy_milli)
+                                            .filter(|&m| m != i64::MAX),
+                                        min_solutions: target
+                                            .as_ref()
+                                            .map_or(0, |t| t.min_solutions),
+                                    },
+                                );
                             }
                             if job_tx.send(job).await.is_err() {
                                 break;
@@ -454,7 +583,19 @@ pub fn run<S: Sampler>(
     common: &CommonArgs,
     open: impl FnOnce() -> Result<S, OpenError>,
 ) -> StdExitCode {
-    let _ = &common.log_level;
+    // Install the subscriber before anything else can log. `--capabilities`
+    // writes JSON to stdout and must stay parseable, but the subscriber writes
+    // to stderr, so installing first is safe for it too.
+    if let Err(e) = crate::logging::init(&common.log_level) {
+        #[expect(
+            clippy::print_stderr,
+            reason = "the subscriber failed to install, so tracing would discard this"
+        )]
+        {
+            eprintln!("quip-miner-{}: {e}", id.backend);
+        }
+        return StdExitCode::from(ExitCode::ConfigInvalid as u8);
+    }
 
     if common.capabilities {
         print_capabilities(&id);

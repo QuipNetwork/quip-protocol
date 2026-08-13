@@ -3,11 +3,12 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use quip_coordinator::chain::extrinsic::{load_hybrid_pair, miner_identity_bytes};
 use quip_coordinator::chain::RealChainClient;
-use quip_coordinator::config::{parse_config, LaunchEntry};
+use quip_coordinator::config::{parse_config, CoordinatorConfig, LaunchEntry};
 use quip_coordinator::drive::{
     aggregate, drain_all, parse_topology_spec, print_table, run_drive, write_jsonl,
     DriveManyParams, ListSource, RandomSource,
 };
+use quip_coordinator::logging::LogLevel;
 use quip_coordinator::runtime::{run_runtime, RuntimeParams};
 use quip_coordinator::session::{gen_session_token, CoordinatorState};
 use quip_coordinator::supervisor::BackoffPolicy;
@@ -16,6 +17,7 @@ use quip_proto::v1::{Configure, Job};
 use quip_protocol::session::ExitCode;
 use std::path::PathBuf;
 use std::process::ExitCode as StdExitCode;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -32,6 +34,11 @@ struct Cli {
     /// Path to coordinator config.toml (ignored when a subcommand is given)
     #[arg(long)]
     config: Option<PathBuf>,
+
+    /// Log verbosity. Defaults to `info`. Takes precedence over `RUST_LOG`;
+    /// when omitted, `RUST_LOG` is honored if set. Logs go to stderr.
+    #[arg(long, value_enum, global = true)]
+    log_level: Option<LogLevel>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -113,12 +120,25 @@ struct DriveArgs {
     yielding: bool,
 }
 
+#[expect(
+    clippy::print_stderr,
+    reason = "the log subscriber is what failed; stderr is the only channel left"
+)]
 fn main() -> StdExitCode {
     let cli = Cli::parse();
+    // Before anything else: without this, every `tracing` call in the process
+    // is a silent no-op and `RUST_LOG` has no effect.
+    if let Err(e) = quip_coordinator::logging::init(cli.log_level) {
+        eprintln!("error: {e}");
+        return StdExitCode::from(ExitCode::ConfigInvalid as u8);
+    }
     match cli.command {
-        Some(Command::Drive(args)) => run_drive_cli(args),
+        Some(Command::Drive(args)) => run_drive_cli(args, cli.log_level.unwrap_or(LogLevel::Info)),
         Some(Command::Keygen(args)) => run_keygen_cli(&args),
-        None => run_config_path(cli.config),
+        // When --log-level is omitted the coordinator default is Info (unless
+        // RUST_LOG overrides the coordinator filter alone). Forward that same
+        // default to miner children so their verbosity matches the CLI default.
+        None => run_config_path(cli.config, cli.log_level.unwrap_or(LogLevel::Info)),
     }
 }
 
@@ -140,37 +160,52 @@ fn run_keygen_cli(args: &KeygenArgs) -> StdExitCode {
     }
 }
 
-#[expect(
-    clippy::print_stderr,
-    reason = "CLI binary reports config/runtime errors to stderr"
-)]
-fn run_config_path(config: Option<PathBuf>) -> StdExitCode {
-    // --help is handled by clap (exit 0). Missing/invalid config → exit 64.
+fn load_coordinator_config(
+    config: Option<PathBuf>,
+) -> Result<(PathBuf, CoordinatorConfig), StdExitCode> {
     let Some(config_path) = config else {
-        eprintln!("error: --config <path> is required");
-        return StdExitCode::from(ExitCode::ConfigInvalid as u8);
+        tracing::error!("--config <path> is required");
+        return Err(StdExitCode::from(ExitCode::ConfigInvalid as u8));
     };
 
     let text = match std::fs::read_to_string(&config_path) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("error: cannot read config {}: {e}", config_path.display());
-            return StdExitCode::from(ExitCode::ConfigInvalid as u8);
+            tracing::error!(path = %config_path.display(), error = %e, "cannot read config");
+            return Err(StdExitCode::from(ExitCode::ConfigInvalid as u8));
         }
     };
 
-    let cfg = match parse_config(&text) {
-        Ok(c) => c,
+    match parse_config(&text) {
+        Ok(c) => Ok((config_path, c)),
         Err(e) => {
-            eprintln!("error: invalid config: {e}");
-            return StdExitCode::from(ExitCode::ConfigInvalid as u8);
+            tracing::error!(path = %config_path.display(), error = %e, "invalid config");
+            Err(StdExitCode::from(ExitCode::ConfigInvalid as u8))
         }
+    }
+}
+
+fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode {
+    // --help is handled by clap (exit 0). Missing/invalid config → exit 64.
+    let (config_path, cfg) = match load_coordinator_config(config) {
+        Ok(v) => v,
+        Err(code) => return code,
     };
+
+    // Identify the process before doing anything that can warn or fail, so the
+    // first line of any captured log says what this is and what it is talking to.
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        protocol = 1,
+        config = %config_path.display(),
+        "quip-coordinator starting"
+    );
+    tracing::info!(validators = ?cfg.validators, "chain validators configured");
 
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("error: runtime: {e}");
+            tracing::error!(error = %e, "cannot start tokio runtime");
             return StdExitCode::from(ExitCode::InternalFatal as u8);
         }
     };
@@ -178,19 +213,60 @@ fn run_config_path(config: Option<PathBuf>) -> StdExitCode {
     let chain = Arc::new(RealChainClient::new(
         cfg.validators.clone(),
         cfg.signer_key.clone(),
+        quip_coordinator::config::participate_kind(&cfg.launch),
     ));
+
+    // Compatibility gate. The coordinator drives the chain through mirrored
+    // SCALE types and a pinned runtime API; against a validator that predates
+    // them every read fails one poll at a time, deep in the feeder. Decide it
+    // here instead.
+    //
+    // A *skewed* validator is fatal (exit 64 — operator error, do not respawn).
+    // An *unreachable* one is not: the node manager starts the coordinator and
+    // its validator together, so exiting because the node is still booting
+    // would just crash-loop. The feeder retries, and reachability transitions
+    // are logged.
+    match rt.block_on(chain.preflight()) {
+        Ok(_) => {}
+        Err(quip_coordinator::chain::preflight::PreflightError::Unreachable(e)) => {
+            tracing::warn!(
+                error = %e,
+                "cannot reach a validator to verify compatibility; starting anyway and \
+                 will retry (set --log-level debug to watch the retries)"
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "incompatible validator; refusing to start");
+            return StdExitCode::from(ExitCode::ConfigInvalid as u8);
+        }
+    }
+
     let state = Arc::new(Mutex::new(CoordinatorState::new()));
     // Canonical miner account (blake2_256(SCALE(account))) seeds PoW nonce
     // derivation. A live mining coordinator needs its signer key; without a
     // usable one, warn and fall back to a zero account — it still serves and
     // feeds, but its proofs won't verify on-chain.
-    let miner_account = match load_hybrid_pair(&cfg.signer_key) {
-        Ok(pair) => miner_identity_bytes(&pair),
-        Err(e) => {
-            eprintln!("warning: no usable signer key ({e}); PoW proofs will not verify on-chain");
-            [0u8; 32]
-        }
+    let miner_account = miner_account_from_key(&cfg.signer_key);
+
+    let funding = quip_coordinator::funding::FundingParams {
+        faucet_url: cfg.faucet_url.clone(),
+        min_balance: cfg.min_balance_plancks,
+        top_up: cfg.faucet_top_up_plancks,
+        timeout: std::time::Duration::from_secs(cfg.funding_timeout_s),
     };
+    let descriptor = quip_coordinator::config::DescriptorParams::from_config(&cfg);
+    let descriptor_filed = Arc::new(AtomicBool::new(false));
+    if let Some(code) = run_startup_prepare(
+        &rt,
+        chain.as_ref(),
+        miner_account,
+        &funding,
+        &descriptor,
+        descriptor_filed.as_ref(),
+    ) {
+        return code;
+    }
+
     let params = RuntimeParams {
         sock_path: format!("/tmp/quip-coordinator-{}.sock", std::process::id()),
         grace_ms: 2000,
@@ -205,21 +281,79 @@ fn run_config_path(config: Option<PathBuf>) -> StdExitCode {
             .dashboard
             .as_ref()
             .map(|d| (d.listen.clone(), PathBuf::from(&d.data_dir))),
+        log_level,
+        funding,
+        descriptor,
+        descriptor_filed,
     };
-    eprintln!(
-        "quip-coordinator: serving {} miner(s) on {}",
-        cfg.launch.len(),
-        params.sock_path
+    tracing::info!(
+        miners = cfg.launch.len(),
+        ids = ?cfg.launch.iter().map(|e| e.miner_id.as_str()).collect::<Vec<_>>(),
+        socket = %params.sock_path,
+        "serving miner session socket"
     );
 
     let result = rt.block_on(async move {
         run_runtime(cfg.launch, chain, state, params, shutdown_signal()).await
     });
     match result {
-        Ok(()) => StdExitCode::from(ExitCode::Clean as u8),
+        Ok(()) => {
+            tracing::info!("quip-coordinator stopped cleanly");
+            StdExitCode::from(ExitCode::Clean as u8)
+        }
         Err(e) => {
-            eprintln!("error: runtime: {e}");
+            tracing::error!(error = %e, "runtime failed");
             StdExitCode::from(ExitCode::InternalFatal as u8)
+        }
+    }
+}
+
+fn miner_account_from_key(signer_key: &str) -> [u8; 32] {
+    match load_hybrid_pair(signer_key) {
+        Ok(pair) => miner_identity_bytes(&pair),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "no usable signer key; PoW proofs will not verify on-chain"
+            );
+            [0u8; 32]
+        }
+    }
+}
+
+/// Same readiness walk the feeder re-runs on every later round.
+///
+/// Funding failure is fatal at startup (exit 64). A missing snapshot is not:
+/// the feeder retries once miners are connected.
+fn run_startup_prepare(
+    rt: &tokio::runtime::Runtime,
+    chain: &RealChainClient,
+    miner_account: [u8; 32],
+    funding: &quip_coordinator::funding::FundingParams,
+    descriptor: &quip_coordinator::config::DescriptorParams,
+    descriptor_filed: &AtomicBool,
+) -> Option<StdExitCode> {
+    let faucet = quip_coordinator::readiness::build_faucet(funding.faucet_url.as_deref());
+    match rt.block_on(quip_coordinator::readiness::prepare_round(
+        chain,
+        faucet.as_ref(),
+        miner_account,
+        funding,
+        tokio::time::sleep,
+        descriptor,
+        descriptor_filed,
+    )) {
+        Ok(_) => None,
+        Err(quip_coordinator::readiness::ReadinessError::Funding(e)) => {
+            tracing::error!(error = %e, "miner account is not funded; refusing to start");
+            Some(StdExitCode::from(ExitCode::ConfigInvalid as u8))
+        }
+        Err(quip_coordinator::readiness::ReadinessError::Snapshot(e)) => {
+            tracing::warn!(
+                error = %e,
+                "no mining snapshot at startup; feeder will retry"
+            );
+            None
         }
     }
 }
@@ -380,7 +514,7 @@ fn preset_path(name: &str) -> Result<PathBuf, String> {
     clippy::print_stderr,
     reason = "CLI binary reports drive runtime errors to stderr"
 )]
-fn run_drive_cli(args: DriveArgs) -> StdExitCode {
+fn run_drive_cli(args: DriveArgs, log_level: LogLevel) -> StdExitCode {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -388,14 +522,14 @@ fn run_drive_cli(args: DriveArgs) -> StdExitCode {
             return StdExitCode::from(ExitCode::InternalFatal as u8);
         }
     };
-    rt.block_on(drive_main(args))
+    rt.block_on(drive_main(args, log_level))
 }
 
 #[expect(
     clippy::print_stderr,
     reason = "CLI binary reports drive run failures to stderr"
 )]
-async fn drive_main(args: DriveArgs) -> StdExitCode {
+async fn drive_main(args: DriveArgs, log_level: LogLevel) -> StdExitCode {
     // 0 => no deadline (the sentinel the miner honors); otherwise an absolute
     // wall-clock deadline `now + args.deadline_ms`.
     let deadline_ms = if args.deadline_ms == 0 {
@@ -414,6 +548,7 @@ async fn drive_main(args: DriveArgs) -> StdExitCode {
     let entry = LaunchEntry {
         miner_id: "drive-0".into(),
         binary: args.miner.to_string_lossy().into_owned(),
+        backend: "cpu".into(),
         configure: Configure {
             queue_depth: 3,
             idle_timeout_s: 30,
@@ -435,6 +570,7 @@ async fn drive_main(args: DriveArgs) -> StdExitCode {
         jobs,
         utilization: args.utilization,
         yielding: args.yielding,
+        log_level,
     })
     .await;
 

@@ -1,12 +1,11 @@
 //! Spawn miner binaries, restart policy by exit code, shutdown fan-out.
 
 use crate::config::LaunchEntry;
+use crate::logging::LogLevel;
 use crate::session::{gen_session_token, shutdown_msg, CoordinatorState};
 use std::collections::{HashMap, VecDeque};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, Mutex};
 
@@ -203,43 +202,39 @@ impl Supervisor {
     }
 }
 
-/// Spawn a miner child with `QUIP_SESSION_TOKEN` (never argv) and stderr piped
-/// so its log lines can be merged into the coordinator's stream.
+/// Spawn a miner child with `QUIP_SESSION_TOKEN` (never argv). Stdout and stderr
+/// inherit the coordinator's streams so miner log lines appear without a
+/// re-emit pump. Pass `--log-level` so the child's own subscriber matches the
+/// coordinator verbosity (the coordinator filter no longer sees child bytes).
 fn spawn_supervised_child(
     entry: &LaunchEntry,
     token: &str,
     sock_uri: &str,
+    log_level: LogLevel,
 ) -> std::io::Result<Child> {
     Command::new(&entry.binary)
         .arg("--quip-coordinator")
         .arg(sock_uri)
         .arg("--miner-id")
         .arg(&entry.miner_id)
+        .arg("--log-level")
+        .arg(log_level.to_string())
         .env("QUIP_SESSION_TOKEN", token)
-        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
 }
 
-/// Forward a child's stderr to the coordinator log, one line per record, tagged
-/// with the miner id. Miners emit JSON log lines; they pass through verbatim.
-async fn merge_stderr(miner_id: String, stderr: tokio::process::ChildStderr) {
-    let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        tracing::info!(target: "miner", miner = %miner_id, "{line}");
-    }
-}
-
 /// Supervise one miner for the run: (re)spawn per the exit-code policy with
-/// backoff + failure budget, merge its stderr, re-queue its in-flight + staged
-/// jobs to the router on a crash, and send an in-band `Shutdown` (then kill
-/// after grace) once `stop` flips true.
+/// backoff + failure budget, re-queue its in-flight + staged jobs to the router
+/// on a crash, and send an in-band `Shutdown` (then kill after grace) once
+/// `stop` flips true.
 pub async fn supervise_miner(
     entry: LaunchEntry,
     sock_uri: String,
     state: Arc<Mutex<CoordinatorState>>,
     policy: BackoffPolicy,
     grace_ms: u32,
+    log_level: LogLevel,
     mut stop: watch::Receiver<bool>,
 ) {
     let mut tracker = RestartTracker::new(policy);
@@ -255,17 +250,19 @@ pub async fn supervise_miner(
                 .insert(entry.miner_id.clone(), token.clone());
         }
 
-        let mut child = match spawn_supervised_child(&entry, &token, &sock_uri) {
+        let mut child = match spawn_supervised_child(&entry, &token, &sock_uri, log_level) {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!(miner = %entry.miner_id, "spawn failed: {e}");
+                tracing::error!(miner = %entry.miner_id, binary = %entry.binary, error = %e, "miner spawn failed");
                 break;
             }
         };
-        if let Some(stderr) = child.stderr.take() {
-            // Detach the stderr pump; it ends when the child closes the pipe.
-            drop(tokio::spawn(merge_stderr(entry.miner_id.clone(), stderr)));
-        }
+        tracing::info!(
+            miner = %entry.miner_id,
+            binary = %entry.binary,
+            pid = %crate::logging::display_option(child.id()),
+            "miner spawned"
+        );
 
         // Run until the child exits on its own or shutdown is requested.
         let exited = tokio::select! {
@@ -290,6 +287,13 @@ pub async fn supervise_miner(
         };
 
         let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
+        // A miner dying is never routine: exit 0 is a clean stop, anything else
+        // cost this coordinator a backend.
+        if code == 0 {
+            tracing::info!(miner = %entry.miner_id, "miner exited cleanly");
+        } else {
+            tracing::warn!(miner = %entry.miner_id, code, "miner exited");
+        }
 
         // Self-exit (crash or clean): return this miner's in-flight + staged
         // jobs to the router. A clean exit (code 0) can still leave in-flight
@@ -319,6 +323,7 @@ pub async fn supervise_miner(
                 }
             }
             RestartAction::Backoff(delay) => {
+                tracing::info!(miner = %entry.miner_id, delay_ms = delay, "restarting miner after backoff");
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_millis(delay)) => {}
                     _ = stop.changed() => break,

@@ -6,10 +6,18 @@
 //! stash) is layered on top by the live-mining epic; a coordinator built from
 //! this alone serves sessions and supervises miners but stages no work yet.
 
+use crate::chain::sync::{wait_until_synced, SyncOutcome, SyncSource};
 use crate::chain::{ChainClient, MiningSnapshot};
-use crate::config::LaunchEntry;
+use crate::config::{DescriptorParams, LaunchEntry};
 use crate::decay::{build_decay_schedule, EnergyCurve};
+use crate::funding::{ensure_funded, BalanceSource, Faucet};
+use crate::logging::LogLevel;
 use crate::producer::derive_pow_job;
+use crate::readiness::{
+    build_faucet, declare_round_participation, file_round_descriptor, ReadinessError,
+    SUBMIT_ATTEMPTS,
+};
+use crate::round::{RoundEvent, RoundState};
 use crate::session::{coord, CoordinatorService, CoordinatorState};
 use crate::supervisor::{supervise_miner, BackoffPolicy};
 use crate::topology::Topology;
@@ -18,6 +26,7 @@ use quip_proto::v1::{coord_msg, SetTarget};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UnixListener;
@@ -45,6 +54,16 @@ pub struct RuntimeParams {
     /// Optional attempt-dashboard: `(listen_addr, data_dir)`. `None` disables
     /// recording + the REST endpoint.
     pub dashboard: Option<(String, std::path::PathBuf)>,
+    /// Log level forwarded to each miner child as `--log-level`. Children inherit
+    /// coordinator stdio, so their own subscriber needs this flag to match
+    /// coordinator verbosity.
+    pub log_level: LogLevel,
+    /// Account-funding knobs reused on every round, not only at process start.
+    pub funding: crate::funding::FundingParams,
+    /// Node identity and miner list for `set_descriptor`.
+    pub descriptor: DescriptorParams,
+    /// Set after the first `DescriptorFiled` walk in this process.
+    pub descriptor_filed: Arc<AtomicBool>,
 }
 
 /// Inputs to the feeder loop.
@@ -57,6 +76,12 @@ pub struct FeederParams {
     pub buffer_depth: usize,
     /// How often the feeder polls the chain head and tops up buffers.
     pub poll_interval: Duration,
+    /// Account-funding knobs reused on every round, not only at process start.
+    pub funding: crate::funding::FundingParams,
+    /// Node identity and miner list for `set_descriptor`.
+    pub descriptor: DescriptorParams,
+    /// Set after the first `DescriptorFiled` walk in this process.
+    pub descriptor_filed: Arc<AtomicBool>,
 }
 
 /// EMA smoothing for the per-miner consumption signal. Lower reacts slower but
@@ -73,10 +98,11 @@ const WINDOW_HEADROOM: f64 = 2.0;
 const DECAY_HORIZON_STEPS: usize = 256;
 
 /// Adaptive staging depth for one miner from its smoothed drain rate. The
-/// `buffer_depth` floor keeps a small reserve for idle/slow miners. `ema` is
-/// anchored to real completions, so depth self-bounds to ~headroom × actual
-/// throughput; the feeder additionally clamps it to [`stage_ceiling`] so a fast
-/// miner on a large topology can't stage an unbounded-memory reserve.
+/// `buffer_depth` floor keeps a small reserve for idle/slow miners. `ema`
+/// tracks dispatches per poll (`Router::take_consumed`): a job leaves the
+/// staged queue at dispatch, so that is the drain signal the feeder sizes
+/// against. The feeder additionally clamps the depth to [`stage_ceiling`] so a
+/// fast miner on a large topology cannot stage an unbounded-memory reserve.
 fn adaptive_depth(ema: f64, floor: usize) -> usize {
     #[expect(
         clippy::cast_possible_truncation,
@@ -97,6 +123,26 @@ const MAX_STAGE_BYTES_PER_MINER: usize = 64 * 1024 * 1024; // 64 MiB
 
 /// Periodic liveness ping interval for [`crate::liveness::liveness_loop`].
 const LIVENESS_PING_INTERVAL: Duration = Duration::from_secs(15);
+
+/// How often the feeder emits its steady-state throughput line. The loop polls
+/// once per `poll_interval` (1s in production), so narrating every poll at
+/// `info` would bury everything else; the per-poll detail sits at `debug`.
+const FEEDER_HEARTBEAT: Duration = Duration::from_mins(1);
+
+/// Outcome of one snapshot poll. The feeder logs *transitions* between these
+/// at `info`/`warn` rather than one line per poll, so a coordinator that cannot
+/// mine says so once and loudly instead of either spamming or staying silent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeedState {
+    /// The chain returned a usable mining snapshot.
+    Ready,
+    /// The chain answered, but has no mining snapshot: no default topology is
+    /// registered, or none is mineable yet. Nothing can be staged.
+    Empty,
+    /// The snapshot fetch itself failed (RPC down, runtime API absent, decode
+    /// mismatch). Nothing can be staged.
+    Failed,
+}
 
 /// Estimated materialized-model bytes for one staged job on this topology: one
 /// i32 field per node (`h`) and one per edge (`j`). The 32-byte `topology_hash`
@@ -161,12 +207,14 @@ async fn broadcast_topology(state: &Arc<Mutex<CoordinatorState>>, topo: quip_pro
 /// Fan out a protocol `Cancel(max_generation)` to every live miner on reseed so
 /// they abandon stale-generation work promptly. Belt-and-suspenders with the
 /// miner-side cooperative-cancel guard and the cleared salts (which already make
-/// a late stale-generation result unsubmittable).
-async fn broadcast_cancel(state: &Arc<Mutex<CoordinatorState>>, max_generation: u64) {
+/// a late stale-generation result unsubmittable). Returns how many miners were
+/// told.
+async fn broadcast_cancel(state: &Arc<Mutex<CoordinatorState>>, max_generation: u64) -> usize {
     let senders: Vec<_> = {
         let st = state.lock().await;
         st.outbound.values().cloned().collect()
     };
+    let n = senders.len();
     for tx in senders {
         let _ = tx
             .send(Ok(coord(coord_msg::Msg::Cancel(quip_proto::v1::Cancel {
@@ -174,6 +222,7 @@ async fn broadcast_cancel(state: &Arc<Mutex<CoordinatorState>>, max_generation: 
             }))))
             .await;
     }
+    n
 }
 
 /// A unique 32-byte salt from a monotonic counter: distinct salts derive
@@ -184,23 +233,260 @@ fn salt_from_counter(ctr: u64) -> [u8; 32] {
     salt
 }
 
+/// A state that is held this long is no longer a healthy walk.
+const SLOW_STATE: Duration = Duration::from_secs(10);
+
+/// Per-entry timer so a slow or retrying state warns once, not every poll.
+struct StateHold {
+    entered: std::time::Instant,
+    warned: bool,
+}
+
+impl StateHold {
+    fn new() -> Self {
+        Self {
+            entered: std::time::Instant::now(),
+            warned: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.entered = std::time::Instant::now();
+        self.warned = false;
+    }
+
+    fn warn_once(&mut self, machine: RoundState, generation: u64) {
+        if self.warned {
+            return;
+        }
+        machine.log_unhealthy(generation);
+        self.warned = true;
+    }
+}
+
+/// Wait for `work`. Warn once if this state stays active longer than 10 seconds.
+/// Returns `None` when shutdown is requested.
+async fn await_round_step<T>(
+    machine: RoundState,
+    generation: u64,
+    hold: &mut StateHold,
+    stop: &mut watch::Receiver<bool>,
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::pin!(work);
+    loop {
+        let remaining = SLOW_STATE.saturating_sub(hold.entered.elapsed());
+        tokio::select! {
+            biased;
+            _ = stop.changed() => return None,
+            () = tokio::time::sleep(remaining), if !hold.warned => {
+                hold.warn_once(machine, generation);
+            }
+            out = &mut work => return Some(out),
+        }
+    }
+}
+
+/// Drive [`RoundState`] from `machine` until [`RoundState::StartMining`].
+///
+/// The caller logs the entry into the first state and bumps `generation`.
+/// This function does the I/O for each state, applies the pure transition,
+/// and logs each new state once. A failed step stays in that state and
+/// retries after `poll_interval`. Returns `None` when shutdown is requested.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match arm per round state plus retry"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "last_declared is walk-local state, not a sixth RoundState"
+)]
+async fn drive_to_mining<C, F>(
+    mut machine: RoundState,
+    chain: &C,
+    coord: &Arc<Mutex<CoordinatorState>>,
+    params: &FeederParams,
+    faucet: Option<&F>,
+    generation: u64,
+    stop: &mut watch::Receiver<bool>,
+    last_declared: &mut Option<u64>,
+) -> Option<(MiningSnapshot, usize, usize)>
+where
+    C: ChainClient + SyncSource + BalanceSource,
+    F: Faucet + ?Sized,
+{
+    let mut cancelled_jobs = 0usize;
+    let mut miners_told = 0usize;
+    let mut snap: Option<MiningSnapshot> = None;
+    let mut hold = StateHold::new();
+
+    loop {
+        let event = match machine {
+            RoundState::StopMining => {
+                cancelled_jobs = {
+                    let mut st = coord.lock().await;
+                    st.generation = generation;
+                    st.current_best_milli = None;
+                    st.stash.reset(generation, Vec::new(), 0, 0);
+                    let dropped = st.router.cancel(generation.saturating_sub(1));
+                    let _ = st.cancel_inflight(generation.saturating_sub(1));
+                    st.clear_salts();
+                    dropped
+                };
+                miners_told = if generation > 1 {
+                    broadcast_cancel(coord, generation.saturating_sub(1)).await
+                } else {
+                    0
+                };
+                RoundEvent::Succeeded
+            }
+            RoundState::ValidatorSynced => {
+                let outcome = await_round_step(
+                    machine,
+                    generation,
+                    &mut hold,
+                    stop,
+                    wait_until_synced(chain, tokio::time::sleep),
+                )
+                .await?;
+                match outcome {
+                    SyncOutcome::Synced => RoundEvent::Succeeded,
+                    SyncOutcome::Unknown(reason) => {
+                        tracing::warn!(
+                            reason = %reason,
+                            "cannot confirm the validator has caught up; continuing, but funding and \
+                             mining may fail until it does"
+                        );
+                        RoundEvent::Succeeded
+                    }
+                }
+            }
+            RoundState::AccountFunded => {
+                let result = await_round_step(
+                    machine,
+                    generation,
+                    &mut hold,
+                    stop,
+                    ensure_funded(
+                        chain,
+                        faucet,
+                        params.miner_account,
+                        &params.funding,
+                        tokio::time::sleep,
+                    ),
+                )
+                .await?;
+                match result {
+                    Ok(_) => RoundEvent::Succeeded,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %ReadinessError::Funding(e),
+                            generation,
+                            "round readiness failed; holding off mining"
+                        );
+                        RoundEvent::Failed
+                    }
+                }
+            }
+            RoundState::RequirementsDownloaded => {
+                let result = await_round_step(
+                    machine,
+                    generation,
+                    &mut hold,
+                    stop,
+                    chain.fetch_mining_snapshot(None, params.miner_account, None),
+                )
+                .await?;
+                match result {
+                    Ok(Some(s)) => {
+                        snap = Some(s);
+                        RoundEvent::Succeeded
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            error = %ReadinessError::Snapshot(
+                                "chain has no mining snapshot".into()
+                            ),
+                            generation,
+                            "round readiness failed; holding off mining"
+                        );
+                        RoundEvent::Failed
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %ReadinessError::Snapshot(e.to_string()),
+                            generation,
+                            "round readiness failed; holding off mining"
+                        );
+                        RoundEvent::Failed
+                    }
+                }
+            }
+            RoundState::DescriptorFiled => {
+                file_round_descriptor(
+                    chain,
+                    params.descriptor_filed.as_ref(),
+                    &params.descriptor,
+                    params.miner_account,
+                )
+                .await;
+                RoundEvent::Succeeded
+            }
+            RoundState::ParticipationDeclared => {
+                for _ in 0..SUBMIT_ATTEMPTS {
+                    declare_round_participation(chain, last_declared, params.miner_account).await;
+                    if last_declared.is_some() {
+                        break;
+                    }
+                }
+                RoundEvent::Succeeded
+            }
+            RoundState::StartMining => {
+                return snap.map(|s| (s, cancelled_jobs, miners_told));
+            }
+        };
+
+        if event == RoundEvent::Failed {
+            hold.warn_once(machine, generation);
+            tokio::select! {
+                () = tokio::time::sleep(params.poll_interval) => {}
+                _ = stop.changed() => {
+                    let _ = machine.transition(RoundEvent::Shutdown);
+                    return None;
+                }
+            }
+        }
+
+        let next = machine.transition(event)?;
+        if next != machine {
+            next.log_entry(generation);
+            hold.reset();
+        }
+        machine = next;
+    }
+}
+
 /// The replenished `PoW` feeder: follow the chain head, and keep each registered
 /// miner's staged queue topped up to `buffer_depth` with fresh-salt jobs.
 ///
-/// On a new `last_proof_block_hash` it reseeds — bump the generation, cancel the
-/// prior generation's staged jobs, refresh topology + difficulty target, and
-/// drop stale salts — then refills under the new seed. Runs until `stop` flips.
-/// `pub` so it can be exercised directly in tests without a gRPC server.
+/// On a new `last_proof_block_hash` it drives the round state machine: stop
+/// mining, wait until the validator is synced, confirm the miner account can
+/// pay fees, download the next qblock's requirements, file a node descriptor
+/// on the first walk, declare participation, then start mining under the new
+/// seed. Runs until `stop` flips. `pub` so it can be exercised directly in
+/// tests without a gRPC server.
 #[expect(
     clippy::too_many_lines,
     reason = "single feeder loop: reseed, top-up, win-time submit"
 )]
-pub async fn feeder_loop<C: ChainClient>(
+pub async fn feeder_loop<C>(
     chain: Arc<C>,
     state: Arc<Mutex<CoordinatorState>>,
     params: FeederParams,
     mut stop: watch::Receiver<bool>,
-) {
+) where
+    C: ChainClient + SyncSource + BalanceSource,
+{
     let mut current_head: Option<[u8; 32]> = None;
     let mut generation: u64 = 0;
     let mut salt_ctr: u64 = 0;
@@ -208,31 +494,89 @@ pub async fn feeder_loop<C: ChainClient>(
     let start = std::time::Instant::now();
     // Per-miner smoothed jobs-consumed-per-poll, driving the adaptive window.
     let mut consumption_ema: HashMap<String, f64> = HashMap::new();
-    // Last difficulty triple broadcast to miners, so we only re-push on change.
+    // Last difficulty triple broadcast to miners, so we only re-push on change
+    // within a round. A reseed always pushes Topology and SetTarget again.
     let mut last_broadcast: Option<(i64, u32, u32)> = None;
-    // Last topology hash pushed to miners, so we re-push only when it changes
-    // (including first availability), not on every per-block reseed.
-    let mut last_topology_hash: Option<Vec<u8>> = None;
+
+    // Last snapshot-poll outcome, so the feeder narrates transitions instead of
+    // one line per poll. `None` until the first poll completes.
+    let mut feed_state: Option<FeedState> = None;
+    let mut last_heartbeat = std::time::Instant::now();
+    // Completions printed on the last heartbeat, per miner. The next
+    // heartbeat reports the delta from this map so the line does not
+    // depend on which poll it lands on.
+    let mut last_completed: HashMap<String, u64> = HashMap::new();
+    let faucet = build_faucet(params.funding.faucet_url.as_deref());
+    let mut round: Option<RoundState> = None;
+    let mut last_declared: Option<u64> = None;
 
     loop {
-        let snap = match chain
+        let (snap, state_now) = match chain
             .fetch_mining_snapshot(None, params.miner_account, None)
             .await
         {
-            Ok(Some(s)) => Some(s),
-            Ok(None) => None,
+            Ok(Some(s)) => (Some(s), FeedState::Ready),
+            Ok(None) => (None, FeedState::Empty),
             Err(e) => {
-                tracing::warn!("feeder: snapshot fetch failed: {e}");
-                None
+                // Repeat the detail every poll at debug: the transition line
+                // below carries it once, but a changing error matters while
+                // diagnosing (e.g. RPC refused → runtime API missing).
+                tracing::debug!(error = %e, "feeder: snapshot fetch failed");
+                if feed_state != Some(FeedState::Failed) {
+                    tracing::warn!(
+                        error = %e,
+                        "feeder: cannot fetch mining snapshot; staging nothing until this clears"
+                    );
+                }
+                (None, FeedState::Failed)
             }
         };
 
-        if let Some(snap) = snap.as_ref() {
+        // Narrate the transition. Without this, a coordinator that never mines
+        // is indistinguishable from one that mines fine.
+        if feed_state != Some(state_now) {
+            match state_now {
+                FeedState::Ready => tracing::info!("feeder: mining snapshot available"),
+                FeedState::Empty => tracing::warn!(
+                    "feeder: chain has no mining snapshot (no registered/mineable topology); \
+                     staging nothing"
+                ),
+                // Already reported above, with the error attached.
+                FeedState::Failed => {}
+            }
+            feed_state = Some(state_now);
+        }
+
+        if let Some(mut snap) = snap {
             let head = snap.last_proof_block_hash;
             if current_head != Some(head) {
-                // Reseed on a new head.
-                current_head = Some(head);
+                let next = match round {
+                    Some(s) => s.transition(RoundEvent::NewHead),
+                    None => Some(RoundState::start()),
+                };
+                let Some(machine) = next else {
+                    return;
+                };
                 generation = generation.saturating_add(1);
+                machine.log_entry(generation);
+
+                let Some((fresh, cancelled_jobs, miners_told)) = drive_to_mining(
+                    machine,
+                    chain.as_ref(),
+                    &state,
+                    &params,
+                    faucet.as_ref(),
+                    generation,
+                    &mut stop,
+                    &mut last_declared,
+                )
+                .await
+                else {
+                    return;
+                };
+                snap = fresh;
+                round = Some(RoundState::StartMining);
+
                 let topo = Topology::from_nodes_edges(
                     snap.nodes.clone(),
                     snap.edges.clone(),
@@ -240,9 +584,6 @@ pub async fn feeder_loop<C: ChainClient>(
                     &snap.allowed_j_milli,
                     &snap.allowed_spin_milli,
                 );
-                // Refresh the chain qblock id + decay-projection inputs for the
-                // attempt logs and win-time stash (best-effort; fetched before
-                // locking so we never await under the state lock).
                 let qblock_id = match chain.fetch_latest_qblock_id().await {
                     Ok(id) => id,
                     Err(e) => {
@@ -260,7 +601,6 @@ pub async fn feeder_loop<C: ChainClient>(
                     },
                     Err(_) => None,
                 };
-                // Project the per-generation decay schedule for the stash.
                 let (schedule, last_proof_block, epoch_length) = match &decay {
                     Some(dp) => {
                         let curve = EnergyCurve::from_topology(
@@ -285,46 +625,63 @@ pub async fn feeder_loop<C: ChainClient>(
                     None => (Vec::new(), 0, 0),
                 };
                 let topo_proto = topo.to_proto();
-                let topology_changed =
-                    last_topology_hash.as_deref() != Some(snap.topology_hash.as_slice());
-                let mut st = state.lock().await;
-                st.set_topology(Some(topo));
-                st.target = Some(target_from_snapshot(snap));
-                st.generation = generation;
-                st.qblock_id = qblock_id;
-                // Each generation is an independent PoW problem (new nonce/model),
-                // so best energies are not comparable across generations. Reset
-                // the best or later generations would have to beat a historical
-                // minimum and never submit (the chain clears its block-best too).
-                st.current_best_milli = None;
-                st.stash
-                    .reset(generation, schedule, last_proof_block, epoch_length);
-                st.router.cancel(generation - 1); // drop the prior generation's staged jobs
-                st.clear_salts();
-                drop(st);
-                // Fan out the reseed to live miners, off-lock. Cancel the prior
-                // generation's work (skip the first reseed: generation 0 has none).
-                if generation > 1 {
-                    broadcast_cancel(&state, generation - 1).await;
+                let target = target_from_snapshot(&snap);
+                let target_key = (
+                    target.max_energy_milli,
+                    target.min_solutions,
+                    target.min_diversity_milli,
+                );
+                tracing::info!(
+                    generation,
+                    qblock_id = %crate::logging::display_option(qblock_id),
+                    block = snap.block_number,
+                    cancelled_jobs,
+                    miners_told,
+                    topology = %crate::chain::extrinsic::hex_encode(&snap.topology_hash),
+                    nodes = snap.nodes.len(),
+                    edges = snap.edges.len(),
+                    max_energy = crate::logging::energy_units(target.max_energy_milli),
+                    min_solutions = target.min_solutions,
+                    min_diversity_milli = target.min_diversity_milli,
+                    allowed_h_milli = ?snap.allowed_h_milli,
+                    allowed_j_milli = ?snap.allowed_j_milli,
+                    allowed_spin_milli = ?snap.allowed_spin_milli,
+                    "new round"
+                );
+                {
+                    let mut st = state.lock().await;
+                    st.set_topology(Some(topo));
+                    st.target = Some(target);
+                    st.qblock_id = qblock_id;
+                    st.stash
+                        .reset(generation, schedule, last_proof_block, epoch_length);
                 }
-                // Push topology only when it changed (incl. first availability),
-                // so a miner that connected before it was cached can resolve
-                // hash-based jobs — without re-sending an identical graph each block.
-                if topology_changed {
-                    broadcast_topology(&state, topo_proto).await;
-                    last_topology_hash = Some(snap.topology_hash.clone());
-                }
+                // Requirements before any new-generation Job: Topology and
+                // SetTarget go out on every reseed, even when the values match
+                // the last round. Staging happens only after these sends.
+                broadcast_topology(&state, topo_proto).await;
+                broadcast_set_target(&state, target).await;
+                last_broadcast = Some(target_key);
+                current_head = Some(snap.last_proof_block_hash);
             }
 
             // Push the refreshed difficulty to live miners when it changed, so
             // they adapt their sampling budget as the chain difficulty moves.
-            let target = target_from_snapshot(snap);
+            let target = target_from_snapshot(&snap);
             let key = (
                 target.max_energy_milli,
                 target.min_solutions,
                 target.min_diversity_milli,
             );
             if last_broadcast != Some(key) {
+                // Difficulty eases every block via the decay ratchet, so this is
+                // debug: at info it would fire nearly every poll.
+                tracing::debug!(
+                    max_energy = crate::logging::energy_units(key.0),
+                    min_solutions = key.1,
+                    min_diversity_milli = key.2,
+                    "difficulty target changed; broadcasting to miners"
+                );
                 broadcast_set_target(&state, target).await;
                 last_broadcast = Some(key);
             }
@@ -340,8 +697,13 @@ pub async fn feeder_loop<C: ChainClient>(
             // without this, `st.target` would stay pinned at the last reseed's
             // (harder) gate and under-accept solutions viable at the eased one.
             st.target = Some(target);
+            // Per-miner drain/staging stats for the heartbeat, collected here
+            // and emitted off-lock below. The completion pair is (window,
+            // total): window is completions since the last heartbeat.
+            let mut stats: Vec<(String, u64, u64, usize, usize)> = Vec::new();
             for id in st.router.miner_ids() {
-                let consumed = f64::from(st.router.take_consumed(&id));
+                let consumed_raw = st.router.take_consumed(&id);
+                let consumed = f64::from(consumed_raw);
                 let ema = match consumption_ema.get(&id) {
                     Some(&prev) => {
                         CONSUMPTION_EMA_ALPHA * consumed + (1.0 - CONSUMPTION_EMA_ALPHA) * prev
@@ -359,7 +721,7 @@ pub async fn feeder_loop<C: ChainClient>(
                 while st.router.staged_len(&id) < depth {
                     salt_ctr = salt_ctr.saturating_add(1);
                     let salt = salt_from_counter(salt_ctr);
-                    let job = match derive_pow_job(snap, params.miner_account, salt, generation, 0)
+                    let job = match derive_pow_job(&snap, params.miner_account, salt, generation, 0)
                     {
                         Ok(job) => job,
                         Err(e) => {
@@ -378,6 +740,27 @@ pub async fn feeder_loop<C: ChainClient>(
                         break; // not capable for this shape — stop topping up
                     }
                 }
+                // Wake the dispatcher now that work is staged. A miner grants
+                // its credits when it starts, which is normally before the
+                // first snapshot arrives, so that grant drained an empty queue
+                // and the dispatcher parked. Without this the miner waits for a
+                // job and the coordinator waits for a request, forever.
+                st.wake_dispatcher(&id);
+                let completed_total = st.router.jobs_completed(&id);
+                let completed_window =
+                    completed_total.saturating_sub(last_completed.get(&id).copied().unwrap_or(0));
+                stats.push((
+                    id.clone(),
+                    completed_window,
+                    completed_total,
+                    depth,
+                    st.router.staged_len(&id),
+                ));
+            }
+            if stats.is_empty() {
+                // Miners are configured but none has completed a handshake, so
+                // there is nowhere to stage work. Silent otherwise.
+                tracing::debug!("feeder: no registered miners; nothing to stage");
             }
 
             // Win-time submission: observe the head for block estimation, pick
@@ -397,7 +780,39 @@ pub async fn feeder_loop<C: ChainClient>(
                 .unwrap_or(snap.block_number);
             let best = st.current_best_milli;
             let due = st.stash.due_improving(current_block, best).cloned();
+            let validated = st.results_validated;
             drop(st);
+
+            // Steady-state narration. Every poll at debug for diagnosis; once a
+            // minute at info so an operator watching the log sees the
+            // coordinator is alive and how fast each miner is draining work.
+            tracing::debug!(
+                block = current_block,
+                generation,
+                miners = ?stats,
+                "feeder: poll"
+            );
+            if last_heartbeat.elapsed() >= FEEDER_HEARTBEAT {
+                for (id, completed, completed_total, depth, staged) in &stats {
+                    tracing::info!(
+                        miner = %id,
+                        jobs_completed = completed,
+                        jobs_completed_total = completed_total,
+                        staged = staged,
+                        window = depth,
+                        "miner throughput"
+                    );
+                    let _ = last_completed.insert(id.clone(), *completed_total);
+                }
+                tracing::info!(
+                    block = current_block,
+                    generation,
+                    results_validated = validated,
+                    best_energy = %crate::logging::display_energy(best),
+                    "coordinator alive"
+                );
+                last_heartbeat = std::time::Instant::now();
+            }
 
             if let Some(cand) = due {
                 use crate::chain::SubmitAction;
@@ -460,7 +875,12 @@ pub async fn feeder_loop<C: ChainClient>(
 
         tokio::select! {
             () = tokio::time::sleep(params.poll_interval) => {}
-            _ = stop.changed() => break,
+            _ = stop.changed() => {
+                if let Some(s) = round {
+                    let _ = s.transition(RoundEvent::Shutdown);
+                }
+                break;
+            }
         }
     }
 }
@@ -481,7 +901,7 @@ pub async fn run_runtime<C, S>(
     shutdown: S,
 ) -> std::io::Result<()>
 where
-    C: ChainClient + 'static,
+    C: ChainClient + SyncSource + BalanceSource + 'static,
     S: Future<Output = ()>,
 {
     let _ = std::fs::remove_file(&params.sock_path);
@@ -532,6 +952,7 @@ where
             Arc::clone(&state),
             params.backoff,
             params.grace_ms,
+            params.log_level,
             stop_rx.clone(),
         )));
     }
@@ -544,6 +965,9 @@ where
             miner_account: params.miner_account,
             buffer_depth: params.buffer_depth,
             poll_interval: Duration::from_millis(params.poll_interval_ms),
+            funding: params.funding,
+            descriptor: params.descriptor,
+            descriptor_filed: params.descriptor_filed,
         },
         stop_rx.clone(),
     ));

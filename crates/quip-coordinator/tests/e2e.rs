@@ -102,6 +102,7 @@ async fn e2e_mock_miner_pow_submit_via_fake_chain() {
     let entry = LaunchEntry {
         miner_id: "cpu-0".into(),
         binary: miner.clone(),
+        backend: "cpu".into(),
         configure: Configure {
             queue_depth: 3,
             idle_timeout_s: 30,
@@ -147,6 +148,8 @@ fn config_maps_mock_miner_launch() {
 [miner]
 validators = ["ws://127.0.0.1:9944"]
 signer_key = "//Alice"
+public_host = "203.0.113.10"
+public_port = 20050
 
 [cpu]
 binary = "quip-mock-miner"

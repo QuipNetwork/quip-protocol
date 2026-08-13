@@ -202,8 +202,8 @@ pub fn validate_result(
         (Ok(h), Ok(j)) => (h, j),
         (h, j) => {
             tracing::error!(
-                h_err = ?h.err(),
-                j_err = ?j.err(),
+                h_err = %crate::logging::display_option(h.err()),
+                j_err = %crate::logging::display_option(j.err()),
                 "validate_result: malformed problem wire bytes (not i32-aligned); rejecting result"
             );
             return Validated {

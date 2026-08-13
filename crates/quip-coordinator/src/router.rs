@@ -35,6 +35,9 @@ struct MinerQueue {
     /// The feeder reads-and-resets this each poll to size the adaptive staging
     /// window from the miner's observed drain rate (see `feeder_loop`).
     consumed_since_poll: u32,
+    /// Jobs this miner finished (Result or Reject) since it registered.
+    /// The heartbeat reads this total. Polls do not reset it.
+    completed: u64,
     unsupported_kinds: HashSet<i32>,
 }
 
@@ -75,6 +78,7 @@ impl Router {
                         staged: VecDeque::new(),
                         granted_credits: 0,
                         consumed_since_poll: 0,
+                        completed: 0,
                         unsupported_kinds: HashSet::new(),
                     },
                 );
@@ -143,6 +147,22 @@ impl Router {
             .map_or(0, |q| std::mem::take(&mut q.consumed_since_poll))
     }
 
+    /// Record that `miner_id` finished a job (Result or Reject).
+    pub fn record_completion(&mut self, miner_id: &str) {
+        if let Some(q) = self.miners.get_mut(miner_id) {
+            q.completed = q.completed.saturating_add(1);
+        }
+    }
+
+    /// Jobs `miner_id` has finished since it registered. 0 if unknown.
+    ///
+    /// The heartbeat prints this total and the delta since the last
+    /// heartbeat. Feeder polls do not reset it.
+    #[must_use]
+    pub fn jobs_completed(&self, miner_id: &str) -> u64 {
+        self.miners.get(miner_id).map_or(0, |q| q.completed)
+    }
+
     /// Handle a miner reject: mark unsupported kinds, re-route to a *different*
     /// capable miner.
     ///
@@ -167,12 +187,17 @@ impl Router {
     }
 
     /// Drop staged `PoW` jobs where `0 < generation <= max_generation`.
-    /// Mempool jobs (`generation == 0`) are preserved.
-    pub fn cancel(&mut self, max_generation: u64) {
+    /// Mempool jobs (`generation == 0`) are preserved. Returns how many jobs
+    /// were dropped.
+    pub fn cancel(&mut self, max_generation: u64) -> usize {
+        let mut dropped = 0;
         for q in self.miners.values_mut() {
+            let before = q.staged.len();
             q.staged
                 .retain(|j| j.generation == 0 || j.generation > max_generation);
+            dropped += before.saturating_sub(q.staged.len());
         }
+        dropped
     }
 
     /// Return all outstanding + staged jobs for a miner (e.g. on crash re-queue).
@@ -350,6 +375,31 @@ mod tests {
         assert_eq!(r.take_consumed("unknown"), 0); // unknown miner
     }
 
+    /// The heartbeat must report completions, not the per-poll dispatch
+    /// counter. Stage 8, dispatch 8, complete 3, then drain the poll
+    /// counter twice. The reported number is 3, not 8 and not 0.
+    #[test]
+    fn heartbeat_reports_completions_not_poll_dispatches() {
+        let mut r = Router::new();
+        r.register_miner("cpu-0", caps_ising());
+        for generation in 1..=8 {
+            let _ = r.route(make_job(generation, JobKind::IsingSample));
+        }
+        r.grant_credits("cpu-0", 8);
+        for _ in 0..8 {
+            assert!(r.next_job("cpu-0").is_some());
+        }
+        for _ in 0..3 {
+            r.record_completion("cpu-0");
+        }
+        // A feeder poll reads and resets the dispatch counter. The
+        // heartbeat used to print whatever that single poll held.
+        assert_eq!(r.take_consumed("cpu-0"), 8);
+        assert_eq!(r.take_consumed("cpu-0"), 0);
+        assert_eq!(r.jobs_completed("cpu-0"), 3);
+        assert_eq!(r.jobs_completed("unknown"), 0);
+    }
+
     #[test]
     fn cancel_drops_pow_keeps_mempool_and_newer() {
         let mut r = Router::new();
@@ -358,7 +408,7 @@ mod tests {
         let _ = r.route(make_job(3, JobKind::IsingSample));
         let _ = r.route(make_job(5, JobKind::IsingSample));
         let _ = r.route(make_job(6, JobKind::IsingSample));
-        r.cancel(5);
+        assert_eq!(r.cancel(5), 2);
         // keep gen 0 and gen 6
         assert_eq!(r.staged_len("cpu-0"), 2);
         let mut gens: Vec<u64> = Vec::new();

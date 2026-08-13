@@ -11,10 +11,14 @@ use super::extrinsic::{
 };
 use super::proof_encode::{build_quantum_proof, ProofBuildContext};
 use super::scale_types::{
-    encode_submit_proof_call, require_set_values, CurveCScale, DifficultyConfig, JobOrderScale,
-    MiningSnapshotScale, OrderStatus,
+    encode_participate_call, encode_set_descriptor_call, encode_submit_proof_call,
+    require_set_values, CurveCScale, DifficultyConfig, JobOrderScale, MinerKind,
+    MiningSnapshotScale, NodeDescriptorV2Input, OrderStatus,
 };
-use super::submit::{classify_receipt, Proof, SubmitAction};
+use super::submit::{
+    classify_descriptor, classify_participation, classify_receipt, DescriptorOutcome,
+    ParticipationOutcome, Proof, SubmitAction,
+};
 use super::{ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot};
 use crate::decay::{
     DEFAULT_BASE_MAX_ENERGY_MILLI, DEFAULT_C_EASY_MILLI, DEFAULT_C_HARD_MILLI,
@@ -28,10 +32,26 @@ use serde_json::Value;
 use sp_core::crypto::Ss58Codec;
 use sp_core::Pair as _;
 use std::sync::Mutex;
+use std::time::Duration;
 use subxt::config::substrate::H256;
 use subxt::ext::scale_value::{Composite, Primitive, ValueDef};
 use subxt::transactions::TransactionStatus;
 use tokio::sync::OnceCell;
+
+/// Budget for opening a session to one validator (TCP connect + WS handshake).
+///
+/// A wedged peer that accepts TCP and never speaks used to block the ordered
+/// failover list forever. Five seconds is long enough for a slow host path and
+/// short enough that the next endpoint is tried before the coordinator looks
+/// hung at startup.
+const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Budget for one JSON-RPC method after the client is up.
+///
+/// The jsonrpsee default is 60s, which multiplies badly across a validator list
+/// when a peer is silent. Fifteen seconds still covers a loaded but working
+/// node; it does not wait a full minute before moving on.
+const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// subxt client for read-only, metadata-aware event decoding. Submit stays on
 /// the hybrid-signed jsonrpsee path — subxt is used only to decode mempool
@@ -53,12 +73,19 @@ pub struct RealChainClient {
     last_spin_spec: Mutex<Option<AllowedValueSpec<Vec<i32>>>>,
     /// Lazily-connected subxt client for mempool `JobProposed` event decoding.
     subxt: OnceCell<SubxtClient>,
+    /// Whether the last RPC round-trip reached the validator. `None` before the
+    /// first call. Every RPC builds a fresh client (see `rpc_http` / `rpc_ws`),
+    /// so a per-call "connected" line would run to thousands an hour; this
+    /// tracks reachability so only the *transitions* are reported.
+    reachable: Mutex<Option<bool>>,
+    /// Kind declared on `participate`. Derived from the miners this process starts.
+    participate_kind: MinerKind,
 }
 
 impl RealChainClient {
     /// Construct a client over the given validators and signer material.
     #[must_use]
-    pub fn new(validators: Vec<String>, signer_key: String) -> Self {
+    pub fn new(validators: Vec<String>, signer_key: String, participate_kind: MinerKind) -> Self {
         Self {
             validators,
             signer_key,
@@ -66,7 +93,33 @@ impl RealChainClient {
             last_snapshot: Mutex::new(None),
             last_spin_spec: Mutex::new(None),
             subxt: OnceCell::new(),
+            reachable: Mutex::new(None),
+            participate_kind,
         }
+    }
+
+    /// Record the outcome of one RPC round-trip and log reachability changes.
+    ///
+    /// A validator that goes away (or comes back) is the single most common
+    /// reason a coordinator stops mining, and v0.2.1 narrated it on every
+    /// reconnect. Reporting only the edges keeps that signal without the
+    /// per-call volume.
+    fn note_reachability(&self, url: &str, outcome: Result<(), &ChainError>) {
+        let now = outcome.is_ok();
+        // Poisoned lock: reachability is advisory, never fail an RPC over it.
+        let Ok(mut guard) = self.reachable.lock() else {
+            return;
+        };
+        if *guard == Some(now) {
+            return;
+        }
+        match outcome {
+            Ok(()) => tracing::info!(url = %url, "validator RPC reachable"),
+            Err(e) => {
+                tracing::warn!(url = %url, error = %e, "validator RPC unreachable");
+            }
+        }
+        *guard = Some(now);
     }
 
     /// Lazily connect the read-only subxt client to the primary validator.
@@ -104,9 +157,71 @@ impl RealChainClient {
             .ok_or_else(|| ChainError::Unavailable("no validators configured".into()))
     }
 
+    /// Issue `method` against the configured validators in order, returning the
+    /// first success.
+    ///
+    /// `validators` is documented as an ordered failover list, and the default
+    /// pair leads with a container-network name that does not resolve on a host
+    /// install. Trying only the first entry makes that default unusable off
+    /// Docker, so every entry gets a turn before the call is called failed.
     async fn rpc_call(&self, method: &str, params: Value) -> Result<Value, ChainError> {
-        let url = self.primary_url()?;
-        rpc_request(url, method, params).await
+        if self.validators.is_empty() {
+            return Err(ChainError::Unavailable("no validators configured".into()));
+        }
+        let mut last: Option<ChainError> = None;
+        for url in &self.validators {
+            let out = rpc_request(url, method, params.clone()).await;
+            tracing::trace!(url = %url, method = %method, ok = out.is_ok(), "rpc call");
+            match out {
+                Ok(v) => {
+                    // Lock only after the await: `reachable` is a std Mutex and
+                    // must never be held across a suspension point.
+                    self.note_reachability(url, Ok(()));
+                    return Ok(v);
+                }
+                Err(e) => {
+                    tracing::debug!(url = %url, method = %method, error = %e, "validator failed; trying next");
+                    last = Some(e);
+                }
+            }
+        }
+        // Every endpoint failed: report against the primary, which is the one an
+        // operator will look at first.
+        let err =
+            last.unwrap_or_else(|| ChainError::Unavailable("no validators configured".into()));
+        if let Some(primary) = self.validators.first() {
+            self.note_reachability(primary, Err(&err));
+        }
+        Err(err)
+    }
+
+    /// Raw `state_getRuntimeVersion` response, for the startup compatibility
+    /// check in [`super::preflight`].
+    ///
+    /// # Errors
+    /// Returns a transport error when the validator cannot be reached.
+    pub(crate) async fn runtime_version_raw(&self) -> Result<Value, ChainError> {
+        self.rpc_call("state_getRuntimeVersion", Value::Array(vec![]))
+            .await
+    }
+
+    /// Raw `system_health` response, for the startup sync gate in
+    /// [`super::sync`].
+    ///
+    /// # Errors
+    /// Returns a transport error when the validator cannot be reached.
+    pub(crate) async fn system_health_raw(&self) -> Result<Value, ChainError> {
+        self.rpc_call("system_health", Value::Array(vec![])).await
+    }
+
+    /// Raw `system_syncState` response: the block heights the sync gate reports.
+    ///
+    /// # Errors
+    /// Returns a transport error when the validator cannot be reached, or when
+    /// it does not serve this method.
+    pub(crate) async fn sync_state_raw(&self) -> Result<Value, ChainError> {
+        self.rpc_call("system_syncState", Value::Array(vec![]))
+            .await
     }
 
     /// Read + SCALE-decode a storage value at `at_hex`. `Ok(None)` when the key
@@ -132,6 +247,191 @@ impl RealChainClient {
         T::decode(&mut &bytes[..])
             .map(Some)
             .map_err(|e| ChainError::Decode(e.to_string()))
+    }
+
+    /// Nonce, genesis hash, and runtime versions for a signed extrinsic.
+    async fn signed_extension_context(
+        &self,
+        pair: &HybridPair,
+    ) -> Result<SignedExtensionContext, ChainError> {
+        let account_ss58 =
+            quip_transaction_crypto::account_id_from_public(&pair.public()).to_ss58check();
+        let nonce_val = self
+            .rpc_call(
+                "system_accountNextIndex",
+                Value::Array(vec![Value::String(account_ss58)]),
+            )
+            .await?;
+        let account_nonce = u32::try_from(
+            nonce_val
+                .as_u64()
+                .ok_or_else(|| ChainError::Decode("system_accountNextIndex not a u64".into()))?,
+        )
+        .map_err(|_| ChainError::Decode("account nonce exceeds u32".into()))?;
+
+        let genesis = self
+            .rpc_call(
+                "chain_getBlockHash",
+                Value::Array(vec![Value::Number(0.into())]),
+            )
+            .await?;
+        let genesis_hex = genesis
+            .as_str()
+            .ok_or_else(|| ChainError::Decode("genesis hash not a string".into()))?;
+        let genesis_bytes = hex_decode(genesis_hex).map_err(ChainError::Decode)?;
+        let mut genesis_hash = [0u8; 32];
+        if genesis_bytes.len() != 32 {
+            return Err(ChainError::Decode("genesis hash length".into()));
+        }
+        genesis_hash.copy_from_slice(&genesis_bytes);
+
+        let rv = self
+            .rpc_call("state_getRuntimeVersion", Value::Array(vec![]))
+            .await?;
+        let spec_version = u32::try_from(
+            rv.get("specVersion")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    ChainError::Decode("runtime specVersion missing/not a u64".into())
+                })?,
+        )
+        .map_err(|_| ChainError::Decode("specVersion exceeds u32".into()))?;
+        let transaction_version = u32::try_from(
+            rv.get("transactionVersion")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    ChainError::Decode("runtime transactionVersion missing/not a u64".into())
+                })?,
+        )
+        .map_err(|_| ChainError::Decode("transactionVersion exceeds u32".into()))?;
+
+        Ok(SignedExtensionContext {
+            account_nonce,
+            genesis_hash,
+            spec_version,
+            transaction_version,
+            tip: 0,
+        })
+    }
+
+    /// Hybrid-sign `call` and watch inclusion. Callers classify the outcome.
+    ///
+    /// Submits via subxt's `author_submitAndWatchExtrinsic` and CONFIRMS the
+    /// on-chain outcome, rather than treating pool acceptance as success. The
+    /// status stream is watched to in-best-block, not to finality, to stay
+    /// responsive: a re-org after that point is rare on the local validator,
+    /// and the per-generation `current_best` reset bounds any wrong advance.
+    async fn submit_signed_call(&self, call: &[u8]) -> Result<SignedCallOutcome, ChainError> {
+        let pair = self.pair()?;
+        let signed_ctx = self.signed_extension_context(&pair).await?;
+        let ext = build_hybrid_signed_extrinsic(&pair, call, &signed_ctx);
+
+        let client = self.subxt_client().await?;
+        let tx_client = client
+            .tx()
+            .await
+            .map_err(|e| ChainError::Unavailable(format!("subxt tx client: {e}")))?;
+        let mut progress = tx_client
+            .from_bytes(ext)
+            .submit_and_watch()
+            .await
+            .map_err(|e| ChainError::Submit(format!("submit_and_watch: {e}")))?;
+        loop {
+            let status = progress
+                .next()
+                .await
+                .ok_or_else(|| ChainError::Unavailable("tx status stream ended".into()))?
+                .map_err(|e| ChainError::Unavailable(format!("tx progress: {e}")))?;
+            match status {
+                TransactionStatus::InBestBlock(in_block)
+                | TransactionStatus::InFinalizedBlock(in_block) => {
+                    let block = in_block.block_hash().to_string();
+                    return match in_block.wait_for_success().await {
+                        Ok(_events) => Ok(SignedCallOutcome::Success { block }),
+                        Err(e) => {
+                            let error = match &e {
+                                subxt::error::TransactionEventsError::ExtrinsicFailed(
+                                    subxt::error::DispatchError::Module(m),
+                                ) => m.details_string(),
+                                other => other.to_string(),
+                            };
+                            Ok(SignedCallOutcome::DispatchFailed { error })
+                        }
+                    };
+                }
+                TransactionStatus::Invalid { message } => {
+                    return Ok(SignedCallOutcome::Invalid { message });
+                }
+                TransactionStatus::Dropped { message } | TransactionStatus::Error { message } => {
+                    return Ok(SignedCallOutcome::Dropped { message });
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// On-chain result of a hybrid-signed extrinsic, before pallet-specific classify.
+enum SignedCallOutcome {
+    Success { block: String },
+    DispatchFailed { error: String },
+    Invalid { message: String },
+    Dropped { message: String },
+}
+
+/// Pull `data.free` out of a decoded `System.Account` value.
+///
+/// `AccountInfo`'s field layout has changed across Substrate releases, so this
+/// walks the metadata-decoded value by name instead of assuming a SCALE shape.
+fn free_from_account_info(value: &subxt::ext::scale_value::Value) -> Option<u128> {
+    let ValueDef::Composite(outer) = &value.value else {
+        return None;
+    };
+    let data = named_field(outer, "data")?;
+    let ValueDef::Composite(inner) = &data.value else {
+        return None;
+    };
+    let free = named_field(inner, "free")?;
+    match &free.value {
+        ValueDef::Primitive(Primitive::U128(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+/// Look up a named field in a composite, ignoring unnamed composites.
+fn named_field<'a>(c: &'a Composite<()>, want: &str) -> Option<&'a subxt::ext::scale_value::Value> {
+    match c {
+        Composite::Named(fields) => fields.iter().find(|(k, _)| k == want).map(|(_, v)| v),
+        Composite::Unnamed(_) => None,
+    }
+}
+
+#[async_trait]
+impl crate::funding::BalanceSource for RealChainClient {
+    async fn free_balance(&self, account: [u8; 32]) -> Result<u128, String> {
+        use subxt::ext::scale_value::Value as SValue;
+
+        let client = self.subxt_client().await.map_err(|e| e.to_string())?;
+        let at = client
+            .at_current_block()
+            .await
+            .map_err(|e| format!("at_current_block: {e}"))?;
+        let addr = subxt::dynamic::storage("System", "Account");
+        let found = at
+            .storage()
+            .try_fetch(addr, vec![SValue::from_bytes(account)])
+            .await
+            .map_err(|e| format!("fetch System.Account: {e}"))?;
+        // No entry means the account has never been touched on chain, which is
+        // a zero balance rather than a read failure.
+        let Some(entry) = found else {
+            return Ok(0);
+        };
+        let value = entry
+            .decode()
+            .map_err(|e| format!("decode System.Account: {e}"))?;
+        free_from_account_info(&value)
+            .ok_or_else(|| "System.Account has no data.free field".to_string())
     }
 }
 
@@ -397,10 +697,6 @@ impl ChainClient for RealChainClient {
         Ok(orders)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "hybrid sign + RPC submit path is one linear procedure"
-    )]
     async fn submit_proof(&self, proof: &Proof) -> Result<SubmitAction, ChainError> {
         let pair = self.pair()?;
         let snap = self
@@ -443,134 +739,53 @@ impl ChainClient for RealChainClient {
             .map_err(|e| ChainError::Submit(format!("encode proof: {e}")))?;
         let call = encode_submit_proof_call(&quantum);
 
-        // Chain state for signed extensions. `system_accountNextIndex` expects
-        // an SS58-encoded address (the node rejects a hex account with a
-        // "Base 58 requirement is violated" param error), so encode the
-        // derived account with the default SS58 prefix.
-        let account_ss58 =
-            quip_transaction_crypto::account_id_from_public(&pair.public()).to_ss58check();
-        let nonce_val = self
-            .rpc_call(
-                "system_accountNextIndex",
-                Value::Array(vec![Value::String(account_ss58)]),
-            )
-            .await?;
-        let account_nonce = u32::try_from(
-            nonce_val
-                .as_u64()
-                .ok_or_else(|| ChainError::Decode("system_accountNextIndex not a u64".into()))?,
-        )
-        .map_err(|_| ChainError::Decode("account nonce exceeds u32".into()))?;
-
-        let genesis = self
-            .rpc_call(
-                "chain_getBlockHash",
-                Value::Array(vec![Value::Number(0.into())]),
-            )
-            .await?;
-        let genesis_hex = genesis
-            .as_str()
-            .ok_or_else(|| ChainError::Decode("genesis hash not a string".into()))?;
-        let genesis_bytes = hex_decode(genesis_hex).map_err(ChainError::Decode)?;
-        let mut genesis_hash = [0u8; 32];
-        if genesis_bytes.len() != 32 {
-            return Err(ChainError::Decode("genesis hash length".into()));
-        }
-        genesis_hash.copy_from_slice(&genesis_bytes);
-
-        let rv = self
-            .rpc_call("state_getRuntimeVersion", Value::Array(vec![]))
-            .await?;
-        let spec_version = u32::try_from(
-            rv.get("specVersion")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    ChainError::Decode("runtime specVersion missing/not a u64".into())
-                })?,
-        )
-        .map_err(|_| ChainError::Decode("specVersion exceeds u32".into()))?;
-        let transaction_version = u32::try_from(
-            rv.get("transactionVersion")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    ChainError::Decode("runtime transactionVersion missing/not a u64".into())
-                })?,
-        )
-        .map_err(|_| ChainError::Decode("transactionVersion exceeds u32".into()))?;
-
-        let signed_ctx = SignedExtensionContext {
-            account_nonce,
-            genesis_hash,
-            spec_version,
-            transaction_version,
-            tip: 0,
-        };
-        let ext = build_hybrid_signed_extrinsic(&pair, &call, &signed_ctx);
-
-        // Submit via subxt's `author_submitAndWatchExtrinsic` and CONFIRM the
-        // on-chain outcome, rather than treating pool acceptance as success.
-        // We watch the status stream to in-best-block (not finality, to stay
-        // responsive — a re-org after this is rare on the local validator and
-        // the per-generation `current_best` reset bounds any wrong advance),
-        // then check the extrinsic's own events: `ExtrinsicSuccess` -> Success,
-        // `ExtrinsicFailed` -> classify the pallet error via `classify_receipt`.
-        let client = self.subxt_client().await?;
-        let tx_client = client
-            .tx()
-            .await
-            .map_err(|e| ChainError::Unavailable(format!("subxt tx client: {e}")))?;
-        let mut progress = tx_client
-            .from_bytes(ext)
-            .submit_and_watch()
-            .await
-            .map_err(|e| ChainError::Submit(format!("submit_and_watch: {e}")))?;
-        loop {
-            let status = progress
-                .next()
-                .await
-                .ok_or_else(|| ChainError::Unavailable("tx status stream ended".into()))?
-                .map_err(|e| ChainError::Unavailable(format!("tx progress: {e}")))?;
-            match status {
-                TransactionStatus::InBestBlock(in_block)
-                | TransactionStatus::InFinalizedBlock(in_block) => {
-                    return match in_block.wait_for_success().await {
-                        Ok(_events) => {
-                            tracing::info!(
-                                block = %in_block.block_hash(),
-                                "proof included and dispatched successfully"
-                            );
-                            Ok(SubmitAction::Success)
-                        }
-                        Err(e) => {
-                            // Included, but the pallet dispatch failed
-                            // (`ExtrinsicFailed`). Extract the `Pallet::Variant`
-                            // name for a precise classification (e.g. InvalidNonce
-                            // -> StopRoundStale/retry, not the default Fatal);
-                            // fall back to the Display string otherwise.
-                            let msg = match &e {
-                                subxt::error::TransactionEventsError::ExtrinsicFailed(
-                                    subxt::error::DispatchError::Module(m),
-                                ) => m.details_string(),
-                                other => other.to_string(),
-                            };
-                            tracing::warn!(error = %msg, "proof included but ExtrinsicFailed");
-                            Ok(classify_receipt(Some(&msg)))
-                        }
-                    };
-                }
-                TransactionStatus::Invalid { message } => {
-                    // Bad nonce / signature: stale for this round.
-                    tracing::warn!(%message, "proof rejected as invalid before inclusion");
-                    return Ok(classify_receipt(Some(&message)));
-                }
-                TransactionStatus::Dropped { message } | TransactionStatus::Error { message } => {
-                    // Pool drop / transient node error: retry the candidate.
-                    tracing::warn!(%message, "proof dropped by node before inclusion");
-                    return Ok(SubmitAction::Retry);
-                }
-                // Validated / Broadcasted / NoLongerInBestBlock: keep watching.
-                _ => {}
+        match self.submit_signed_call(&call).await? {
+            SignedCallOutcome::Success { block } => {
+                tracing::info!(block = %block, "proof included and dispatched successfully");
+                Ok(SubmitAction::Success)
             }
+            SignedCallOutcome::DispatchFailed { error, .. } => {
+                tracing::warn!(error = %error, "proof included but ExtrinsicFailed");
+                Ok(classify_receipt(Some(&error)))
+            }
+            SignedCallOutcome::Invalid { message } => {
+                tracing::warn!(%message, "proof rejected as invalid before inclusion");
+                Ok(classify_receipt(Some(&message)))
+            }
+            SignedCallOutcome::Dropped { message } => {
+                tracing::warn!(%message, "proof dropped by node before inclusion");
+                Ok(SubmitAction::Retry)
+            }
+        }
+    }
+
+    async fn file_descriptor(
+        &self,
+        descriptor: &NodeDescriptorV2Input,
+    ) -> Result<DescriptorOutcome, ChainError> {
+        let call = encode_set_descriptor_call(descriptor);
+        match self.submit_signed_call(&call).await? {
+            SignedCallOutcome::Success { .. } => Ok(DescriptorOutcome::Filed),
+            SignedCallOutcome::DispatchFailed { error, .. }
+            | SignedCallOutcome::Invalid { message: error } => {
+                classify_descriptor(Some(&error)).ok_or(ChainError::Submit(error))
+            }
+            SignedCallOutcome::Dropped { message } => Err(ChainError::Submit(message)),
+        }
+    }
+
+    async fn declare_participation(
+        &self,
+        qblock_id: u64,
+    ) -> Result<ParticipationOutcome, ChainError> {
+        let call = encode_participate_call(qblock_id, self.participate_kind, None);
+        match self.submit_signed_call(&call).await? {
+            SignedCallOutcome::Success { .. } => Ok(ParticipationOutcome::Declared),
+            SignedCallOutcome::DispatchFailed { error, .. }
+            | SignedCallOutcome::Invalid { message: error } => {
+                classify_participation(Some(&error)).ok_or(ChainError::Submit(error))
+            }
+            SignedCallOutcome::Dropped { message } => Err(ChainError::Submit(message)),
         }
     }
 }
@@ -630,7 +845,11 @@ async fn rpc_http(url: &str, method: &str, params: Value) -> Result<Value, Chain
     use jsonrpsee::core::client::ClientT;
     use jsonrpsee::http_client::HttpClientBuilder;
 
+    // HttpClientBuilder has no separate connection_timeout. request_timeout
+    // wraps the full transport send (connect + response), so one budget covers
+    // both phases and surfaces as Unavailable for failover.
     let client = HttpClientBuilder::default()
+        .request_timeout(RPC_REQUEST_TIMEOUT)
         .build(url)
         .map_err(|e| ChainError::Unavailable(format!("http client: {e}")))?;
     let result: Value = client
@@ -644,10 +863,25 @@ async fn rpc_ws(url: &str, method: &str, params: Value) -> Result<Value, ChainEr
     use jsonrpsee::core::client::ClientT;
     use jsonrpsee::ws_client::WsClientBuilder;
 
-    let client = WsClientBuilder::default()
-        .build(url)
-        .await
-        .map_err(|e| ChainError::Unavailable(format!("ws client: {e}")))?;
+    // connection_timeout only bounds TCP connect inside jsonrpsee. A peer that
+    // accepts and never completes the WebSocket handshake still hangs build(),
+    // so the whole build is wrapped in the same connect budget.
+    let build = WsClientBuilder::default()
+        .connection_timeout(RPC_CONNECT_TIMEOUT)
+        .request_timeout(RPC_REQUEST_TIMEOUT)
+        .build(url);
+    let client = match tokio::time::timeout(RPC_CONNECT_TIMEOUT, build).await {
+        Ok(Ok(client)) => client,
+        Ok(Err(e)) => {
+            return Err(ChainError::Unavailable(format!("ws client: {e}")));
+        }
+        Err(_) => {
+            return Err(ChainError::Unavailable(format!(
+                "ws connect timed out after {}s",
+                RPC_CONNECT_TIMEOUT.as_secs()
+            )));
+        }
+    };
     let result: Value = client
         .request(method, rpc_params_from_value(params))
         .await
@@ -674,8 +908,116 @@ fn rpc_params_from_value(params: Value) -> jsonrpsee::core::params::ArrayParams 
 
 #[cfg(test)]
 mod tests {
-    use super::order_id_from_fields;
+    use super::{
+        free_from_account_info, order_id_from_fields, rpc_request, RealChainClient,
+        RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT,
+    };
+    use crate::chain::scale_types::MinerKind;
+    use crate::chain::ChainError;
+    use serde_json::Value as JsonValue;
+    use std::time::{Duration, Instant};
     use subxt::ext::scale_value::{Composite, Value};
+    use tokio::net::TcpListener;
+
+    /// Accept connections and never write a response byte. Models a wedged peer
+    /// that passes TCP but blocks the client forever without timeouts.
+    async fn spawn_blackhole_listener() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole listener");
+        let addr = listener.local_addr().expect("blackhole local addr");
+        drop(tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                // Hold the accepted socket open and never write. The peer must
+                // time out on its own; that is the behaviour under test.
+                drop(tokio::spawn(async move {
+                    let _sock = sock;
+                    std::future::pending::<()>().await;
+                }));
+            }
+        }));
+        format!("{addr}")
+    }
+
+    /// Upper bound for a single-endpoint blackhole: connect budget plus slack
+    /// for scheduler jitter on a loaded CI host. Must stay well under the
+    /// test's outer timeout so a hang fails the test, not the harness.
+    fn single_endpoint_budget() -> Duration {
+        RPC_CONNECT_TIMEOUT
+            .saturating_mul(2)
+            .saturating_add(Duration::from_secs(5))
+    }
+
+    /// Upper bound when the first endpoint blackholes and the second refuses:
+    /// one connect timeout plus a refused connect, with CI slack.
+    fn failover_budget() -> Duration {
+        RPC_CONNECT_TIMEOUT
+            .saturating_mul(3)
+            .saturating_add(RPC_REQUEST_TIMEOUT)
+            .saturating_add(Duration::from_secs(5))
+    }
+
+    /// `AccountInfo` as recent Substrate runtimes shape it. The reader walks by
+    /// field name, so extra fields and field order must not matter.
+    fn account_info(free: u128) -> Value {
+        Value::named_composite(vec![
+            ("nonce".to_string(), Value::u128(7)),
+            ("consumers".to_string(), Value::u128(0)),
+            ("providers".to_string(), Value::u128(1)),
+            ("sufficients".to_string(), Value::u128(0)),
+            (
+                "data".to_string(),
+                Value::named_composite(vec![
+                    ("free".to_string(), Value::u128(free)),
+                    ("reserved".to_string(), Value::u128(0)),
+                    ("frozen".to_string(), Value::u128(0)),
+                ]),
+            ),
+        ])
+    }
+
+    #[test]
+    fn reads_free_balance_from_account_info() {
+        assert_eq!(free_from_account_info(&account_info(42)), Some(42));
+        assert_eq!(free_from_account_info(&account_info(0)), Some(0));
+    }
+
+    #[test]
+    fn free_balance_survives_extra_and_reordered_fields() {
+        // A runtime upgrade that adds a field or reorders must not break this.
+        let v = Value::named_composite(vec![
+            (
+                "data".to_string(),
+                Value::named_composite(vec![
+                    ("flags".to_string(), Value::u128(9)),
+                    ("free".to_string(), Value::u128(500)),
+                ]),
+            ),
+            ("nonce".to_string(), Value::u128(1)),
+        ]);
+        assert_eq!(free_from_account_info(&v), Some(500));
+    }
+
+    #[test]
+    fn missing_or_malformed_account_info_reads_as_none() {
+        // No `data` field.
+        let no_data = Value::named_composite(vec![("nonce".to_string(), Value::u128(1))]);
+        assert_eq!(free_from_account_info(&no_data), None);
+        // `data` present but no `free`.
+        let no_free = Value::named_composite(vec![(
+            "data".to_string(),
+            Value::named_composite(vec![("reserved".to_string(), Value::u128(1))]),
+        )]);
+        assert_eq!(free_from_account_info(&no_free), None);
+        // Unnamed composite: not the shape we can read by name.
+        assert_eq!(
+            free_from_account_info(&Value::unnamed_composite(vec![Value::u128(1)])),
+            None
+        );
+    }
 
     #[test]
     fn order_id_from_named_ignores_other_fields() {
@@ -710,5 +1052,101 @@ mod tests {
         );
         // Empty unnamed composite.
         assert_eq!(order_id_from_fields(&Composite::Unnamed(vec![])), None);
+    }
+
+    #[tokio::test]
+    async fn ws_blackhole_endpoint_errors_within_connect_budget() {
+        let addr = spawn_blackhole_listener().await;
+        let url = format!("ws://{addr}");
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            single_endpoint_budget(),
+            rpc_request(&url, "system_health", JsonValue::Array(vec![])),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "ws blackhole call hung past {:?}",
+            single_endpoint_budget()
+        );
+        let err = outcome
+            .expect("outer timeout")
+            .expect_err("blackhole must not succeed");
+        assert!(
+            matches!(err, ChainError::Unavailable(_)),
+            "timeout must classify as Unavailable for failover, got {err}"
+        );
+        assert!(
+            started.elapsed() < single_endpoint_budget(),
+            "elapsed {:?} exceeds budget",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn http_blackhole_endpoint_errors_within_request_budget() {
+        let addr = spawn_blackhole_listener().await;
+        let url = format!("http://{addr}");
+        // HTTP has no separate connect timeout; request_timeout covers the hang.
+        let budget = RPC_REQUEST_TIMEOUT.saturating_add(Duration::from_secs(10));
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            budget,
+            rpc_request(&url, "system_health", JsonValue::Array(vec![])),
+        )
+        .await;
+        assert!(outcome.is_ok(), "http blackhole call hung past {budget:?}");
+        let err = outcome
+            .expect("outer timeout")
+            .expect_err("blackhole must not succeed");
+        assert!(
+            matches!(err, ChainError::Unavailable(_)),
+            "timeout must classify as Unavailable for failover, got {err}"
+        );
+        assert!(
+            started.elapsed() < budget,
+            "elapsed {:?} exceeds budget",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_call_fails_over_past_blackhole_first_validator() {
+        let addr = spawn_blackhole_listener().await;
+        // Primary accepts and stays silent. Secondary refuses immediately so
+        // the call ends after one connect timeout plus a fast connection error.
+        let client = RealChainClient::new(
+            vec![format!("ws://{addr}"), "ws://127.0.0.1:1".to_string()],
+            "//Alice".to_string(),
+            MinerKind::Cpu,
+        );
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(failover_budget(), client.runtime_version_raw()).await;
+        assert!(
+            outcome.is_ok(),
+            "failover hung past {:?}",
+            failover_budget()
+        );
+        let err = outcome
+            .expect("outer timeout")
+            .expect_err("no working validator in the list");
+        assert!(
+            matches!(err, ChainError::Unavailable(_)),
+            "all-endpoint failure must be Unavailable, got {err}"
+        );
+        // Must have left the blackhole: elapsed is under one connect budget
+        // times a small factor, not an unbounded hang.
+        assert!(
+            started.elapsed() < failover_budget(),
+            "elapsed {:?} exceeds failover budget",
+            started.elapsed()
+        );
+        // And it must have waited long enough that the connect timeout fired
+        // (not instant success / skip). A refused-only pair would be near 0.
+        assert!(
+            started.elapsed() >= RPC_CONNECT_TIMEOUT,
+            "expected at least one connect timeout ({RPC_CONNECT_TIMEOUT:?}), got {:?}",
+            started.elapsed()
+        );
     }
 }

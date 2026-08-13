@@ -80,6 +80,7 @@ async fn clean_exit_reclaims_and_reroutes_inflight() {
     let entry = LaunchEntry {
         miner_id: "cpu-0".into(),
         binary: true_bin.to_string(),
+        backend: "cpu".into(),
         configure: Configure::default(),
     };
     // Large base_ms: after the code-0 exit the supervisor parks in the OnDemand
@@ -97,6 +98,7 @@ async fn clean_exit_reclaims_and_reroutes_inflight() {
         Arc::clone(&state),
         policy,
         200,
+        quip_coordinator::logging::LogLevel::Info,
         stop_rx,
     ));
 

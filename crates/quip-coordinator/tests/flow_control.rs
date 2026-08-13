@@ -90,6 +90,7 @@ async fn deep_credit_pool_does_not_deadlock_the_session() {
     let entry = LaunchEntry {
         miner_id: "cpu-0".into(),
         binary: miner.clone(),
+        backend: "cpu".into(),
         configure: Configure {
             // The lever: `seed_credits` is `queue_depth`, so this grants the
             // whole pool up front and the coordinator dispatches every staged
@@ -115,6 +116,7 @@ async fn deep_credit_pool_does_not_deadlock_the_session() {
         jobs,
         utilization: None,
         yielding: false,
+        log_level: quip_coordinator::logging::LogLevel::Info,
     });
 
     // A generous bound: the mock miner answers instantly, so this only fires if
