@@ -221,6 +221,16 @@ fn next_backoff(current: Duration) -> Duration {
     current.saturating_mul(2).min(BACKOFF_MAX)
 }
 
+/// Headline for the retry warning after one funding pass.
+///
+/// A missing balance is a chain-read failure, not a funding state.
+fn retry_warning_message(last_balance: Option<u128>) -> &'static str {
+    match last_balance {
+        None => "cannot read miner account balance from the chain; retrying",
+        Some(_) => "miner account is not funded yet; retrying",
+    }
+}
+
 /// Bring `account` up to `params.min_balance`, topping up through the faucet if
 /// one is configured. Returns the balance once it clears the floor.
 ///
@@ -316,14 +326,25 @@ where
                 None => FundingError::Chain(last_note),
             });
         }
-        tracing::warn!(
-            attempt,
-            balance = %crate::logging::display_option(last_balance),
-            threshold = params.min_balance,
-            retry_in_s = backoff.as_secs(),
-            note = %last_note,
-            "miner account is not funded yet; retrying"
-        );
+        let message = retry_warning_message(last_balance);
+        match last_balance {
+            None => tracing::warn!(
+                attempt,
+                retry_in_s = backoff.as_secs(),
+                note = %last_note,
+                "{}",
+                message
+            ),
+            Some(balance) => tracing::warn!(
+                attempt,
+                balance,
+                threshold = params.min_balance,
+                retry_in_s = backoff.as_secs(),
+                note = %last_note,
+                "{}",
+                message
+            ),
+        }
         sleep(backoff).await;
         remaining = remaining.saturating_sub(backoff);
         backoff = next_backoff(backoff);
@@ -668,6 +689,18 @@ mod tests {
     fn faucet_base_url_trailing_slash_is_normalised() {
         let f = HttpFaucet::new("https://faucet.example/").unwrap();
         assert_eq!(f.base_url, "https://faucet.example");
+    }
+
+    #[test]
+    fn retry_warning_names_a_chain_read_failure_when_balance_is_unknown() {
+        assert_eq!(
+            retry_warning_message(None),
+            "cannot read miner account balance from the chain; retrying"
+        );
+        assert_eq!(
+            retry_warning_message(Some(5)),
+            "miner account is not funded yet; retrying"
+        );
     }
 
     #[test]
