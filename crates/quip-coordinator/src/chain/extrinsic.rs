@@ -235,7 +235,10 @@ pub fn last_proof_block_storage_key() -> Vec<u8> {
     key
 }
 
-fn twox128(data: &[u8]) -> [u8; 16] {
+/// Substrate `Twox128` of `data`: two `XxHash64` digests, seeds 0 and 1,
+/// concatenated little-endian.
+#[must_use]
+pub fn twox128(data: &[u8]) -> [u8; 16] {
     use std::hash::Hasher;
     use twox_hash::XxHash64;
     let mut h0 = XxHash64::with_seed(0);
@@ -248,7 +251,12 @@ fn twox128(data: &[u8]) -> [u8; 16] {
     out
 }
 
-fn blake2_128(data: &[u8]) -> [u8; 16] {
+/// Substrate `Blake2_128` of `data`.
+///
+/// # Panics
+/// Panics only if the blake2 crate rejects a 16-byte digest, which it does not.
+#[must_use]
+pub fn blake2_128(data: &[u8]) -> [u8; 16] {
     use blake2::digest::{Update, VariableOutput};
     use blake2::Blake2bVar;
     #[expect(

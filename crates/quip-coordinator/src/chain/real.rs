@@ -405,59 +405,34 @@ enum SignedCallOutcome {
     Dropped { message: String },
 }
 
-/// Pull `data.free` out of a decoded `System.Account` value.
-///
-/// `AccountInfo`'s field layout has changed across Substrate releases, so this
-/// walks the metadata-decoded value by name instead of assuming a SCALE shape.
-fn free_from_account_info(value: &subxt::ext::scale_value::Value) -> Option<u128> {
-    let ValueDef::Composite(outer) = &value.value else {
-        return None;
-    };
-    let data = named_field(outer, "data")?;
-    let ValueDef::Composite(inner) = &data.value else {
-        return None;
-    };
-    let free = named_field(inner, "free")?;
-    match &free.value {
-        ValueDef::Primitive(Primitive::U128(n)) => Some(*n),
-        _ => None,
-    }
-}
-
-/// Look up a named field in a composite, ignoring unnamed composites.
-fn named_field<'a>(c: &'a Composite<()>, want: &str) -> Option<&'a subxt::ext::scale_value::Value> {
-    match c {
-        Composite::Named(fields) => fields.iter().find(|(k, _)| k == want).map(|(_, v)| v),
-        Composite::Unnamed(_) => None,
-    }
-}
-
 #[async_trait]
 impl crate::funding::BalanceSource for RealChainClient {
     async fn free_balance(&self, account: [u8; 32]) -> Result<u128, String> {
-        use subxt::ext::scale_value::Value as SValue;
-
-        let client = self.subxt_client().await.map_err(|e| e.to_string())?;
-        let at = client
-            .at_current_block()
+        let key = super::account::system_account_storage_key(&account);
+        let head = self
+            .rpc_call("chain_getBlockHash", Value::Array(vec![]))
             .await
-            .map_err(|e| format!("at_current_block: {e}"))?;
-        let addr = subxt::dynamic::storage("System", "Account");
-        let found = at
-            .storage()
-            .try_fetch(addr, vec![SValue::from_bytes(account)])
+            .map_err(|e| e.to_string())?;
+        let at = head
+            .as_str()
+            .ok_or_else(|| "chain_getBlockHash did not return a string".to_string())?;
+        let raw = self
+            .rpc_call(
+                "state_getStorage",
+                Value::Array(vec![
+                    Value::String(hex_encode(&key)),
+                    Value::String(at.to_string()),
+                ]),
+            )
             .await
-            .map_err(|e| format!("fetch System.Account: {e}"))?;
-        // No entry means the account has never been touched on chain, which is
-        // a zero balance rather than a read failure.
-        let Some(entry) = found else {
+            .map_err(|e| e.to_string())?;
+        // A null result means the account has never been touched on chain,
+        // which is a zero balance rather than a read failure.
+        let Some(hex) = raw.as_str() else {
             return Ok(0);
         };
-        let value = entry
-            .decode()
-            .map_err(|e| format!("decode System.Account: {e}"))?;
-        free_from_account_info(&value)
-            .ok_or_else(|| "System.Account has no data.free field".to_string())
+        let bytes = hex_decode(hex)?;
+        super::account::free_from_account_bytes(&bytes)
     }
 }
 
@@ -861,8 +836,8 @@ fn order_id_from_fields(fields: &Composite<()>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        free_from_account_info, order_id_from_fields, rpc_request, RealChainClient,
-        RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT,
+        order_id_from_fields, rpc_request, RealChainClient, RPC_CONNECT_TIMEOUT,
+        RPC_REQUEST_TIMEOUT,
     };
     use crate::chain::scale_types::MinerKind;
     use crate::chain::ChainError;
@@ -910,65 +885,6 @@ mod tests {
             .saturating_mul(3)
             .saturating_add(RPC_REQUEST_TIMEOUT)
             .saturating_add(Duration::from_secs(5))
-    }
-
-    /// `AccountInfo` as recent Substrate runtimes shape it. The reader walks by
-    /// field name, so extra fields and field order must not matter.
-    fn account_info(free: u128) -> Value {
-        Value::named_composite(vec![
-            ("nonce".to_string(), Value::u128(7)),
-            ("consumers".to_string(), Value::u128(0)),
-            ("providers".to_string(), Value::u128(1)),
-            ("sufficients".to_string(), Value::u128(0)),
-            (
-                "data".to_string(),
-                Value::named_composite(vec![
-                    ("free".to_string(), Value::u128(free)),
-                    ("reserved".to_string(), Value::u128(0)),
-                    ("frozen".to_string(), Value::u128(0)),
-                ]),
-            ),
-        ])
-    }
-
-    #[test]
-    fn reads_free_balance_from_account_info() {
-        assert_eq!(free_from_account_info(&account_info(42)), Some(42));
-        assert_eq!(free_from_account_info(&account_info(0)), Some(0));
-    }
-
-    #[test]
-    fn free_balance_survives_extra_and_reordered_fields() {
-        // A runtime upgrade that adds a field or reorders must not break this.
-        let v = Value::named_composite(vec![
-            (
-                "data".to_string(),
-                Value::named_composite(vec![
-                    ("flags".to_string(), Value::u128(9)),
-                    ("free".to_string(), Value::u128(500)),
-                ]),
-            ),
-            ("nonce".to_string(), Value::u128(1)),
-        ]);
-        assert_eq!(free_from_account_info(&v), Some(500));
-    }
-
-    #[test]
-    fn missing_or_malformed_account_info_reads_as_none() {
-        // No `data` field.
-        let no_data = Value::named_composite(vec![("nonce".to_string(), Value::u128(1))]);
-        assert_eq!(free_from_account_info(&no_data), None);
-        // `data` present but no `free`.
-        let no_free = Value::named_composite(vec![(
-            "data".to_string(),
-            Value::named_composite(vec![("reserved".to_string(), Value::u128(1))]),
-        )]);
-        assert_eq!(free_from_account_info(&no_free), None);
-        // Unnamed composite: not the shape we can read by name.
-        assert_eq!(
-            free_from_account_info(&Value::unnamed_composite(vec![Value::u128(1)])),
-            None
-        );
     }
 
     #[test]
