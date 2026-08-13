@@ -88,6 +88,7 @@ async fn runtime_serves_supervises_and_shuts_down_clean() {
     let chain = Arc::new(FakeChain::new(trivial_snapshot(), None));
     let state = Arc::new(Mutex::new(CoordinatorState::new()));
     let params = RuntimeParams {
+        max_submit_attempts: 5,
         sock_path: sock,
         grace_ms: 500,
         backoff: BackoffPolicy::default(),
@@ -192,6 +193,7 @@ async fn feeder_tops_up_to_buffer_depth_records_salts_and_sets_target() {
         Arc::clone(&chain),
         Arc::clone(&state),
         FeederParams {
+            max_submit_attempts: 5,
             miner_account: [0u8; 32],
             buffer_depth: 4,
             poll_interval: Duration::from_millis(50),
@@ -249,6 +251,7 @@ async fn feeder_grows_window_for_drainer_and_holds_floor_for_idle() {
         Arc::clone(&chain),
         Arc::clone(&state),
         FeederParams {
+            max_submit_attempts: 5,
             miner_account: [0u8; 32],
             buffer_depth: FLOOR,
             poll_interval: Duration::from_millis(30),
@@ -312,6 +315,7 @@ async fn feeder_broadcasts_set_target_once_per_difficulty() {
         Arc::clone(&chain),
         Arc::clone(&state),
         FeederParams {
+            max_submit_attempts: 5,
             miner_account: [0u8; 32],
             buffer_depth: 4,
             poll_interval: Duration::from_millis(50),
@@ -368,6 +372,7 @@ async fn feeder_broadcasts_set_target_once_per_difficulty() {
 
 fn feeder_params(buffer_depth: usize, poll_ms: u64) -> FeederParams {
     FeederParams {
+        max_submit_attempts: 5,
         miner_account: [0u8; 32],
         buffer_depth,
         poll_interval: Duration::from_millis(poll_ms),

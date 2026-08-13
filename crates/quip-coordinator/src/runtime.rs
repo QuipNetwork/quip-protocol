@@ -38,6 +38,9 @@ use tonic::transport::Server;
 pub struct RuntimeParams {
     /// Unix-domain socket the server binds and miners connect to.
     pub sock_path: String,
+    /// Consecutive failed submissions of one proof, inside one quantum block,
+    /// before the coordinator stops retrying it. From `[miner]` config.
+    pub max_submit_attempts: u32,
     /// Grace period (ms) between an in-band `Shutdown` and a hard kill.
     pub grace_ms: u32,
     /// Restart backoff + failure budget applied to each miner.
@@ -82,6 +85,9 @@ pub struct FeederParams {
     pub descriptor: DescriptorParams,
     /// Set after the first `DescriptorFiled` walk in this process.
     pub descriptor_filed: Arc<AtomicBool>,
+    /// Consecutive failed submissions of one proof, inside one quantum block,
+    /// before the coordinator stops retrying it.
+    pub max_submit_attempts: u32,
 }
 
 /// EMA smoothing for the per-miner consumption signal. Lower reacts slower but
@@ -510,8 +516,7 @@ pub async fn feeder_loop<C>(
     let mut round: Option<RoundState> = None;
     let mut last_declared: Option<u64> = None;
     // Consecutive failed submits of one proof in one quantum block.
-    // Bound is the coordinator config default of 5.
-    let mut submit_ledger = crate::chain::SubmitLedger::new(5);
+    let mut submit_ledger = crate::chain::SubmitLedger::new(params.max_submit_attempts);
 
     loop {
         let (snap, state_now) = match chain
@@ -986,6 +991,7 @@ where
             funding: params.funding,
             descriptor: params.descriptor,
             descriptor_filed: params.descriptor_filed,
+            max_submit_attempts: params.max_submit_attempts,
         },
         stop_rx.clone(),
     ));

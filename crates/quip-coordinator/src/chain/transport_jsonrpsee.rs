@@ -136,10 +136,22 @@ impl RpcTransport for JsonrpseeTransport {
                 )))
             }
         };
-        let sub_stream: Subscription<Value> = client
+        let sub_stream: Subscription<Value> = match client
             .subscribe(sub, rpc_params_from_value(params), unsub)
             .await
-            .map_err(|e| ChainError::Unavailable(format!("subscribe {sub}: {e}")))?;
+        {
+            Ok(s) => s,
+            // A JSON-RPC error object is the node's answer about this request.
+            // For `author_submitAndWatchExtrinsic` it means the node rejected
+            // the extrinsic, and resubmitting the same bytes cannot change
+            // that. Report it as a submit failure so the caller does not read a
+            // permanent rejection as an unreachable node and retry forever.
+            // Every other error is a transport fault and stays transient.
+            Err(jsonrpsee::core::client::Error::Call(obj)) => {
+                return Err(ChainError::Submit(format!("subscribe {sub}: {obj}")))
+            }
+            Err(e) => return Err(ChainError::Unavailable(format!("subscribe {sub}: {e}"))),
+        };
 
         // The client must outlive the stream: dropping it closes the socket and
         // ends the subscription. Move it into the stream's state.

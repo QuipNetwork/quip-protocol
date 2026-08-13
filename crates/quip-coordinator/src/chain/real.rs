@@ -339,7 +339,7 @@ impl RealChainClient {
         let want_hash = extrinsic_hash(&ext);
 
         let url = self.primary_url()?.to_string();
-        let mut stream = self
+        let mut stream = match self
             .transport
             .subscribe(
                 &url,
@@ -347,7 +347,17 @@ impl RealChainClient {
                 Value::Array(vec![Value::String(hex_encode(&ext))]),
                 "author_unwatchExtrinsic",
             )
-            .await?;
+            .await
+        {
+            Ok(s) => s,
+            // A node that answers the submit with a rejection is delivering a
+            // verdict about this extrinsic, not reporting a transport failure.
+            // Resubmitting the same bytes cannot change it. Returning an error
+            // here would let the caller read a permanent rejection as transient
+            // and retry the same proof forever, which is how a lost win hides.
+            Err(ChainError::Submit(message)) => return Ok(SignedCallOutcome::Invalid { message }),
+            Err(e) => return Err(e),
+        };
 
         while let Some(item) = stream.next().await {
             let value = item?;
