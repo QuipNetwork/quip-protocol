@@ -4,6 +4,7 @@
 pub mod extrinsic;
 pub mod fake;
 pub mod mempool;
+pub mod outcome;
 pub mod preflight;
 pub mod proof_encode;
 pub mod real;
@@ -16,6 +17,7 @@ pub mod transport_jsonrpsee;
 
 pub use fake::FakeChain;
 pub use mempool::JobOrder;
+pub use outcome::{SubmitLedger, QBLOCK_RETENTION};
 pub use real::RealChainClient;
 pub use scale_types::{MinerKind, MinerSpecScale, NodeDescriptorV2Input, NodeLogLevel};
 pub use snapshot::{head_state_key, DecayParams, MiningSnapshot};
