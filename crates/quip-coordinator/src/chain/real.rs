@@ -6,8 +6,10 @@
 
 use super::extrinsic::{
     build_hybrid_signed_extrinsic, default_topology_storage_key, difficulties_storage_key,
-    hex_decode, hex_encode, job_orders_storage_key, last_proof_block_storage_key, load_hybrid_pair,
-    miner_identity_bytes, topology_curve_c_storage_key, SignedExtensionContext,
+    extrinsic_hash, hex_decode, hex_encode, job_orders_storage_key, last_proof_block_storage_key,
+    load_hybrid_pair, miner_identity_bytes, node_descriptors_storage_key,
+    participants_by_qblock_storage_key, qblocks_storage_key, topology_curve_c_storage_key,
+    SignedExtensionContext,
 };
 use super::proof_encode::{build_quantum_proof, ProofBuildContext};
 use super::scale_types::{
@@ -19,51 +21,29 @@ use super::submit::{
     classify_descriptor, classify_participation, classify_receipt, DescriptorOutcome,
     ParticipationOutcome, Proof, SubmitAction,
 };
-use super::transport_jsonrpsee::{rpc_request, RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT};
+use super::transport::RpcTransport;
+use super::transport_jsonrpsee::JsonrpseeTransport;
+use super::watch::{parse_tx_status, TxStatus};
 use super::{ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot};
 use crate::decay::{
     DEFAULT_BASE_MAX_ENERGY_MILLI, DEFAULT_C_EASY_MILLI, DEFAULT_C_HARD_MILLI,
     DEFAULT_C_KNEE_MILLI, EPOCH_LENGTH_BLOCKS,
 };
 use async_trait::async_trait;
+use futures::StreamExt as _;
 use parity_scale_codec::Decode;
 use quantum_validation::AllowedValueSpec;
-use quip_transaction_crypto::HybridPair;
+use quip_transaction_crypto::{account_id_from_public, HybridPair};
 use serde_json::Value;
 use sp_core::crypto::Ss58Codec;
 use sp_core::Pair as _;
-use std::sync::Mutex;
-use std::time::Duration;
-use subxt::rpcs::client::reconnecting_rpc_client::{ExponentialBackoff, PingConfig};
-use subxt::rpcs::client::ReconnectingRpcClient;
-use subxt::transactions::TransactionStatus;
-use tokio::sync::OnceCell;
-
-/// Interval between WebSocket pings on the cached subxt client.
-///
-/// A half-open socket, which a NAT or firewall idle timeout produces, raises
-/// no error. Without a ping the coordinator does not learn the link is dead
-/// until something tries to use it. Ten seconds is frequent enough to notice
-/// a drop long before a later submit needs the socket. The builder default
-/// also enables a ping, but that default is not ours to depend on.
-const RPC_WS_PING_INTERVAL: Duration = Duration::from_secs(10);
-
-/// Time without a pong before the reconnecting client treats the socket as dead.
-///
-/// This must stay well above [`RPC_WS_PING_INTERVAL`] so one slow pong does
-/// not force a needless reconnect. Thirty seconds gives the peer two extra
-/// ping intervals after the first miss. `max_failures` stays at its default
-/// of 1.
-const RPC_WS_PING_INACTIVE_LIMIT: Duration = Duration::from_secs(30);
+use std::sync::{Arc, Mutex};
 
 /// Keys requested per `state_getKeysPaged` call when walking the order map.
 ///
 /// The mempool holds tens of orders in practice. A page of 200 fetches them in
 /// one round trip while staying far below any node response limit.
 const ORDER_PAGE_SIZE: u32 = 200;
-
-/// Cached subxt client. Submit still uses it for `submit_and_watch`.
-type SubxtClient = subxt::OnlineClient<subxt::SubstrateConfig>;
 
 /// Production chain client (RPC + hybrid-signed submit).
 pub struct RealChainClient {
@@ -78,8 +58,9 @@ pub struct RealChainClient {
     last_snapshot: Mutex<Option<MiningSnapshot>>,
     /// Last `allowed_spin` spec (full `AllowedValueSpec`, not just Set values).
     last_spin_spec: Mutex<Option<AllowedValueSpec<Vec<i32>>>>,
-    /// Lazily-connected subxt client for `submit_and_watch`.
-    subxt: OnceCell<SubxtClient>,
+    /// How this client reaches the validator. Boxed so a WebAssembly build can
+    /// supply a browser transport in place of the native one.
+    transport: Arc<dyn RpcTransport>,
     /// Whether the last RPC round-trip reached the validator. `None` before the
     /// first call. Every RPC builds a fresh client (see `rpc_http` / `rpc_ws`),
     /// so a per-call "connected" line would run to thousands an hour; this
@@ -99,10 +80,23 @@ impl RealChainClient {
             pair: Mutex::new(None),
             last_snapshot: Mutex::new(None),
             last_spin_spec: Mutex::new(None),
-            subxt: OnceCell::new(),
+            transport: Arc::new(JsonrpseeTransport),
             reachable: Mutex::new(None),
             participate_kind,
         }
+    }
+
+    /// Construct a client over a caller-supplied transport.
+    #[must_use]
+    pub fn with_transport(
+        validators: Vec<String>,
+        signer_key: String,
+        participate_kind: MinerKind,
+        transport: Arc<dyn RpcTransport>,
+    ) -> Self {
+        let mut c = Self::new(validators, signer_key, participate_kind);
+        c.transport = transport;
+        c
     }
 
     /// Record the outcome of one RPC round-trip and log reachability changes.
@@ -127,39 +121,6 @@ impl RealChainClient {
             }
         }
         *guard = Some(now);
-    }
-
-    /// Return the cached subxt client, connecting on the first call.
-    ///
-    /// The client sits on a reconnecting WebSocket. The socket reopens after
-    /// a validator restart. Runtime metadata stays cached in the `OnceCell`.
-    ///
-    /// Method calls resume on the new socket. Subscriptions do not replay.
-    /// A `submit_and_watch` that is in flight when the socket drops fails
-    /// that one submission. The caller retries on the next round.
-    async fn subxt_client(&self) -> Result<&SubxtClient, ChainError> {
-        let url = self.primary_url()?.to_string();
-        self.subxt
-            .get_or_try_init(|| async move {
-                let rpc = ReconnectingRpcClient::builder()
-                    .retry_policy(
-                        ExponentialBackoff::from_millis(200).max_delay(Duration::from_secs(10)),
-                    )
-                    .connection_timeout(RPC_CONNECT_TIMEOUT)
-                    .request_timeout(RPC_REQUEST_TIMEOUT)
-                    .enable_ws_ping(
-                        PingConfig::new()
-                            .ping_interval(RPC_WS_PING_INTERVAL)
-                            .inactive_limit(RPC_WS_PING_INACTIVE_LIMIT),
-                    )
-                    .build(&url)
-                    .await
-                    .map_err(|e| ChainError::Unavailable(format!("subxt connect: {e}")))?;
-                SubxtClient::from_rpc_client(rpc)
-                    .await
-                    .map_err(|e| ChainError::Unavailable(format!("subxt connect: {e}")))
-            })
-            .await
     }
 
     fn pair(&self) -> Result<HybridPair, ChainError> {
@@ -198,7 +159,7 @@ impl RealChainClient {
         }
         let mut last: Option<ChainError> = None;
         for url in &self.validators {
-            let out = rpc_request(url, method, params.clone()).await;
+            let out = self.transport.request(url, method, params.clone()).await;
             tracing::trace!(url = %url, method = %method, ok = out.is_ok(), "rpc call");
             match out {
                 Ok(v) => {
@@ -301,8 +262,7 @@ impl RealChainClient {
         &self,
         pair: &HybridPair,
     ) -> Result<SignedExtensionContext, ChainError> {
-        let account_ss58 =
-            quip_transaction_crypto::account_id_from_public(&pair.public()).to_ss58check();
+        let account_ss58 = account_id_from_public(&pair.public()).to_ss58check();
         let nonce_val = self
             .rpc_call(
                 "system_accountNextIndex",
@@ -361,64 +321,231 @@ impl RealChainClient {
         })
     }
 
-    /// Hybrid-sign `call` and watch inclusion. Callers classify the outcome.
+    /// Hybrid-sign `call`, submit it, and confirm the result from chain state.
     ///
-    /// Submits via subxt's `author_submitAndWatchExtrinsic` and CONFIRMS the
-    /// on-chain outcome, rather than treating pool acceptance as success. The
-    /// status stream is watched to in-best-block, not to finality, to stay
-    /// responsive: a re-org after that point is rare on the local validator,
-    /// and the per-generation `current_best` reset bounds any wrong advance.
+    /// The status subscription reports pool and inclusion progress only. It
+    /// cannot say whether the dispatch inside the block succeeded, because that
+    /// lives in the block's events and decoding those needs runtime metadata.
+    /// So each call names the storage entry its own success writes. Inclusion
+    /// is confirmed from the block body. Both reads are metadata-free.
     pub(crate) async fn submit_signed_call(
         &self,
         call: &[u8],
+        confirmation: Confirmation,
     ) -> Result<SignedCallOutcome, ChainError> {
         let pair = self.pair()?;
         let signed_ctx = self.signed_extension_context(&pair).await?;
         let ext = build_hybrid_signed_extrinsic(&pair, call, &signed_ctx);
+        let want_hash = extrinsic_hash(&ext);
 
-        let client = self.subxt_client().await?;
-        let tx_client = client
-            .tx()
-            .await
-            .map_err(|e| ChainError::Unavailable(format!("subxt tx client: {e}")))?;
-        let mut progress = tx_client
-            .from_bytes(ext)
-            .submit_and_watch()
-            .await
-            .map_err(|e| ChainError::Submit(format!("submit_and_watch: {e}")))?;
-        loop {
-            let status = progress
-                .next()
+        let url = self.primary_url()?.to_string();
+        let mut stream = self
+            .transport
+            .subscribe(
+                &url,
+                "author_submitAndWatchExtrinsic",
+                Value::Array(vec![Value::String(hex_encode(&ext))]),
+                "author_unwatchExtrinsic",
+            )
+            .await?;
+
+        while let Some(item) = stream.next().await {
+            let value = item?;
+            match parse_tx_status(&value) {
+                TxStatus::InBlock(block) | TxStatus::Finalized(block) => {
+                    return self
+                        .confirm_in_block(&block, &want_hash, confirmation)
+                        .await;
+                }
+                TxStatus::Invalid(message) => return Ok(SignedCallOutcome::Invalid { message }),
+                TxStatus::Dropped(message) => return Ok(SignedCallOutcome::Dropped { message }),
+                TxStatus::Other(s) => {
+                    tracing::debug!(status = %s, "unmodelled transaction status");
+                }
+                TxStatus::Ready | TxStatus::Broadcast | TxStatus::Future => {}
+            }
+        }
+        Err(ChainError::Unavailable(
+            "transaction status stream ended before inclusion".into(),
+        ))
+    }
+
+    /// Read the block that claimed to include our extrinsic and decide.
+    async fn confirm_in_block(
+        &self,
+        block_hex: &str,
+        want_hash: &[u8; 32],
+        confirmation: Confirmation,
+    ) -> Result<SignedCallOutcome, ChainError> {
+        let included = self.block_contains(block_hex, want_hash).await?;
+        let confirmed = self.confirmation_present(block_hex, &confirmation).await?;
+        match classify_state_outcome(included, confirmed) {
+            StateOutcome::Won => Ok(SignedCallOutcome::Success {
+                block: block_hex.to_string(),
+            }),
+            StateOutcome::IncludedButNotWon => Ok(SignedCallOutcome::DispatchFailed {
+                error: Self::explain_failure(),
+            }),
+            StateOutcome::NotIncluded => Ok(SignedCallOutcome::Dropped {
+                message: format!("extrinsic absent from block {block_hex}"),
+            }),
+        }
+    }
+
+    /// Is our extrinsic in this block?
+    ///
+    /// `chain_getBlock` is in the safe RPC set. Each extrinsic comes back as a
+    /// hex blob, so inclusion is a hash comparison and needs no metadata.
+    async fn block_contains(
+        &self,
+        block_hex: &str,
+        want_hash: &[u8; 32],
+    ) -> Result<bool, ChainError> {
+        let body = self
+            .rpc_call(
+                "chain_getBlock",
+                Value::Array(vec![Value::String(block_hex.to_string())]),
+            )
+            .await?;
+        let Some(exts) = body
+            .get("block")
+            .and_then(|b| b.get("extrinsics"))
+            .and_then(Value::as_array)
+        else {
+            return Err(ChainError::Decode(
+                "chain_getBlock has no block.extrinsics array".into(),
+            ));
+        };
+        for e in exts {
+            let Some(hex) = e.as_str() else { continue };
+            let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
+            if extrinsic_hash(&bytes) == *want_hash {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Is the storage entry this call should have written present at `block_hex`?
+    async fn confirmation_present(
+        &self,
+        block_hex: &str,
+        confirmation: &Confirmation,
+    ) -> Result<bool, ChainError> {
+        match *confirmation {
+            Confirmation::ProofWin { account } => self.proof_win_at(block_hex, &account).await,
+            Confirmation::Descriptor { account } => {
+                self.storage_value_present(&node_descriptors_storage_key(&account), block_hex)
+                    .await
+            }
+            Confirmation::Participation { qblock_id, account } => {
+                self.storage_value_present(
+                    &participants_by_qblock_storage_key(qblock_id, &account),
+                    block_hex,
+                )
                 .await
-                .ok_or_else(|| ChainError::Unavailable("tx status stream ended".into()))?
-                .map_err(|e| ChainError::Unavailable(format!("tx progress: {e}")))?;
-            match status {
-                TransactionStatus::InBestBlock(in_block)
-                | TransactionStatus::InFinalizedBlock(in_block) => {
-                    let block = in_block.block_hash().to_string();
-                    return match in_block.wait_for_success().await {
-                        Ok(_events) => Ok(SignedCallOutcome::Success { block }),
-                        Err(e) => {
-                            let error = match &e {
-                                subxt::error::TransactionEventsError::ExtrinsicFailed(
-                                    subxt::error::DispatchError::Module(m),
-                                ) => m.details_string(),
-                                other => other.to_string(),
-                            };
-                            Ok(SignedCallOutcome::DispatchFailed { error })
-                        }
-                    };
-                }
-                TransactionStatus::Invalid { message } => {
-                    return Ok(SignedCallOutcome::Invalid { message });
-                }
-                TransactionStatus::Dropped { message } | TransactionStatus::Error { message } => {
-                    return Ok(SignedCallOutcome::Dropped { message });
-                }
-                _ => {}
+            }
+            Confirmation::DefaultTopology => {
+                self.storage_value_present(&default_topology_storage_key(), block_hex)
+                    .await
+            }
+            Confirmation::Difficulty { topology_hash } => {
+                self.storage_value_present(&difficulties_storage_key(&topology_hash), block_hex)
+                    .await
             }
         }
     }
+
+    /// Did this account win the qblock recorded at `block_hex`?
+    ///
+    /// `QuantumPow::QBlocks` is keyed by block number and its value begins with
+    /// the winning account, so this answers the question exactly. Comparing
+    /// `LastProofBlock` instead would report a false success whenever another
+    /// miner won the same block.
+    async fn proof_win_at(
+        &self,
+        block_hex: &str,
+        our_account: &[u8; 32],
+    ) -> Result<bool, ChainError> {
+        let header = self
+            .rpc_call(
+                "chain_getHeader",
+                Value::Array(vec![Value::String(block_hex.to_string())]),
+            )
+            .await?;
+        let block_number = u32::try_from(parse_block_number(&header)?)
+            .map_err(|_| ChainError::Decode("block number exceeds u32".into()))?;
+
+        let key = qblocks_storage_key(block_number);
+        let raw = self
+            .rpc_call(
+                "state_getStorage",
+                Value::Array(vec![
+                    Value::String(hex_encode(&key)),
+                    Value::String(block_hex.to_string()),
+                ]),
+            )
+            .await?;
+        // No entry means no proof was accepted in this block at all.
+        let Some(hex) = raw.as_str() else {
+            return Ok(false);
+        };
+        let bytes = hex_decode(hex).map_err(ChainError::Decode)?;
+        // `miner` is the first field of `QBlock`, so it occupies the leading 32
+        // bytes. Reading only those survives the migrations that appended
+        // fields to the end of the struct.
+        let Some(miner) = bytes.get(..32) else {
+            return Err(ChainError::Decode(format!(
+                "QBlocks value is {} bytes, too short to hold an account",
+                bytes.len()
+            )));
+        };
+        Ok(miner == our_account)
+    }
+
+    /// Is any value stored at `key` in the block named by `at_hex`?
+    async fn storage_value_present(&self, key: &[u8], at_hex: &str) -> Result<bool, ChainError> {
+        let raw = self
+            .rpc_call(
+                "state_getStorage",
+                Value::Array(vec![
+                    Value::String(hex_encode(key)),
+                    Value::String(at_hex.to_string()),
+                ]),
+            )
+            .await?;
+        Ok(raw.as_str().is_some())
+    }
+
+    /// Best-effort reason for a failed dispatch.
+    ///
+    /// Returns a plain note when `system_dryRun` is unavailable, which is the
+    /// case on a node started with `--rpc-methods=safe`. The caller must treat
+    /// this as log text only.
+    fn explain_failure() -> String {
+        "dispatch failed; chain state does not record the expected write for this extrinsic"
+            .to_string()
+    }
+}
+
+/// What chain state proves a submitted call succeeded.
+///
+/// The status subscription reports pool and inclusion progress only. It cannot
+/// say whether the dispatch inside the block succeeded, because that lives in
+/// the block's events and decoding those needs runtime metadata. So each call
+/// names the storage entry its own success writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Confirmation {
+    /// `QuantumPow.QBlocks[block_number].miner` equals this account.
+    ProofWin { account: [u8; 32] },
+    /// `MinerRegistry.NodeDescriptors[account]` is present.
+    Descriptor { account: [u8; 32] },
+    /// `MinerRegistry.ParticipantsByQBlock[qblock_id][account]` is present.
+    Participation { qblock_id: u64, account: [u8; 32] },
+    /// `QuantumPow.DefaultTopology` is present. Used by seed-chain.
+    DefaultTopology,
+    /// `QuantumPow.Difficulties[topology_hash]` is present. Used by seed-chain.
+    Difficulty { topology_hash: [u8; 32] },
 }
 
 /// On-chain result of a hybrid-signed extrinsic, before pallet-specific classify.
@@ -778,8 +905,12 @@ impl ChainClient for RealChainClient {
         let quantum = build_quantum_proof(proof, &ctx)
             .map_err(|e| ChainError::Submit(format!("encode proof: {e}")))?;
         let call = encode_submit_proof_call(&quantum);
+        let account = *AsRef::<[u8; 32]>::as_ref(&account_id_from_public(&pair.public()));
 
-        match self.submit_signed_call(&call).await? {
+        match self
+            .submit_signed_call(&call, Confirmation::ProofWin { account })
+            .await?
+        {
             SignedCallOutcome::Success { block } => {
                 tracing::info!(block = %block, "proof included and dispatched successfully");
                 Ok(SubmitAction::Success)
@@ -804,7 +935,11 @@ impl ChainClient for RealChainClient {
         descriptor: &NodeDescriptorV2Input,
     ) -> Result<DescriptorOutcome, ChainError> {
         let call = encode_set_descriptor_call(descriptor);
-        match self.submit_signed_call(&call).await? {
+        let account = *AsRef::<[u8; 32]>::as_ref(&account_id_from_public(&self.pair()?.public()));
+        match self
+            .submit_signed_call(&call, Confirmation::Descriptor { account })
+            .await?
+        {
             SignedCallOutcome::Success { .. } => Ok(DescriptorOutcome::Filed),
             SignedCallOutcome::DispatchFailed { error, .. }
             | SignedCallOutcome::Invalid { message: error } => {
@@ -819,7 +954,11 @@ impl ChainClient for RealChainClient {
         qblock_id: u64,
     ) -> Result<ParticipationOutcome, ChainError> {
         let call = encode_participate_call(qblock_id, self.participate_kind, None);
-        match self.submit_signed_call(&call).await? {
+        let account = *AsRef::<[u8; 32]>::as_ref(&account_id_from_public(&self.pair()?.public()));
+        match self
+            .submit_signed_call(&call, Confirmation::Participation { qblock_id, account })
+            .await?
+        {
             SignedCallOutcome::Success { .. } => Ok(ParticipationOutcome::Declared),
             SignedCallOutcome::DispatchFailed { error, .. }
             | SignedCallOutcome::Invalid { message: error } => {
@@ -839,6 +978,34 @@ fn extract_salt(proof: &Proof) -> Option<[u8; 32]> {
     Some(s)
 }
 
+/// What chain state says about a submitted extrinsic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateOutcome {
+    /// Our extrinsic is in the block and the expected storage write is present.
+    Won,
+    /// Our extrinsic is in the block but the expected storage write is absent.
+    /// The dispatch failed, and state does not say why.
+    IncludedButNotWon,
+    /// Our extrinsic is not in the block.
+    NotIncluded,
+}
+
+/// Fold the two state reads into an outcome.
+///
+/// The second argument is true when the storage entry this call should have
+/// written is present. That is not the same as winning a quantum block. A
+/// descriptor or a participation write never touches `QBlocks`. Confirmation
+/// only counts when our own extrinsic is in the block. Another account's
+/// extrinsic can write the same entry, and claiming that would mark a failed
+/// call as successful.
+const fn classify_state_outcome(included: bool, won_here: bool) -> StateOutcome {
+    match (included, won_here) {
+        (true, true) => StateOutcome::Won,
+        (true, false) => StateOutcome::IncludedButNotWon,
+        (false, _) => StateOutcome::NotIncluded,
+    }
+}
+
 fn parse_block_number(header: &Value) -> Result<u64, ChainError> {
     let number = header
         .get("number")
@@ -855,7 +1022,10 @@ fn parse_block_number(header: &Value) -> Result<u64, ChainError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{rpc_request, RealChainClient, RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT};
+    use super::super::transport_jsonrpsee::{
+        rpc_request, RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT,
+    };
+    use super::{classify_state_outcome, RealChainClient, StateOutcome};
     use crate::chain::scale_types::MinerKind;
     use crate::chain::ChainError;
     use serde_json::Value as JsonValue;
@@ -996,6 +1166,32 @@ mod tests {
             started.elapsed() >= RPC_CONNECT_TIMEOUT,
             "expected at least one connect timeout ({RPC_CONNECT_TIMEOUT:?}), got {:?}",
             started.elapsed()
+        );
+    }
+
+    /// The submit path must not treat inclusion as success. A block that
+    /// includes the extrinsic but does not advance `LastProofBlock` is a failed
+    /// dispatch, and reporting it as success would mark a losing proof as won.
+    #[test]
+    fn inclusion_without_a_win_is_not_success() {
+        assert_eq!(
+            classify_state_outcome(true, false),
+            StateOutcome::IncludedButNotWon
+        );
+        assert_eq!(classify_state_outcome(true, true), StateOutcome::Won);
+        assert_eq!(
+            classify_state_outcome(false, false),
+            StateOutcome::NotIncluded
+        );
+    }
+
+    /// A win recorded while our extrinsic never made the block belongs to
+    /// another miner and must not be claimed.
+    #[test]
+    fn a_win_without_our_extrinsic_is_not_ours() {
+        assert_eq!(
+            classify_state_outcome(false, true),
+            StateOutcome::NotIncluded
         );
     }
 }
