@@ -1,6 +1,7 @@
 //! Chain access behind `ChainClient`. Real impl talks Substrate JSON-RPC;
 //! tests use `FakeChain`.
 
+pub mod dryrun;
 pub mod extrinsic;
 pub mod fake;
 pub mod mempool;
@@ -14,6 +15,7 @@ pub mod sync;
 pub mod transport;
 pub mod transport_jsonrpsee;
 
+pub use dryrun::{decode_dispatch_error, describe_module_error, ModuleError};
 pub use fake::FakeChain;
 pub use mempool::JobOrder;
 pub use real::RealChainClient;
