@@ -53,7 +53,7 @@ The PyO3 crate is a workspace member held out of `default-members`, so a bare `c
 
 ## Running the coordinator
 
-`quip-coordinator` has two modes.
+`quip-coordinator` runs from a config file, or as a subcommand.
 
 ```bash
 # Production: read the config, connect to the validators, spawn and supervise the
@@ -64,11 +64,33 @@ quip-coordinator --config ./docker/config.toml
 # for benchmarking and matched-condition parity runs.
 quip-coordinator drive --miner ./miners/quip-cpu-sa --source random \
   --topology-preset advantage2-system1 --count 100
+
+# Seed a fresh chain: register the default topology and set its difficulty.
+# Give exactly one of --sudo-key or --mnemonic-file.
+quip-coordinator seed-chain --sudo-key //Alice
 ```
+
+`seed-chain` defaults to `--validator ws://quip-validator:9944` and
+`--topology-preset advantage2-system1`. Difficulty defaults are
+`--min-solutions 5`, `--max-energy-milli -2500000`, and
+`--min-diversity-milli 200`. `--sudo-key` accepts a `//DevUri`, a BIP39
+mnemonic, a 32-byte hex master seed, or a keystore path. `--mnemonic-file`
+reads a BIP39 phrase from a file. Pass `--topology` to use a specification JSON
+file instead of a preset.
+
+You can seed a chain only once. `register_topology` writes `DefaultTopology`
+only when that value is unset. `seed-chain` refuses to run when a chain already
+has a default topology. Wipe the chain data and restart the validator instead.
+
+The coordinator binary embeds the `advantage2-system1` and `smoke` topology
+presets. `drive --topology-preset` and `seed-chain` read those presets from the
+binary.
 
 The config registers miners and their launch plan. Each backend section (`[cpu]`, `[cuda.0]`, `[metal]`, `[dwave]`) becomes one supervised subprocess; `binary` selects the executable — `quip-cpu-sa`, or the chromatic `quip-cpu-gibbs`. See `crates/quip-coordinator/config.toml.example`. Miner binaries are fetched per host by `crates/quip-coordinator/tools/fetch-miners.sh` from the standalone repos and resolved on `PATH` or by absolute path.
 
-`signer_key` is a dev account URI (`//Alice`) or a path to a hybrid sr25519 + ML-DSA-44 keystore. `.env` holds credentials such as `DWAVE_API_KEY` — **never read or display its contents.**
+`signer_key` accepts a keystore path, a 32-byte hex master seed, or a `//DevUri`
+such as `//Alice`. It also accepts any substrate secret URI, including a BIP39
+mnemonic phrase. `.env` holds credentials such as `DWAVE_API_KEY` — **never read or display its contents.**
 
 ## The PyO3 SDK
 
