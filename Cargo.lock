@@ -3619,6 +3619,7 @@ dependencies = [
  "blake3",
  "bytemuck",
  "clap",
+ "futures",
  "getrandom 0.2.17",
  "hyper-util",
  "jsonrpsee",

@@ -11,6 +11,8 @@ pub mod scale_types;
 pub mod snapshot;
 pub mod submit;
 pub mod sync;
+pub mod transport;
+pub mod transport_jsonrpsee;
 
 pub use fake::FakeChain;
 pub use mempool::JobOrder;
@@ -21,6 +23,8 @@ pub use submit::{
     classify_descriptor, classify_participation, classify_receipt, DescriptorOutcome,
     ParticipationOutcome, Proof, SubmitAction,
 };
+pub use transport::{BoxStream, RpcTransport};
+pub use transport_jsonrpsee::JsonrpseeTransport;
 
 use async_trait::async_trait;
 

@@ -19,6 +19,7 @@ use super::submit::{
     classify_descriptor, classify_participation, classify_receipt, DescriptorOutcome,
     ParticipationOutcome, Proof, SubmitAction,
 };
+use super::transport_jsonrpsee::{rpc_request, RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT};
 use super::{ChainClient, ChainError, DecayParams, JobOrder, MiningSnapshot};
 use crate::decay::{
     DEFAULT_BASE_MAX_ENERGY_MILLI, DEFAULT_C_EASY_MILLI, DEFAULT_C_HARD_MILLI,
@@ -39,21 +40,6 @@ use subxt::rpcs::client::reconnecting_rpc_client::{ExponentialBackoff, PingConfi
 use subxt::rpcs::client::ReconnectingRpcClient;
 use subxt::transactions::TransactionStatus;
 use tokio::sync::OnceCell;
-
-/// Budget for opening a session to one validator (TCP connect + WS handshake).
-///
-/// A wedged peer that accepts TCP and never speaks used to block the ordered
-/// failover list forever. Five seconds is long enough for a slow host path and
-/// short enough that the next endpoint is tried before the coordinator looks
-/// hung at startup.
-const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Budget for one JSON-RPC method after the client is up.
-///
-/// The jsonrpsee default is 60s, which multiplies badly across a validator list
-/// when a peer is silent. Fifteen seconds still covers a loaded but working
-/// node; it does not wait a full minute before moving on.
-const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Interval between WebSocket pings on the cached subxt client.
 ///
@@ -869,80 +855,6 @@ fn order_id_from_fields(fields: &Composite<()>) -> Option<u64> {
     match &value.value {
         ValueDef::Primitive(Primitive::U128(n)) => u64::try_from(*n).ok(),
         _ => None,
-    }
-}
-
-async fn rpc_request(url: &str, method: &str, params: Value) -> Result<Value, ChainError> {
-    // Support both ws:// and http(s):// via jsonrpsee.
-    if url.starts_with("ws://") || url.starts_with("wss://") {
-        rpc_ws(url, method, params).await
-    } else {
-        rpc_http(url, method, params).await
-    }
-}
-
-async fn rpc_http(url: &str, method: &str, params: Value) -> Result<Value, ChainError> {
-    use jsonrpsee::core::client::ClientT;
-    use jsonrpsee::http_client::HttpClientBuilder;
-
-    // HttpClientBuilder has no separate connection_timeout. request_timeout
-    // wraps the full transport send (connect + response), so one budget covers
-    // both phases and surfaces as Unavailable for failover.
-    let client = HttpClientBuilder::default()
-        .request_timeout(RPC_REQUEST_TIMEOUT)
-        .build(url)
-        .map_err(|e| ChainError::Unavailable(format!("http client: {e}")))?;
-    let result: Value = client
-        .request(method, rpc_params_from_value(params))
-        .await
-        .map_err(|e| ChainError::Unavailable(format!("rpc {method}: {e}")))?;
-    Ok(result)
-}
-
-async fn rpc_ws(url: &str, method: &str, params: Value) -> Result<Value, ChainError> {
-    use jsonrpsee::core::client::ClientT;
-    use jsonrpsee::ws_client::WsClientBuilder;
-
-    // connection_timeout only bounds TCP connect inside jsonrpsee. A peer that
-    // accepts and never completes the WebSocket handshake still hangs build(),
-    // so the whole build is wrapped in the same connect budget.
-    let build = WsClientBuilder::default()
-        .connection_timeout(RPC_CONNECT_TIMEOUT)
-        .request_timeout(RPC_REQUEST_TIMEOUT)
-        .build(url);
-    let client = match tokio::time::timeout(RPC_CONNECT_TIMEOUT, build).await {
-        Ok(Ok(client)) => client,
-        Ok(Err(e)) => {
-            return Err(ChainError::Unavailable(format!("ws client: {e}")));
-        }
-        Err(_) => {
-            return Err(ChainError::Unavailable(format!(
-                "ws connect timed out after {}s",
-                RPC_CONNECT_TIMEOUT.as_secs()
-            )));
-        }
-    };
-    let result: Value = client
-        .request(method, rpc_params_from_value(params))
-        .await
-        .map_err(|e| ChainError::Unavailable(format!("rpc {method}: {e}")))?;
-    Ok(result)
-}
-
-fn rpc_params_from_value(params: Value) -> jsonrpsee::core::params::ArrayParams {
-    match params {
-        Value::Array(arr) => {
-            let mut p = jsonrpsee::core::params::ArrayParams::new();
-            for v in arr {
-                let _ = p.insert(v);
-            }
-            p
-        }
-        other => {
-            let mut p = jsonrpsee::core::params::ArrayParams::new();
-            let _ = p.insert(other);
-            p
-        }
     }
 }
 
