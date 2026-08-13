@@ -114,9 +114,8 @@ struct DriveArgs {
     /// given. For `--source list`, needed only if the list has a nonce-ref entry.
     #[arg(long)]
     topology: Option<PathBuf>,
-    /// Built-in topology by name (`advantage2-system1`, `smoke`), resolved to a
-    /// committed fixture under `fixtures/drive/`. Mutually exclusive with
-    /// `--topology`.
+    /// Built-in topology by name (`advantage2-system1`, `smoke`), embedded in
+    /// the binary. Mutually exclusive with `--topology`.
     #[arg(long)]
     topology_preset: Option<String>,
     /// Number of problems to draw (`--source random`).
