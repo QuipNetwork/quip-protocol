@@ -319,7 +319,27 @@ build-coordinator-darwin-arm64:
   before_script:
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --no-modify-path
     - source "$CARGO_HOME/env"
-    - brew install protobuf
+    # The shell executor runs non-interactively and sources no login profile,
+    # so Homebrew's bin directory is not guaranteed to be on PATH. v0.3.0-rc7
+    # failed here with "brew: command not found" and took the whole binary
+    # release with it. Put brew on PATH from its known prefix, then install
+    # protobuf only when protoc is still missing.
+    - |
+      for prefix in /opt/homebrew /usr/local; do
+        if [ -x "$prefix/bin/brew" ]; then
+          eval "$("$prefix/bin/brew" shellenv)"
+          break
+        fi
+      done
+      if ! command -v protoc >/dev/null 2>&1; then
+        if ! command -v brew >/dev/null 2>&1; then
+          echo "protoc is missing and no brew was found under /opt/homebrew or /usr/local" >&2
+          echo "install protobuf on this runner, or put brew on the runner PATH" >&2
+          exit 1
+        fi
+        brew install protobuf
+      fi
+      protoc --version
   script:
     - cargo build --release -p quip-coordinator
     - mkdir -p dist
