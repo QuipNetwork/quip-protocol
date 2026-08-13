@@ -12,6 +12,7 @@ pub mod preflight;
 pub mod proof_encode;
 pub mod real;
 pub mod scale_types;
+pub mod seed;
 pub mod snapshot;
 pub mod submit;
 pub mod sync;
@@ -27,6 +28,7 @@ pub use orders::{job_orders_prefix, order_id_from_key};
 pub use outcome::{SubmitLedger, QBLOCK_RETENTION};
 pub use real::RealChainClient;
 pub use scale_types::{MinerKind, MinerSpecScale, NodeDescriptorV2Input, NodeLogLevel};
+pub use seed::{encode_register_topology, encode_set_difficulty, SeedTopology};
 pub use snapshot::{head_state_key, DecayParams, MiningSnapshot};
 pub use submit::{
     classify_descriptor, classify_participation, classify_receipt, DescriptorOutcome,
