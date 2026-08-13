@@ -35,7 +35,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use subxt::config::substrate::H256;
 use subxt::ext::scale_value::{Composite, Primitive, ValueDef};
-use subxt::rpcs::client::reconnecting_rpc_client::ExponentialBackoff;
+use subxt::rpcs::client::reconnecting_rpc_client::{ExponentialBackoff, PingConfig};
 use subxt::rpcs::client::ReconnectingRpcClient;
 use subxt::transactions::TransactionStatus;
 use tokio::sync::OnceCell;
@@ -54,6 +54,23 @@ const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// when a peer is silent. Fifteen seconds still covers a loaded but working
 /// node; it does not wait a full minute before moving on.
 const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Interval between WebSocket pings on the cached subxt client.
+///
+/// A half-open socket, which a NAT or firewall idle timeout produces, raises
+/// no error. Without a ping the coordinator does not learn the link is dead
+/// until something tries to use it. Ten seconds is frequent enough to notice
+/// a drop long before a later submit needs the socket. The builder default
+/// also enables a ping, but that default is not ours to depend on.
+const RPC_WS_PING_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Time without a pong before the reconnecting client treats the socket as dead.
+///
+/// This must stay well above [`RPC_WS_PING_INTERVAL`] so one slow pong does
+/// not force a needless reconnect. Thirty seconds gives the peer two extra
+/// ping intervals after the first miss. `max_failures` stays at its default
+/// of 1.
+const RPC_WS_PING_INACTIVE_LIMIT: Duration = Duration::from_secs(30);
 
 /// subxt client for read-only, metadata-aware event decoding. Submit stays on
 /// the hybrid-signed jsonrpsee path — subxt is used only to decode mempool
@@ -142,6 +159,11 @@ impl RealChainClient {
                     )
                     .connection_timeout(RPC_CONNECT_TIMEOUT)
                     .request_timeout(RPC_REQUEST_TIMEOUT)
+                    .enable_ws_ping(
+                        PingConfig::new()
+                            .ping_interval(RPC_WS_PING_INTERVAL)
+                            .inactive_limit(RPC_WS_PING_INACTIVE_LIMIT),
+                    )
                     .build(&url)
                     .await
                     .map_err(|e| ChainError::Unavailable(format!("subxt connect: {e}")))?;
