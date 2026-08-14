@@ -251,6 +251,49 @@ pub fn default_topology_storage_key() -> Vec<u8> {
     key
 }
 
+/// `QuantumPow::QBlocks[block_number]` — the accepted proof for one block.
+///
+/// The map is `Blake2_128Concat` over `BlockNumberFor<T>`, which is `u32` on
+/// this runtime. The value begins with the winning account.
+#[must_use]
+pub fn qblocks_storage_key(block_number: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(16 + 16 + 16 + 4);
+    key.extend_from_slice(&twox128(b"QuantumPow"));
+    key.extend_from_slice(&twox128(b"QBlocks"));
+    let encoded = block_number.encode();
+    key.extend_from_slice(&blake2_128(&encoded));
+    key.extend_from_slice(&encoded);
+    key
+}
+
+/// `MinerRegistry::NodeDescriptors[account]` — presence proves the descriptor.
+#[must_use]
+pub fn node_descriptors_storage_key(account: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(16 + 16 + 16 + 32);
+    key.extend_from_slice(&twox128(b"MinerRegistry"));
+    key.extend_from_slice(&twox128(b"NodeDescriptors"));
+    key.extend_from_slice(&blake2_128(account));
+    key.extend_from_slice(account);
+    key
+}
+
+/// `MinerRegistry::ParticipantsByQBlock[qblock_id][account]`.
+///
+/// A double map key is `twox128(pallet) ++ twox128(item) ++ blake2_128(k1) ++
+/// k1 ++ blake2_128(k2) ++ k2`. Presence proves participation.
+#[must_use]
+pub fn participants_by_qblock_storage_key(qblock_id: u64, account: &[u8; 32]) -> Vec<u8> {
+    let encoded_id = qblock_id.encode();
+    let mut key = Vec::with_capacity(16 + 16 + 16 + 8 + 16 + 32);
+    key.extend_from_slice(&twox128(b"MinerRegistry"));
+    key.extend_from_slice(&twox128(b"ParticipantsByQBlock"));
+    key.extend_from_slice(&blake2_128(&encoded_id));
+    key.extend_from_slice(&encoded_id);
+    key.extend_from_slice(&blake2_128(account));
+    key.extend_from_slice(account);
+    key
+}
+
 /// Substrate `Twox128` of `data`: two `XxHash64` digests, seeds 0 and 1,
 /// concatenated little-endian.
 #[must_use]
@@ -431,5 +474,43 @@ mod tests {
             assert_eq!(&key[..16], &twox128(b"QuantumPow")[..]);
             assert_eq!(&key[16..], &twox128(b"DefaultTopology")[..]);
         }
+    }
+
+    #[test]
+    fn the_qblocks_key_is_a_blake2_128_concat_map_key() {
+        let key = qblocks_storage_key(1_121_300);
+        assert_eq!(key.len(), 16 + 16 + 16 + 4);
+        // Blake2_128Concat appends the SCALE-encoded key after its hash.
+        assert_eq!(
+            key.get(key.len() - 4..),
+            Some(1_121_300u32.encode().as_slice())
+        );
+        assert_ne!(qblocks_storage_key(1), qblocks_storage_key(2));
+    }
+
+    #[test]
+    fn the_node_descriptors_key_ends_with_the_account() {
+        let account = [7u8; 32];
+        let key = node_descriptors_storage_key(&account);
+        assert_eq!(key.len(), 16 + 16 + 16 + 32);
+        assert_eq!(key.get(key.len() - 32..), Some(account.as_slice()));
+        assert_ne!(
+            node_descriptors_storage_key(&[1u8; 32]),
+            node_descriptors_storage_key(&[2u8; 32])
+        );
+    }
+
+    #[test]
+    fn the_participants_key_is_a_blake2_128_concat_double_map() {
+        let account = [9u8; 32];
+        let key = participants_by_qblock_storage_key(42, &account);
+        assert_eq!(key.len(), 16 + 16 + 16 + 8 + 16 + 32);
+        assert_eq!(key.get(key.len() - 32..), Some(account.as_slice()));
+        let encoded = 42u64.encode();
+        assert_eq!(key.get(32 + 16..32 + 16 + 8), Some(encoded.as_slice()));
+        assert_ne!(
+            participants_by_qblock_storage_key(1, &account),
+            participants_by_qblock_storage_key(2, &account)
+        );
     }
 }

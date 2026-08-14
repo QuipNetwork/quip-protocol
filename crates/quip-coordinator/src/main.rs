@@ -380,6 +380,7 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
 
     let params = RuntimeParams {
         sock_path: format!("/tmp/quip-coordinator-{}.sock", std::process::id()),
+        max_submit_attempts: cfg.max_submit_attempts,
         grace_ms: 2000,
         backoff: BackoffPolicy::default(),
         miner_account,

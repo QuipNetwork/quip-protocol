@@ -9,7 +9,7 @@
 //!
 //! This module encodes the calls and drives the two-call seed sequence.
 
-use super::real::{RealChainClient, SignedCallOutcome};
+use super::real::{Confirmation, RealChainClient, SignedCallOutcome};
 use super::scale_types::{
     DifficultyConfig, MinerKind, QUANTUM_POW_PALLET_INDEX, REGISTER_TOPOLOGY_CALL_INDEX,
     SET_DIFFICULTY_CALL_INDEX, SUDO_CALL_INDEX, SUDO_PALLET_INDEX,
@@ -177,6 +177,7 @@ pub async fn seed_chain(params: SeedParams) -> Result<SeedReport, ChainError> {
         &client,
         &encode_register_topology(&params.topology),
         "register_topology",
+        Confirmation::DefaultTopology,
     )
     .await?;
 
@@ -203,6 +204,9 @@ pub async fn seed_chain(params: SeedParams) -> Result<SeedReport, ChainError> {
         &client,
         &encode_set_difficulty(expected, &params.difficulty),
         "set_difficulty",
+        Confirmation::Difficulty {
+            topology_hash: expected,
+        },
     )
     .await?;
 
@@ -216,9 +220,14 @@ pub async fn seed_chain(params: SeedParams) -> Result<SeedReport, ChainError> {
 }
 
 /// Submit one call and return the block that included it.
-async fn dispatch(client: &RealChainClient, call: &[u8], what: &str) -> Result<String, ChainError> {
+async fn dispatch(
+    client: &RealChainClient,
+    call: &[u8],
+    what: &str,
+    confirmation: Confirmation,
+) -> Result<String, ChainError> {
     tracing::info!(call = what, "submitting sudo call");
-    match client.submit_signed_call(call).await? {
+    match client.submit_signed_call(call, confirmation).await? {
         SignedCallOutcome::Success { block } => {
             tracing::info!(call = what, block = %block, "sudo call included");
             Ok(block)

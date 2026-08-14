@@ -415,6 +415,22 @@ fn build_adjacency(
 // Test
 // ----------------------------------------------------------------------------
 
+/// Install the coordinator's log subscriber so a failed submit reports the
+/// module error it hit. Without this, `submit_proof` logs the dispatch error at
+/// `warn` and the test sees only the classified action, which cannot say why.
+/// Ignores a second call, because both tests in this file may run together.
+fn init_test_logging() {
+    let level = std::env::var("QUIP_DEVNET_LOG")
+        .ok()
+        .and_then(|s| match s.as_str() {
+            "trace" => Some(quip_coordinator::logging::LogLevel::Trace),
+            "debug" => Some(quip_coordinator::logging::LogLevel::Debug),
+            _ => None,
+        })
+        .unwrap_or(quip_coordinator::logging::LogLevel::Info);
+    let _ = quip_coordinator::logging::init(Some(level));
+}
+
 #[tokio::test]
 #[ignore = "requires a live devnet; set QUIP_DEVNET=ws://host:port"]
 async fn devnet_submit_proof_end_to_end() {
@@ -422,6 +438,7 @@ async fn devnet_submit_proof_end_to_end() {
         eprintln!("QUIP_DEVNET unset; skipping live devnet test");
         return;
     };
+    init_test_logging();
 
     let alice = HybridPair::from_string("//Alice", None).expect("//Alice");
     let alice_acct = account_id_from_public(&alice.public());
@@ -700,6 +717,7 @@ async fn devnet_mempool_job_proposed_end_to_end() {
         eprintln!("QUIP_DEVNET unset; skipping live devnet mempool test");
         return;
     };
+    init_test_logging();
 
     let alice = HybridPair::from_string("//Alice", None).expect("//Alice");
     let alice_acct = account_id_from_public(&alice.public());

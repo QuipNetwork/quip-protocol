@@ -38,6 +38,9 @@ use tonic::transport::Server;
 pub struct RuntimeParams {
     /// Unix-domain socket the server binds and miners connect to.
     pub sock_path: String,
+    /// Consecutive failed submissions of one proof, inside one quantum block,
+    /// before the coordinator stops retrying it. From `[miner]` config.
+    pub max_submit_attempts: u32,
     /// Grace period (ms) between an in-band `Shutdown` and a hard kill.
     pub grace_ms: u32,
     /// Restart backoff + failure budget applied to each miner.
@@ -82,6 +85,9 @@ pub struct FeederParams {
     pub descriptor: DescriptorParams,
     /// Set after the first `DescriptorFiled` walk in this process.
     pub descriptor_filed: Arc<AtomicBool>,
+    /// Consecutive failed submissions of one proof, inside one quantum block,
+    /// before the coordinator stops retrying it.
+    pub max_submit_attempts: u32,
 }
 
 /// EMA smoothing for the per-miner consumption signal. Lower reacts slower but
@@ -509,6 +515,8 @@ pub async fn feeder_loop<C>(
     let faucet = build_faucet(params.funding.faucet_url.as_deref());
     let mut round: Option<RoundState> = None;
     let mut last_declared: Option<u64> = None;
+    // Consecutive failed submits of one proof in one quantum block.
+    let mut submit_ledger = crate::chain::SubmitLedger::new(params.max_submit_attempts);
 
     loop {
         let (snap, state_now) = match chain
@@ -834,6 +842,8 @@ pub async fn feeder_loop<C>(
                     Ok(SubmitAction::Success) => {
                         let mut st = state.lock().await;
                         st.stash.mark_submitted(&cand.job_id);
+                        let qblock_key = st.qblock_id.unwrap_or(0);
+                        submit_ledger.record_success(qblock_key, &cand.job_id);
                         st.current_best_milli = Some(cand.best_energy_milli);
                         let qblock_id = st.qblock_id;
                         let body = crate::attempt::summary_body(
@@ -847,10 +857,23 @@ pub async fn feeder_loop<C>(
                         }
                     }
                     Ok(SubmitAction::Retry) => {
-                        // Retryable reject (e.g. InsufficientEnergy / ProofLimit):
-                        // leave the candidate in the stash so a later due-window
-                        // resubmits it; do NOT mark_submitted.
-                        tracing::warn!(job = %job_hex, "win-time submit rejected (retryable); leaving stashed");
+                        let qblock_key = state.lock().await.qblock_id.unwrap_or(0);
+                        let decided = submit_ledger.record_failure(qblock_key, &cand.job_id);
+                        let attempts = submit_ledger.attempts(qblock_key, &cand.job_id);
+                        if decided == SubmitAction::StopFatal {
+                            tracing::error!(
+                                job = %job_hex,
+                                attempts,
+                                "win-time submit refused repeatedly; stopping this proof"
+                            );
+                            state.lock().await.stash.mark_submitted(&cand.job_id);
+                        } else {
+                            tracing::warn!(
+                                job = %job_hex,
+                                attempts,
+                                "win-time submit rejected (retryable); leaving stashed"
+                            );
+                        }
                     }
                     Ok(SubmitAction::StopRoundStale) => {
                         // Stale for this round (e.g. InvalidNonce / topology moved);
@@ -968,6 +991,7 @@ where
             funding: params.funding,
             descriptor: params.descriptor,
             descriptor_filed: params.descriptor_filed,
+            max_submit_attempts: params.max_submit_attempts,
         },
         stop_rx.clone(),
     ));

@@ -72,26 +72,15 @@ impl fmt::Display for LogLevel {
 }
 
 /// Targets whose events are the coordinator's own operational narration. Third
-/// party crates (jsonrpsee, subxt, tonic, hyper) stay at `warn` under the
-/// default filter so `--log-level debug` stays readable; `RUST_LOG` is the
-/// escape hatch when their internals are what you actually need. Miner child
-/// processes inherit the coordinator stdio and emit under their own subscriber,
-/// so they are not listed here.
+/// party crates (jsonrpsee, tonic, hyper) stay at `warn` under the default
+/// filter so `--log-level debug` stays readable; `RUST_LOG` is the escape hatch
+/// when their internals are what you actually need. Miner child processes
+/// inherit the coordinator stdio and emit under their own subscriber, so they
+/// are not listed here.
 const OWN_TARGETS: [&str; 3] = ["quip_coordinator", "quip_protocol", "quip_miner_core"];
 
-/// Third-party reconnect target pinned at `debug` in the default filter.
-///
-/// This does not belong in [`OWN_TARGETS`]. That array is our own narration,
-/// shown at the operator's chosen level. This target is a third-party crate
-/// and stays at a fixed `debug` so a drop and a recovery stay visible when
-/// `--log-level` is `info`. The module has three `tracing` calls, and each
-/// fires only on a connection transition: close, re-establish, and give-up.
-/// Reporting those edges keeps the signal without per-call volume.
-const RECONNECT_RPC_TARGET: &str = "subxt-reconnecting-rpc-client";
-
 /// Build the default filter for `level`: third-party crates at `warn`, this
-/// coordinator's own targets at `level`, and the reconnecting RPC client at
-/// a fixed `debug`.
+/// coordinator's own targets at `level`.
 fn default_filter(level: LogLevel) -> String {
     let mut s = String::from("warn");
     for target in OWN_TARGETS {
@@ -100,9 +89,6 @@ fn default_filter(level: LogLevel) -> String {
         s.push('=');
         s.push_str(level.as_str());
     }
-    s.push(',');
-    s.push_str(RECONNECT_RPC_TARGET);
-    s.push_str("=debug");
     s
 }
 
@@ -205,24 +191,9 @@ mod tests {
     }
 
     #[test]
-    fn default_filter_pins_reconnect_target_at_debug() {
-        for level in [
-            LogLevel::Trace,
-            LogLevel::Debug,
-            LogLevel::Info,
-            LogLevel::Warn,
-            LogLevel::Error,
-        ] {
-            let d = default_filter(level);
-            assert!(d.contains("subxt-reconnecting-rpc-client=debug"), "{d}");
-        }
-    }
-
-    #[test]
-    fn rust_log_still_wins_over_reconnect_default() {
+    fn rust_log_still_wins_over_the_default_filter() {
         let d = resolve_directives(None, Some("warn"));
         assert_eq!(d, "warn");
-        assert!(!d.contains("subxt-reconnecting-rpc-client"), "{d}");
     }
 
     #[test]
