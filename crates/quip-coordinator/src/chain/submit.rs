@@ -118,6 +118,31 @@ pub fn classify_participation(error: Option<&str>) -> Option<ParticipationOutcom
     None
 }
 
+/// Outcome of a `QuantumPow.register_miner` submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationOutcome {
+    /// The registration landed and the deposit is reserved.
+    Registered,
+    /// This account was already in `QuantumPow.Miners`. Treat as success.
+    AlreadyRegistered,
+}
+
+/// Classify a `register_miner` pallet error. `None` is a successful dispatch.
+///
+/// Only the already-registered race is benign. Everything else — a deposit the
+/// account cannot cover above all — stays `None` so the caller reports it and
+/// retries rather than marking the miner ready to submit proofs it cannot land.
+#[must_use]
+pub fn classify_registration(error: Option<&str>) -> Option<RegistrationOutcome> {
+    let Some(e) = error else {
+        return Some(RegistrationOutcome::Registered);
+    };
+    if e.contains("MinerAlreadyRegistered") {
+        return Some(RegistrationOutcome::AlreadyRegistered);
+    }
+    None
+}
+
 /// Classify a pallet/dispatch error string into a fire-loop action.
 ///
 /// Mirrors `substrate/submitter.py:_classify_receipt`. Unknown → fail loud.
@@ -194,6 +219,21 @@ mod tests {
             Some(DescriptorOutcome::Rejected)
         );
         assert_eq!(classify_descriptor(Some("SomethingUnknown")), None);
+    }
+
+    #[test]
+    fn classifies_registration_errors() {
+        assert_eq!(
+            classify_registration(None),
+            Some(RegistrationOutcome::Registered)
+        );
+        assert_eq!(
+            classify_registration(Some("QuantumPow: MinerAlreadyRegistered")),
+            Some(RegistrationOutcome::AlreadyRegistered)
+        );
+        // A deposit the account cannot reserve must not read as success.
+        assert_eq!(classify_registration(Some("InsufficientBalance")), None);
+        assert_eq!(classify_registration(Some("SomethingUnknown")), None);
     }
 
     #[test]

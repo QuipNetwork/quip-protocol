@@ -93,6 +93,7 @@ async fn runtime_serves_supervises_and_shuts_down_clean() {
         grace_ms: 500,
         backoff: BackoffPolicy::default(),
         // Lifecycle test only: buffer_depth 0 disables feeding.
+        miner_identity: [0u8; 32],
         miner_account: [0u8; 32],
         buffer_depth: 0,
         poll_interval_ms: 200,
@@ -101,6 +102,7 @@ async fn runtime_serves_supervises_and_shuts_down_clean() {
         funding: quip_coordinator::funding::FundingParams::default(),
         descriptor: quip_coordinator::config::DescriptorParams::default(),
         descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let (trigger_tx, trigger_rx) = oneshot::channel::<()>();
 
@@ -194,12 +196,14 @@ async fn feeder_tops_up_to_buffer_depth_records_salts_and_sets_target() {
         Arc::clone(&state),
         FeederParams {
             max_submit_attempts: 5,
+            miner_identity: [0u8; 32],
             miner_account: [0u8; 32],
             buffer_depth: 4,
             poll_interval: Duration::from_millis(50),
             funding: quip_coordinator::funding::FundingParams::default(),
             descriptor: quip_coordinator::config::DescriptorParams::default(),
             descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
         stop_rx,
     ));
@@ -230,6 +234,145 @@ async fn feeder_tops_up_to_buffer_depth_records_salts_and_sets_target() {
         .expect("feeder task panicked");
 }
 
+/// The signing account and the `PoW` identity are two different 32-byte values
+/// derived from one key, and each has exactly one correct destination. Funding
+/// the identity leaves the signer broke, so every submit fails with "Inability
+/// to pay some fees"; deriving nonces from the account makes every proof fail
+/// `InvalidNonce`. Neither failure names the mix-up, so pin both routes here.
+#[tokio::test]
+async fn feeder_funds_the_account_and_derives_jobs_from_the_identity() {
+    use quip_protocol::derive::derive_nonce;
+
+    const IDENTITY: [u8; 32] = [0x11; 32];
+    const ACCOUNT: [u8; 32] = [0x22; 32];
+    const HEAD: [u8; 32] = [0x33; 32];
+
+    let chain = Arc::new(FakeChain::new(snapshot_with_head(HEAD), None));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    state
+        .lock()
+        .await
+        .router
+        .register_miner("cpu-0", ising_caps());
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        FeederParams {
+            max_submit_attempts: 5,
+            miner_identity: IDENTITY,
+            miner_account: ACCOUNT,
+            buffer_depth: 2,
+            poll_interval: Duration::from_millis(30),
+            funding: quip_coordinator::funding::FundingParams::default(),
+            descriptor: quip_coordinator::config::DescriptorParams::default(),
+            descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+        stop_rx,
+    ));
+
+    let mut filled = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        if state.lock().await.router.staged_len("cpu-0") >= 2 {
+            filled = true;
+            break;
+        }
+    }
+    assert!(filled, "feeder never staged any jobs");
+
+    let checked = chain.take_balance_accounts();
+    assert!(!checked.is_empty(), "funding never read a balance");
+    assert!(
+        checked.iter().all(|a| *a == ACCOUNT),
+        "funding must read the signing account, not the PoW identity: {checked:?}"
+    );
+
+    let st = state.lock().await;
+    assert!(!st.salts.is_empty(), "no salts recorded for staged jobs");
+    for (job_id, salt) in &st.salts {
+        assert_eq!(
+            job_id.as_slice(),
+            derive_nonce(HEAD, IDENTITY, *salt).as_slice(),
+            "job nonce must derive from the PoW identity"
+        );
+        assert_ne!(
+            job_id.as_slice(),
+            derive_nonce(HEAD, ACCOUNT, *salt).as_slice(),
+            "job nonce must not derive from the signing account"
+        );
+    }
+    drop(st);
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+}
+
+/// Registration sits between funding and requirements. A coordinator that
+/// cannot register must not mine: the pallet rejects every proof from an
+/// unregistered account, and the account still pays for each attempt.
+#[tokio::test]
+async fn feeder_registers_once_and_holds_off_mining_until_it_succeeds() {
+    let chain = Arc::new(FakeChain::new(ising_snapshot(), None));
+    chain.set_registration_result(Err(quip_coordinator::chain::ChainError::Unavailable(
+        "rpc down".into(),
+    )));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+    state
+        .lock()
+        .await
+        .router
+        .register_miner("cpu-0", ising_caps());
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        feeder_params(2, 30),
+        stop_rx,
+    ));
+
+    // Registration keeps failing, so the walk never reaches staging.
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            state.lock().await.router.staged_len("cpu-0"),
+            0,
+            "an unregistered miner must not be fed work"
+        );
+    }
+
+    chain.set_registration_result(Ok(quip_coordinator::chain::RegistrationOutcome::Registered));
+    let mut filled = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        if state.lock().await.router.staged_len("cpu-0") >= 2 {
+            filled = true;
+            break;
+        }
+    }
+    assert!(filled, "mining never started after registration succeeded");
+
+    let submits = chain.registration_submits();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert_eq!(
+        chain.registration_submits(),
+        submits,
+        "later rounds must not re-submit register_miner"
+    );
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+}
+
 #[tokio::test]
 async fn feeder_grows_window_for_drainer_and_holds_floor_for_idle() {
     let chain = Arc::new(FakeChain::new(ising_snapshot(), None));
@@ -252,12 +395,14 @@ async fn feeder_grows_window_for_drainer_and_holds_floor_for_idle() {
         Arc::clone(&state),
         FeederParams {
             max_submit_attempts: 5,
+            miner_identity: [0u8; 32],
             miner_account: [0u8; 32],
             buffer_depth: FLOOR,
             poll_interval: Duration::from_millis(30),
             funding: quip_coordinator::funding::FundingParams::default(),
             descriptor: quip_coordinator::config::DescriptorParams::default(),
             descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
         stop_rx,
     ));
@@ -316,12 +461,14 @@ async fn feeder_broadcasts_set_target_once_per_difficulty() {
         Arc::clone(&state),
         FeederParams {
             max_submit_attempts: 5,
+            miner_identity: [0u8; 32],
             miner_account: [0u8; 32],
             buffer_depth: 4,
             poll_interval: Duration::from_millis(50),
             funding: quip_coordinator::funding::FundingParams::default(),
             descriptor: quip_coordinator::config::DescriptorParams::default(),
             descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
         stop_rx,
     ));
@@ -373,12 +520,14 @@ async fn feeder_broadcasts_set_target_once_per_difficulty() {
 fn feeder_params(buffer_depth: usize, poll_ms: u64) -> FeederParams {
     FeederParams {
         max_submit_attempts: 5,
+        miner_identity: [0u8; 32],
         miner_account: [0u8; 32],
         buffer_depth,
         poll_interval: Duration::from_millis(poll_ms),
         funding: quip_coordinator::funding::FundingParams::default(),
         descriptor: quip_coordinator::config::DescriptorParams::default(),
         descriptor_filed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        miner_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
 }
 

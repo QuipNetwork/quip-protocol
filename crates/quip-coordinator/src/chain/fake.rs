@@ -3,7 +3,7 @@
 use super::sync::{SyncSource, SyncStatus};
 use super::{
     ChainClient, ChainError, DecayParams, DescriptorOutcome, JobOrder, MiningSnapshot,
-    NodeDescriptorV2Input, ParticipationOutcome, Proof, SubmitAction,
+    NodeDescriptorV2Input, ParticipationOutcome, Proof, RegistrationOutcome, SubmitAction,
 };
 use crate::funding::BalanceSource;
 use async_trait::async_trait;
@@ -36,6 +36,16 @@ pub struct FakeChain {
     descriptors: Mutex<Vec<NodeDescriptorV2Input>>,
     /// Scripted descriptor result (default `Filed`).
     descriptor_result: Mutex<Result<DescriptorOutcome, ChainError>>,
+    /// Scripted `QuantumPow.Miners` presence for the signing account.
+    registered: Mutex<bool>,
+    /// Scripted `register_miner` result (default `Registered`).
+    registration_result: Mutex<Result<RegistrationOutcome, ChainError>>,
+    /// Calls to [`ChainClient::ensure_miner_registered`], submitted or not.
+    registration_calls: Mutex<usize>,
+    /// Calls that reached the submit path (the account was not registered).
+    registration_submits: Mutex<usize>,
+    /// Accounts passed to [`BalanceSource::free_balance`], in call order.
+    balance_accounts: Mutex<Vec<[u8; 32]>>,
 }
 
 impl FakeChain {
@@ -63,6 +73,11 @@ impl FakeChain {
             participation_result: Mutex::new(Ok(ParticipationOutcome::Declared)),
             descriptors: Mutex::new(Vec::new()),
             descriptor_result: Mutex::new(Ok(DescriptorOutcome::Filed)),
+            registered: Mutex::new(false),
+            registration_result: Mutex::new(Ok(RegistrationOutcome::Registered)),
+            registration_calls: Mutex::new(0),
+            registration_submits: Mutex::new(0),
+            balance_accounts: Mutex::new(Vec::new()),
         }
     }
 
@@ -283,6 +298,80 @@ impl FakeChain {
         }
     }
 
+    /// Script whether `QuantumPow.Miners` already holds the signing account.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_registered(&self, registered: bool) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.registered.lock().unwrap() = registered;
+        }
+    }
+
+    /// Script the next `ensure_miner_registered` submit result.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    pub fn set_registration_result(&self, result: Result<RegistrationOutcome, ChainError>) {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.registration_result.lock().unwrap() = result;
+        }
+    }
+
+    /// How many times `ensure_miner_registered` has been called.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn registration_calls(&self) -> usize {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.registration_calls.lock().unwrap()
+        }
+    }
+
+    /// How many `register_miner` extrinsics the fake chain was asked to submit.
+    /// An already-registered account submits none.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn registration_submits(&self) -> usize {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.registration_submits.lock().unwrap()
+        }
+    }
+
+    /// Drain and return the accounts passed to `free_balance`, in call order.
+    ///
+    /// # Panics
+    /// Panics if a prior holder poisoned this mutex.
+    #[must_use]
+    pub fn take_balance_accounts(&self) -> Vec<[u8; 32]> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            std::mem::take(&mut *self.balance_accounts.lock().unwrap())
+        }
+    }
+
     /// Drain and return captured descriptor payloads.
     ///
     /// # Panics
@@ -340,6 +429,31 @@ impl ChainClient for FakeChain {
             // reconstruct Success/Retry/etc from a stored pattern.
             match &*self.submit_result.lock().unwrap() {
                 Ok(a) => Ok(*a),
+                Err(ChainError::Unavailable(s)) => Err(ChainError::Unavailable(s.clone())),
+                Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
+                Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),
+            }
+        }
+    }
+
+    async fn ensure_miner_registered(&self) -> Result<RegistrationOutcome, ChainError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "test double; Mutex poison is a test failure"
+        )]
+        {
+            *self.registration_calls.lock().unwrap() += 1;
+            // Mirrors the real client: read the map first, submit only when the
+            // account is absent.
+            if *self.registered.lock().unwrap() {
+                return Ok(RegistrationOutcome::AlreadyRegistered);
+            }
+            *self.registration_submits.lock().unwrap() += 1;
+            match &*self.registration_result.lock().unwrap() {
+                Ok(o) => {
+                    *self.registered.lock().unwrap() = true;
+                    Ok(*o)
+                }
                 Err(ChainError::Unavailable(s)) => Err(ChainError::Unavailable(s.clone())),
                 Err(ChainError::Decode(s)) => Err(ChainError::Decode(s.clone())),
                 Err(ChainError::Submit(s)) => Err(ChainError::Submit(s.clone())),
@@ -411,13 +525,14 @@ impl ChainClient for FakeChain {
 
 #[async_trait]
 impl BalanceSource for FakeChain {
-    async fn free_balance(&self, _account: [u8; 32]) -> Result<u128, String> {
+    async fn free_balance(&self, account: [u8; 32]) -> Result<u128, String> {
         #[expect(
             clippy::unwrap_used,
             reason = "test double; Mutex poison is a test failure"
         )]
         {
             *self.balance_calls.lock().unwrap() += 1;
+            self.balance_accounts.lock().unwrap().push(account);
             self.balance.lock().unwrap().clone()
         }
     }

@@ -49,10 +49,11 @@ use quantum_validation::{
 };
 use quip_coordinator::chain::extrinsic::{
     build_hybrid_signed_extrinsic, hex_decode, hex_encode, miner_identity_bytes,
-    SignedExtensionContext,
+    miners_storage_key, SignedExtensionContext,
 };
 use quip_coordinator::chain::scale_types::{
-    IsingParams, JobMode, MiningSnapshotScale, ResultDelivery, RewardResolution,
+    encode_register_miner_call, IsingParams, JobMode, MiningSnapshotScale, ResultDelivery,
+    RewardResolution,
 };
 use quip_coordinator::chain::submit::SubmitAction;
 use quip_coordinator::chain::{ChainClient, JobOrder, RealChainClient};
@@ -65,7 +66,6 @@ use quip_transaction_crypto::{account_id_from_public, HybridPair};
 use sp_core::Pair;
 
 const QUANTUM_POW_PALLET: u8 = 10;
-const REGISTER_MINER_CALL: u8 = 0;
 
 /// `QuantumPow` `Error` variants in declaration order (module error index).
 const POW_ERRORS: &[&str] = &[
@@ -210,7 +210,8 @@ async fn account_nonce(url: &str, acct: &[u8; 32]) -> u32 {
 }
 
 async fn miner_proofs_submitted(url: &str, acct: &[u8; 32]) -> Option<u32> {
-    let key = map_key(b"QuantumPow", b"Miners", acct);
+    // The production key builder, so a live chain checks it too.
+    let key = miners_storage_key(acct);
     let bytes = get_storage(url, &key, None).await?;
     MinerInfoLite::decode(&mut &bytes[..])
         .map(|m| m.proofs_submitted)
@@ -504,7 +505,7 @@ async fn devnet_submit_proof_end_to_end() {
     if miner_proofs_submitted(&url, &alice_bytes).await.is_none() {
         let nonce = account_nonce(&url, &alice_bytes).await;
         let ctx = fetch_ext_ctx(&url, nonce).await;
-        let call = vec![QUANTUM_POW_PALLET, REGISTER_MINER_CALL];
+        let call = encode_register_miner_call();
         let ext = build_hybrid_signed_extrinsic(&alice, &call, &ctx);
         let block = submit_and_confirm(&url, &hex_encode(&ext), "register_miner", |u| async move {
             miner_proofs_submitted(&u, &alice_bytes).await.is_some()

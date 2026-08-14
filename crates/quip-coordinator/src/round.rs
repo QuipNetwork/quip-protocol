@@ -14,6 +14,8 @@ pub(crate) enum RoundState {
     ValidatorSynced,
     /// Confirm the miner account can pay submit fees.
     AccountFunded,
+    /// Confirm the signing account is in `QuantumPow.Miners`.
+    MinerRegistered,
     /// Download topology, target, minimum solutions, and diversity.
     RequirementsDownloaded,
     /// File a node descriptor. Submits only on the first walk after process start.
@@ -54,7 +56,8 @@ impl RoundState {
             RoundEvent::Succeeded => match self {
                 Self::StopMining => Some(Self::ValidatorSynced),
                 Self::ValidatorSynced => Some(Self::AccountFunded),
-                Self::AccountFunded => Some(Self::RequirementsDownloaded),
+                Self::AccountFunded => Some(Self::MinerRegistered),
+                Self::MinerRegistered => Some(Self::RequirementsDownloaded),
                 Self::RequirementsDownloaded => Some(Self::DescriptorFiled),
                 Self::DescriptorFiled => Some(Self::ParticipationDeclared),
                 Self::ParticipationDeclared => Some(Self::StartMining),
@@ -70,6 +73,7 @@ impl RoundState {
             Self::StopMining => "stop_mining",
             Self::ValidatorSynced => "validator_synced",
             Self::AccountFunded => "account_funded",
+            Self::MinerRegistered => "miner_registered",
             Self::RequirementsDownloaded => "requirements_downloaded",
             Self::DescriptorFiled => "descriptor_filed",
             Self::ParticipationDeclared => "participation_declared",
@@ -84,6 +88,7 @@ impl RoundState {
             Self::StopMining => "stopping miners; a new qblock ended the round",
             Self::ValidatorSynced => "waiting until the validator is synced",
             Self::AccountFunded => "confirming the miner account can pay submit fees",
+            Self::MinerRegistered => "registering the signing account as a miner on chain",
             Self::RequirementsDownloaded => "downloading the next qblock requirements",
             Self::DescriptorFiled => "filing the node descriptor",
             Self::ParticipationDeclared => "declaring participation for the candidate qblock",
@@ -128,10 +133,11 @@ mod tests {
         }
     }
 
-    const ALL: [RoundState; 7] = [
+    const ALL: [RoundState; 8] = [
         RoundState::StopMining,
         RoundState::ValidatorSynced,
         RoundState::AccountFunded,
+        RoundState::MinerRegistered,
         RoundState::RequirementsDownloaded,
         RoundState::DescriptorFiled,
         RoundState::ParticipationDeclared,
@@ -142,7 +148,7 @@ mod tests {
     fn full_round_visits_each_state_in_order() {
         let mut state = RoundState::start();
         let mut seen = vec![state];
-        for _ in 0..6 {
+        for _ in 0..7 {
             state = step(state, RoundEvent::Succeeded);
             seen.push(state);
         }
@@ -203,7 +209,7 @@ mod tests {
     #[test]
     fn a_win_during_mining_restarts_the_round() {
         let mut state = RoundState::start();
-        for _ in 0..6 {
+        for _ in 0..7 {
             state = step(state, RoundEvent::Succeeded);
         }
         assert_eq!(state, RoundState::StartMining);

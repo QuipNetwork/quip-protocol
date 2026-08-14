@@ -206,6 +206,10 @@ pub const SUBMIT_PROOF_CALL_INDEX: u8 = 4;
 pub const SUDO_PALLET_INDEX: u8 = 6;
 /// `pallet_sudo::Call::sudo` call index.
 pub const SUDO_CALL_INDEX: u8 = 0;
+/// `QuantumPow::register_miner` call index. Takes no arguments; the origin is
+/// the miner. `QuantumPow::submit_proof` rejects any account that has not made
+/// this call with `MinerNotRegistered`.
+pub const REGISTER_MINER_CALL_INDEX: u8 = 0;
 /// `QuantumPow::register_topology` call index.
 pub const REGISTER_TOPOLOGY_CALL_INDEX: u8 = 2;
 /// `QuantumPow::set_difficulty` call index.
@@ -385,6 +389,15 @@ pub fn encode_submit_proof_call(proof: &QuantumProof) -> Vec<u8> {
     // Call args: single composite field `proof`.
     out.extend(proof.encode());
     out
+}
+
+/// SCALE-encode the `QuantumPow.register_miner()` call body.
+///
+/// The call takes no arguments, so the body is the two dispatch indices. The
+/// deposit is reserved from the signing account.
+#[must_use]
+pub fn encode_register_miner_call() -> Vec<u8> {
+    vec![QUANTUM_POW_PALLET_INDEX, REGISTER_MINER_CALL_INDEX]
 }
 
 /// SCALE-encode `MinerRegistry.participate(qblock_id, kind, budget_seconds)`.
@@ -570,6 +583,15 @@ mod tests {
         assert_eq!(some.first().copied(), Some(1));
         assert_eq!(some.get(1..), Some(info.encode().as_slice()));
         assert_ne!(some, vec![1]);
+    }
+
+    #[test]
+    fn register_miner_call_is_the_two_dispatch_indices() {
+        let call = encode_register_miner_call();
+        assert_eq!(call, [QUANTUM_POW_PALLET_INDEX, REGISTER_MINER_CALL_INDEX]);
+        // The call takes no arguments, so anything longer is an encoding bug.
+        assert_eq!(call.len(), 2);
+        assert_ne!(REGISTER_MINER_CALL_INDEX, SUBMIT_PROOF_CALL_INDEX);
     }
 
     #[test]

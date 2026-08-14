@@ -181,11 +181,21 @@ pub fn load_hybrid_pair(signer_key: &str) -> Result<HybridPair, String> {
         .map_err(|e| format!("cannot derive a signer from {signer_key:?}: {e:?}"))
 }
 
+/// The 32-byte `AccountId32` this pair signs and pays with.
+///
+/// This is the address the chain debits for fees, reserves deposits from, and
+/// keys every per-signer storage map by. It is **not** [`miner_identity_bytes`].
+#[must_use]
+pub fn signer_account_bytes(pair: &HybridPair) -> [u8; 32] {
+    *AsRef::<[u8; 32]>::as_ref(&account_id_from_public(&pair.public()))
+}
+
 /// Derive the 32-byte miner identity used in `derive_nonce`.
 ///
 /// Matches the pallet: `blake2_256(account.encode())` where account is the
 /// SCALE-encoded `AccountId32` (32 raw bytes, no length prefix beyond the
-/// fixed array encoding).
+/// fixed array encoding). This is a `PoW` input only — it is not an address,
+/// holds no balance, and nothing on chain is keyed by it.
 #[must_use]
 pub fn miner_identity_bytes(pair: &HybridPair) -> [u8; 32] {
     let account = account_id_from_public(&pair.public());
@@ -206,15 +216,23 @@ pub fn job_orders_storage_key(order_id: u64) -> Vec<u8> {
     key
 }
 
-/// `QuantumPow` `Blake2_128Concat` storage-map key for a 32-byte topology hash
-/// (`H256` encodes as its raw 32 bytes, no length prefix).
-fn quantum_pow_map_key(item: &[u8], topology_hash: &[u8; 32]) -> Vec<u8> {
+/// `QuantumPow` `Blake2_128Concat` storage-map key for any 32-byte map key.
+/// Both `H256` and `AccountId32` encode as their raw 32 bytes, with no length
+/// prefix.
+fn quantum_pow_map_key(item: &[u8], map_key: &[u8; 32]) -> Vec<u8> {
     let mut key = Vec::with_capacity(16 + 16 + 16 + 32);
     key.extend_from_slice(&twox128(b"QuantumPow"));
     key.extend_from_slice(&twox128(item));
-    key.extend_from_slice(&blake2_128(topology_hash));
-    key.extend_from_slice(topology_hash);
+    key.extend_from_slice(&blake2_128(map_key));
+    key.extend_from_slice(map_key);
     key
+}
+
+/// `QuantumPow::Miners[account]` — presence proves the account registered and
+/// its deposit is reserved. `submit_proof` rejects any other account.
+#[must_use]
+pub fn miners_storage_key(account: &[u8; 32]) -> Vec<u8> {
+    quantum_pow_map_key(b"Miners", account)
 }
 
 /// `QuantumPow::Difficulties[topology_hash]` — base (un-decayed) `DifficultyConfig`.
@@ -413,6 +431,89 @@ mod tests {
         assert_eq!(id.len(), 32);
         // Deterministic.
         assert_eq!(id, miner_identity_bytes(&pair));
+    }
+
+    #[test]
+    fn the_signing_account_is_never_the_miner_identity() {
+        let pair = HybridPair::from_string("//Alice", None).expect("alice");
+        let account = signer_account_bytes(&pair);
+        let identity = miner_identity_bytes(&pair);
+        // The identity is a hash *of* the account, so the two addresses can
+        // never coincide. Paying fees from one while funding the other is the
+        // shape of the bug this asserts against.
+        assert_ne!(account, identity);
+        assert_eq!(identity, blake2_256(account.as_slice()));
+        assert_eq!(account, signer_account_bytes(&pair));
+    }
+
+    /// Pins the identity to the pallet expression it mirrors, character for
+    /// character: `pallet_quantum_pow::Pallet::account_to_bytes` is
+    /// `blake2_256(&account.encode())`, and `submit_proof` feeds its result to
+    /// `derive_nonce` before rejecting a mismatch with `InvalidNonce`. Drift
+    /// here is silent — every proof simply stops verifying — so assert against
+    /// the SCALE encoding rather than against the raw account bytes.
+    #[test]
+    fn the_miner_identity_mirrors_the_pallet_account_to_bytes() {
+        let pair = HybridPair::from_string("//Alice", None).expect("alice");
+        let account_id = account_id_from_public(&pair.public());
+
+        // The pallet expression, spelled out.
+        let pallet_account_to_bytes = blake2_256(&account_id.encode());
+        assert_eq!(miner_identity_bytes(&pair), pallet_account_to_bytes);
+
+        // The two agree only because AccountId32 SCALE-encodes as its 32 raw
+        // bytes with no length prefix. Pin that, so a codec change surfaces
+        // here instead of as InvalidNonce on a live chain.
+        let raw: [u8; 32] = *AsRef::<[u8; 32]>::as_ref(&account_id);
+        assert_eq!(account_id.encode(), raw.to_vec());
+    }
+
+    /// The coordinator derives job nonces with `quip_protocol::derive`, while
+    /// the pallet validates them with `quantum_validation`. These are separate
+    /// implementations of the same BLAKE3 composition, so a change to either
+    /// one alone invalidates every proof. Cross-check them over the identity.
+    #[test]
+    fn both_derive_nonce_implementations_agree_over_the_identity() {
+        let pair = HybridPair::from_string("//Alice", None).expect("alice");
+        let identity = miner_identity_bytes(&pair);
+        let head = [0x33u8; 32];
+        let salt = [0x44u8; 32];
+
+        let coordinator = quip_protocol::derive::derive_nonce(head, identity, salt);
+        let pallet: U256 = quantum_validation::derive_nonce(&head, &identity, &salt);
+        assert_eq!(pallet, U256::from_big_endian(&coordinator));
+
+        // The account is not an accepted substitute for the identity anywhere
+        // on this path.
+        let from_account =
+            quip_protocol::derive::derive_nonce(head, signer_account_bytes(&pair), salt);
+        assert_ne!(coordinator, from_account);
+    }
+
+    #[test]
+    fn the_miners_key_ends_with_the_account() {
+        let account = [5u8; 32];
+        let key = miners_storage_key(&account);
+        assert_eq!(key.len(), 16 + 16 + 16 + 32);
+        assert_eq!(key.get(key.len() - 32..), Some(account.as_slice()));
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "length is asserted to 80 bytes above"
+        )]
+        {
+            assert_eq!(&key[..16], &twox128(b"QuantumPow")[..]);
+            assert_eq!(&key[16..32], &twox128(b"Miners")[..]);
+            assert_eq!(&key[32..48], &blake2_128(&account)[..]);
+        }
+        assert_ne!(
+            miners_storage_key(&[1u8; 32]),
+            miners_storage_key(&[2u8; 32])
+        );
+        // Same hasher shape, different item: the two must not collide.
+        assert_ne!(
+            miners_storage_key(&account),
+            difficulties_storage_key(&account)
+        );
     }
 
     #[test]

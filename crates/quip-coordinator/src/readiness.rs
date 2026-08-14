@@ -2,9 +2,9 @@
 //!
 //! Process start has no miners to stop and does not stage work. This module
 //! drives [`crate::round::RoundState`] through validator-synced, account-funded,
-//! requirements-downloaded, descriptor-filed, and participation-declared. The
-//! feeder drives the same machine, including stop-mining and start-mining, on
-//! every later round.
+//! miner-registered, requirements-downloaded, descriptor-filed, and
+//! participation-declared. The feeder drives the same machine, including
+//! stop-mining and start-mining, on every later round.
 //!
 //! A funding failure at startup is fatal. A missing snapshot is not: the
 //! caller warns and the feeder retries after miners connect.
@@ -17,6 +17,7 @@ use crate::chain::scale_types::{
 use crate::chain::sync::{wait_until_synced, SyncOutcome, SyncSource};
 use crate::chain::{
     ChainClient, DescriptorOutcome, MiningSnapshot, NodeDescriptorV2Input, ParticipationOutcome,
+    RegistrationOutcome,
 };
 use crate::config::DescriptorParams;
 use crate::funding::{
@@ -49,6 +50,17 @@ impl std::fmt::Display for ReadinessError {
 
 impl std::error::Error for ReadinessError {}
 
+/// Steps that must happen once per process, not once per round.
+///
+/// Both start clear and are set when their step is known done, so the feeder's
+/// re-walk of the same states is cheap and does not re-submit.
+pub struct ProcessLatches<'a> {
+    /// Set after the node descriptor is filed, rejected, or given up on.
+    pub descriptor_filed: &'a AtomicBool,
+    /// Set once `QuantumPow.Miners` is known to hold the signing account.
+    pub miner_registered: &'a AtomicBool,
+}
+
 /// Build a faucet client from a URL. A URL that will not even construct a
 /// client is reported and then treated as absent.
 #[must_use]
@@ -64,10 +76,14 @@ pub fn build_faucet(url: Option<&str>) -> Option<HttpFaucet> {
 }
 
 /// Drive the round machine through validator-synced, account-funded,
-/// requirements-downloaded, descriptor-filed, and participation-declared.
-/// Used at process start. Descriptor and participation never fail the walk.
-/// The feeder walks the same states, plus stop-mining and start-mining, on
-/// every later round.
+/// miner-registered, requirements-downloaded, descriptor-filed, and
+/// participation-declared. Used at process start. Registration, descriptor and
+/// participation never fail the walk. The feeder walks the same states, plus
+/// stop-mining and start-mining, on every later round.
+///
+/// `account` is the signing `AccountId32`, which is what pays fees, holds the
+/// balance, and keys the on-chain maps. The `PoW` miner identity derived from
+/// the same key is a different value and is not used here.
 ///
 /// `sleep` is injected so tests do not wait on the real clock. A validator
 /// that never answers sync is not a failure here: that matches startup, which
@@ -84,7 +100,7 @@ pub async fn prepare_round<C, F, S, Fut>(
     funding: &FundingParams,
     sleep: S,
     descriptor: &DescriptorParams,
-    descriptor_filed: &AtomicBool,
+    latches: &ProcessLatches<'_>,
 ) -> Result<MiningSnapshot, ReadinessError>
 where
     C: ChainClient + SyncSource + BalanceSource,
@@ -124,6 +140,20 @@ where
         None => state,
     };
 
+    // Not fatal at startup, for the same reason an unreachable validator is
+    // not: the node manager starts the coordinator and its validator together,
+    // so exiting here would crash-loop while the node boots. The latch stays
+    // clear, and the feeder holds off mining and retries every round until it
+    // succeeds.
+    let _ = register_round_miner(chain, latches.miner_registered).await;
+    state = match state.transition(RoundEvent::Succeeded) {
+        Some(next) => {
+            next.log_entry(0);
+            next
+        }
+        None => state,
+    };
+
     let snap = chain
         .fetch_mining_snapshot(None, account, None)
         .await
@@ -137,7 +167,7 @@ where
         None => state,
     };
 
-    file_round_descriptor(chain, descriptor_filed, descriptor, account).await;
+    file_round_descriptor(chain, latches.descriptor_filed, descriptor, account).await;
     state = match state.transition(RoundEvent::Succeeded) {
         Some(next) => {
             next.log_entry(0);
@@ -155,6 +185,51 @@ where
     }
     let _ = state.transition(RoundEvent::Succeeded);
     Ok(snap)
+}
+
+/// Register the signing account with `QuantumPow.register_miner`.
+///
+/// Returns whether the account is known to be registered. The chain client
+/// reads `QuantumPow.Miners` first, so an account that registered in an earlier
+/// process submits nothing; `miner_registered` then latches that answer for the
+/// rest of this process so later rounds skip the read too.
+///
+/// Unlike the descriptor step, a failure does not latch. Without registration
+/// every `submit_proof` is rejected with `MinerNotRegistered`, so the caller
+/// holds off mining and this runs again on the next round.
+pub(crate) async fn register_round_miner<C: ChainClient>(
+    chain: &C,
+    miner_registered: &AtomicBool,
+) -> bool {
+    if miner_registered.load(Ordering::Relaxed) {
+        tracing::trace!("miner already registered this process");
+        return true;
+    }
+    for attempt in 1..=SUBMIT_ATTEMPTS {
+        match chain.ensure_miner_registered().await {
+            Ok(RegistrationOutcome::Registered) => {
+                tracing::info!("registered this account as a miner on chain");
+                miner_registered.store(true, Ordering::Relaxed);
+                return true;
+            }
+            Ok(RegistrationOutcome::AlreadyRegistered) => {
+                tracing::debug!("this account is already a registered miner");
+                miner_registered.store(true, Ordering::Relaxed);
+                return true;
+            }
+            Err(e) => {
+                if attempt == SUBMIT_ATTEMPTS {
+                    tracing::warn!(
+                        error = %e,
+                        attempts = SUBMIT_ATTEMPTS,
+                        "cannot register this account as a miner; proofs would be rejected \
+                         with MinerNotRegistered, so mining waits until this succeeds"
+                    );
+                }
+            }
+        }
+    }
+    false
 }
 
 /// 64-char lowercase hex of the miner account. Fits `MaxNodeIdBytes`.
@@ -364,11 +439,11 @@ pub(crate) async fn declare_round_participation<C: ChainClient>(
 mod tests {
     use super::{
         candidate_qblock_id, declare_round_participation, file_round_descriptor, prepare_round,
-        HttpFaucet,
+        register_round_miner, HttpFaucet, ProcessLatches, SUBMIT_ATTEMPTS,
     };
     use crate::chain::{
         ChainError, DescriptorOutcome, FakeChain, MinerKind, MinerSpecScale, MiningSnapshot,
-        ParticipationOutcome,
+        ParticipationOutcome, RegistrationOutcome,
     };
     use crate::config::DescriptorParams;
     use crate::funding::FundingParams;
@@ -474,7 +549,10 @@ mod tests {
             &FundingParams::default(),
             no_sleep,
             &DescriptorParams::default(),
-            &AtomicBool::new(false),
+            &ProcessLatches {
+                descriptor_filed: &AtomicBool::new(false),
+                miner_registered: &AtomicBool::new(false),
+            },
         )
         .await
         .expect("prepare_round");
@@ -496,7 +574,10 @@ mod tests {
             &FundingParams::default(),
             no_sleep,
             &params,
-            &filed,
+            &ProcessLatches {
+                descriptor_filed: &filed,
+                miner_registered: &AtomicBool::new(false),
+            },
         )
         .await
         .expect("prepare_round");
@@ -521,6 +602,115 @@ mod tests {
         assert!(desc.runtime.is_none());
         file_round_descriptor(&chain, &filed, &params, account()).await;
         assert_eq!(chain.descriptor_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_account_registers_once_and_then_latches() {
+        let chain = FakeChain::new(snap(), None);
+        let registered = AtomicBool::new(false);
+        assert!(register_round_miner(&chain, &registered).await);
+        assert_eq!(chain.registration_submits(), 1);
+        assert!(registered.load(Ordering::Relaxed));
+        // The latch keeps later rounds off the chain entirely.
+        assert!(register_round_miner(&chain, &registered).await);
+        assert_eq!(chain.registration_calls(), 1);
+        assert_eq!(chain.registration_submits(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_already_registered_account_submits_nothing() {
+        let chain = FakeChain::new(snap(), None);
+        chain.set_registered(true);
+        let registered = AtomicBool::new(false);
+        assert!(register_round_miner(&chain, &registered).await);
+        assert_eq!(chain.registration_calls(), 1);
+        assert_eq!(
+            chain.registration_submits(),
+            0,
+            "a second register_miner would fail with MinerAlreadyRegistered and burn fees"
+        );
+        assert!(registered.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn a_failed_registration_retries_and_does_not_latch() {
+        let chain = FakeChain::new(snap(), None);
+        chain.set_registration_result(Err(ChainError::Unavailable("rpc down".into())));
+        let registered = AtomicBool::new(false);
+        assert!(!register_round_miner(&chain, &registered).await);
+        assert_eq!(chain.registration_calls(), SUBMIT_ATTEMPTS as usize);
+        assert!(
+            !registered.load(Ordering::Relaxed),
+            "a failed registration must not latch; mining cannot proceed without it"
+        );
+        // The next round tries again rather than assuming the miner is ready.
+        chain.set_registration_result(Ok(RegistrationOutcome::Registered));
+        assert!(register_round_miner(&chain, &registered).await);
+        assert!(registered.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn prepare_round_registers_the_miner_before_reading_requirements() {
+        let chain = FakeChain::new(snap(), None);
+        let registered = AtomicBool::new(false);
+        let _snap = prepare_round(
+            &chain,
+            None::<&HttpFaucet>,
+            account(),
+            &FundingParams::default(),
+            no_sleep,
+            &DescriptorParams::default(),
+            &ProcessLatches {
+                descriptor_filed: &AtomicBool::new(false),
+                miner_registered: &registered,
+            },
+        )
+        .await
+        .expect("prepare_round");
+        assert_eq!(chain.registration_submits(), 1);
+        assert!(registered.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn prepare_round_funds_the_account_it_was_given() {
+        let chain = FakeChain::new(snap(), None);
+        let _snap = prepare_round(
+            &chain,
+            None::<&HttpFaucet>,
+            account(),
+            &FundingParams::default(),
+            no_sleep,
+            &DescriptorParams::default(),
+            &ProcessLatches {
+                descriptor_filed: &AtomicBool::new(false),
+                miner_registered: &AtomicBool::new(false),
+            },
+        )
+        .await
+        .expect("prepare_round");
+        assert_eq!(chain.take_balance_accounts(), vec![account()]);
+    }
+
+    #[tokio::test]
+    async fn a_registration_failure_does_not_fail_the_startup_walk() {
+        let chain = FakeChain::new(snap(), None);
+        chain.set_registration_result(Err(ChainError::Unavailable("rpc down".into())));
+        let registered = AtomicBool::new(false);
+        let _snap = prepare_round(
+            &chain,
+            None::<&HttpFaucet>,
+            account(),
+            &FundingParams::default(),
+            no_sleep,
+            &DescriptorParams::default(),
+            &ProcessLatches {
+                descriptor_filed: &AtomicBool::new(false),
+                miner_registered: &registered,
+            },
+        )
+        .await
+        .expect("startup continues so the feeder can retry");
+        assert!(!registered.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

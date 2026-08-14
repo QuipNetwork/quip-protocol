@@ -14,8 +14,8 @@ use crate::funding::{ensure_funded, BalanceSource, Faucet};
 use crate::logging::LogLevel;
 use crate::producer::derive_pow_job;
 use crate::readiness::{
-    build_faucet, declare_round_participation, file_round_descriptor, ReadinessError,
-    SUBMIT_ATTEMPTS,
+    build_faucet, declare_round_participation, file_round_descriptor, register_round_miner,
+    ReadinessError, SUBMIT_ATTEMPTS,
 };
 use crate::round::{RoundEvent, RoundState};
 use crate::session::{coord, CoordinatorService, CoordinatorState};
@@ -45,8 +45,11 @@ pub struct RuntimeParams {
     pub grace_ms: u32,
     /// Restart backoff + failure budget applied to each miner.
     pub backoff: BackoffPolicy,
-    /// Canonical miner account (`blake2_256(SCALE(account))`) seeding nonce
-    /// derivation for `PoW` jobs.
+    /// `PoW` nonce input: `blake2_256(SCALE(account))`, matching the pallet's
+    /// `account_to_bytes`. Not an address — see [`Self::miner_account`].
+    pub miner_identity: [u8; 32],
+    /// The signing `AccountId32`. Pays fees, holds the balance the funding path
+    /// tops up, and keys every per-signer chain map.
     pub miner_account: [u8; 32],
     /// Floor for the adaptive staging window: minimum staged jobs per miner
     /// (0 disables feeding). The window grows above this with each miner's
@@ -67,11 +70,15 @@ pub struct RuntimeParams {
     pub descriptor: DescriptorParams,
     /// Set after the first `DescriptorFiled` walk in this process.
     pub descriptor_filed: Arc<AtomicBool>,
+    /// Set once `QuantumPow.Miners` is known to hold the signing account.
+    pub miner_registered: Arc<AtomicBool>,
 }
 
 /// Inputs to the feeder loop.
 pub struct FeederParams {
-    /// Canonical miner account seeding `PoW` nonce derivation.
+    /// `PoW` nonce input: `blake2_256(SCALE(account))`. Not an address.
+    pub miner_identity: [u8; 32],
+    /// The signing `AccountId32`. Pays fees and keys the chain maps.
     pub miner_account: [u8; 32],
     /// Floor for the adaptive staging window: the minimum staged jobs kept per
     /// miner (0 disables feeding). The window grows above this from the miner's
@@ -85,6 +92,8 @@ pub struct FeederParams {
     pub descriptor: DescriptorParams,
     /// Set after the first `DescriptorFiled` walk in this process.
     pub descriptor_filed: Arc<AtomicBool>,
+    /// Set once `QuantumPow.Miners` is known to hold the signing account.
+    pub miner_registered: Arc<AtomicBool>,
     /// Consecutive failed submissions of one proof, inside one quantum block,
     /// before the coordinator stops retrying it.
     pub max_submit_attempts: u32,
@@ -392,6 +401,23 @@ where
                         );
                         RoundEvent::Failed
                     }
+                }
+            }
+            RoundState::MinerRegistered => {
+                let registered = await_round_step(
+                    machine,
+                    generation,
+                    &mut hold,
+                    stop,
+                    register_round_miner(chain, params.miner_registered.as_ref()),
+                )
+                .await?;
+                if registered {
+                    RoundEvent::Succeeded
+                } else {
+                    // Mining without registration is guaranteed waste: the
+                    // pallet rejects every proof and the account still pays.
+                    RoundEvent::Failed
                 }
             }
             RoundState::RequirementsDownloaded => {
@@ -729,8 +755,13 @@ pub async fn feeder_loop<C>(
                 while st.router.staged_len(&id) < depth {
                     salt_ctr = salt_ctr.saturating_add(1);
                     let salt = salt_from_counter(salt_ctr);
-                    let job = match derive_pow_job(&snap, params.miner_account, salt, generation, 0)
-                    {
+                    let job = match derive_pow_job(
+                        &snap,
+                        params.miner_identity,
+                        salt,
+                        generation,
+                        0,
+                    ) {
                         Ok(job) => job,
                         Err(e) => {
                             // The snapshot's allowed-value sets are validated at
@@ -1009,12 +1040,14 @@ where
         Arc::clone(&chain),
         Arc::clone(&state),
         FeederParams {
+            miner_identity: params.miner_identity,
             miner_account: params.miner_account,
             buffer_depth: params.buffer_depth,
             poll_interval: Duration::from_millis(params.poll_interval_ms),
             funding: params.funding,
             descriptor: params.descriptor,
             descriptor_filed: params.descriptor_filed,
+            miner_registered: params.miner_registered,
             max_submit_attempts: params.max_submit_attempts,
         },
         stop_rx.clone(),
