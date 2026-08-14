@@ -232,7 +232,7 @@ async fn dispatch(
             tracing::info!(call = what, block = %block, "sudo call included");
             Ok(block)
         }
-        SignedCallOutcome::DispatchFailed { error } => Err(ChainError::Submit(format!(
+        SignedCallOutcome::DispatchFailed { error, .. } => Err(ChainError::Submit(format!(
             "{what} was included but the dispatch failed: {error}"
         ))),
         SignedCallOutcome::Invalid { message } => Err(ChainError::Submit(format!(
