@@ -639,8 +639,11 @@ async fn run_session<C: ChainClient>(
                                     generation: job.generation,
                                     // Raw best (gate-agnostic) so the decay
                                     // projection can decide when the easing gate
-                                    // admits it; the diverse/lowest-energy subset
-                                    // (≤ MAX_PROOF_SOLUTIONS) is what gets resubmitted.
+                                    // admits it. The rows resubmitted with it are
+                                    // `stash_solutions`: the prefix-safe subset
+                                    // (≤ MAX_PROOF_SOLUTIONS) that keeps clearing
+                                    // the chain's diversity gate however tight the
+                                    // ceiling is when the proof lands.
                                     best_energy_milli: validated.raw_best_energy_milli,
                                     diversity_milli: validated.diversity_milli,
                                     n_valid: validated.n_valid,

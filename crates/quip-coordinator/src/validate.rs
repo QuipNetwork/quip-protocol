@@ -42,10 +42,88 @@ pub struct Validated {
     /// gate) this reflects the true best the miner found, so the decay-ratchet
     /// stash can project when the easing gate will admit it.
     pub raw_best_energy_milli: i64,
-    /// The lowest-energy deduped rows (≤ [`MAX_PROOF_SOLUTIONS`]) regardless of
-    /// the current gate — the candidates the stash retains for a future,
-    /// eased-threshold submission.
+    /// The deduped rows (≤ [`MAX_PROOF_SOLUTIONS`]) the stash retains for a
+    /// future, eased-ceiling submission, chosen regardless of the current gate.
+    /// Ordered by ascending energy and pruned so that every prefix of them
+    /// still clears the chain's diversity gate.
     pub stash_solutions: Vec<Solution>,
+}
+
+/// Outcome of replaying the chain's proof gates over an already-scored row set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProofGates {
+    /// Lowest energy among the rows the ceiling admits, or `i64::MAX` if none.
+    pub best_energy_milli: i64,
+    /// Diversity (milli) of the diverse selection over the admitted rows.
+    pub diversity_milli: u32,
+    /// Count of rows the ceiling admits.
+    pub n_valid: u32,
+    /// Whether the admitted rows clear all three chain gates.
+    pub accepted: bool,
+}
+
+/// The chain's post-energy-filter procedure: select the most separated
+/// `min(rows.len(), min_solutions)` rows, then score that selection. Returns
+/// the selected indices into `rows` alongside the diversity in milli.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "indices come from select_diverse over the same slice"
+)]
+fn select_and_score(rows: &[&[i8]], min_solutions: u32) -> (Vec<usize>, u32) {
+    let target = rows.len().min(min_solutions.max(1) as usize);
+    let selected = select_diverse(rows, target).unwrap_or_else(|e| {
+        // Unreachable in principle (every byte was validated during scoring);
+        // log if the invariant ever breaks instead of silently accepting the
+        // full set.
+        tracing::warn!(error = ?e, "select_diverse failed on validated spins; selecting all");
+        (0..rows.len()).collect()
+    });
+    let picked: Vec<&[i8]> = selected.iter().map(|&i| rows[i]).collect();
+    let diversity = calculate_diversity(&picked).unwrap_or_else(|e| {
+        tracing::warn!(error = ?e, "calculate_diversity failed on validated spins; treating as 0");
+        0
+    });
+    (selected, diversity)
+}
+
+/// Replay the chain's proof gates over rows that already carry their scored
+/// energy, so a proof held in the stash can be re-checked against the
+/// difficulty live now rather than the one it was stashed under.
+///
+/// The energies are the ones this coordinator computed when the result was
+/// validated; the pallet recomputes them from the same problem and reaches the
+/// same values, so only the gate parameters have to be fresh. `gates`
+/// `min_energy_milli` carries the chain's `max_energy_milli` ceiling.
+#[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "n_valid is a solution count; the pallet bound is 32"
+)]
+pub fn check_proof_gates(solutions: &[Solution], gates: &QualityGates) -> ProofGates {
+    let admitted: Vec<&Solution> = solutions
+        .iter()
+        .filter(|s| s.energy_milli < gates.min_energy_milli)
+        .collect();
+    let Some(best_energy_milli) = admitted.iter().map(|s| s.energy_milli).min() else {
+        return ProofGates {
+            best_energy_milli: i64::MAX,
+            diversity_milli: 0,
+            n_valid: 0,
+            accepted: false,
+        };
+    };
+    let rows: Vec<&[i8]> = admitted
+        .iter()
+        .map(|s| bytemuck::cast_slice::<u8, i8>(&s.spins_bytes))
+        .collect();
+    let n_valid = rows.len() as u32;
+    let (_, diversity_milli) = select_and_score(&rows, gates.min_solutions);
+    ProofGates {
+        best_energy_milli,
+        diversity_milli,
+        n_valid,
+        accepted: n_valid >= gates.min_solutions && diversity_milli >= gates.min_diversity_milli,
+    }
 }
 
 /// Build validation gates from the session difficulty target (`SetTarget`), or
@@ -173,10 +251,6 @@ fn energy_in_place(
 /// jobs; inline `EdgeList` jobs carry their own (already position-indexed)
 /// edges.
 #[expect(
-    clippy::too_many_lines,
-    reason = "single validation pipeline: score, dedup, diversity, stash view"
-)]
-#[expect(
     clippy::indexing_slicing,
     reason = "indices drawn from enumerate/len of the same scored buffers"
 )]
@@ -267,76 +341,46 @@ pub fn validate_result(
         .collect();
     let n_valid = unique_valid_indices.len() as u32;
 
-    let (best_energy_milli, diversity_milli, selected_solutions) = if unique_valid_indices
-        .is_empty()
-    {
-        (i64::MAX, 0u32, Vec::new())
-    } else {
-        // Diversity reads the valid spin vectors as `&[i8]` reinterpreted from
-        // their wire bytes (0x01/0xFF -> +1/-1) — a zero-copy view, sound
-        // because every byte was validated during scoring.
-        let energy_valid: Vec<&[i8]> = unique_valid_indices
-            .iter()
-            .map(|&i| bytemuck::cast_slice::<u8, i8>(byte_rows[i]))
-            .collect();
-        let target = energy_valid.len().min(gates.min_solutions.max(1) as usize);
-        let selected = select_diverse(&energy_valid, target).unwrap_or_else(|e| {
-            // Unreachable in principle (every byte was validated during
-            // scoring); log if the invariant ever breaks instead of silently
-            // accepting the full set.
-            tracing::warn!(error = ?e, "select_diverse failed on validated spins; selecting all");
-            (0..energy_valid.len()).collect()
-        });
-        let selected_spins: Vec<&[i8]> = selected.iter().map(|&i| energy_valid[i]).collect();
-        let diversity = calculate_diversity(&selected_spins).unwrap_or_else(|e| {
-            tracing::warn!(error = ?e, "calculate_diversity failed on validated spins; treating as 0");
-            0
-        });
-        let best = selected
-            .iter()
-            .map(|&i| energies[unique_valid_indices[i]])
-            .min()
-            .unwrap_or(i64::MAX);
-        // Materialize the diverse subset (capped at the pallet bound) as the
-        // exact rows to submit, so proofs never exceed MAX_PROOF_SOLUTIONS.
-        let selected_solutions: Vec<Solution> = selected
-            .iter()
-            .take(MAX_PROOF_SOLUTIONS)
-            .map(|&i| {
-                let row = unique_valid_indices[i];
-                Solution {
-                    spins_bytes: byte_rows[row].to_vec(),
-                    energy_milli: energies[row],
-                }
-            })
-            .collect();
-        (best, diversity, selected_solutions)
-    };
+    let (best_energy_milli, diversity_milli, selected_solutions) =
+        if unique_valid_indices.is_empty() {
+            (i64::MAX, 0u32, Vec::new())
+        } else {
+            // Diversity reads the valid spin vectors as `&[i8]` reinterpreted from
+            // their wire bytes (0x01/0xFF -> +1/-1) — a zero-copy view, sound
+            // because every byte was validated during scoring.
+            let energy_valid: Vec<&[i8]> = unique_valid_indices
+                .iter()
+                .map(|&i| bytemuck::cast_slice::<u8, i8>(byte_rows[i]))
+                .collect();
+            let (selected, diversity) = select_and_score(&energy_valid, gates.min_solutions);
+            let best = selected
+                .iter()
+                .map(|&i| energies[unique_valid_indices[i]])
+                .min()
+                .unwrap_or(i64::MAX);
+            // Materialize the diverse subset (capped at the pallet bound) as the
+            // exact rows to submit, so proofs never exceed MAX_PROOF_SOLUTIONS.
+            let selected_solutions: Vec<Solution> = selected
+                .iter()
+                .take(MAX_PROOF_SOLUTIONS)
+                .map(|&i| {
+                    let row = unique_valid_indices[i];
+                    Solution {
+                        spins_bytes: byte_rows[row].to_vec(),
+                        energy_milli: energies[row],
+                    }
+                })
+                .collect();
+            (best, diversity, selected_solutions)
+        };
 
     let accepted = n_valid >= gates.min_solutions && diversity_milli >= gates.min_diversity_milli;
 
     // Gate-agnostic view for the decay-ratchet stash: the true best energy the
-    // miner found and the lowest-energy deduped rows (capped at the pallet
-    // bound). These are what becomes viable as the difficulty eases, so they are
-    // chosen by energy rather than by the current (harder) gate.
+    // miner found, and the rows that stay submittable as the difficulty eases.
+    // Both ignore the current (harder) gate, which nothing here has to clear.
     let raw_best_energy_milli = energies.iter().copied().min().unwrap_or(i64::MAX);
-    let stash_solutions: Vec<Solution> = {
-        let mut idx: Vec<usize> = (0..byte_rows.len()).collect();
-        idx.sort_by_key(|&i| energies[i]);
-        let mut seen: HashSet<Vec<i8>> = HashSet::new();
-        idx.into_iter()
-            .filter(|&i| {
-                seen.insert(canonicalize_spins(bytemuck::cast_slice::<u8, i8>(
-                    byte_rows[i],
-                )))
-            })
-            .take(MAX_PROOF_SOLUTIONS)
-            .map(|i| Solution {
-                spins_bytes: byte_rows[i].to_vec(),
-                energy_milli: energies[i],
-            })
-            .collect()
-    };
+    let stash_solutions = stash_rows(&byte_rows, &energies, gates);
 
     Validated {
         best_energy_milli,
@@ -347,6 +391,71 @@ pub fn validate_result(
         raw_best_energy_milli,
         stash_solutions,
     }
+}
+
+/// Unique candidate rows examined while filling the stash. Each candidate costs
+/// a diversity pass over the rows already held, so an unbounded scan of a large
+/// result would dominate validation; the chain accepts at most
+/// [`MAX_PROOF_SOLUTIONS`] rows in a proof regardless.
+const STASH_SCAN_LIMIT: usize = 4 * MAX_PROOF_SOLUTIONS;
+
+/// Pick the rows the decay-ratchet stash holds for a later, eased-ceiling
+/// submission.
+///
+/// The chain filters a submitted proof to `energy < max_energy_milli` at the
+/// inclusion block and scores diversity over only the survivors, so the subset
+/// it judges is always a lowest-energy prefix of what was submitted. Rows are
+/// therefore admitted in ascending energy order only while each resulting
+/// prefix still clears `min_diversity_milli` under the chain's own selection; a
+/// row sitting too close to one already held is skipped in favour of a more
+/// distant, higher-energy row. Taking the globally lowest energies instead
+/// packs the prefix with near-twins of the optimum and collapses its diversity.
+///
+/// The single best row is always kept, because the decay projection rides on
+/// it. Scoring it alone yields 0 diversity, but a one-row prefix can never
+/// reach the diversity gate anyway: the chain rejects a difficulty carrying
+/// `min_diversity_milli > 0` with `min_solutions < 2`.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "indices drawn from enumerate/len of the same scored buffers"
+)]
+fn stash_rows(byte_rows: &[&[u8]], energies: &[i64], gates: &QualityGates) -> Vec<Solution> {
+    let mut order: Vec<usize> = (0..byte_rows.len()).collect();
+    order.sort_by_key(|&i| energies[i]);
+
+    let mut seen: HashSet<Vec<i8>> = HashSet::new();
+    let mut examined = 0usize;
+    let mut chosen: Vec<usize> = Vec::new();
+    for i in order {
+        if chosen.len() == MAX_PROOF_SOLUTIONS || examined == STASH_SCAN_LIMIT {
+            break;
+        }
+        let spins = bytemuck::cast_slice::<u8, i8>(byte_rows[i]);
+        if !seen.insert(canonicalize_spins(spins)) {
+            continue;
+        }
+        examined += 1;
+        chosen.push(i);
+        if chosen.len() < 2 {
+            continue;
+        }
+        let prefix: Vec<&[i8]> = chosen
+            .iter()
+            .map(|&k| bytemuck::cast_slice::<u8, i8>(byte_rows[k]))
+            .collect();
+        let (_, diversity) = select_and_score(&prefix, gates.min_solutions);
+        if diversity < gates.min_diversity_milli {
+            let _ = chosen.pop();
+        }
+    }
+
+    chosen
+        .into_iter()
+        .map(|i| Solution {
+            spins_bytes: byte_rows[i].to_vec(),
+            energy_milli: energies[i],
+        })
+        .collect()
 }
 
 /// Strict less-than tie-break: first accepted holds on equal energy.
@@ -691,6 +800,277 @@ mod tests {
         };
         let v = validate_result(&problem, &sols, &gates, &ResolvedTopo::default());
         assert_eq!(v.n_valid, 1);
+    }
+
+    /// Spins that carry no field, so they set distance without moving energy.
+    const SHAPE_SPINS: usize = 32;
+    /// Spins carrying powers-of-two fields, which set a row's energy level.
+    const LEVEL_SPINS: u32 = 4;
+    /// Chain-static gates used by the clustered-optimum fixture below.
+    const FIXTURE_MIN_SOLUTIONS: u32 = 3;
+    const FIXTURE_MIN_DIVERSITY: u32 = 300;
+
+    fn level_fixture_problem() -> IsingProblem {
+        let mut h = vec![0i32; SHAPE_SPINS];
+        h.extend_from_slice(&[1000, 2000, 4000, 8000]);
+        IsingProblem {
+            graph: None,
+            h_milli_le32: encode_i32_le(&h),
+            j_milli_le32: vec![],
+            num_reads: 0,
+            num_sweeps: 0,
+            anneal_time_us: 0,
+        }
+    }
+
+    /// Row `shape` of the order-32 Sylvester-Hadamard matrix, whose distinct
+    /// rows sit at symmetric Hamming distance 16 — the maximum for 32 spins.
+    /// `flips` negates that many leading spins, which parks a row next to its
+    /// base instead. The trailing level spins give the row energy
+    /// `15000 - 2000 * level`.
+    fn level_row(shape: usize, flips: usize, level: u32) -> Solution {
+        let mut spins: Vec<i8> = (0..SHAPE_SPINS)
+            .map(|col| {
+                if (shape & col).count_ones().is_multiple_of(2) {
+                    1
+                } else {
+                    -1
+                }
+            })
+            .collect();
+        for s in spins.iter_mut().take(flips) {
+            *s = -*s;
+        }
+        for bit in 0..LEVEL_SPINS {
+            spins.push(if (level >> bit) & 1 == 1 { -1 } else { 1 });
+        }
+        Solution {
+            spins_bytes: encode_spins(&spins),
+            energy_milli: 15_000 - 2_000 * i64::from(level),
+        }
+    }
+
+    /// Four near-identical rows holding the four lowest energies, with five
+    /// mutually distant rows above them. This is the shape that made the chain
+    /// reject a proof the coordinator had cleared locally: the whole set is
+    /// diverse, every low-energy prefix of it is not.
+    fn clustered_optimum_rows() -> Vec<Solution> {
+        vec![
+            level_row(0, 0, 15),
+            level_row(0, 1, 14),
+            level_row(0, 2, 13),
+            level_row(0, 3, 12),
+            level_row(1, 0, 5),
+            level_row(2, 0, 4),
+            level_row(4, 0, 3),
+            level_row(8, 0, 2),
+            level_row(16, 0, 1),
+        ]
+    }
+
+    /// The chain's own procedure written out against the consensus primitives:
+    /// keep the rows under `ceiling`, select `min(count, min_solutions)` of them
+    /// by maximum separation, then score that selection. Returns
+    /// `(valid_solution_count, diversity_milli)` — the two values the pallet
+    /// gates on. This is the oracle the coordinator's row choice must satisfy.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "indices come from select_diverse over the same slice"
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "fixture row counts are single digits"
+    )]
+    fn pallet_gates(rows: &[Solution], ceiling: i64, min_solutions: u32) -> (u32, u32) {
+        let valid: Vec<&[i8]> = rows
+            .iter()
+            .filter(|s| s.energy_milli < ceiling)
+            .map(|s| bytemuck::cast_slice::<u8, i8>(&s.spins_bytes))
+            .collect();
+        if valid.is_empty() {
+            return (0, 0);
+        }
+        let target = valid.len().min(min_solutions.max(1) as usize);
+        let selected = select_diverse(&valid, target).expect("fixture spins are valid");
+        let picked: Vec<&[i8]> = selected.iter().map(|&i| valid[i]).collect();
+        let diversity = calculate_diversity(&picked).expect("fixture spins are valid");
+        (valid.len() as u32, diversity)
+    }
+
+    /// Every ceiling that admits a different subset of `rows`: one just below
+    /// and one just above each row energy.
+    fn ceiling_sweep(rows: &[Solution]) -> Vec<i64> {
+        let mut ceilings: Vec<i64> = rows
+            .iter()
+            .flat_map(|s| [s.energy_milli, s.energy_milli + 1])
+            .collect();
+        ceilings.sort_unstable();
+        ceilings.dedup();
+        ceilings
+    }
+
+    /// The gates the fixture rows are stashed under: a ceiling far below every
+    /// row, so nothing is submittable yet and the whole result goes to the
+    /// decay-ratchet stash.
+    fn fixture_gates() -> QualityGates {
+        QualityGates {
+            min_energy_milli: -100_000,
+            min_diversity_milli: FIXTURE_MIN_DIVERSITY,
+            min_solutions: FIXTURE_MIN_SOLUTIONS,
+        }
+    }
+
+    #[test]
+    fn stashed_rows_keep_every_low_energy_prefix_diverse() {
+        let problem = level_fixture_problem();
+        let rows = clustered_optimum_rows();
+        let gates = fixture_gates();
+
+        // The failure shape: sorting purely by energy puts the four clustered
+        // rows first, so a ceiling admitting only those collapses diversity
+        // even though the full set scores well above the gate.
+        let mut energy_sorted = rows.clone();
+        energy_sorted.sort_by_key(|s| s.energy_milli);
+        let (all_valid, all_diversity) =
+            pallet_gates(&energy_sorted, i64::MAX, gates.min_solutions);
+        assert_eq!(all_valid, 9);
+        assert!(
+            all_diversity >= gates.min_diversity_milli,
+            "fixture must clear the gate over the whole set, scored {all_diversity}"
+        );
+        let energy_sorted_failures: Vec<(i64, u32)> = ceiling_sweep(&energy_sorted)
+            .into_iter()
+            .filter_map(|ceiling| {
+                let (n_valid, diversity) =
+                    pallet_gates(&energy_sorted, ceiling, gates.min_solutions);
+                (n_valid >= gates.min_solutions && diversity < gates.min_diversity_milli)
+                    .then_some((ceiling, diversity))
+            })
+            .collect();
+        assert!(
+            !energy_sorted_failures.is_empty(),
+            "fixture must reproduce the rejection: pure energy order should fail some ceiling"
+        );
+
+        // The stash rows must clear the same sweep at every ceiling that admits
+        // enough rows to reach the diversity gate at all.
+        let v = validate_result(&problem, &rows, &gates, &ResolvedTopo::default());
+        assert!(!v.accepted, "fixture stashes rather than submits");
+        for ceiling in ceiling_sweep(&v.stash_solutions) {
+            let (n_valid, diversity) =
+                pallet_gates(&v.stash_solutions, ceiling, gates.min_solutions);
+            if n_valid >= gates.min_solutions {
+                assert!(
+                    diversity >= gates.min_diversity_milli,
+                    "ceiling {ceiling} admits {n_valid} stashed rows scoring {diversity}, \
+                     below the {} gate",
+                    gates.min_diversity_milli
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stash_keeps_the_best_row_and_drops_only_its_near_twins() {
+        let problem = level_fixture_problem();
+        let rows = clustered_optimum_rows();
+        let v = validate_result(&problem, &rows, &fixture_gates(), &ResolvedTopo::default());
+
+        assert_eq!(v.raw_best_energy_milli, -15_000);
+        assert_eq!(
+            v.stash_solutions.first().map(|s| s.energy_milli),
+            Some(-15_000),
+            "the decay projection rides on the best row, which must always be stashed"
+        );
+        // The three near-twins of the best row are the only rows dropped.
+        let kept: Vec<i64> = v.stash_solutions.iter().map(|s| s.energy_milli).collect();
+        assert_eq!(kept, vec![-15_000, 5_000, 7_000, 9_000, 11_000, 13_000]);
+    }
+
+    #[test]
+    fn stash_falls_back_to_energy_order_when_no_diversity_is_demanded() {
+        let problem = level_fixture_problem();
+        let rows = clustered_optimum_rows();
+        let gates = QualityGates {
+            min_energy_milli: -100_000,
+            min_diversity_milli: 0,
+            min_solutions: FIXTURE_MIN_SOLUTIONS,
+        };
+        let v = validate_result(&problem, &rows, &gates, &ResolvedTopo::default());
+        let kept: Vec<i64> = v.stash_solutions.iter().map(|s| s.energy_milli).collect();
+        assert_eq!(
+            kept,
+            vec![-15_000, -13_000, -11_000, -9_000, 5_000, 7_000, 9_000, 11_000, 13_000],
+            "with no diversity gate every deduped row is worth holding"
+        );
+    }
+
+    #[test]
+    fn proof_gate_check_tracks_the_live_ceiling() {
+        let problem = level_fixture_problem();
+        let rows = clustered_optimum_rows();
+        let stashed = validate_result(&problem, &rows, &fixture_gates(), &ResolvedTopo::default())
+            .stash_solutions;
+
+        // Too early: the ceiling admits only the best row, short of the
+        // solution count the chain demands.
+        let early = check_proof_gates(
+            &stashed,
+            &QualityGates {
+                min_energy_milli: 0,
+                min_diversity_milli: FIXTURE_MIN_DIVERSITY,
+                min_solutions: FIXTURE_MIN_SOLUTIONS,
+            },
+        );
+        assert_eq!(early.n_valid, 1);
+        assert!(!early.accepted);
+
+        // Eased far enough to admit the whole stash: every gate clears.
+        let ready = check_proof_gates(
+            &stashed,
+            &QualityGates {
+                min_energy_milli: 20_000,
+                min_diversity_milli: FIXTURE_MIN_DIVERSITY,
+                min_solutions: FIXTURE_MIN_SOLUTIONS,
+            },
+        );
+        assert_eq!(ready.n_valid, 6);
+        assert_eq!(ready.best_energy_milli, -15_000);
+        assert!(ready.accepted);
+
+        // The check must agree with the chain's own procedure at every ceiling.
+        for ceiling in ceiling_sweep(&stashed) {
+            let gates = QualityGates {
+                min_energy_milli: ceiling,
+                min_diversity_milli: FIXTURE_MIN_DIVERSITY,
+                min_solutions: FIXTURE_MIN_SOLUTIONS,
+            };
+            let (n_valid, diversity) = pallet_gates(&stashed, ceiling, gates.min_solutions);
+            let got = check_proof_gates(&stashed, &gates);
+            assert_eq!(got.n_valid, n_valid, "ceiling {ceiling}");
+            assert_eq!(got.diversity_milli, diversity, "ceiling {ceiling}");
+        }
+    }
+
+    #[test]
+    fn proof_gate_check_rejects_a_diversity_collapse() {
+        // The rows a pure energy sort would have stashed, re-checked at the
+        // ceiling that admits exactly the clustered prefix: the count gate
+        // clears and the diversity gate does not — the chain's
+        // `InsufficientDiversity` rejection.
+        let mut energy_sorted = clustered_optimum_rows();
+        energy_sorted.sort_by_key(|s| s.energy_milli);
+        let got = check_proof_gates(
+            &energy_sorted,
+            &QualityGates {
+                min_energy_milli: -8_000,
+                min_diversity_milli: FIXTURE_MIN_DIVERSITY,
+                min_solutions: FIXTURE_MIN_SOLUTIONS,
+            },
+        );
+        assert_eq!(got.n_valid, 4);
+        assert!(got.diversity_milli < FIXTURE_MIN_DIVERSITY);
+        assert!(!got.accepted);
     }
 
     #[test]
