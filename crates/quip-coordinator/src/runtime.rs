@@ -822,6 +822,29 @@ pub async fn feeder_loop<C>(
                 last_heartbeat = std::time::Instant::now();
             }
 
+            // The chain re-runs its gates against the difficulty live at the
+            // inclusion block: it filters the proof to the rows under that
+            // ceiling and scores diversity over only those. The ceiling moves
+            // between stashing and submission, so replay the gates against the
+            // freshest target and leave a candidate that does not clear them
+            // stashed for a later window instead of spending a rejection on it.
+            let live_gates = crate::validate::gates_from_target(Some(&target));
+            let due = due.filter(|cand| {
+                let check = crate::validate::check_proof_gates(&cand.solutions, &live_gates);
+                if !check.accepted {
+                    tracing::debug!(
+                        job = %crate::chain::extrinsic::hex_encode(&cand.job_id),
+                        n_valid = check.n_valid,
+                        diversity_milli = check.diversity_milli,
+                        min_solutions = live_gates.min_solutions,
+                        min_diversity_milli = live_gates.min_diversity_milli,
+                        max_energy = %crate::logging::energy_units(live_gates.min_energy_milli),
+                        "win-time candidate does not clear the live difficulty; leaving stashed"
+                    );
+                }
+                check.accepted
+            });
+
             if let Some(cand) = due {
                 use crate::chain::SubmitAction;
 

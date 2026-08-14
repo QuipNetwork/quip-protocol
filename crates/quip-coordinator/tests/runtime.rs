@@ -1034,3 +1034,138 @@ async fn feeder_keeps_mining_when_descriptor_is_rejected() {
         .expect("feeder did not stop")
         .expect("feeder task panicked");
 }
+
+/// Difficulty gates that demand three mutually distant solutions, with the
+/// energy ceiling the caller wants live on the chain.
+fn gated_snapshot(max_energy_milli: i64) -> MiningSnapshot {
+    let mut snap = snapshot_with_head([9u8; 32]);
+    snap.min_solutions = 3;
+    snap.min_diversity_milli = 300;
+    snap.max_energy_milli = max_energy_milli;
+    snap
+}
+
+/// Wire spin bytes: `+1 -> 0x01`, `-1 -> 0xFF`.
+fn spin_bytes(spins: &[i8]) -> Vec<u8> {
+    spins
+        .iter()
+        .map(|&s| if s > 0 { 0x01 } else { 0xFF })
+        .collect()
+}
+
+/// Three mutually distant rows, each pair at symmetric Hamming distance 2 of 4
+/// spins, so any two score 500 milli and all three score 500 milli.
+fn distant_rows() -> Vec<quip_proto::v1::Solution> {
+    [
+        (vec![1, 1, 1, 1], -3000),
+        (vec![1, 1, -1, -1], -2000),
+        (vec![1, -1, 1, -1], -1000),
+    ]
+    .into_iter()
+    .map(|(spins, energy_milli)| quip_proto::v1::Solution {
+        spins_bytes: spin_bytes(&spins),
+        energy_milli,
+    })
+    .collect()
+}
+
+/// A stashed candidate whose viability projection has already arrived, so the
+/// only thing standing between it and a submission is the live difficulty.
+fn due_candidate() -> quip_coordinator::stash::Candidate {
+    quip_coordinator::stash::Candidate {
+        job_id: vec![0xaa],
+        salt: Some([1u8; 32]),
+        generation: 1,
+        best_energy_milli: -3000,
+        diversity_milli: 500,
+        n_valid: 3,
+        solutions: distant_rows(),
+        is_pow: true,
+        order_id: vec![],
+        device_access_time_us: 0,
+        submitted: false,
+    }
+}
+
+/// The decay projection says a stashed candidate is due, but the chain gates it
+/// would meet at the inclusion block are the ones live *now*, not the ones it
+/// was stashed under. While the ceiling admits only two of its three rows the
+/// chain would reject it for want of solutions, so the feeder has to hold it;
+/// once the ceiling eases to admit all three, it submits.
+#[tokio::test]
+async fn feeder_holds_a_stashed_candidate_until_the_live_difficulty_admits_it() {
+    let chain = Arc::new(FakeChain::new(gated_snapshot(-1500), None));
+    let state = Arc::new(Mutex::new(CoordinatorState::new()));
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let feeder = tokio::spawn(feeder_loop(
+        Arc::clone(&chain),
+        Arc::clone(&state),
+        feeder_params(2, 40),
+        stop_rx,
+    ));
+
+    // Wait for the first reseed to arm the round, then plant the candidate. The
+    // head never changes below, so no later reseed clears the stash.
+    let mut armed = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        if state.lock().await.target.is_some() {
+            armed = true;
+            break;
+        }
+    }
+    assert!(armed, "feeder never reseeded the round");
+    {
+        let mut st = state.lock().await;
+        // A schedule that clears at step 0 makes the candidate due immediately,
+        // so the projection is never what withholds it.
+        let generation = st.generation;
+        st.stash.reset(generation, vec![i64::MAX], 0, 1);
+        assert!(
+            st.stash.insert(due_candidate()),
+            "candidate must be stashed"
+        );
+    }
+
+    // The ceiling admits two of the three rows: below `min_solutions`.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        chain.submitted.lock().expect("submitted lock").is_empty(),
+        "a candidate the live difficulty rejects must not be submitted"
+    );
+    assert!(
+        !state.lock().await.stash.is_empty(),
+        "the withheld candidate must stay stashed for a later window"
+    );
+
+    // Ease the ceiling past every row. Same head, so this is a difficulty
+    // refresh rather than a new round.
+    chain.set_snapshot(Some(gated_snapshot(0)));
+
+    let mut submitted = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        if !chain.submitted.lock().expect("submitted lock").is_empty() {
+            submitted = true;
+            break;
+        }
+    }
+    assert!(
+        submitted,
+        "the eased ceiling must let the candidate through"
+    );
+    {
+        let sent = chain.submitted.lock().expect("submitted lock");
+        assert_eq!(sent.len(), 1);
+        let proof = sent.first().expect("one recorded proof");
+        assert_eq!(proof.job_id, vec![0xaa]);
+        assert_eq!(proof.solutions.len(), 3);
+    }
+
+    let _ = stop_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), feeder)
+        .await
+        .expect("feeder did not stop")
+        .expect("feeder task panicked");
+}
