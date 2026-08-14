@@ -159,8 +159,17 @@ All chain access sits behind one trait, `ChainClient` (`chain/mod.rs`):
   account and, when the account is absent, submit
   `QuantumPow.register_miner`.
 
+One key produces two different 32-byte values, and they are not
+interchangeable. The **account** is `blake2b_256(domain ++ public_key)`: it
+signs, holds the balance, and keys every account storage map. The
+**identity** is `blake2_256(account.encode())`, one further hash of that
+account. The identity is the PoW nonce input, and it must equal what the
+pallet computes in `account_to_bytes`, or the pallet rejects the proof with
+`InvalidNonce`. Fund and look up the account. Derive nonces from the
+identity.
+
 `RealChainClient` (`chain/real.rs`) is the live client over Substrate
-JSON-RPC and subxt; `FakeChain` (`chain/fake.rs`) backs the tests. Supporting
+JSON-RPC. `FakeChain` (`chain/fake.rs`) backs the tests. Supporting
 modules: `extrinsic` (hybrid sr25519 + ML-DSA-44 signing, `load_hybrid_pair`,
 `miner_identity_bytes`, `signer_account_bytes`), `snapshot`
 (`MiningSnapshot`, `DecayParams`),
