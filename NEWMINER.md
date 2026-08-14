@@ -122,11 +122,16 @@ edits:
 ## Publishing releases
 
 `fetch-miners.sh` pulls each miner from its repository's GitLab generic-package
-registry at `MINERS_TAG`. Publish one asset per architecture named
-`<binary>-<arch>` (`quip-mybackend-sa-amd64` for the amd64 build). The script downloads
+registry. It resolves each repository's newest release on its own, so a miner
+reaches the images and the host install as soon as it cuts a release, and
+nobody has to bump a pin here. Set the matching `<BACKEND>_MINERS_TAG` variable
+to hold one miner at a specific tag.
+
+Publish one asset per architecture named `<binary>-<arch>`
+(`quip-mybackend-sa-amd64` for the amd64 build). The script downloads
 `<binary>-<arch>` and saves it under the clean name `<binary>`, which is what
 `config.toml`'s `binary` field and the coordinator's `PATH` lookup expect. A
-real fetch stays inert until the miner repository has cut a release at the tag.
+real fetch stays inert until the miner repository has cut its first release.
 
 ## A non-Rust backend
 
