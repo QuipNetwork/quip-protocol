@@ -58,6 +58,7 @@ use quip_coordinator::chain::submit::SubmitAction;
 use quip_coordinator::chain::{ChainClient, JobOrder, RealChainClient};
 use quip_coordinator::drive::parse_topology_spec;
 use quip_coordinator::presets::preset_spec;
+use quip_coordinator::validate::MAX_PROOF_SOLUTIONS;
 use quip_proto::v1::Solution;
 use quip_protocol::wire::encode_spins;
 use quip_transaction_crypto::{account_id_from_public, HybridPair};
@@ -551,6 +552,10 @@ async fn devnet_submit_proof_end_to_end() {
             valid.push((s, e));
         }
     }
+    // The runtime bounds a proof at `QuantumPowMaxSolutions` rows. More than
+    // that fails to decode, so the node answers the submission with a codec
+    // error instead of a dispatch result and the test learns nothing.
+    valid.truncate(MAX_PROOF_SOLUTIONS);
 
     // (4) Best-effort diversity over whatever we found (0 if < 2 rows).
     let valid_slices: Vec<&[i8]> = valid.iter().map(|(s, _)| s.as_slice()).collect();
