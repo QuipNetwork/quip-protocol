@@ -168,6 +168,36 @@ pallet computes in `account_to_bytes`, or the pallet rejects the proof with
 `InvalidNonce`. Fund and look up the account. Derive nonces from the
 identity.
 
+### Confirming a submission
+
+The transaction status stream reports pool and inclusion progress only. It
+cannot say whether the dispatch inside the block succeeded, because that
+answer lives in the block events and decoding those needs runtime metadata
+this client does not carry. Each call instead names the storage entry its own
+success writes, and the client reads that entry back at the inclusion block.
+
+When the extrinsic is in the block but the storage entry is absent, the
+client reports why in the terms of that storage rather than as one generic
+failure. For a proof it reads `QuantumPow.QBlocks` at the inclusion block and
+compares the winner:
+
+| What the qblock slot holds | Meaning | Action |
+| --- | --- | --- |
+| Another account | Another miner won the race. The proof was sound. | `StopRoundStale`, logged at info |
+| The signing account | The read raced the write | `StopRoundStale` |
+| Nothing | The pallet rejected the proof itself. Check diversity, energy, and registration. | `classify_receipt` |
+
+A lost race is the one included-but-failed case that says nothing is wrong
+with the proof, so it must not appear as a rejection.
+
+`system_dryRun` cannot answer this question. At the chain head the nonce is
+already spent. At the parent block the replay leaves out whatever the block
+ordered ahead of the extrinsic, which is the exact thing that beats a proof.
+
+Naming the pallet error variant itself, such as `InsufficientDiversity`,
+still needs metadata decoding. `classify_receipt` matches those names, so it
+only ever sees them for errors the node reports before inclusion.
+
 `RealChainClient` (`chain/real.rs`) is the live client over Substrate
 JSON-RPC. `FakeChain` (`chain/fake.rs`) backs the tests. Supporting
 modules: `extrinsic` (hybrid sr25519 + ML-DSA-44 signing, `load_hybrid_pair`,
