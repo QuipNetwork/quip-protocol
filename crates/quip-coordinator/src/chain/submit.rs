@@ -125,12 +125,10 @@ pub fn classify_participation(error: Option<&str>) -> Option<ParticipationOutcom
 pub fn classify_receipt(error: Option<&str>) -> SubmitAction {
     const RETRY: [&str; 2] = ["InsufficientEnergy", "ProofLimitReached"];
     const STALE: [&str; 3] = ["InvalidNonce", "TopologyNotRegistered", "InvalidTopology"];
-    const FATAL: [&str; 5] = [
+    const FATAL: [&str; 3] = [
         "InsufficientSolutions",
         "InsufficientDiversity",
         "MinerNotRegistered",
-        "BadSignature",
-        "BadProof",
     ];
     let Some(e) = error else {
         return SubmitAction::Success;
@@ -172,10 +170,6 @@ mod tests {
         ));
         assert!(matches!(
             classify_receipt(Some("InsufficientSolutions")),
-            SubmitAction::StopFatal
-        ));
-        assert!(matches!(
-            classify_receipt(Some("BadProof")),
             SubmitAction::StopFatal
         ));
         assert!(matches!(

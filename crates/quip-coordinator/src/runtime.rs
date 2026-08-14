@@ -882,8 +882,9 @@ pub async fn feeder_loop<C>(
                         state.lock().await.stash.mark_submitted(&cand.job_id);
                     }
                     Ok(SubmitAction::StopFatal) => {
-                        // Fatally rejected by the pallet (BadProof/BadSignature/...):
-                        // never retry it, or the same candidate loops every window.
+                        // Fatally rejected by the pallet (InsufficientSolutions/
+                        // InsufficientDiversity/MinerNotRegistered/...): never
+                        // retry it, or the same candidate loops every window.
                         tracing::error!(job = %job_hex, "win-time submit fatally rejected by pallet; dropping candidate");
                         state.lock().await.stash.mark_submitted(&cand.job_id);
                     }
