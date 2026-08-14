@@ -30,14 +30,18 @@ impl CsrGraph {
     /// Build CSR adjacency from the base problem.
     ///
     /// Edges whose endpoints are out of range for `h.len()` are skipped (same
-    /// defensive posture as `energy_milli`). Couplings shorter than edges are
-    /// treated as 0 for the missing entries.
+    /// defensive posture as `energy_milli`). Self-loops `(u, u)` are skipped:
+    /// a self-loop in a neighbor row would inject a spurious self-force into
+    /// that node's local field, while `energy_milli` scores the loop as an
+    /// unoptimizable constant. This matches `CpuGraph::from_base` and
+    /// `SbGraph::from_base` in quip-miner-cpu. Couplings shorter than edges
+    /// are treated as 0 for the missing entries.
     #[must_use]
     pub fn from_base(g: &IsingGraph) -> Self {
         let n = g.h.len();
         let mut adj: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
         for (k, &(u, v)) in g.edges.iter().enumerate() {
-            if u >= n || v >= n {
+            if u >= n || v >= n || u == v {
                 continue;
             }
             #[expect(
@@ -51,9 +55,7 @@ impl CsrGraph {
             )]
             {
                 adj[u].push((v, coup));
-                if u != v {
-                    adj[v].push((u, coup));
-                }
+                adj[v].push((u, coup));
             }
         }
         // Deterministic neighbor order (matches Python GPU CSR builder).
@@ -127,6 +129,34 @@ mod tests {
     fn empty_graph() {
         let g = CsrGraph::from_base(&IsingGraph::new(vec![], vec![], vec![]));
         assert_eq!(g.row_ptr, vec![0]);
+        assert_eq!(g.nnz(), 0);
+    }
+
+    /// A self-loop `(u, u)` must not appear in the CSR adjacency: it should
+    /// contribute no entry to `col_ind`/`j_csr` and not inflate `row_ptr`,
+    /// matching `CpuGraph::from_base` and `SbGraph::from_base` in
+    /// quip-miner-cpu, which both skip `u == v` outright.
+    #[test]
+    fn csr_drops_self_loops() {
+        let g = CsrGraph::from_base(&IsingGraph::new(
+            vec![0.5, -0.25, 0.0],
+            vec![2.0, -1.0, 0.75],
+            vec![(0, 0), (0, 1), (1, 2)],
+        ));
+        assert_eq!(g.row_ptr, vec![0, 1, 3, 4]);
+        assert_eq!(g.col_ind, vec![1, 0, 2, 1]);
+        assert_eq!(g.j_csr, vec![-1.0, -1.0, 0.75, 0.75]);
+        assert_eq!(g.nnz(), 4);
+    }
+
+    /// A pure self-loop on a single node produces an empty adjacency row, not
+    /// a row containing the node itself.
+    #[test]
+    fn csr_pure_self_loop_yields_empty_row() {
+        let g = CsrGraph::from_base(&IsingGraph::new(vec![0.0], vec![3.0], vec![(0, 0)]));
+        assert_eq!(g.row_ptr, vec![0, 0]);
+        assert!(g.col_ind.is_empty());
+        assert!(g.j_csr.is_empty());
         assert_eq!(g.nnz(), 0);
     }
 }
