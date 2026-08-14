@@ -15,8 +15,8 @@
 #   CPU_MINERS_TAG, CUDA_MINERS_TAG, METAL_MINERS_TAG, DWAVE_MINERS_TAG
 #               release tag per miner repo, each overriding the pin set below.
 #               One variable per repo because the miners version independently:
-#               as of this writing cpu, cuda and dwave are at v0.3.0-rc3 while
-#               metal is still at v0.3.0-rc2.
+#               as of this writing cuda is at v0.3.0-rc6, cpu and dwave at
+#               v0.3.0-rc3, and metal at v0.3.0-rc2.
 #   MINER_SET   which miners to fetch:
 #                 auto      (default) derive from this host's OS/arch —
 #                           Linux -> cpu (+cuda if amd64, optional);
@@ -46,7 +46,7 @@ set -euo pipefail
 # shipped a coordinator fix while every miner stood still, and a build that
 # assumed one shared tag looked for miner releases that were never cut.
 CPU_TAG="${CPU_MINERS_TAG:-v0.3.0-rc3}"
-CUDA_TAG="${CUDA_MINERS_TAG:-v0.3.0-rc3}"
+CUDA_TAG="${CUDA_MINERS_TAG:-v0.3.0-rc6}"
 METAL_TAG="${METAL_MINERS_TAG:-v0.3.0-rc2}"
 DWAVE_TAG="${DWAVE_MINERS_TAG:-v0.3.0-rc3}"
 
