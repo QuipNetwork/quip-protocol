@@ -101,7 +101,10 @@ verify-fetch-miners:
   image: alpine:3.20
   tags: [linux, amd64]
   before_script:
-    - apk add --no-cache bash shellcheck
+    # curl: the script resolves each miner's newest release from the API, and
+    # it does so on a DRY_RUN too, because the asset URL it prints carries the
+    # tag. Alpine ships busybox wget, not curl.
+    - apk add --no-cache bash shellcheck curl
   script:
     - shellcheck crates/quip-coordinator/tools/fetch-miners.sh
     - |
