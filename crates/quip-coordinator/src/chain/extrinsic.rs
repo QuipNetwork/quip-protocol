@@ -446,6 +446,50 @@ mod tests {
         assert_eq!(account, signer_account_bytes(&pair));
     }
 
+    /// Pins the identity to the pallet expression it mirrors, character for
+    /// character: `pallet_quantum_pow::Pallet::account_to_bytes` is
+    /// `blake2_256(&account.encode())`, and `submit_proof` feeds its result to
+    /// `derive_nonce` before rejecting a mismatch with `InvalidNonce`. Drift
+    /// here is silent — every proof simply stops verifying — so assert against
+    /// the SCALE encoding rather than against the raw account bytes.
+    #[test]
+    fn the_miner_identity_mirrors_the_pallet_account_to_bytes() {
+        let pair = HybridPair::from_string("//Alice", None).expect("alice");
+        let account_id = account_id_from_public(&pair.public());
+
+        // The pallet expression, spelled out.
+        let pallet_account_to_bytes = blake2_256(&account_id.encode());
+        assert_eq!(miner_identity_bytes(&pair), pallet_account_to_bytes);
+
+        // The two agree only because AccountId32 SCALE-encodes as its 32 raw
+        // bytes with no length prefix. Pin that, so a codec change surfaces
+        // here instead of as InvalidNonce on a live chain.
+        let raw: [u8; 32] = *AsRef::<[u8; 32]>::as_ref(&account_id);
+        assert_eq!(account_id.encode(), raw.to_vec());
+    }
+
+    /// The coordinator derives job nonces with `quip_protocol::derive`, while
+    /// the pallet validates them with `quantum_validation`. These are separate
+    /// implementations of the same BLAKE3 composition, so a change to either
+    /// one alone invalidates every proof. Cross-check them over the identity.
+    #[test]
+    fn both_derive_nonce_implementations_agree_over_the_identity() {
+        let pair = HybridPair::from_string("//Alice", None).expect("alice");
+        let identity = miner_identity_bytes(&pair);
+        let head = [0x33u8; 32];
+        let salt = [0x44u8; 32];
+
+        let coordinator = quip_protocol::derive::derive_nonce(head, identity, salt);
+        let pallet: U256 = quantum_validation::derive_nonce(&head, &identity, &salt);
+        assert_eq!(pallet, U256::from_big_endian(&coordinator));
+
+        // The account is not an accepted substitute for the identity anywhere
+        // on this path.
+        let from_account =
+            quip_protocol::derive::derive_nonce(head, signer_account_bytes(&pair), salt);
+        assert_ne!(coordinator, from_account);
+    }
+
     #[test]
     fn the_miners_key_ends_with_the_account() {
         let account = [5u8; 32];
