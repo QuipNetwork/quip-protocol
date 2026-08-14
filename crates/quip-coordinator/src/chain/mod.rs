@@ -34,8 +34,8 @@ pub use seed::{
 };
 pub use snapshot::{head_state_key, DecayParams, MiningSnapshot};
 pub use submit::{
-    classify_descriptor, classify_participation, classify_receipt, DescriptorOutcome,
-    ParticipationOutcome, Proof, SubmitAction,
+    classify_descriptor, classify_participation, classify_receipt, classify_registration,
+    DescriptorOutcome, ParticipationOutcome, Proof, RegistrationOutcome, SubmitAction,
 };
 pub use transport::{BoxStream, RpcTransport};
 pub use transport_jsonrpsee::JsonrpseeTransport;
@@ -85,6 +85,14 @@ pub trait ChainClient: Send + Sync {
 
     /// Hybrid-sign and submit a proof extrinsic; classify the receipt.
     async fn submit_proof(&self, proof: &Proof) -> Result<SubmitAction, ChainError>;
+
+    /// Register the signing account with `QuantumPow.register_miner`, unless
+    /// `QuantumPow.Miners` already holds it.
+    ///
+    /// The signing account pays the call and has the miner deposit reserved
+    /// from it. Until this succeeds, every `submit_proof` fails with
+    /// `MinerNotRegistered`.
+    async fn ensure_miner_registered(&self) -> Result<RegistrationOutcome, ChainError>;
 
     /// Hybrid-sign and submit `MinerRegistry.set_descriptor`.
     async fn file_descriptor(

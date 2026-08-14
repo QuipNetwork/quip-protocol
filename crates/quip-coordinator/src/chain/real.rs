@@ -7,19 +7,19 @@
 use super::extrinsic::{
     build_hybrid_signed_extrinsic, default_topology_storage_key, difficulties_storage_key,
     extrinsic_hash, hex_decode, hex_encode, job_orders_storage_key, last_proof_block_storage_key,
-    load_hybrid_pair, miner_identity_bytes, node_descriptors_storage_key,
-    participants_by_qblock_storage_key, qblocks_storage_key, topology_curve_c_storage_key,
-    SignedExtensionContext,
+    load_hybrid_pair, miner_identity_bytes, miners_storage_key, node_descriptors_storage_key,
+    participants_by_qblock_storage_key, qblocks_storage_key, signer_account_bytes,
+    topology_curve_c_storage_key, SignedExtensionContext,
 };
 use super::proof_encode::{build_quantum_proof, ProofBuildContext};
 use super::scale_types::{
-    encode_participate_call, encode_set_descriptor_call, encode_submit_proof_call,
-    require_set_values, CurveCScale, DifficultyConfig, JobOrderScale, MinerKind,
-    MiningSnapshotScale, NodeDescriptorV2Input, OrderStatus,
+    encode_participate_call, encode_register_miner_call, encode_set_descriptor_call,
+    encode_submit_proof_call, require_set_values, CurveCScale, DifficultyConfig, JobOrderScale,
+    MinerKind, MiningSnapshotScale, NodeDescriptorV2Input, OrderStatus,
 };
 use super::submit::{
-    classify_descriptor, classify_participation, classify_receipt, DescriptorOutcome,
-    ParticipationOutcome, Proof, SubmitAction,
+    classify_descriptor, classify_participation, classify_receipt, classify_registration,
+    DescriptorOutcome, ParticipationOutcome, Proof, RegistrationOutcome, SubmitAction,
 };
 use super::transport::RpcTransport;
 use super::transport_jsonrpsee::JsonrpseeTransport;
@@ -448,6 +448,10 @@ impl RealChainClient {
                 self.storage_value_present(&node_descriptors_storage_key(&account), block_hex)
                     .await
             }
+            Confirmation::MinerRegistered { account } => {
+                self.storage_value_present(&miners_storage_key(&account), block_hex)
+                    .await
+            }
             Confirmation::Participation { qblock_id, account } => {
                 self.storage_value_present(
                     &participants_by_qblock_storage_key(qblock_id, &account),
@@ -513,6 +517,18 @@ impl RealChainClient {
         Ok(miner == our_account)
     }
 
+    /// Is `account` already in `QuantumPow.Miners` at the current head?
+    async fn miner_is_registered(&self, account: &[u8; 32]) -> Result<bool, ChainError> {
+        let head = self
+            .rpc_call("chain_getBlockHash", Value::Array(vec![]))
+            .await?;
+        let at = head
+            .as_str()
+            .ok_or_else(|| ChainError::Decode("chain_getBlockHash not a string".into()))?;
+        self.storage_value_present(&miners_storage_key(account), at)
+            .await
+    }
+
     /// Is any value stored at `key` in the block named by `at_hex`?
     async fn storage_value_present(&self, key: &[u8], at_hex: &str) -> Result<bool, ChainError> {
         let raw = self
@@ -550,6 +566,8 @@ pub(crate) enum Confirmation {
     ProofWin { account: [u8; 32] },
     /// `MinerRegistry.NodeDescriptors[account]` is present.
     Descriptor { account: [u8; 32] },
+    /// `QuantumPow.Miners[account]` is present.
+    MinerRegistered { account: [u8; 32] },
     /// `MinerRegistry.ParticipantsByQBlock[qblock_id][account]` is present.
     Participation { qblock_id: u64, account: [u8; 32] },
     /// `QuantumPow.DefaultTopology` is present. Used by seed-chain.
@@ -915,7 +933,7 @@ impl ChainClient for RealChainClient {
         let quantum = build_quantum_proof(proof, &ctx)
             .map_err(|e| ChainError::Submit(format!("encode proof: {e}")))?;
         let call = encode_submit_proof_call(&quantum);
-        let account = *AsRef::<[u8; 32]>::as_ref(&account_id_from_public(&pair.public()));
+        let account = signer_account_bytes(&pair);
 
         match self
             .submit_signed_call(&call, Confirmation::ProofWin { account })
@@ -940,12 +958,31 @@ impl ChainClient for RealChainClient {
         }
     }
 
+    async fn ensure_miner_registered(&self) -> Result<RegistrationOutcome, ChainError> {
+        let account = signer_account_bytes(&self.pair()?);
+        if self.miner_is_registered(&account).await? {
+            return Ok(RegistrationOutcome::AlreadyRegistered);
+        }
+        let call = encode_register_miner_call();
+        match self
+            .submit_signed_call(&call, Confirmation::MinerRegistered { account })
+            .await?
+        {
+            SignedCallOutcome::Success { .. } => Ok(RegistrationOutcome::Registered),
+            SignedCallOutcome::DispatchFailed { error, .. }
+            | SignedCallOutcome::Invalid { message: error } => {
+                classify_registration(Some(&error)).ok_or(ChainError::Submit(error))
+            }
+            SignedCallOutcome::Dropped { message } => Err(ChainError::Submit(message)),
+        }
+    }
+
     async fn file_descriptor(
         &self,
         descriptor: &NodeDescriptorV2Input,
     ) -> Result<DescriptorOutcome, ChainError> {
         let call = encode_set_descriptor_call(descriptor);
-        let account = *AsRef::<[u8; 32]>::as_ref(&account_id_from_public(&self.pair()?.public()));
+        let account = signer_account_bytes(&self.pair()?);
         match self
             .submit_signed_call(&call, Confirmation::Descriptor { account })
             .await?
@@ -964,7 +1001,7 @@ impl ChainClient for RealChainClient {
         qblock_id: u64,
     ) -> Result<ParticipationOutcome, ChainError> {
         let call = encode_participate_call(qblock_id, self.participate_kind, None);
-        let account = *AsRef::<[u8; 32]>::as_ref(&account_id_from_public(&self.pair()?.public()));
+        let account = signer_account_bytes(&self.pair()?);
         match self
             .submit_signed_call(&call, Confirmation::Participation { qblock_id, account })
             .await?

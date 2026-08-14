@@ -155,11 +155,15 @@ All chain access sits behind one trait, `ChainClient` (`chain/mod.rs`):
 - `file_descriptor` — hybrid-sign and submit
   `MinerRegistry.set_descriptor` with a V2 payload, then classify the
   pallet error.
+- `ensure_miner_registered` — read `QuantumPow.Miners` for the signing
+  account and, when the account is absent, submit
+  `QuantumPow.register_miner`.
 
 `RealChainClient` (`chain/real.rs`) is the live client over Substrate
 JSON-RPC and subxt; `FakeChain` (`chain/fake.rs`) backs the tests. Supporting
 modules: `extrinsic` (hybrid sr25519 + ML-DSA-44 signing, `load_hybrid_pair`,
-`miner_identity_bytes`), `snapshot` (`MiningSnapshot`, `DecayParams`),
+`miner_identity_bytes`, `signer_account_bytes`), `snapshot`
+(`MiningSnapshot`, `DecayParams`),
 `mempool` (`JobOrder`), `submit` (`Proof`, `classify_receipt`, `SubmitAction`),
 plus `proof_encode` and `scale_types` for SCALE codec. Nothing outside
 `chain/` talks to the node directly.
@@ -183,22 +187,28 @@ The states, in order:
    `Cancel{max_generation}`. Miners stay connected and idle. The gRPC server
    is not blocked.
 2. **Validator is synced.** The feeder calls `wait_until_synced`.
-3. **Account is funded.** The feeder calls `ensure_funded`. One balance read
-   is the common case. A mid-run failure is not fatal. The feeder warns, holds
-   this state, and retries. It does not exit.
-4. **Requirements for the next qblock downloaded.** Topology, energy target,
+3. **Account is funded.** The feeder calls `ensure_funded` with the signing
+   account. One balance read is the common case. A mid-run failure is not
+   fatal. The feeder warns, holds this state, and retries. It does not exit.
+4. **Miner registered.** The coordinator reads `QuantumPow.Miners` for the
+   signing account. If the account is absent, the coordinator submits
+   `QuantumPow.register_miner`, which reserves the miner deposit from that
+   account. Later rounds skip both the read and the submit. Three transient
+   failures warn and hold this state. The pallet rejects every proof from an
+   unregistered account, so mining waits until registration succeeds.
+5. **Requirements for the next qblock downloaded.** Topology, energy target,
    required solution count, and diversity come from a fresh snapshot after
    sync and funding.
-5. **Descriptor filed.** On the first walk after the process starts, the
+6. **Descriptor filed.** On the first walk after the process starts, the
    coordinator submits `MinerRegistry.set_descriptor` with a V2 payload.
    Later rounds skip the submit and log at `trace`. A missing required
    value, a pallet rejection, or three transient failures warn and advance.
    This state never holds mining.
-6. **Participation declared.** The coordinator submits
+7. **Participation declared.** The coordinator submits
    `MinerRegistry.participate` for the candidate qblock. The call already
    deduplicates per qblock. Three transient failures warn and advance. This
    state never holds mining.
-7. **Start mining.** The feeder always sends `Topology` and `SetTarget` for
+8. **Start mining.** The feeder always sends `Topology` and `SetTarget` for
    the new round, then stages jobs. A job of the new generation cannot leave
    before those two messages.
 

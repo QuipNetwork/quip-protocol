@@ -1,7 +1,9 @@
 //! quip-coordinator binary: CLI, runtime wiring, graceful shutdown.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use quip_coordinator::chain::extrinsic::{hex_encode, load_hybrid_pair, miner_identity_bytes};
+use quip_coordinator::chain::extrinsic::{
+    hex_encode, load_hybrid_pair, miner_identity_bytes, signer_account_bytes,
+};
 use quip_coordinator::chain::scale_types::DifficultyConfig;
 use quip_coordinator::chain::{
     seed_chain, RealChainClient, SeedParams, SeedReport, SeedTopology, DEFAULT_SEED_DIFFICULTY,
@@ -327,37 +329,19 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
         quip_coordinator::config::participate_kind(&cfg.launch),
     ));
 
-    // Compatibility gate. The coordinator drives the chain through mirrored
-    // SCALE types and a pinned runtime API; against a validator that predates
-    // them every read fails one poll at a time, deep in the feeder. Decide it
-    // here instead.
-    //
-    // A *skewed* validator is fatal (exit 64 — operator error, do not respawn).
-    // An *unreachable* one is not: the node manager starts the coordinator and
-    // its validator together, so exiting because the node is still booting
-    // would just crash-loop. The feeder retries, and reachability transitions
-    // are logged.
-    match rt.block_on(chain.preflight()) {
-        Ok(_) => {}
-        Err(quip_coordinator::chain::preflight::PreflightError::Unreachable(e)) => {
-            tracing::warn!(
-                error = %e,
-                "cannot reach a validator to verify compatibility; starting anyway and \
-                 will retry (set --log-level debug to watch the retries)"
-            );
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "incompatible validator; refusing to start");
-            return StdExitCode::from(ExitCode::ConfigInvalid as u8);
-        }
+    if let Some(code) = run_preflight_gate(&rt, chain.as_ref()) {
+        return code;
     }
 
     let state = Arc::new(Mutex::new(CoordinatorState::new()));
-    // Canonical miner account (blake2_256(SCALE(account))) seeds PoW nonce
-    // derivation. A live mining coordinator needs its signer key; without a
-    // usable one, warn and fall back to a zero account — it still serves and
-    // feeds, but its proofs won't verify on-chain.
-    let miner_account = miner_account_from_key(&cfg.signer_key);
+    // Two distinct 32-byte values come out of one signer key, and mixing them
+    // up funds an address that never signs anything. A live mining coordinator
+    // needs its signer key; without a usable one, warn and fall back to zeros —
+    // it still serves and feeds, but its proofs won't verify on-chain.
+    let MinerKeys {
+        identity: miner_identity,
+        account: miner_account,
+    } = miner_keys_from_key(&cfg.signer_key);
 
     let funding = quip_coordinator::funding::FundingParams {
         faucet_url: cfg.faucet_url.clone(),
@@ -367,13 +351,17 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
     };
     let descriptor = quip_coordinator::config::DescriptorParams::from_config(&cfg);
     let descriptor_filed = Arc::new(AtomicBool::new(false));
+    let miner_registered = Arc::new(AtomicBool::new(false));
     if let Some(code) = run_startup_prepare(
         &rt,
         chain.as_ref(),
         miner_account,
         &funding,
         &descriptor,
-        descriptor_filed.as_ref(),
+        &quip_coordinator::readiness::ProcessLatches {
+            descriptor_filed: descriptor_filed.as_ref(),
+            miner_registered: miner_registered.as_ref(),
+        },
     ) {
         return code;
     }
@@ -383,6 +371,7 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
         max_submit_attempts: cfg.max_submit_attempts,
         grace_ms: 2000,
         backoff: BackoffPolicy::default(),
+        miner_identity,
         miner_account,
         // Generous floor: keep every miner well-fed from the first poll, before
         // its drain-rate EMA ramps. The adaptive window grows above this for
@@ -397,6 +386,7 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
         funding,
         descriptor,
         descriptor_filed,
+        miner_registered,
     };
     tracing::info!(
         miners = cfg.launch.len(),
@@ -420,15 +410,60 @@ fn run_config_path(config: Option<PathBuf>, log_level: LogLevel) -> StdExitCode 
     }
 }
 
-fn miner_account_from_key(signer_key: &str) -> [u8; 32] {
+/// Compatibility gate run before anything else touches the chain.
+///
+/// The coordinator drives the chain through mirrored SCALE types and a pinned
+/// runtime API; against a validator that predates them every read fails one
+/// poll at a time, deep in the feeder. Decide it here instead.
+///
+/// A *skewed* validator is fatal (exit 64 — operator error, do not respawn).
+/// An *unreachable* one is not: the node manager starts the coordinator and its
+/// validator together, so exiting because the node is still booting would just
+/// crash-loop. The feeder retries, and reachability transitions are logged.
+fn run_preflight_gate(
+    rt: &tokio::runtime::Runtime,
+    chain: &RealChainClient,
+) -> Option<StdExitCode> {
+    match rt.block_on(chain.preflight()) {
+        Ok(_) => None,
+        Err(quip_coordinator::chain::preflight::PreflightError::Unreachable(e)) => {
+            tracing::warn!(
+                error = %e,
+                "cannot reach a validator to verify compatibility; starting anyway and \
+                 will retry (set --log-level debug to watch the retries)"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "incompatible validator; refusing to start");
+            Some(StdExitCode::from(ExitCode::ConfigInvalid as u8))
+        }
+    }
+}
+
+/// The two unrelated 32-byte values one signer key produces.
+struct MinerKeys {
+    /// `PoW` nonce input. Holds no balance and keys no storage map.
+    identity: [u8; 32],
+    /// Signing `AccountId32`: pays fees, holds the balance, keys the maps.
+    account: [u8; 32],
+}
+
+fn miner_keys_from_key(signer_key: &str) -> MinerKeys {
     match load_hybrid_pair(signer_key) {
-        Ok(pair) => miner_identity_bytes(&pair),
+        Ok(pair) => MinerKeys {
+            identity: miner_identity_bytes(&pair),
+            account: signer_account_bytes(&pair),
+        },
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 "no usable signer key; PoW proofs will not verify on-chain"
             );
-            [0u8; 32]
+            MinerKeys {
+                identity: [0u8; 32],
+                account: [0u8; 32],
+            }
         }
     }
 }
@@ -443,7 +478,7 @@ fn run_startup_prepare(
     miner_account: [u8; 32],
     funding: &quip_coordinator::funding::FundingParams,
     descriptor: &quip_coordinator::config::DescriptorParams,
-    descriptor_filed: &AtomicBool,
+    latches: &quip_coordinator::readiness::ProcessLatches<'_>,
 ) -> Option<StdExitCode> {
     let faucet = quip_coordinator::readiness::build_faucet(funding.faucet_url.as_deref());
     match rt.block_on(quip_coordinator::readiness::prepare_round(
@@ -453,7 +488,7 @@ fn run_startup_prepare(
         funding,
         tokio::time::sleep,
         descriptor,
-        descriptor_filed,
+        latches,
     )) {
         Ok(_) => None,
         Err(quip_coordinator::readiness::ReadinessError::Funding(e)) => {
